@@ -29,6 +29,19 @@ pub struct S3Backend {
 impl S3Backend {
     /// Build an S3Backend from the application configuration.
     pub async fn from_config(config: &Config) -> Result<Self, ProxyError> {
+        // Enforce BACKEND_ALLOW_HTTP: reject http:// endpoints unless explicitly allowed.
+        if !config.backend_allow_http
+            && config.backend_endpoint.starts_with("http://")
+        {
+            return Err(ProxyError::InvalidRequest {
+                message: format!(
+                    "backend endpoint uses HTTP ({}) but BACKEND_ALLOW_HTTP is not enabled; \
+                     set BACKEND_ALLOW_HTTP=true to allow plaintext connections",
+                    config.backend_endpoint,
+                ),
+            });
+        }
+
         let credentials = Credentials::new(
             &config.backend_access_key_id,
             &config.backend_secret_access_key,
