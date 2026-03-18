@@ -59,7 +59,7 @@ impl DiskCache {
     }
 
     /// Scan the objects directory to compute initial stats.
-    async fn scan_existing_stats(cache_dir: &PathBuf) -> Result<CacheStats, ProxyError> {
+    async fn scan_existing_stats(cache_dir: &std::path::Path) -> Result<CacheStats, ProxyError> {
         let objects_dir = cache_dir.join("objects");
         let stats = CacheStats::default();
 
@@ -282,12 +282,14 @@ impl CacheStore for DiskCache {
                 source: Box::new(e),
                 operation: "rename body".into(),
             })?;
-        tokio::fs::rename(&temp_meta, &final_meta)
-            .await
-            .map_err(|e| ProxyError::Cache {
+        if let Err(e) = tokio::fs::rename(&temp_meta, &final_meta).await {
+            // Clean up the already-renamed body to avoid orphan files.
+            let _ = tokio::fs::remove_file(&final_body).await;
+            return Err(ProxyError::Cache {
                 source: Box::new(e),
                 operation: "rename metadata".into(),
-            })?;
+            });
+        }
 
         // Update stats atomically
         self.stats.entry_count.fetch_add(1, Ordering::Relaxed);
@@ -339,9 +341,10 @@ impl CacheStore for DiskCache {
         }
 
         if removed {
-            // Atomically update stats
-            self.stats.entry_count.fetch_sub(1, Ordering::Relaxed);
-            // Use fetch_sub with saturating logic: load, compute, store via compare_exchange loop
+            // Use saturating subtraction to avoid wrapping on partial/orphan entries.
+            let _ = self.stats.entry_count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(1))
+            });
             let total_removed = body_size + meta_size;
             let _ = self.stats.total_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_sub(total_removed))

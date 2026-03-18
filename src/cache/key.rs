@@ -19,9 +19,19 @@ impl CacheKey {
     /// Returns a hex-encoded hash for filesystem paths.
     /// Uses ahash (AES-NI accelerated) instead of SHA-256 for speed.
     ///
-    /// NOTE: This produces a different hash than the previous SHA-256 implementation.
-    /// Existing cache files on disk will no longer be found after upgrading.
-    /// This is expected and safe — old entries will be evicted naturally.
+    /// # Stability
+    /// ahash does not guarantee hash stability across library versions or platforms.
+    /// `AHasher::default()` uses fixed (non-random) keys, so hashes are stable within
+    /// a single binary build, but a dependency update could change the output. If that
+    /// happens, existing cache entries become unreachable ("orphaned") — lookups and
+    /// purges won't find them. This is safe because:
+    /// - The eviction loop walks the filesystem directly (by `.meta.json` pattern),
+    ///   so orphaned entries are still counted and evicted normally.
+    /// - After one full eviction sweep the cache re-converges with no manual intervention.
+    /// - The cache is ephemeral by design; data loss only means a temporary miss storm.
+    ///
+    /// If stronger durability guarantees are needed (e.g. surviving rolling upgrades
+    /// without a cold-cache spike), replace ahash with a stable hash like SHA-256.
     pub fn hash_hex(&self) -> String {
         let mut hasher = AHasher::default();
         self.bucket.hash(&mut hasher);

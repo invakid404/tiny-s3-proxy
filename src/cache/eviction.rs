@@ -36,7 +36,7 @@ pub async fn run_eviction_loop(
 
 /// Walk the objects directory and collect all cache entries as eviction candidates.
 async fn collect_candidates(
-    objects_dir: &PathBuf,
+    objects_dir: &std::path::Path,
 ) -> Result<Vec<EvictionCandidate>, Box<dyn std::error::Error + Send + Sync>> {
     let mut candidates = Vec::new();
 
@@ -109,7 +109,7 @@ async fn collect_candidates(
 
 /// Single eviction pass: scan cache, sort by LRU, evict until under limit.
 pub async fn run_eviction_pass(
-    cache_dir: &PathBuf,
+    cache_dir: &std::path::Path,
     max_bytes: u64,
     stats: &Arc<CacheStats>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -140,15 +140,24 @@ pub async fn run_eviction_pass(
         if current_size <= max_bytes {
             break;
         }
-        let _ = tokio::fs::remove_file(&candidate.body_path).await;
-        let _ = tokio::fs::remove_file(&candidate.meta_path).await;
-        current_size -= candidate.size;
-        evicted += 1;
-        tracing::debug!(
-            path = %candidate.body_path.display(),
-            size = candidate.size,
-            "evicted cache entry"
-        );
+        let body_removed = tokio::fs::remove_file(&candidate.body_path).await.is_ok();
+        let meta_removed = tokio::fs::remove_file(&candidate.meta_path).await.is_ok();
+        if body_removed && meta_removed {
+            current_size -= candidate.size;
+            evicted += 1;
+            tracing::debug!(
+                path = %candidate.body_path.display(),
+                size = candidate.size,
+                "evicted cache entry"
+            );
+        } else {
+            tracing::warn!(
+                path = %candidate.body_path.display(),
+                body_removed,
+                meta_removed,
+                "eviction: partial removal, skipping size accounting"
+            );
+        }
     }
 
     // Update stats atomically
