@@ -19,6 +19,11 @@ pub async fn handle_put<B: Backend, C: CacheStore>(
     key: &str,
     body: Body,
 ) -> Response<Body> {
+    // NOTE: Bodies are fully buffered because the backend client's retry logic
+    // needs to clone and resend the body on failure. For truly large objects,
+    // clients should use multipart upload with bounded part sizes. The
+    // configurable max_request_body_bytes limit prevents OOM.
+
     // Read body bytes
     let body_bytes = match axum::body::to_bytes(body, state.config.max_request_body_bytes as usize).await {
         Ok(bytes) => bytes,
@@ -29,7 +34,7 @@ pub async fn handle_put<B: Backend, C: CacheStore>(
                 key = key,
                 "failed to read request body"
             );
-            let s3err = S3Error::internal_error(
+            let s3err = S3Error::entity_too_large(
                 &format!("failed to read request body: {}", e),
                 &parsed.request_id,
             );

@@ -103,6 +103,39 @@ impl S3Error {
         }
     }
 
+    /// Create an EntityTooLarge error (HTTP 400).
+    pub fn entity_too_large(message: &str, request_id: &str) -> Self {
+        S3Error {
+            http_status: StatusCode::BAD_REQUEST,
+            code: "EntityTooLarge".to_string(),
+            message: message.to_string(),
+            resource: None,
+            request_id: request_id.to_string(),
+        }
+    }
+
+    /// Create a MalformedXML error (HTTP 400).
+    pub fn malformed_xml(message: &str, request_id: &str) -> Self {
+        S3Error {
+            http_status: StatusCode::BAD_REQUEST,
+            code: "MalformedXML".to_string(),
+            message: message.to_string(),
+            resource: None,
+            request_id: request_id.to_string(),
+        }
+    }
+
+    /// Create an InvalidArgument error (HTTP 400).
+    pub fn invalid_argument(message: &str, request_id: &str) -> Self {
+        S3Error {
+            http_status: StatusCode::BAD_REQUEST,
+            code: "InvalidArgument".to_string(),
+            message: message.to_string(),
+            resource: None,
+            request_id: request_id.to_string(),
+        }
+    }
+
     /// Create a NotImplemented error.
     pub fn not_implemented(operation: &str, request_id: &str) -> Self {
         S3Error {

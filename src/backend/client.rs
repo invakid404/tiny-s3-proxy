@@ -359,6 +359,7 @@ impl Backend for S3Backend {
         bucket: &str,
         key: &str,
         content_type: Option<&str>,
+        metadata: &HashMap<String, String>,
     ) -> Result<CreateMultipartOutput, ProxyError> {
         let mut builder = self
             .client
@@ -368,6 +369,9 @@ impl Backend for S3Backend {
 
         if let Some(ct) = content_type {
             builder = builder.content_type(ct);
+        }
+        for (k, v) in metadata {
+            builder = builder.metadata(k, v);
         }
 
         let resp = builder
@@ -504,10 +508,10 @@ async fn list_objects_v2(
     if let Some(start_after) = &req.start_after {
         builder = builder.start_after(start_after);
     }
-    if let Some(encoding_type) = &req.encoding_type {
-        if encoding_type == "url" {
-            builder = builder.encoding_type(aws_sdk_s3::types::EncodingType::Url);
-        }
+    if let Some(encoding_type) = &req.encoding_type
+        && encoding_type == "url"
+    {
+        builder = builder.encoding_type(aws_sdk_s3::types::EncodingType::Url);
     }
 
     let resp = builder
@@ -574,10 +578,10 @@ async fn list_objects_v1(
     if let Some(marker) = &req.marker {
         builder = builder.marker(marker);
     }
-    if let Some(encoding_type) = &req.encoding_type {
-        if encoding_type == "url" {
-            builder = builder.encoding_type(aws_sdk_s3::types::EncodingType::Url);
-        }
+    if let Some(encoding_type) = &req.encoding_type
+        && encoding_type == "url"
+    {
+        builder = builder.encoding_type(aws_sdk_s3::types::EncodingType::Url);
     }
 
     let resp = builder

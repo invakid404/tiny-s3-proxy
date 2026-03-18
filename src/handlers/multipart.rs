@@ -27,6 +27,7 @@ pub async fn handle_create_multipart<B: Backend, C: CacheStore>(
             &state.backend_bucket,
             key,
             parsed.content_type.as_deref(),
+            &parsed.user_metadata,
         )
         .await;
 
@@ -79,6 +80,15 @@ pub async fn handle_upload_part<B: Backend, C: CacheStore>(
     upload_id: &str,
     body: Body,
 ) -> Response<Body> {
+    // Validate partNumber: S3 requires 1..=10000
+    if !(1..=10000).contains(&part_number) {
+        let s3err = S3Error::invalid_argument(
+            &format!("Part number must be between 1 and 10000, got {}", part_number),
+            &parsed.request_id,
+        );
+        return s3err.to_response();
+    }
+
     // Read body bytes
     let body_bytes = match axum::body::to_bytes(body, state.config.max_request_body_bytes as usize).await {
         Ok(bytes) => bytes,
@@ -89,7 +99,7 @@ pub async fn handle_upload_part<B: Backend, C: CacheStore>(
                 key = key,
                 "failed to read request body"
             );
-            let s3err = S3Error::internal_error(
+            let s3err = S3Error::entity_too_large(
                 &format!("failed to read request body: {}", e),
                 &parsed.request_id,
             );
@@ -166,7 +176,7 @@ pub async fn handle_complete_multipart<B: Backend, C: CacheStore>(
                 key = key,
                 "failed to read request body"
             );
-            let s3err = S3Error::internal_error(
+            let s3err = S3Error::entity_too_large(
                 &format!("failed to read request body: {}", e),
                 &parsed.request_id,
             );
@@ -184,8 +194,8 @@ pub async fn handle_complete_multipart<B: Backend, C: CacheStore>(
                 key = key,
                 "failed to parse CompleteMultipartUpload XML"
             );
-            let s3err = S3Error::internal_error(
-                &format!("failed to parse request body: {}", e),
+            let s3err = S3Error::malformed_xml(
+                &format!("failed to parse CompleteMultipartUpload XML: {}", e),
                 &parsed.request_id,
             );
             return s3err.to_response();
