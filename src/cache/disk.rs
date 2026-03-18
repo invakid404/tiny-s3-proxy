@@ -191,8 +191,22 @@ impl CacheStore for DiskCache {
             return Ok(None);
         }
 
-        // Record hit — NO disk write, just atomic counter
+        // Record hit
         self.stats.hit_count.fetch_add(1, Ordering::Relaxed);
+
+        // Update last_accessed_at on disk if older than 1 hour.
+        // This is throttled to avoid a disk write on every single cache hit.
+        let now = chrono::Utc::now();
+        if now.signed_duration_since(meta.last_accessed_at) > chrono::Duration::hours(1) {
+            let mut updated_meta = meta.clone();
+            updated_meta.last_accessed_at = now;
+            let meta_path_owned = meta_path.clone();
+            tokio::spawn(async move {
+                if let Ok(bytes) = serde_json::to_vec(&updated_meta) {
+                    let _ = tokio::fs::write(&meta_path_owned, &bytes).await;
+                }
+            });
+        }
 
         Ok(Some(CacheEntry { meta, body_path }))
     }
@@ -697,5 +711,42 @@ mod tests {
         let s = cache.stats().await;
         assert_eq!(s.entry_count, 1);
         assert!(s.total_bytes > 0);
+    }
+
+    #[tokio::test]
+    async fn test_lookup_updates_last_accessed_at_when_stale() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = DiskCache::new(tmp.path().to_path_buf(), 1_000_000, test_policy())
+            .await
+            .unwrap();
+
+        let key = test_key();
+        let body = b"console.log('hello');".to_vec();
+        let mut meta = test_meta(body.len());
+        // Set last_accessed_at to 2 hours ago to trigger the update
+        meta.last_accessed_at = Utc::now() - chrono::Duration::hours(2);
+
+        let temp_path = write_temp_body(tmp.path(), &body).await;
+        let guard = cache.begin_fill(&key).await.unwrap();
+        cache.commit_fill(guard, temp_path, meta).await.unwrap();
+
+        // Lookup should trigger access time update
+        let entry = cache.lookup(&key).await.unwrap().expect("should hit");
+        assert!(entry.meta.last_accessed_at < Utc::now() - chrono::Duration::minutes(90));
+
+        // Wait for the background task to complete
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Re-read metadata from disk to verify it was updated
+        let (_, meta_path) = cache.paths_for_key(&key);
+        let meta_bytes = tokio::fs::read(&meta_path).await.unwrap();
+        let updated_meta: CacheMeta = serde_json::from_slice(&meta_bytes).unwrap();
+        // The updated last_accessed_at should be recent (within last few seconds)
+        let age = Utc::now().signed_duration_since(updated_meta.last_accessed_at);
+        assert!(
+            age < chrono::Duration::seconds(5),
+            "last_accessed_at should have been updated to now, age: {:?}",
+            age
+        );
     }
 }
