@@ -4,7 +4,6 @@ use axum::body::Body;
 use http::Response;
 
 use crate::backend::models::PutObjectInput;
-use crate::backend::retry::{with_retry, RetryPolicy};
 use crate::backend::Backend;
 use crate::cache::key::CacheKey;
 use crate::cache::CacheStore;
@@ -47,25 +46,8 @@ pub async fn handle_put<B: Backend, C: CacheStore>(
         metadata: parsed.user_metadata.clone(),
     };
 
-    let backend = state.backend.clone();
-    let policy = RetryPolicy::for_writes(
-        state.config.put_max_attempts,
-        state.config.retry_base_backoff_ms,
-    );
-
-    let result = with_retry(&policy, "put_object", |_attempt| {
-        let backend = backend.clone();
-        let input = PutObjectInput {
-            bucket: input.bucket.clone(),
-            key: input.key.clone(),
-            body: input.body.clone(),
-            content_type: input.content_type.clone(),
-            content_md5: input.content_md5.clone(),
-            metadata: input.metadata.clone(),
-        };
-        async move { backend.put_object(input).await }
-    })
-    .await;
+    // Retry handled by the backend client
+    let result = state.backend.put_object(input).await;
 
     match result {
         Ok(output) => {

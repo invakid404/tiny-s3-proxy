@@ -3,7 +3,6 @@ use std::sync::Arc;
 use axum::body::Body;
 use http::Response;
 
-use crate::backend::retry::{with_retry, RetryPolicy};
 use crate::backend::Backend;
 use crate::cache::key::CacheKey;
 use crate::cache::CacheStore;
@@ -68,22 +67,8 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
         }
     }
 
-    // Passthrough to backend
-    let backend = state.backend.clone();
-    let bucket = state.backend_bucket.clone();
-    let key_owned = key.to_string();
-    let policy = RetryPolicy::for_reads(
-        state.config.head_max_attempts,
-        state.config.retry_base_backoff_ms,
-    );
-
-    let result = with_retry(&policy, "head_object", |_attempt| {
-        let backend = backend.clone();
-        let bucket = bucket.clone();
-        let key_owned = key_owned.clone();
-        async move { backend.head_object(&bucket, &key_owned).await }
-    })
-    .await;
+    // Passthrough to backend (retry handled by the backend client)
+    let result = state.backend.head_object(&state.backend_bucket, key).await;
 
     match result {
         Ok(output) => {

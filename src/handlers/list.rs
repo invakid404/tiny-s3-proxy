@@ -4,7 +4,6 @@ use axum::body::Body;
 use http::Response;
 
 use crate::backend::models::ListObjectsInput;
-use crate::backend::retry::{with_retry, RetryPolicy};
 use crate::backend::Backend;
 use crate::cache::CacheStore;
 use crate::handlers::AppState;
@@ -32,18 +31,8 @@ pub async fn handle_list<B: Backend, C: CacheStore>(
         is_v2,
     };
 
-    let backend = state.backend.clone();
-    let policy = RetryPolicy::for_reads(
-        state.config.list_max_attempts,
-        state.config.retry_base_backoff_ms,
-    );
-
-    let result = with_retry(&policy, "list_objects", |_attempt| {
-        let backend = backend.clone();
-        let input = input.clone();
-        async move { backend.list_objects(input).await }
-    })
-    .await;
+    // Retry handled by the backend client
+    let result = state.backend.list_objects(input).await;
 
     match result {
         Ok(output) => {

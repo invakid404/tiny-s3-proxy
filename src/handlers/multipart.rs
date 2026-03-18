@@ -4,7 +4,6 @@ use axum::body::Body;
 use http::Response;
 
 use crate::backend::models::{CompleteMultipartInput, UploadPartInput};
-use crate::backend::retry::{with_retry, RetryPolicy};
 use crate::backend::Backend;
 use crate::cache::key::CacheKey;
 use crate::cache::CacheStore;
@@ -107,22 +106,8 @@ pub async fn handle_upload_part<B: Backend, C: CacheStore>(
         content_md5: parsed.content_md5.clone(),
     };
 
-    let backend = state.backend.clone();
-    let policy = RetryPolicy::no_retry();
-
-    let result = with_retry(&policy, "upload_part", |_attempt| {
-        let backend = backend.clone();
-        let input = UploadPartInput {
-            bucket: input.bucket.clone(),
-            key: input.key.clone(),
-            upload_id: input.upload_id.clone(),
-            part_number: input.part_number,
-            body: input.body.clone(),
-            content_md5: input.content_md5.clone(),
-        };
-        async move { backend.upload_part(input).await }
-    })
-    .await;
+    // No retry for upload_part (handled by the backend client)
+    let result = state.backend.upload_part(input).await;
 
     match result {
         Ok(output) => {

@@ -3,7 +3,6 @@ use std::sync::Arc;
 use axum::body::Body;
 use http::Response;
 
-use crate::backend::retry::{with_retry, RetryPolicy};
 use crate::backend::Backend;
 use crate::cache::key::CacheKey;
 use crate::cache::CacheStore;
@@ -18,21 +17,8 @@ pub async fn handle_delete<B: Backend, C: CacheStore>(
     parsed: &ParsedRequest,
     key: &str,
 ) -> Response<Body> {
-    let backend = state.backend.clone();
-    let bucket = state.backend_bucket.clone();
-    let key_owned = key.to_string();
-    let policy = RetryPolicy::for_idempotent_writes(
-        state.config.delete_max_attempts,
-        state.config.retry_base_backoff_ms,
-    );
-
-    let result = with_retry(&policy, "delete_object", |_attempt| {
-        let backend = backend.clone();
-        let bucket = bucket.clone();
-        let key_owned = key_owned.clone();
-        async move { backend.delete_object(&bucket, &key_owned).await }
-    })
-    .await;
+    // Retry handled by the backend client
+    let result = state.backend.delete_object(&state.backend_bucket, key).await;
 
     match result {
         Ok(()) => {
