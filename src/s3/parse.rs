@@ -5,6 +5,18 @@ use std::collections::HashMap;
 use crate::request_id;
 use crate::s3::ops::{ListParams, ParsedRequest, S3Operation};
 
+/// S3 subresource query parameters that change the meaning of an operation.
+/// When present, the request is NOT a simple object GET/PUT/DELETE and must
+/// be routed as Unsupported (passthrough) to avoid misclassifying it.
+const S3_SUBRESOURCE_PARAMS: &[&str] = &[
+    "acl", "cors", "delete", "encryption", "intelligent-tiering",
+    "inventory", "legal-hold", "lifecycle", "location", "logging",
+    "metrics", "notification", "object-lock", "policy", "replication",
+    "requestPayment", "restore", "retention", "select", "tagging",
+    "torrent", "versioning", "versions", "website", "accelerate",
+    "analytics",
+];
+
 /// Parse query string into key-value pairs.
 fn parse_query(query: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
@@ -13,10 +25,12 @@ fn parse_query(query: &str) -> HashMap<String, String> {
     }
     for pair in query.split('&') {
         if let Some((key, value)) = pair.split_once('=') {
-            map.insert(key.to_string(), value.to_string());
+            let decoded_key = percent_decode_str(key).decode_utf8_lossy().to_string();
+            let decoded_value = percent_decode_str(value).decode_utf8_lossy().to_string();
+            map.insert(decoded_key, decoded_value);
         } else {
-            // Query param with no value (e.g., "uploads")
-            map.insert(pair.to_string(), String::new());
+            let decoded_key = percent_decode_str(pair).decode_utf8_lossy().to_string();
+            map.insert(decoded_key, String::new());
         }
     }
     map
@@ -59,6 +73,16 @@ pub fn parse_request<B>(req: &Request<B>) -> ParsedRequest {
             path: path.to_string(),
         }
     } else if has_key {
+        // Check for S3 subresource query parameters. When present, the request
+        // is a subresource operation (e.g. GET ?acl, PUT ?tagging) that we don't
+        // handle natively. Route it as Unsupported so it goes through passthrough.
+        let is_subresource = S3_SUBRESOURCE_PARAMS.iter().any(|p| query.contains_key(*p));
+        if is_subresource {
+            S3Operation::Unsupported {
+                method: method.to_string(),
+                path: path.to_string(),
+            }
+        } else {
         // Operations on objects
         match method {
             "GET" => S3Operation::GetObject {
@@ -127,29 +151,39 @@ pub fn parse_request<B>(req: &Request<B>) -> ParsedRequest {
                 path: path.to_string(),
             },
         }
+        }
     } else {
         // Bucket-level operations (no key)
         match method {
             "GET" => {
-                let params = ListParams {
-                    prefix: query.get("prefix").cloned(),
-                    delimiter: query.get("delimiter").cloned(),
-                    max_keys: query.get("max-keys").and_then(|v| v.parse().ok()),
-                    continuation_token: query.get("continuation-token").cloned(),
-                    marker: query.get("marker").cloned(),
-                    start_after: query.get("start-after").cloned(),
-                    encoding_type: query.get("encoding-type").cloned(),
-                };
-
-                if query.get("list-type").map(|v| v.as_str()) == Some("2") {
-                    S3Operation::ListObjectsV2 {
-                        bucket: bucket.to_string(),
-                        params,
+                // Check for bucket-level subresource queries
+                let is_subresource = S3_SUBRESOURCE_PARAMS.iter().any(|p| query.contains_key(*p));
+                if is_subresource {
+                    S3Operation::Unsupported {
+                        method: method.to_string(),
+                        path: path.to_string(),
                     }
                 } else {
-                    S3Operation::ListObjectsV1 {
-                        bucket: bucket.to_string(),
-                        params,
+                    let params = ListParams {
+                        prefix: query.get("prefix").cloned(),
+                        delimiter: query.get("delimiter").cloned(),
+                        max_keys: query.get("max-keys").and_then(|v| v.parse().ok()),
+                        continuation_token: query.get("continuation-token").cloned(),
+                        marker: query.get("marker").cloned(),
+                        start_after: query.get("start-after").cloned(),
+                        encoding_type: query.get("encoding-type").cloned(),
+                    };
+
+                    if query.get("list-type").map(|v| v.as_str()) == Some("2") {
+                        S3Operation::ListObjectsV2 {
+                            bucket: bucket.to_string(),
+                            params,
+                        }
+                    } else {
+                        S3Operation::ListObjectsV1 {
+                            bucket: bucket.to_string(),
+                            params,
+                        }
                     }
                 }
             }
@@ -168,8 +202,11 @@ pub fn parse_request<B>(req: &Request<B>) -> ParsedRequest {
     for (name, value) in req.headers() {
         let name_lower = name.as_str();
         if let Ok(v) = value.to_str() {
-            if name_lower.starts_with("x-amz-meta-") {
-                user_metadata.insert(name_lower.to_string(), v.to_string());
+            if let Some(bare_key) = name_lower.strip_prefix("x-amz-meta-") {
+                // Store bare key (without "x-amz-meta-" prefix) for internal use.
+                // The prefix is added back when building response headers, and the
+                // AWS SDK expects bare keys in its metadata() builder method.
+                user_metadata.insert(bare_key.to_string(), v.to_string());
             } else if name_lower.starts_with("x-amz-")
                 && name_lower != "x-amz-date"
                 && name_lower != "x-amz-content-sha256"
@@ -445,14 +482,8 @@ mod tests {
             .unwrap();
         let parsed = parse_request(&req);
         assert_eq!(parsed.user_metadata.len(), 2);
-        assert_eq!(
-            parsed.user_metadata.get("x-amz-meta-author").unwrap(),
-            "alice"
-        );
-        assert_eq!(
-            parsed.user_metadata.get("x-amz-meta-version").unwrap(),
-            "42"
-        );
+        assert_eq!(parsed.user_metadata.get("author").unwrap(), "alice");
+        assert_eq!(parsed.user_metadata.get("version").unwrap(), "42");
     }
 
     #[test]
@@ -490,5 +521,47 @@ mod tests {
         // x-amz-meta-* should be in user_metadata, NOT in extra_amz_headers
         assert_eq!(parsed.user_metadata.len(), 1);
         assert!(parsed.extra_amz_headers.is_empty());
+    }
+
+    #[test]
+    fn test_get_object_with_acl_subresource_is_unsupported() {
+        let req = build_request("GET", "/mybucket/mykey?acl");
+        let parsed = parse_request(&req);
+        assert!(matches!(parsed.operation, S3Operation::Unsupported { .. }));
+    }
+
+    #[test]
+    fn test_put_object_with_tagging_subresource_is_unsupported() {
+        let req = build_request("PUT", "/mybucket/mykey?tagging");
+        let parsed = parse_request(&req);
+        assert!(matches!(parsed.operation, S3Operation::Unsupported { .. }));
+    }
+
+    #[test]
+    fn test_get_bucket_location_is_unsupported() {
+        let req = build_request("GET", "/mybucket?location");
+        let parsed = parse_request(&req);
+        assert!(matches!(parsed.operation, S3Operation::Unsupported { .. }));
+    }
+
+    #[test]
+    fn test_multipart_params_not_treated_as_subresource() {
+        // partNumber+uploadId should still be UploadPart, not Unsupported
+        let req = build_request("PUT", "/mybucket/mykey?partNumber=1&uploadId=abc");
+        let parsed = parse_request(&req);
+        assert!(matches!(parsed.operation, S3Operation::UploadPart { .. }));
+    }
+
+    #[test]
+    fn test_query_params_are_percent_decoded() {
+        let req = build_request("GET", "/mybucket?prefix=%2Fdir%2F&delimiter=%2F");
+        let parsed = parse_request(&req);
+        match &parsed.operation {
+            S3Operation::ListObjectsV1 { params, .. } => {
+                assert_eq!(params.prefix.as_deref(), Some("/dir/"));
+                assert_eq!(params.delimiter.as_deref(), Some("/"));
+            }
+            other => panic!("Expected ListObjectsV1, got {:?}", other),
+        }
     }
 }

@@ -11,15 +11,17 @@ fn format_last_modified(dt: &chrono::DateTime<chrono::Utc>) -> String {
 }
 
 /// Build response headers for `x-amz-meta-*` user metadata.
+///
+/// Metadata is stored internally with bare keys (e.g. "author", "version").
+/// This function adds the `x-amz-meta-` prefix for the HTTP response.
 pub fn metadata_headers(metadata: &HashMap<String, String>) -> HeaderMap {
     let mut headers = HeaderMap::new();
     for (k, v) in metadata {
-        if k.starts_with("x-amz-meta-")
-            && let (Ok(name), Ok(val)) = (
-                HeaderName::from_bytes(k.as_bytes()),
-                HeaderValue::from_str(v),
-            )
-        {
+        let header_name = format!("x-amz-meta-{}", k);
+        if let (Ok(name), Ok(val)) = (
+            HeaderName::from_bytes(header_name.as_bytes()),
+            HeaderValue::from_str(v),
+        ) {
             headers.insert(name, val);
         }
     }
@@ -30,27 +32,26 @@ pub fn metadata_headers(metadata: &HashMap<String, String>) -> HeaderMap {
 pub fn get_object_headers(meta: &GetObjectMeta) -> HeaderMap {
     let mut headers = HeaderMap::new();
 
-    if let Some(ref ct) = meta.content_type {
-        if let Ok(val) = HeaderValue::from_str(ct) {
-            headers.insert("content-type", val);
-        }
+    if let Some(ref ct) = meta.content_type
+        && let Ok(val) = HeaderValue::from_str(ct)
+    {
+        headers.insert("content-type", val);
     }
 
     if let Some(cl) = meta.content_length {
         headers.insert("content-length", HeaderValue::from(cl));
     }
 
-    if let Some(ref etag) = meta.etag {
-        if let Ok(val) = HeaderValue::from_str(etag) {
-            headers.insert("etag", val);
-        }
+    if let Some(ref etag) = meta.etag
+        && let Ok(val) = HeaderValue::from_str(etag)
+    {
+        headers.insert("etag", val);
     }
 
-    if let Some(ref dt) = meta.last_modified {
-        let formatted = format_last_modified(dt);
-        if let Ok(val) = HeaderValue::from_str(&formatted) {
-            headers.insert("last-modified", val);
-        }
+    if let Some(ref dt) = meta.last_modified
+        && let Ok(val) = HeaderValue::from_str(&format_last_modified(dt))
+    {
+        headers.insert("last-modified", val);
     }
 
     // Include x-amz-meta-* user metadata
@@ -63,27 +64,26 @@ pub fn get_object_headers(meta: &GetObjectMeta) -> HeaderMap {
 pub fn head_object_headers(output: &HeadObjectOutput) -> HeaderMap {
     let mut headers = HeaderMap::new();
 
-    if let Some(ref ct) = output.content_type {
-        if let Ok(val) = HeaderValue::from_str(ct) {
-            headers.insert("content-type", val);
-        }
+    if let Some(ref ct) = output.content_type
+        && let Ok(val) = HeaderValue::from_str(ct)
+    {
+        headers.insert("content-type", val);
     }
 
     if let Some(cl) = output.content_length {
         headers.insert("content-length", HeaderValue::from(cl));
     }
 
-    if let Some(ref etag) = output.etag {
-        if let Ok(val) = HeaderValue::from_str(etag) {
-            headers.insert("etag", val);
-        }
+    if let Some(ref etag) = output.etag
+        && let Ok(val) = HeaderValue::from_str(etag)
+    {
+        headers.insert("etag", val);
     }
 
-    if let Some(ref dt) = output.last_modified {
-        let formatted = format_last_modified(dt);
-        if let Ok(val) = HeaderValue::from_str(&formatted) {
-            headers.insert("last-modified", val);
-        }
+    if let Some(ref dt) = output.last_modified
+        && let Ok(val) = HeaderValue::from_str(&format_last_modified(dt))
+    {
+        headers.insert("last-modified", val);
     }
 
     // Include x-amz-meta-* user metadata
@@ -110,10 +110,10 @@ pub fn common_headers(request_id: &str) -> HeaderMap {
 pub fn put_object_headers(etag: Option<&str>, request_id: &str) -> HeaderMap {
     let mut headers = common_headers(request_id);
 
-    if let Some(etag) = etag {
-        if let Ok(val) = HeaderValue::from_str(etag) {
-            headers.insert("etag", val);
-        }
+    if let Some(etag) = etag
+        && let Ok(val) = HeaderValue::from_str(etag)
+    {
+        headers.insert("etag", val);
     }
 
     headers
@@ -228,16 +228,12 @@ mod tests {
     #[test]
     fn test_metadata_headers_produces_correct_headermap() {
         let mut metadata = HashMap::new();
-        metadata.insert("x-amz-meta-author".to_string(), "alice".to_string());
-        metadata.insert("x-amz-meta-version".to_string(), "42".to_string());
-        // Non x-amz-meta-* keys should be skipped
-        metadata.insert("x-amz-storage-class".to_string(), "STANDARD".to_string());
+        metadata.insert("author".to_string(), "alice".to_string());
+        metadata.insert("version".to_string(), "42".to_string());
 
         let headers = metadata_headers(&metadata);
         assert_eq!(headers.get("x-amz-meta-author").unwrap(), "alice");
         assert_eq!(headers.get("x-amz-meta-version").unwrap(), "42");
-        // x-amz-storage-class is NOT x-amz-meta-*, so should not be included
-        assert!(headers.get("x-amz-storage-class").is_none());
     }
 
     #[test]
@@ -250,7 +246,7 @@ mod tests {
     #[test]
     fn test_get_object_headers_includes_metadata() {
         let mut metadata = HashMap::new();
-        metadata.insert("x-amz-meta-custom".to_string(), "value".to_string());
+        metadata.insert("custom".to_string(), "value".to_string());
         let meta = GetObjectMeta {
             content_type: Some("text/plain".to_string()),
             content_length: Some(100),
@@ -266,7 +262,7 @@ mod tests {
     #[test]
     fn test_head_object_headers_includes_metadata() {
         let mut metadata = HashMap::new();
-        metadata.insert("x-amz-meta-tag".to_string(), "test".to_string());
+        metadata.insert("tag".to_string(), "test".to_string());
         let output = HeadObjectOutput {
             content_type: None,
             content_length: Some(200),
