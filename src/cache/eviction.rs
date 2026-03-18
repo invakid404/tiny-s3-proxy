@@ -197,6 +197,7 @@ mod tests {
             last_accessed_at,
             hit_count: 0,
             source_status: 200,
+            metadata: std::collections::HashMap::new(),
         };
         let meta_json = serde_json::to_vec(&meta).unwrap();
         tokio::fs::write(&meta_path, &meta_json).await.unwrap();

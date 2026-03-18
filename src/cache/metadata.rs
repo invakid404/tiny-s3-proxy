@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -14,4 +16,6 @@ pub struct CacheMeta {
     pub last_accessed_at: DateTime<Utc>,
     pub hit_count: u64,
     pub source_status: u16,
+    #[serde(default)]
+    pub metadata: HashMap<String, String>,
 }

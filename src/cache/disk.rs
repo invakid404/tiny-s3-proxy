@@ -376,6 +376,7 @@ mod tests {
             last_accessed_at: now,
             hit_count: 0,
             source_status: 200,
+            metadata: std::collections::HashMap::new(),
         }
     }
 
@@ -601,6 +602,7 @@ mod tests {
                     last_accessed_at: Utc::now(),
                     hit_count: 0,
                     source_status: 200,
+                    metadata: std::collections::HashMap::new(),
                 };
                 let temp_path = write_temp_body(&tmp_path, &body).await;
                 let guard = cache1.begin_fill(&key1).await.unwrap();
@@ -621,6 +623,7 @@ mod tests {
                 last_accessed_at: Utc::now(),
                 hit_count: 0,
                 source_status: 200,
+                metadata: std::collections::HashMap::new(),
             };
             let temp_path = write_temp_body(&tmp_path, &body).await;
             let guard = cache2.begin_fill(&key2).await.unwrap();

@@ -39,7 +39,7 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
                     content_length: Some(entry.meta.content_length),
                     etag: entry.meta.etag.clone(),
                     last_modified: entry.meta.last_modified,
-                    metadata: std::collections::HashMap::new(),
+                    metadata: entry.meta.metadata.clone(),
                 };
 
                 let mut headers = head_object_headers(&head_output);

@@ -684,6 +684,7 @@ pub mod test_utils {
             last_accessed_at: Utc::now(),
             hit_count: 0,
             source_status: 200,
+            metadata: HashMap::new(),
         }
     }
 }

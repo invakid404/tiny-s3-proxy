@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -75,7 +74,7 @@ async fn build_cache_response(
         content_length: Some(entry.meta.content_length),
         etag: entry.meta.etag.clone(),
         last_modified: entry.meta.last_modified,
-        metadata: HashMap::new(),
+        metadata: entry.meta.metadata.clone(),
     };
 
     let body_path = entry.body_path.clone();
@@ -249,6 +248,7 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                     last_accessed_at: chrono::Utc::now(),
                     hit_count: 0,
                     source_status: 200,
+                    metadata: meta.metadata.clone(),
                 };
                 let temp_path_clone = temp_body_path.clone();
 
@@ -451,6 +451,7 @@ async fn handle_follower<B: Backend + 'static, C: CacheStore + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use crate::cache::key::CacheKey;
     use crate::handlers::test_utils::*;
     use crate::s3::ops::{ParsedRequest, S3Operation};
