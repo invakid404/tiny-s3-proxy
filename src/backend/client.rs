@@ -1,0 +1,570 @@
+use std::collections::HashMap;
+use std::time::Duration;
+
+use aws_credential_types::Credentials;
+use aws_sdk_s3::config::Region;
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::Client;
+use aws_smithy_types::timeout::TimeoutConfig;
+
+use crate::backend::models::*;
+use crate::backend::retry::{with_retry, RetryPolicy};
+use crate::backend::Backend;
+use crate::config::Config;
+use crate::error::ProxyError;
+
+/// S3 backend client that uses the aws-sdk-s3 crate to talk to an S3-compatible backend.
+pub struct S3Backend {
+    client: Client,
+    #[allow(dead_code)]
+    default_bucket: String,
+    get_policy: RetryPolicy,
+    head_policy: RetryPolicy,
+    list_policy: RetryPolicy,
+    put_policy: RetryPolicy,
+    delete_policy: RetryPolicy,
+}
+
+impl S3Backend {
+    /// Build an S3Backend from the application configuration.
+    pub async fn from_config(config: &Config) -> Result<Self, ProxyError> {
+        let credentials = Credentials::new(
+            &config.backend_access_key_id,
+            &config.backend_secret_access_key,
+            None,  // session token
+            None,  // expiry
+            "tiny-s3-proxy-static",
+        );
+
+        let timeout_config = TimeoutConfig::builder()
+            .connect_timeout(Duration::from_millis(config.upstream_connect_timeout_ms))
+            .read_timeout(Duration::from_millis(config.upstream_request_timeout_ms))
+            .build();
+
+        let sdk_config = aws_sdk_s3::config::Builder::new()
+            .endpoint_url(&config.backend_endpoint)
+            .region(Region::new(config.backend_region.clone()))
+            .credentials_provider(credentials)
+            .force_path_style(config.backend_use_path_style)
+            .timeout_config(timeout_config)
+            .behavior_version_latest()
+            .build();
+
+        let client = Client::from_conf(sdk_config);
+
+        let base_ms = config.retry_base_backoff_ms;
+
+        Ok(Self {
+            client,
+            default_bucket: config.backend_bucket.clone(),
+            get_policy: RetryPolicy::for_reads(config.get_max_attempts, base_ms),
+            head_policy: RetryPolicy::for_reads(config.head_max_attempts, base_ms),
+            list_policy: RetryPolicy::for_reads(config.list_max_attempts, base_ms),
+            put_policy: RetryPolicy::for_writes(config.put_max_attempts, base_ms),
+            delete_policy: RetryPolicy::for_idempotent_writes(config.delete_max_attempts, base_ms),
+        })
+    }
+}
+
+/// Map an AWS SDK error to our ProxyError type.
+fn map_sdk_error<E: std::fmt::Debug>(
+    err: aws_sdk_s3::error::SdkError<E>,
+    operation: &str,
+) -> ProxyError {
+    match &err {
+        aws_sdk_s3::error::SdkError::ConstructionFailure(_) => ProxyError::Internal {
+            source: format!("{operation}: SDK construction failure: {err:?}").into(),
+        },
+        aws_sdk_s3::error::SdkError::TimeoutError(_) => ProxyError::Timeout {
+            operation: operation.to_string(),
+        },
+        aws_sdk_s3::error::SdkError::DispatchFailure(_) => ProxyError::Backend {
+            source: format!("connection/dispatch failure: {err:?}").into(),
+            operation: operation.to_string(),
+        },
+        aws_sdk_s3::error::SdkError::ResponseError(resp_err) => {
+            let status = resp_err.raw().status().as_u16();
+            if status == 403 {
+                ProxyError::Auth {
+                    message: format!("{operation}: access denied from backend"),
+                }
+            } else {
+                ProxyError::Backend {
+                    source: format!("response error (HTTP {status}): {err:?}").into(),
+                    operation: operation.to_string(),
+                }
+            }
+        }
+        aws_sdk_s3::error::SdkError::ServiceError(svc_err) => {
+            let status = svc_err.raw().status().as_u16();
+            match status {
+                403 => ProxyError::Auth {
+                    message: format!("{operation}: access denied from backend"),
+                },
+                _ => ProxyError::Backend {
+                    source: format!("service error (HTTP {status}): {err:?}").into(),
+                    operation: operation.to_string(),
+                },
+            }
+        }
+        _ => ProxyError::Backend {
+            source: format!("unknown SDK error: {err:?}").into(),
+            operation: operation.to_string(),
+        },
+    }
+}
+
+/// Convert an AWS SDK DateTime to a chrono DateTime<Utc>.
+fn to_chrono(dt: &aws_smithy_types::DateTime) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::from_timestamp(dt.secs(), dt.subsec_nanos())
+}
+
+impl Backend for S3Backend {
+    async fn get_object(&self, bucket: &str, key: &str) -> Result<GetObjectOutput, ProxyError> {
+        let bucket = bucket.to_string();
+        let key = key.to_string();
+
+        with_retry(&self.get_policy, "get_object", |_attempt| {
+            let client = &self.client;
+            let bucket = bucket.clone();
+            let key = key.clone();
+            async move {
+                let resp = client
+                    .get_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .send()
+                    .await
+                    .map_err(|e| map_sdk_error(e, "get_object"))?;
+
+                let content_type = resp.content_type().map(|s| s.to_string());
+                let content_length = resp.content_length();
+                let etag = resp.e_tag().map(|s| s.to_string());
+                let last_modified = resp.last_modified().and_then(to_chrono);
+                let metadata = resp
+                    .metadata()
+                    .map(|m| {
+                        m.iter()
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                            .collect::<HashMap<String, String>>()
+                    })
+                    .unwrap_or_default();
+
+                let body = resp
+                    .body
+                    .collect()
+                    .await
+                    .map_err(|e| ProxyError::Backend {
+                        source: format!("failed to read body: {e}").into(),
+                        operation: "get_object".into(),
+                    })?
+                    .into_bytes()
+                    .to_vec();
+
+                Ok(GetObjectOutput {
+                    body,
+                    content_type,
+                    content_length,
+                    etag,
+                    last_modified,
+                    metadata,
+                })
+            }
+        })
+        .await
+    }
+
+    async fn head_object(&self, bucket: &str, key: &str) -> Result<HeadObjectOutput, ProxyError> {
+        let bucket = bucket.to_string();
+        let key = key.to_string();
+
+        with_retry(&self.head_policy, "head_object", |_attempt| {
+            let client = &self.client;
+            let bucket = bucket.clone();
+            let key = key.clone();
+            async move {
+                let resp = client
+                    .head_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .send()
+                    .await
+                    .map_err(|e| map_sdk_error(e, "head_object"))?;
+
+                let content_type = resp.content_type().map(|s| s.to_string());
+                let content_length = resp.content_length();
+                let etag = resp.e_tag().map(|s| s.to_string());
+                let last_modified = resp.last_modified().and_then(to_chrono);
+                let metadata = resp
+                    .metadata()
+                    .map(|m| {
+                        m.iter()
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                            .collect::<HashMap<String, String>>()
+                    })
+                    .unwrap_or_default();
+
+                Ok(HeadObjectOutput {
+                    content_type,
+                    content_length,
+                    etag,
+                    last_modified,
+                    metadata,
+                })
+            }
+        })
+        .await
+    }
+
+    async fn put_object(&self, req: PutObjectInput) -> Result<PutObjectOutput, ProxyError> {
+        let body_bytes = req.body.clone();
+
+        with_retry(&self.put_policy, "put_object", |_attempt| {
+            let client = &self.client;
+            let bucket = req.bucket.clone();
+            let key = req.key.clone();
+            let content_type = req.content_type.clone();
+            let content_md5 = req.content_md5.clone();
+            let metadata = req.metadata.clone();
+            let body = body_bytes.clone();
+            async move {
+                let mut builder = client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .body(ByteStream::from(body));
+
+                if let Some(ct) = content_type {
+                    builder = builder.content_type(ct);
+                }
+                if let Some(md5) = content_md5 {
+                    builder = builder.content_md5(md5);
+                }
+                for (k, v) in &metadata {
+                    builder = builder.metadata(k, v);
+                }
+
+                let resp = builder
+                    .send()
+                    .await
+                    .map_err(|e| map_sdk_error(e, "put_object"))?;
+
+                Ok(PutObjectOutput {
+                    etag: resp.e_tag().map(|s| s.to_string()),
+                })
+            }
+        })
+        .await
+    }
+
+    async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), ProxyError> {
+        let bucket = bucket.to_string();
+        let key = key.to_string();
+
+        with_retry(&self.delete_policy, "delete_object", |_attempt| {
+            let client = &self.client;
+            let bucket = bucket.clone();
+            let key = key.clone();
+            async move {
+                client
+                    .delete_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .send()
+                    .await
+                    .map_err(|e| map_sdk_error(e, "delete_object"))?;
+
+                Ok(())
+            }
+        })
+        .await
+    }
+
+    async fn list_objects(
+        &self,
+        req: ListObjectsInput,
+    ) -> Result<ListObjectsOutput, ProxyError> {
+        with_retry(&self.list_policy, "list_objects", |_attempt| {
+            let client = &self.client;
+            let req = req.clone();
+            async move {
+                if req.is_v2 {
+                    list_objects_v2(client, &req).await
+                } else {
+                    list_objects_v1(client, &req).await
+                }
+            }
+        })
+        .await
+    }
+
+    async fn create_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        content_type: Option<&str>,
+    ) -> Result<CreateMultipartOutput, ProxyError> {
+        let mut builder = self
+            .client
+            .create_multipart_upload()
+            .bucket(bucket)
+            .key(key);
+
+        if let Some(ct) = content_type {
+            builder = builder.content_type(ct);
+        }
+
+        let resp = builder
+            .send()
+            .await
+            .map_err(|e| map_sdk_error(e, "create_multipart_upload"))?;
+
+        let upload_id = resp
+            .upload_id()
+            .ok_or_else(|| ProxyError::Internal {
+                source: "create_multipart_upload returned no upload_id".into(),
+            })?
+            .to_string();
+
+        Ok(CreateMultipartOutput { upload_id })
+    }
+
+    async fn upload_part(&self, req: UploadPartInput) -> Result<UploadPartOutput, ProxyError> {
+        let mut builder = self
+            .client
+            .upload_part()
+            .bucket(&req.bucket)
+            .key(&req.key)
+            .upload_id(&req.upload_id)
+            .part_number(req.part_number)
+            .body(ByteStream::from(req.body));
+
+        if let Some(md5) = &req.content_md5 {
+            builder = builder.content_md5(md5);
+        }
+
+        let resp = builder
+            .send()
+            .await
+            .map_err(|e| map_sdk_error(e, "upload_part"))?;
+
+        let etag = resp
+            .e_tag()
+            .ok_or_else(|| ProxyError::Internal {
+                source: "upload_part returned no ETag".into(),
+            })?
+            .to_string();
+
+        Ok(UploadPartOutput { etag })
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        req: CompleteMultipartInput,
+    ) -> Result<CompleteMultipartOutput, ProxyError> {
+        let sdk_parts: Vec<aws_sdk_s3::types::CompletedPart> = req
+            .parts
+            .iter()
+            .map(|p| {
+                aws_sdk_s3::types::CompletedPart::builder()
+                    .e_tag(&p.etag)
+                    .part_number(p.part_number)
+                    .build()
+            })
+            .collect();
+
+        let completed_upload = aws_sdk_s3::types::CompletedMultipartUpload::builder()
+            .set_parts(Some(sdk_parts))
+            .build();
+
+        let resp = self
+            .client
+            .complete_multipart_upload()
+            .bucket(&req.bucket)
+            .key(&req.key)
+            .upload_id(&req.upload_id)
+            .multipart_upload(completed_upload)
+            .send()
+            .await
+            .map_err(|e| map_sdk_error(e, "complete_multipart_upload"))?;
+
+        Ok(CompleteMultipartOutput {
+            etag: resp.e_tag().map(|s| s.to_string()),
+            location: resp.location().map(|s| s.to_string()),
+        })
+    }
+
+    async fn abort_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<(), ProxyError> {
+        let bucket = bucket.to_string();
+        let key = key.to_string();
+        let upload_id = upload_id.to_string();
+
+        with_retry(&self.delete_policy, "abort_multipart_upload", |_attempt| {
+            let client = &self.client;
+            let bucket = bucket.clone();
+            let key = key.clone();
+            let upload_id = upload_id.clone();
+            async move {
+                client
+                    .abort_multipart_upload()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .upload_id(&upload_id)
+                    .send()
+                    .await
+                    .map_err(|e| map_sdk_error(e, "abort_multipart_upload"))?;
+
+                Ok(())
+            }
+        })
+        .await
+    }
+}
+
+/// Execute a ListObjectsV2 call and map the response.
+async fn list_objects_v2(
+    client: &Client,
+    req: &ListObjectsInput,
+) -> Result<ListObjectsOutput, ProxyError> {
+    let mut builder = client.list_objects_v2().bucket(&req.bucket);
+
+    if let Some(prefix) = &req.prefix {
+        builder = builder.prefix(prefix);
+    }
+    if let Some(delimiter) = &req.delimiter {
+        builder = builder.delimiter(delimiter);
+    }
+    if let Some(max_keys) = req.max_keys {
+        builder = builder.max_keys(max_keys);
+    }
+    if let Some(token) = &req.continuation_token {
+        builder = builder.continuation_token(token);
+    }
+    if let Some(start_after) = &req.start_after {
+        builder = builder.start_after(start_after);
+    }
+    if let Some(encoding_type) = &req.encoding_type {
+        if encoding_type == "url" {
+            builder = builder.encoding_type(aws_sdk_s3::types::EncodingType::Url);
+        }
+    }
+
+    let resp = builder
+        .send()
+        .await
+        .map_err(|e| map_sdk_error(e, "list_objects_v2"))?;
+
+    let contents = resp
+        .contents()
+        .iter()
+        .map(|obj| ObjectInfo {
+            key: obj.key().unwrap_or_default().to_string(),
+            last_modified: obj.last_modified().and_then(to_chrono),
+            etag: obj.e_tag().map(|s| s.to_string()),
+            size: obj.size(),
+            storage_class: obj
+                .storage_class()
+                .map(|sc| sc.as_str().to_string()),
+        })
+        .collect();
+
+    let common_prefixes = resp
+        .common_prefixes()
+        .iter()
+        .filter_map(|cp| cp.prefix().map(|s| s.to_string()))
+        .collect();
+
+    Ok(ListObjectsOutput {
+        is_truncated: resp.is_truncated().unwrap_or(false),
+        contents,
+        common_prefixes,
+        name: resp.name().unwrap_or_default().to_string(),
+        prefix: resp.prefix().map(|s| s.to_string()),
+        delimiter: resp.delimiter().map(|s| s.to_string()),
+        max_keys: resp.max_keys().unwrap_or(1000),
+        encoding_type: resp
+            .encoding_type()
+            .map(|et| et.as_str().to_string()),
+        key_count: resp.key_count(),
+        continuation_token: req.continuation_token.clone(),
+        next_continuation_token: resp.next_continuation_token().map(|s| s.to_string()),
+        start_after: resp.start_after().map(|s| s.to_string()),
+        marker: None,
+        next_marker: None,
+    })
+}
+
+/// Execute a ListObjects (v1) call and map the response.
+async fn list_objects_v1(
+    client: &Client,
+    req: &ListObjectsInput,
+) -> Result<ListObjectsOutput, ProxyError> {
+    let mut builder = client.list_objects().bucket(&req.bucket);
+
+    if let Some(prefix) = &req.prefix {
+        builder = builder.prefix(prefix);
+    }
+    if let Some(delimiter) = &req.delimiter {
+        builder = builder.delimiter(delimiter);
+    }
+    if let Some(max_keys) = req.max_keys {
+        builder = builder.max_keys(max_keys);
+    }
+    if let Some(marker) = &req.marker {
+        builder = builder.marker(marker);
+    }
+    if let Some(encoding_type) = &req.encoding_type {
+        if encoding_type == "url" {
+            builder = builder.encoding_type(aws_sdk_s3::types::EncodingType::Url);
+        }
+    }
+
+    let resp = builder
+        .send()
+        .await
+        .map_err(|e| map_sdk_error(e, "list_objects"))?;
+
+    let contents = resp
+        .contents()
+        .iter()
+        .map(|obj| ObjectInfo {
+            key: obj.key().unwrap_or_default().to_string(),
+            last_modified: obj.last_modified().and_then(to_chrono),
+            etag: obj.e_tag().map(|s| s.to_string()),
+            size: obj.size(),
+            storage_class: obj
+                .storage_class()
+                .map(|sc| sc.as_str().to_string()),
+        })
+        .collect();
+
+    let common_prefixes = resp
+        .common_prefixes()
+        .iter()
+        .filter_map(|cp| cp.prefix().map(|s| s.to_string()))
+        .collect();
+
+    Ok(ListObjectsOutput {
+        is_truncated: resp.is_truncated().unwrap_or(false),
+        contents,
+        common_prefixes,
+        name: resp.name().unwrap_or_default().to_string(),
+        prefix: resp.prefix().map(|s| s.to_string()),
+        delimiter: resp.delimiter().map(|s| s.to_string()),
+        max_keys: resp.max_keys().unwrap_or(1000),
+        encoding_type: resp
+            .encoding_type()
+            .map(|et| et.as_str().to_string()),
+        key_count: None,
+        continuation_token: None,
+        next_continuation_token: None,
+        start_after: None,
+        marker: resp.marker().map(|s| s.to_string()),
+        next_marker: resp.next_marker().map(|s| s.to_string()),
+    })
+}

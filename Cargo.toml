@@ -1,0 +1,39 @@
+[package]
+name = "tiny-s3-proxy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aws-credential-types = "1.2.14"
+aws-sdk-s3 = "1.127.0"
+aws-smithy-runtime-api = "1.11.6"
+aws-smithy-types = "1.4.7"
+axum = "0.8.8"
+bytes = "1.11.1"
+chrono = { version = "0.4.44", features = ["serde"] }
+futures = "0.3.32"
+hex = "0.4.3"
+http = "1.4.0"
+hyper = { version = "1.8.1", features = ["server", "http1"] }
+metrics = "0.24.3"
+metrics-exporter-prometheus = "0.18.1"
+mime = "0.3.17"
+percent-encoding = "2.3.2"
+quick-xml = { version = "0.39.2", features = ["serialize"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+sha2 = "0.10.9"
+thiserror = "2.0.18"
+tokio = { version = "1.50.0", features = ["full"] }
+tokio-util = { version = "0.7.18", features = ["io"] }
+tower = "0.5.3"
+tower-http = { version = "0.6.8", features = ["trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+uuid = { version = "1.22.0", features = ["v4"] }
+
+[dev-dependencies]
+reqwest = "0.13.2"
+tempfile = "3.27.0"
+testcontainers = "0.27.1"
+tokio-test = "0.4.5"

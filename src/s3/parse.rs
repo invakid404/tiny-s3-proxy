@@ -1,0 +1,417 @@
+use http::Request;
+use percent_encoding::percent_decode_str;
+use std::collections::HashMap;
+
+use crate::request_id;
+use crate::s3::ops::{ListParams, ParsedRequest, S3Operation};
+
+/// Parse query string into key-value pairs.
+fn parse_query(query: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    if query.is_empty() {
+        return map;
+    }
+    for pair in query.split('&') {
+        if let Some((key, value)) = pair.split_once('=') {
+            map.insert(key.to_string(), value.to_string());
+        } else {
+            // Query param with no value (e.g., "uploads")
+            map.insert(pair.to_string(), String::new());
+        }
+    }
+    map
+}
+
+/// Extract a header value as a String.
+fn header_str<B>(req: &Request<B>, name: &str) -> Option<String> {
+    req.headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
+/// Parse an inbound HTTP request into a classified S3 operation.
+pub fn parse_request<B>(req: &Request<B>) -> ParsedRequest {
+    let method = req.method().as_str();
+    let path = req.uri().path();
+    let query_str = req.uri().query().unwrap_or("");
+    let query = parse_query(query_str);
+
+    // Parse path: strip leading '/' then split into bucket and key
+    let trimmed = path.strip_prefix('/').unwrap_or(path);
+    let (bucket, raw_key) = if trimmed.is_empty() {
+        ("", "")
+    } else if let Some((b, k)) = trimmed.split_once('/') {
+        (b, k)
+    } else {
+        (trimmed, "")
+    };
+
+    // URL-decode the key
+    let key = percent_decode_str(raw_key).decode_utf8_lossy().to_string();
+
+    let has_key = !key.is_empty();
+
+    let operation = if bucket.is_empty() {
+        // No bucket in path
+        S3Operation::Unsupported {
+            method: method.to_string(),
+            path: path.to_string(),
+        }
+    } else if has_key {
+        // Operations on objects
+        match method {
+            "GET" => S3Operation::GetObject {
+                bucket: bucket.to_string(),
+                key,
+            },
+            "HEAD" => S3Operation::HeadObject {
+                bucket: bucket.to_string(),
+                key,
+            },
+            "PUT" => {
+                if query.contains_key("partNumber") && query.contains_key("uploadId") {
+                    let part_number = query
+                        .get("partNumber")
+                        .and_then(|v| v.parse::<i32>().ok())
+                        .unwrap_or(0);
+                    let upload_id = query.get("uploadId").cloned().unwrap_or_default();
+                    S3Operation::UploadPart {
+                        bucket: bucket.to_string(),
+                        key,
+                        part_number,
+                        upload_id,
+                    }
+                } else {
+                    S3Operation::PutObject {
+                        bucket: bucket.to_string(),
+                        key,
+                    }
+                }
+            }
+            "POST" => {
+                if query.contains_key("uploads") {
+                    S3Operation::CreateMultipartUpload {
+                        bucket: bucket.to_string(),
+                        key,
+                    }
+                } else if let Some(upload_id) = query.get("uploadId") {
+                    S3Operation::CompleteMultipartUpload {
+                        bucket: bucket.to_string(),
+                        key,
+                        upload_id: upload_id.clone(),
+                    }
+                } else {
+                    S3Operation::Unsupported {
+                        method: method.to_string(),
+                        path: path.to_string(),
+                    }
+                }
+            }
+            "DELETE" => {
+                if let Some(upload_id) = query.get("uploadId") {
+                    S3Operation::AbortMultipartUpload {
+                        bucket: bucket.to_string(),
+                        key,
+                        upload_id: upload_id.clone(),
+                    }
+                } else {
+                    S3Operation::DeleteObject {
+                        bucket: bucket.to_string(),
+                        key,
+                    }
+                }
+            }
+            _ => S3Operation::Unsupported {
+                method: method.to_string(),
+                path: path.to_string(),
+            },
+        }
+    } else {
+        // Bucket-level operations (no key)
+        match method {
+            "GET" => {
+                let params = ListParams {
+                    prefix: query.get("prefix").cloned(),
+                    delimiter: query.get("delimiter").cloned(),
+                    max_keys: query.get("max-keys").and_then(|v| v.parse().ok()),
+                    continuation_token: query.get("continuation-token").cloned(),
+                    marker: query.get("marker").cloned(),
+                    start_after: query.get("start-after").cloned(),
+                    encoding_type: query.get("encoding-type").cloned(),
+                };
+
+                if query.get("list-type").map(|v| v.as_str()) == Some("2") {
+                    S3Operation::ListObjectsV2 {
+                        bucket: bucket.to_string(),
+                        params,
+                    }
+                } else {
+                    S3Operation::ListObjectsV1 {
+                        bucket: bucket.to_string(),
+                        params,
+                    }
+                }
+            }
+            _ => S3Operation::Unsupported {
+                method: method.to_string(),
+                path: path.to_string(),
+            },
+        }
+    };
+
+    let content_length = header_str(req, "content-length").and_then(|v| v.parse::<u64>().ok());
+
+    ParsedRequest {
+        operation,
+        request_id: request_id::generate(),
+        content_type: header_str(req, "content-type"),
+        content_length,
+        content_md5: header_str(req, "content-md5"),
+        authorization: header_str(req, "authorization"),
+        amz_date: header_str(req, "x-amz-date"),
+        amz_content_sha256: header_str(req, "x-amz-content-sha256"),
+        range: header_str(req, "range"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::Request;
+
+    fn build_request(method: &str, uri: &str) -> Request<()> {
+        Request::builder().method(method).uri(uri).body(()).unwrap()
+    }
+
+    #[test]
+    fn test_get_object() {
+        let req = build_request("GET", "/mybucket/mykey");
+        let parsed = parse_request(&req);
+        match &parsed.operation {
+            S3Operation::GetObject { bucket, key } => {
+                assert_eq!(bucket, "mybucket");
+                assert_eq!(key, "mykey");
+            }
+            other => panic!("Expected GetObject, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_head_object() {
+        let req = build_request("HEAD", "/mybucket/mykey");
+        let parsed = parse_request(&req);
+        assert!(matches!(parsed.operation, S3Operation::HeadObject { .. }));
+    }
+
+    #[test]
+    fn test_put_object() {
+        let req = build_request("PUT", "/mybucket/mykey");
+        let parsed = parse_request(&req);
+        assert!(matches!(parsed.operation, S3Operation::PutObject { .. }));
+    }
+
+    #[test]
+    fn test_delete_object() {
+        let req = build_request("DELETE", "/mybucket/mykey");
+        let parsed = parse_request(&req);
+        assert!(matches!(parsed.operation, S3Operation::DeleteObject { .. }));
+    }
+
+    #[test]
+    fn test_list_objects_v2() {
+        let req = build_request("GET", "/mybucket?list-type=2&prefix=scripts/");
+        let parsed = parse_request(&req);
+        match &parsed.operation {
+            S3Operation::ListObjectsV2 { bucket, params } => {
+                assert_eq!(bucket, "mybucket");
+                assert_eq!(params.prefix.as_deref(), Some("scripts/"));
+            }
+            other => panic!("Expected ListObjectsV2, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_list_objects_v1_with_params() {
+        let req = build_request("GET", "/mybucket?prefix=logs/&delimiter=/");
+        let parsed = parse_request(&req);
+        match &parsed.operation {
+            S3Operation::ListObjectsV1 { bucket, params } => {
+                assert_eq!(bucket, "mybucket");
+                assert_eq!(params.prefix.as_deref(), Some("logs/"));
+                assert_eq!(params.delimiter.as_deref(), Some("/"));
+            }
+            other => panic!("Expected ListObjectsV1, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_list_objects_v1_no_params() {
+        let req = build_request("GET", "/mybucket");
+        let parsed = parse_request(&req);
+        match &parsed.operation {
+            S3Operation::ListObjectsV1 { bucket, params } => {
+                assert_eq!(bucket, "mybucket");
+                assert!(params.prefix.is_none());
+                assert!(params.delimiter.is_none());
+            }
+            other => panic!("Expected ListObjectsV1, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_create_multipart_upload() {
+        let req = build_request("POST", "/mybucket/mykey?uploads");
+        let parsed = parse_request(&req);
+        match &parsed.operation {
+            S3Operation::CreateMultipartUpload { bucket, key } => {
+                assert_eq!(bucket, "mybucket");
+                assert_eq!(key, "mykey");
+            }
+            other => panic!("Expected CreateMultipartUpload, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_upload_part() {
+        let req = build_request("PUT", "/mybucket/mykey?partNumber=3&uploadId=abc123");
+        let parsed = parse_request(&req);
+        match &parsed.operation {
+            S3Operation::UploadPart {
+                bucket,
+                key,
+                part_number,
+                upload_id,
+            } => {
+                assert_eq!(bucket, "mybucket");
+                assert_eq!(key, "mykey");
+                assert_eq!(*part_number, 3);
+                assert_eq!(upload_id, "abc123");
+            }
+            other => panic!("Expected UploadPart, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_complete_multipart_upload() {
+        let req = build_request("POST", "/mybucket/mykey?uploadId=abc123");
+        let parsed = parse_request(&req);
+        match &parsed.operation {
+            S3Operation::CompleteMultipartUpload {
+                bucket,
+                key,
+                upload_id,
+            } => {
+                assert_eq!(bucket, "mybucket");
+                assert_eq!(key, "mykey");
+                assert_eq!(upload_id, "abc123");
+            }
+            other => panic!("Expected CompleteMultipartUpload, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_abort_multipart_upload() {
+        let req = build_request("DELETE", "/mybucket/mykey?uploadId=abc123");
+        let parsed = parse_request(&req);
+        match &parsed.operation {
+            S3Operation::AbortMultipartUpload {
+                bucket,
+                key,
+                upload_id,
+            } => {
+                assert_eq!(bucket, "mybucket");
+                assert_eq!(key, "mykey");
+                assert_eq!(upload_id, "abc123");
+            }
+            other => panic!("Expected AbortMultipartUpload, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_deep_key_path() {
+        let req = build_request("GET", "/mybucket/path/to/deep/key.js");
+        let parsed = parse_request(&req);
+        match &parsed.operation {
+            S3Operation::GetObject { bucket, key } => {
+                assert_eq!(bucket, "mybucket");
+                assert_eq!(key, "path/to/deep/key.js");
+            }
+            other => panic!("Expected GetObject, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_url_decoded_key() {
+        let req = build_request("GET", "/mybucket/path%20with%20spaces/key");
+        let parsed = parse_request(&req);
+        match &parsed.operation {
+            S3Operation::GetObject { bucket, key } => {
+                assert_eq!(bucket, "mybucket");
+                assert_eq!(key, "path with spaces/key");
+            }
+            other => panic!("Expected GetObject, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_put_on_bucket_root_is_unsupported() {
+        let req = build_request("PUT", "/mybucket");
+        let parsed = parse_request(&req);
+        assert!(matches!(parsed.operation, S3Operation::Unsupported { .. }));
+    }
+
+    #[test]
+    fn test_no_path_segments_is_unsupported() {
+        let req = build_request("GET", "/");
+        let parsed = parse_request(&req);
+        assert!(matches!(parsed.operation, S3Operation::Unsupported { .. }));
+    }
+
+    #[test]
+    fn test_patch_is_unsupported() {
+        let req = build_request("PATCH", "/mybucket/key");
+        let parsed = parse_request(&req);
+        assert!(matches!(parsed.operation, S3Operation::Unsupported { .. }));
+    }
+
+    #[test]
+    fn test_request_id_is_generated() {
+        let req = build_request("GET", "/mybucket/mykey");
+        let parsed = parse_request(&req);
+        assert!(!parsed.request_id.is_empty());
+    }
+
+    #[test]
+    fn test_headers_extracted() {
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/mybucket/mykey")
+            .header("content-type", "application/octet-stream")
+            .header("content-length", "1024")
+            .header("content-md5", "abc123==")
+            .header("authorization", "AWS4-HMAC-SHA256 ...")
+            .header("x-amz-date", "20240101T000000Z")
+            .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+            .header("range", "bytes=0-99")
+            .body(())
+            .unwrap();
+        let parsed = parse_request(&req);
+        assert_eq!(
+            parsed.content_type.as_deref(),
+            Some("application/octet-stream")
+        );
+        assert_eq!(parsed.content_length, Some(1024));
+        assert_eq!(parsed.content_md5.as_deref(), Some("abc123=="));
+        assert_eq!(
+            parsed.authorization.as_deref(),
+            Some("AWS4-HMAC-SHA256 ...")
+        );
+        assert_eq!(parsed.amz_date.as_deref(), Some("20240101T000000Z"));
+        assert_eq!(
+            parsed.amz_content_sha256.as_deref(),
+            Some("UNSIGNED-PAYLOAD")
+        );
+        assert_eq!(parsed.range.as_deref(), Some("bytes=0-99"));
+    }
+}
