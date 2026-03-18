@@ -90,8 +90,10 @@ fn map_sdk_error<E: std::fmt::Debug>(
                     message: format!("{operation}: access denied from backend"),
                 }
             } else {
-                ProxyError::Backend {
-                    source: format!("response error (HTTP {status}): {err:?}").into(),
+                ProxyError::UpstreamS3 {
+                    status_code: status,
+                    s3_code: default_s3_code_for_status(status).to_string(),
+                    message: format!("response error (HTTP {status}): {err:?}"),
                     operation: operation.to_string(),
                 }
             }
@@ -102,16 +104,54 @@ fn map_sdk_error<E: std::fmt::Debug>(
                 403 => ProxyError::Auth {
                     message: format!("{operation}: access denied from backend"),
                 },
-                _ => ProxyError::Backend {
-                    source: format!("service error (HTTP {status}): {err:?}").into(),
-                    operation: operation.to_string(),
-                },
+                _ => {
+                    let s3_code = extract_s3_code(svc_err.err(), status);
+                    let message = format!("{err:?}");
+                    ProxyError::UpstreamS3 {
+                        status_code: status,
+                        s3_code,
+                        message,
+                        operation: operation.to_string(),
+                    }
+                }
             }
         }
         _ => ProxyError::Backend {
             source: format!("unknown SDK error: {err:?}").into(),
             operation: operation.to_string(),
         },
+    }
+}
+
+/// Try to extract an S3 error code from the SDK error's Debug representation.
+/// Falls back to a status-code-based default.
+fn extract_s3_code<E: std::fmt::Debug>(err: &E, status: u16) -> String {
+    let debug = format!("{:?}", err);
+    // AWS SDK errors format as "VariantName(InnerType { ... })"
+    if let Some(pos) = debug.find('(') {
+        let candidate = &debug[..pos];
+        if !candidate.is_empty()
+            && candidate.chars().next().unwrap().is_uppercase()
+            && candidate.chars().all(|c| c.is_alphanumeric())
+        {
+            return candidate.to_string();
+        }
+    }
+    // Fallback based on HTTP status
+    default_s3_code_for_status(status).to_string()
+}
+
+/// Map an HTTP status code to a reasonable default S3 error code.
+fn default_s3_code_for_status(status: u16) -> &'static str {
+    match status {
+        304 => "NotModified",
+        400 => "InvalidArgument",
+        404 => "NoSuchKey",
+        405 => "MethodNotAllowed",
+        409 => "OperationAborted",
+        412 => "PreconditionFailed",
+        416 => "InvalidRange",
+        _ => "InternalError",
     }
 }
 

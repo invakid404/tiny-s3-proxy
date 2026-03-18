@@ -56,10 +56,17 @@ impl RetryPolicy {
 
 /// Check if a ProxyError is retryable.
 ///
-/// Backend/network errors and timeouts are retryable.
+/// Backend/network errors and timeouts are always retryable.
+/// UpstreamS3 errors are retryable only if their status code is in the policy's list.
 /// Auth errors, invalid requests, and unsupported operations are not.
-pub fn is_retryable(err: &ProxyError) -> bool {
-    matches!(err, ProxyError::Backend { .. } | ProxyError::Timeout { .. })
+pub fn is_retryable(policy: &RetryPolicy, err: &ProxyError) -> bool {
+    match err {
+        ProxyError::Backend { .. } | ProxyError::Timeout { .. } => true,
+        ProxyError::UpstreamS3 { status_code, .. } => {
+            policy.retryable_status_codes.contains(status_code)
+        }
+        _ => false,
+    }
 }
 
 /// Calculate backoff duration for a given attempt using exponential backoff.
@@ -89,7 +96,7 @@ where
         match f(attempt).await {
             Ok(result) => return Ok(result),
             Err(err) => {
-                let retryable = is_retryable(&err);
+                let retryable = is_retryable(policy, &err);
                 let attempts_remaining = max - attempt;
 
                 if !retryable || attempts_remaining == 0 {
@@ -164,35 +171,63 @@ mod tests {
 
     #[test]
     fn test_is_retryable_backend_error() {
+        let policy = RetryPolicy::for_reads(3, 100);
         let err = ProxyError::Backend {
             source: "connection reset".into(),
             operation: "get_object".into(),
         };
-        assert!(is_retryable(&err));
+        assert!(is_retryable(&policy, &err));
     }
 
     #[test]
     fn test_is_retryable_timeout() {
+        let policy = RetryPolicy::for_reads(3, 100);
         let err = ProxyError::Timeout {
             operation: "get_object".into(),
         };
-        assert!(is_retryable(&err));
+        assert!(is_retryable(&policy, &err));
     }
 
     #[test]
     fn test_is_not_retryable_auth() {
+        let policy = RetryPolicy::for_reads(3, 100);
         let err = ProxyError::Auth {
             message: "forbidden".into(),
         };
-        assert!(!is_retryable(&err));
+        assert!(!is_retryable(&policy, &err));
     }
 
     #[test]
     fn test_is_not_retryable_invalid_request() {
+        let policy = RetryPolicy::for_reads(3, 100);
         let err = ProxyError::InvalidRequest {
             message: "bad key".into(),
         };
-        assert!(!is_retryable(&err));
+        assert!(!is_retryable(&policy, &err));
+    }
+
+    #[test]
+    fn test_upstream_s3_retryable_on_500() {
+        let policy = RetryPolicy::for_reads(3, 100);
+        let err = ProxyError::UpstreamS3 {
+            status_code: 500,
+            s3_code: "InternalError".into(),
+            message: "internal".into(),
+            operation: "get_object".into(),
+        };
+        assert!(is_retryable(&policy, &err));
+    }
+
+    #[test]
+    fn test_upstream_s3_not_retryable_on_404() {
+        let policy = RetryPolicy::for_reads(3, 100);
+        let err = ProxyError::UpstreamS3 {
+            status_code: 404,
+            s3_code: "NoSuchKey".into(),
+            message: "not found".into(),
+            operation: "get_object".into(),
+        };
+        assert!(!is_retryable(&policy, &err));
     }
 
     #[tokio::test]

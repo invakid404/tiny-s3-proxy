@@ -28,6 +28,14 @@ pub enum ProxyError {
     #[error("timeout during {operation}")]
     Timeout { operation: String },
 
+    #[error("upstream S3 error (HTTP {status_code}) during {operation}: [{s3_code}] {message}")]
+    UpstreamS3 {
+        status_code: u16,
+        s3_code: String,
+        message: String,
+        operation: String,
+    },
+
     #[error("internal error: {source}")]
     Internal {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -44,6 +52,9 @@ impl ProxyError {
             ProxyError::InvalidRequest { .. } => StatusCode::BAD_REQUEST,
             ProxyError::UnsupportedOperation { .. } => StatusCode::NOT_IMPLEMENTED,
             ProxyError::Timeout { .. } => StatusCode::GATEWAY_TIMEOUT,
+            ProxyError::UpstreamS3 { status_code, .. } => {
+                StatusCode::from_u16(*status_code).unwrap_or(StatusCode::BAD_GATEWAY)
+            }
             ProxyError::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -57,6 +68,7 @@ impl ProxyError {
             ProxyError::InvalidRequest { .. } => "InvalidRequest",
             ProxyError::UnsupportedOperation { .. } => "NotImplemented",
             ProxyError::Timeout { .. } => "RequestTimeout",
+            ProxyError::UpstreamS3 { s3_code, .. } => s3_code.as_str(),
             ProxyError::Internal { .. } => "InternalError",
         }
     }

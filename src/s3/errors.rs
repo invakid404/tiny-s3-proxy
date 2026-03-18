@@ -219,6 +219,19 @@ mod tests {
     }
 
     #[test]
+    fn test_from_proxy_error_upstream_s3() {
+        let proxy_err = ProxyError::UpstreamS3 {
+            status_code: 404,
+            s3_code: "NoSuchKey".to_string(),
+            message: "The specified key does not exist.".to_string(),
+            operation: "get_object".to_string(),
+        };
+        let s3err = S3Error::from_proxy_error(&proxy_err, "req-x", Some("/bucket/key"));
+        assert_eq!(s3err.http_status, StatusCode::NOT_FOUND);
+        assert_eq!(s3err.code, "NoSuchKey");
+    }
+
+    #[test]
     fn test_xml_escapes_special_characters() {
         let err = S3Error::internal_error("value with <xml> & \"quotes\"", "r&id");
         let xml = err.to_xml();
