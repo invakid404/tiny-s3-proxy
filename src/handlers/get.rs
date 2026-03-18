@@ -277,11 +277,11 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                     while let Some(chunk_result) = stream.next().await {
                         match chunk_result {
                             Ok(chunk) => {
-                                if cache_ok {
-                                    if let Err(e) = file.write_all(&chunk).await {
-                                        tracing::warn!("cache fill: write error: {}", e);
-                                        cache_ok = false;
-                                    }
+                                if cache_ok
+                                    && let Err(e) = file.write_all(&chunk).await
+                                {
+                                    tracing::warn!("cache fill: write error: {}", e);
+                                    cache_ok = false;
                                 }
                                 // Send to client; if client disconnected, still
                                 // continue writing to disk so cache fills for followers.
@@ -289,10 +289,7 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                             }
                             Err(e) => {
                                 let _ = tx
-                                    .send(Err(std::io::Error::new(
-                                        std::io::ErrorKind::Other,
-                                        e.to_string(),
-                                    )))
+                                    .send(Err(std::io::Error::other(e.to_string())))
                                     .await;
                                 cache_ok = false;
                                 break;
@@ -373,24 +370,24 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
         }
         Err(e) => {
             // Backend failed. Try serving stale from cache if configured.
-            if state.config.cache_serve_stale_on_error {
-                if let Ok(Some(stale_entry)) = state.cache.lookup(cache_key).await {
-                    waiter.complete().await;
-                    tracing::warn!(
-                        request_id = %parsed.request_id,
-                        operation = "GetObject",
-                        key = key,
-                        cache_status = "STALE",
-                        error = %e,
-                        "serving stale cache entry on backend error"
-                    );
-                    return build_cache_response(
-                        &stale_entry,
-                        &parsed.request_id,
-                        "STALE",
-                    )
-                    .await;
-                }
+            if state.config.cache_serve_stale_on_error
+                && let Ok(Some(stale_entry)) = state.cache.lookup(cache_key).await
+            {
+                waiter.complete().await;
+                tracing::warn!(
+                    request_id = %parsed.request_id,
+                    operation = "GetObject",
+                    key = key,
+                    cache_status = "STALE",
+                    error = %e,
+                    "serving stale cache entry on backend error"
+                );
+                return build_cache_response(
+                    &stale_entry,
+                    &parsed.request_id,
+                    "STALE",
+                )
+                .await;
             }
 
             // No stale entry available

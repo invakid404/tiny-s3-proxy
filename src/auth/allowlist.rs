@@ -5,8 +5,21 @@ use crate::s3::ops::ParsedRequest;
 /// Authenticator that extracts the access key ID from the SigV4
 /// Authorization header and checks it against an allowlist.
 ///
-/// This does NOT verify the signature — it only verifies the access key ID
-/// is known. The backend (R2) will reject requests with invalid signatures.
+/// # Security Model
+/// This is NOT cryptographic authentication — it does NOT verify SigV4
+/// signatures. It only checks that the claimed access key ID is in the
+/// allowlist, which provides coarse-grained access control suitable for
+/// trusted internal networks (e.g. VPC-only deployments).
+///
+/// The proxy re-signs all backend requests with its own credentials
+/// regardless of the inbound signature, so the original signature is
+/// never validated. If you need actual signature verification with
+/// per-client secrets, implement a full SigV4 validator or place the
+/// proxy behind an authenticating reverse proxy.
+///
+/// This mode exists as a lightweight gate for multi-tenant internal
+/// environments where network isolation provides the primary security
+/// boundary and the allowlist adds defence-in-depth.
 pub struct AccessKeyAllowlistAuth {
     allowed_keys: Vec<String>,
 }

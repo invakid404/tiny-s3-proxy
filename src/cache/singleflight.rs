@@ -65,6 +65,12 @@ pub struct SingleFlight {
     registry: Arc<Mutex<HashMap<CacheKey, broadcast::Sender<()>>>>,
 }
 
+impl Default for SingleFlight {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SingleFlight {
     pub fn new() -> Self {
         Self {

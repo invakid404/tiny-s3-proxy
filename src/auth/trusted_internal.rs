@@ -13,6 +13,12 @@ impl TrustedInternalAuth {
     }
 }
 
+impl Default for TrustedInternalAuth {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Authenticator for TrustedInternalAuth {
     fn authenticate(&self, _req: &ParsedRequest) -> Result<(), ProxyError> {
         Ok(())
