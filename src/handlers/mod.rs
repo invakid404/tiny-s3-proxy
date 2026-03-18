@@ -62,6 +62,34 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
         histogram!("s3proxy_request_size_bytes", "operation" => op_name).record(size);
     }
 
+    // Auth check (applies to ALL operations including passthrough)
+    if let Err(e) = state.auth.authenticate(&parsed) {
+        let s3err = S3Error::from_proxy_error(&e, &parsed.request_id, None);
+        let response = s3err.to_response();
+        record_metrics(op_name, &response, start);
+        return response;
+    }
+
+    // Check bucket is allowed (must match frontend_bucket).
+    // For Unsupported operations, extract the bucket from the raw path.
+    let op_bucket = match &parsed.operation {
+        S3Operation::Unsupported { path, .. } => {
+            // Path is like "/bucket/key" or "/bucket" — extract first segment.
+            path.strip_prefix('/')
+                .unwrap_or(path)
+                .split('/')
+                .next()
+                .unwrap_or("")
+        }
+        other => other.bucket(),
+    };
+    if op_bucket != &*state.frontend_bucket {
+        let s3err = S3Error::no_such_bucket(op_bucket, &parsed.request_id);
+        let response = s3err.to_response();
+        record_metrics(op_name, &response, start);
+        return response;
+    }
+
     // Handle unsupported operations by proxying to the backend.
     if let S3Operation::Unsupported { ref method, ref path } = parsed.operation {
         tracing::warn!(
@@ -84,23 +112,6 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
             &parsed.request_id,
         )
         .await;
-        record_metrics(op_name, &response, start);
-        return response;
-    }
-
-    // Auth check
-    if let Err(e) = state.auth.authenticate(&parsed) {
-        let s3err = S3Error::from_proxy_error(&e, &parsed.request_id, None);
-        let response = s3err.to_response();
-        record_metrics(op_name, &response, start);
-        return response;
-    }
-
-    // Check bucket is allowed (must match frontend_bucket)
-    let op_bucket = parsed.operation.bucket();
-    if op_bucket != &*state.frontend_bucket {
-        let s3err = S3Error::no_such_bucket(op_bucket, &parsed.request_id);
-        let response = s3err.to_response();
         record_metrics(op_name, &response, start);
         return response;
     }
@@ -246,6 +257,7 @@ pub mod test_utils {
     }
 
     impl MockBackend {
+        #[allow(clippy::new_without_default)]
         pub fn new() -> Self {
             Self {
                 get_response: Mutex::new(None),
@@ -424,6 +436,7 @@ pub mod test_utils {
             _bucket: &str,
             _key: &str,
             _content_type: Option<&str>,
+            _metadata: &std::collections::HashMap<String, String>,
         ) -> Result<CreateMultipartOutput, ProxyError> {
             self.create_multipart_response
                 .lock()
@@ -501,6 +514,7 @@ pub mod test_utils {
     }
 
     impl MockCache {
+        #[allow(clippy::new_without_default)]
         pub fn new() -> Self {
             Self {
                 entries: Mutex::new(HashMap::new()),
@@ -741,6 +755,20 @@ mod tests {
             .unwrap();
         let body_str = String::from_utf8_lossy(&body);
         assert!(body_str.contains("NoSuchBucket"));
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_operation_requires_auth() {
+        let state = build_app_state(
+            MockBackend::new(),
+            MockCache::new(),
+            MockAuth::deny_all(),
+        );
+
+        let req = build_request("PATCH", "/test-frontend/some-key");
+        let resp = handle_s3_request(State(state), req).await;
+
+        assert_eq!(resp.status(), 403);
     }
 
     #[tokio::test]
