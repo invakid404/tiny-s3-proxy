@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -45,7 +44,7 @@ pub async fn handle_put<B: Backend, C: CacheStore>(
         body: body_bytes.clone(),
         content_type: parsed.content_type.clone(),
         content_md5: parsed.content_md5.clone(),
-        metadata: HashMap::new(),
+        metadata: parsed.user_metadata.clone(),
     };
 
     let backend = state.backend.clone();
@@ -116,6 +115,7 @@ pub async fn handle_put<B: Backend, C: CacheStore>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use super::*;
     use crate::cache::key::CacheKey;
     use crate::handlers::test_utils::*;
@@ -135,6 +135,8 @@ mod tests {
             amz_date: None,
             amz_content_sha256: None,
             range: None,
+            user_metadata: HashMap::new(),
+            extra_amz_headers: HashMap::new(),
         }
     }
 
@@ -148,13 +150,7 @@ mod tests {
             etag: Some("\"new-etag\"".to_string()),
         }));
 
-        let cache = MockCache::new().with_entry(
-            &cache_key,
-            crate::cache::entry::CacheEntry {
-                meta,
-                body: b"old content".to_vec(),
-            },
-        );
+        let cache = MockCache::new().with_entry(&cache_key, b"old content", meta);
 
         let state = build_app_state(backend, cache, MockAuth::allow_all());
         let parsed = make_parsed(key);
@@ -189,5 +185,32 @@ mod tests {
         let resp = handle_put(&state, &parsed, key, body).await;
 
         assert_eq!(resp.status(), 502);
+    }
+
+    #[tokio::test]
+    async fn test_put_forwards_user_metadata_to_backend() {
+        let key = "some/key.txt";
+
+        let backend = MockBackend::new().with_put(Ok(crate::backend::models::PutObjectOutput {
+            etag: Some("\"etag\"".to_string()),
+        }));
+
+        let state = build_app_state(backend, MockCache::new(), MockAuth::allow_all());
+
+        let mut parsed = make_parsed(key);
+        parsed.user_metadata.insert("x-amz-meta-author".to_string(), "alice".to_string());
+        parsed.user_metadata.insert("x-amz-meta-version".to_string(), "3".to_string());
+
+        let body = Body::from(b"hello".to_vec());
+        let resp = handle_put(&state, &parsed, key, body).await;
+
+        assert_eq!(resp.status(), 200);
+
+        // Verify the metadata was forwarded to the backend
+        let calls = state.backend.put_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let put_input = &calls[0];
+        assert_eq!(put_input.metadata.get("x-amz-meta-author").unwrap(), "alice");
+        assert_eq!(put_input.metadata.get("x-amz-meta-version").unwrap(), "3");
     }
 }

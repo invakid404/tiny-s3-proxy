@@ -74,6 +74,10 @@ pub struct ParsedRequest {
     pub amz_date: Option<String>,
     pub amz_content_sha256: Option<String>,
     pub range: Option<String>,
+    /// `x-amz-meta-*` user metadata headers from the inbound request.
+    pub user_metadata: std::collections::HashMap<String, String>,
+    /// Other `x-amz-*` headers that should be forwarded (e.g. `x-amz-storage-class`).
+    pub extra_amz_headers: std::collections::HashMap<String, String>,
 }
 
 impl S3Operation {

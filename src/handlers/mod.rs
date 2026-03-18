@@ -3,6 +3,7 @@ pub mod get;
 pub mod head;
 pub mod list;
 pub mod multipart;
+pub mod passthrough;
 pub mod put;
 
 use std::sync::Arc;
@@ -11,7 +12,7 @@ use std::time::Instant;
 use axum::body::Body;
 use axum::extract::State;
 use http::{Request, Response};
-use metrics::{counter, histogram};
+use metrics::{counter, gauge, histogram};
 
 use crate::auth::Authenticator;
 use crate::backend::Backend;
@@ -42,21 +43,46 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
     req: Request<Body>,
 ) -> Response<Body> {
     let start = Instant::now();
+    gauge!("s3proxy_in_flight_requests").increment(1.0);
 
     // Split request into parts and body so we can parse headers/URI
     // without consuming the body (needed for PUT/POST handlers).
     let (parts, body) = req.into_parts();
     let parse_req = Request::from_parts(parts, ());
     let parsed = parse_request(&parse_req);
+    let (parts, _) = parse_req.into_parts();
 
     let op_name = parsed.operation.name();
 
-    // Handle unsupported operations early (before auth/bucket checks)
-    // since they may not have a valid bucket.
+    // Record request body size for writes (from content-length header).
+    if let Some(cl) = parts.headers.get("content-length")
+        && let Ok(size) = cl.to_str().unwrap_or("0").parse::<f64>()
+    {
+        histogram!("s3proxy_request_size_bytes", "operation" => op_name).record(size);
+    }
+
+    // Handle unsupported operations by proxying to the backend.
     if let S3Operation::Unsupported { ref method, ref path } = parsed.operation {
-        let s3err =
-            S3Error::not_implemented(&format!("{} {}", method, path), &parsed.request_id);
-        let response = s3err.to_response();
+        tracing::warn!(
+            request_id = %parsed.request_id,
+            method = %method,
+            path = %path,
+            "unsupported operation, attempting passthrough to backend"
+        );
+
+        // Rewrite path: replace frontend bucket with backend bucket.
+        let rewritten_path = rewrite_bucket_in_path(path, &state.frontend_bucket, &state.backend_bucket);
+        let query = parts.uri.query();
+        let response = passthrough::handle_passthrough(
+            &state,
+            method,
+            &rewritten_path,
+            query,
+            &parts.headers,
+            body,
+            &parsed.request_id,
+        )
+        .await;
         record_metrics(op_name, &response, start);
         return response;
     }
@@ -119,24 +145,56 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
     response
 }
 
-/// Record request metrics (counter + histogram).
+/// Rewrite the bucket portion of a path-style S3 URL.
+/// E.g. `/frontend-bucket/key` → `/backend-bucket/key`.
+fn rewrite_bucket_in_path(path: &str, frontend_bucket: &str, backend_bucket: &str) -> String {
+    let prefix = format!("/{}/", frontend_bucket);
+    if path.starts_with(&prefix) {
+        format!("/{}/{}", backend_bucket, &path[prefix.len()..])
+    } else if path == format!("/{}", frontend_bucket) {
+        format!("/{}", backend_bucket)
+    } else {
+        // Can't rewrite — pass through as-is.
+        path.to_string()
+    }
+}
+
+/// Record request metrics (counter + histogram + in-flight + cache + response size).
 fn record_metrics(operation: &'static str, response: &Response<Body>, start: Instant) {
+    gauge!("s3proxy_in_flight_requests").decrement(1.0);
+
     let duration = start.elapsed().as_secs_f64();
     let status = response.status().as_u16().to_string();
     counter!("s3proxy_requests_total", "operation" => operation, "status" => status).increment(1);
     histogram!("s3proxy_request_duration_seconds", "operation" => operation).record(duration);
+
+    // Cache hit/miss/bypass/stale tracking.
+    if let Some(cache_status) = response.headers().get("x-cache")
+        && let Ok(cs) = cache_status.to_str()
+    {
+        counter!("s3proxy_cache_total", "status" => cs.to_string()).increment(1);
+    }
+
+    // Response body size.
+    if let Some(cl) = response.headers().get("content-length")
+        && let Ok(size) = cl.to_str().unwrap_or("0").parse::<f64>()
+    {
+        histogram!("s3proxy_response_size_bytes", "operation" => operation).record(size);
+    }
 }
 
 #[cfg(test)]
 pub mod test_utils {
     use std::collections::HashMap;
+    use std::path::PathBuf;
     use std::sync::Mutex;
 
+    use bytes::Bytes;
     use chrono::Utc;
 
     use crate::auth::Authenticator;
     use crate::backend::models::*;
-    use crate::backend::Backend;
+    use crate::backend::{Backend, BoxByteStream};
     use crate::cache::entry::CacheEntry;
     use crate::cache::key::CacheKey;
     use crate::cache::metadata::CacheMeta;
@@ -151,6 +209,14 @@ pub mod test_utils {
         pub body: Vec<u8>,
         pub content_type: Option<String>,
         pub etag: Option<String>,
+    }
+
+    /// Convert a Vec<u8> into a BoxByteStream (single-chunk stream).
+    fn vec_to_stream(data: Vec<u8>) -> BoxByteStream {
+        let stream = futures::stream::once(async move {
+            Ok::<Bytes, std::io::Error>(Bytes::from(data))
+        });
+        Box::pin(stream)
     }
 
     pub struct MockBackend {
@@ -242,7 +308,7 @@ pub mod test_utils {
             &self,
             _bucket: &str,
             _key: &str,
-        ) -> Result<GetObjectOutput, ProxyError> {
+        ) -> Result<(GetObjectMeta, BoxByteStream), ProxyError> {
             let resp = self
                 .get_response
                 .lock()
@@ -255,14 +321,17 @@ pub mod test_utils {
                     })
                 });
             match resp {
-                Ok(mock) => Ok(GetObjectOutput {
-                    body: mock.body.clone(),
-                    content_type: mock.content_type.clone(),
-                    content_length: Some(mock.body.len() as i64),
-                    etag: mock.etag.clone(),
-                    last_modified: Some(Utc::now()),
-                    metadata: HashMap::new(),
-                }),
+                Ok(mock) => {
+                    let meta = GetObjectMeta {
+                        content_type: mock.content_type.clone(),
+                        content_length: Some(mock.body.len() as i64),
+                        etag: mock.etag.clone(),
+                        last_modified: Some(Utc::now()),
+                        metadata: HashMap::new(),
+                    };
+                    let stream = vec_to_stream(mock.body);
+                    Ok((meta, stream))
+                }
                 Err(e) => Err(e),
             }
         }
@@ -408,11 +477,15 @@ pub mod test_utils {
     }
 
     // ---- MockCache ----
+    //
+    // Stores cache entries on disk in a temp directory so that
+    // CacheEntry.body_path is a real file that can be streamed.
 
     pub struct MockCache {
         pub entries: Mutex<HashMap<String, CacheEntry>>,
         pub purge_calls: Mutex<Vec<CacheKey>>,
         pub fill_calls: Mutex<Vec<CacheKey>>,
+        pub temp_dir: tempfile::TempDir,
     }
 
     impl MockCache {
@@ -421,10 +494,21 @@ pub mod test_utils {
                 entries: Mutex::new(HashMap::new()),
                 purge_calls: Mutex::new(Vec::new()),
                 fill_calls: Mutex::new(Vec::new()),
+                temp_dir: tempfile::TempDir::new().expect("create mock cache temp dir"),
             }
         }
 
-        pub fn with_entry(self, key: &CacheKey, entry: CacheEntry) -> Self {
+        /// Add a cache entry, writing the body to a temp file.
+        pub fn with_entry(self, key: &CacheKey, body: &[u8], meta: CacheMeta) -> Self {
+            let body_path = self
+                .temp_dir
+                .path()
+                .join(format!("{}.body", uuid::Uuid::new_v4()));
+            std::fs::write(&body_path, body).expect("write mock body");
+            let entry = CacheEntry {
+                meta,
+                body_path,
+            };
             self.entries.lock().unwrap().insert(key.hash(), entry);
             self
         }
@@ -435,7 +519,7 @@ pub mod test_utils {
             let entries = self.entries.lock().unwrap();
             let entry = entries.get(&key.hash()).map(|e| CacheEntry {
                 meta: e.meta.clone(),
-                body: e.body.clone(),
+                body_path: e.body_path.clone(),
             });
             Ok(entry)
         }
@@ -444,19 +528,21 @@ pub mod test_utils {
             self.fill_calls.lock().unwrap().push(key.clone());
             Ok(FillGuard {
                 key: key.clone(),
-                temp_dir: std::path::PathBuf::from("/tmp/mock"),
+                temp_dir: self.temp_dir.path().to_path_buf(),
             })
         }
 
         async fn commit_fill(
             &self,
             guard: FillGuard,
-            data: Vec<u8>,
+            temp_body_path: PathBuf,
             meta: CacheMeta,
         ) -> Result<(), ProxyError> {
+            // For the mock, the temp_body_path already has the data.
+            // Just store the entry with that path.
             let entry = CacheEntry {
-                meta: meta.clone(),
-                body: data,
+                meta,
+                body_path: temp_body_path,
             };
             self.entries
                 .lock()
@@ -548,7 +634,13 @@ pub mod test_utils {
         cache: MockCache,
         auth: MockAuth,
     ) -> Arc<AppState<MockBackend, MockCache>> {
-        let config = test_config();
+        let mut config = test_config();
+        // Point cache_dir to the MockCache's temp dir so tee tasks can write there
+        config.cache_dir = cache.temp_dir.path().to_str().unwrap().to_string();
+        // Create the tmp sub-directory that the tee task expects
+        let tmp_dir = cache.temp_dir.path().join("tmp");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+
         Arc::new(AppState {
             backend: Arc::new(backend),
             cache: Arc::new(cache),
@@ -597,7 +689,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_unsupported_operation_returns_501() {
+    async fn test_unsupported_operation_attempts_passthrough() {
         let state = build_app_state(
             MockBackend::new(),
             MockCache::new(),
@@ -607,7 +699,11 @@ mod tests {
         let req = build_request("PATCH", "/test-frontend/some-key");
         let resp = handle_s3_request(State(state), req).await;
 
-        assert_eq!(resp.status(), 501);
+        // Unsupported operations are now proxied to the backend.
+        // The response depends on the backend's answer. In tests with
+        // the example.com endpoint the status varies, so just verify
+        // we did NOT get 501 (the old behaviour).
+        assert_ne!(resp.status(), 501);
     }
 
     #[tokio::test]

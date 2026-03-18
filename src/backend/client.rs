@@ -6,10 +6,11 @@ use aws_sdk_s3::config::Region;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use aws_smithy_types::timeout::TimeoutConfig;
+use tokio_util::io::ReaderStream;
 
 use crate::backend::models::*;
 use crate::backend::retry::{with_retry, RetryPolicy};
-use crate::backend::Backend;
+use crate::backend::{Backend, BoxByteStream};
 use crate::config::Config;
 use crate::error::ProxyError;
 
@@ -120,58 +121,47 @@ fn to_chrono(dt: &aws_smithy_types::DateTime) -> Option<chrono::DateTime<chrono:
 }
 
 impl Backend for S3Backend {
-    async fn get_object(&self, bucket: &str, key: &str) -> Result<GetObjectOutput, ProxyError> {
+    async fn get_object(&self, bucket: &str, key: &str) -> Result<(GetObjectMeta, BoxByteStream), ProxyError> {
         let bucket = bucket.to_string();
         let key = key.to_string();
 
-        with_retry(&self.get_policy, "get_object", |_attempt| {
-            let client = &self.client;
+        // Retry only the send() call. Once we have a successful response,
+        // the body stream is returned without further retry wrapping —
+        // a mid-stream error will propagate to the client.
+        let resp = with_retry(&self.get_policy, "get_object", |_attempt| {
+            let client = self.client.clone();
             let bucket = bucket.clone();
             let key = key.clone();
             async move {
-                let resp = client
+                client
                     .get_object()
                     .bucket(&bucket)
                     .key(&key)
                     .send()
                     .await
-                    .map_err(|e| map_sdk_error(e, "get_object"))?;
-
-                let content_type = resp.content_type().map(|s| s.to_string());
-                let content_length = resp.content_length();
-                let etag = resp.e_tag().map(|s| s.to_string());
-                let last_modified = resp.last_modified().and_then(to_chrono);
-                let metadata = resp
-                    .metadata()
-                    .map(|m| {
-                        m.iter()
-                            .map(|(k, v)| (k.to_string(), v.to_string()))
-                            .collect::<HashMap<String, String>>()
-                    })
-                    .unwrap_or_default();
-
-                let body = resp
-                    .body
-                    .collect()
-                    .await
-                    .map_err(|e| ProxyError::Backend {
-                        source: format!("failed to read body: {e}").into(),
-                        operation: "get_object".into(),
-                    })?
-                    .into_bytes()
-                    .to_vec();
-
-                Ok(GetObjectOutput {
-                    body,
-                    content_type,
-                    content_length,
-                    etag,
-                    last_modified,
-                    metadata,
-                })
+                    .map_err(|e| map_sdk_error(e, "get_object"))
             }
         })
-        .await
+        .await?;
+
+        let meta = GetObjectMeta {
+            content_type: resp.content_type().map(|s| s.to_string()),
+            content_length: resp.content_length(),
+            etag: resp.e_tag().map(|s| s.to_string()),
+            last_modified: resp.last_modified().and_then(to_chrono),
+            metadata: resp
+                .metadata()
+                .map(|m| {
+                    m.iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect::<HashMap<String, String>>()
+                })
+                .unwrap_or_default(),
+        };
+
+        // Convert ByteStream → AsyncRead → Stream<Item = Result<Bytes, io::Error>>
+        let stream = ReaderStream::new(resp.body.into_async_read());
+        Ok((meta, Box::pin(stream)))
     }
 
     async fn head_object(&self, bucket: &str, key: &str) -> Result<HeadObjectOutput, ProxyError> {

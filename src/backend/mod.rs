@@ -2,13 +2,22 @@ pub mod client;
 pub mod models;
 pub mod retry;
 
+use std::pin::Pin;
+
+use bytes::Bytes;
+use futures::Stream;
+
 use crate::error::ProxyError;
 use models::*;
+
+/// A streaming body type for GET responses.
+pub type BoxByteStream =
+    Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
 
 /// Trait defining the typed S3 backend interface.
 /// All operations return typed results, not raw HTTP.
 pub trait Backend: Send + Sync {
-    fn get_object(&self, bucket: &str, key: &str) -> impl std::future::Future<Output = Result<GetObjectOutput, ProxyError>> + Send;
+    fn get_object(&self, bucket: &str, key: &str) -> impl std::future::Future<Output = Result<(GetObjectMeta, BoxByteStream), ProxyError>> + Send;
     fn head_object(&self, bucket: &str, key: &str) -> impl std::future::Future<Output = Result<HeadObjectOutput, ProxyError>> + Send;
     fn put_object(&self, req: PutObjectInput) -> impl std::future::Future<Output = Result<PutObjectOutput, ProxyError>> + Send;
     fn delete_object(&self, bucket: &str, key: &str) -> impl std::future::Future<Output = Result<(), ProxyError>> + Send;

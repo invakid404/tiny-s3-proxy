@@ -1,10 +1,14 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::body::Body;
+use bytes::Bytes;
 use http::Response;
+use tokio_util::io::ReaderStream;
 
-use crate::backend::retry::{with_retry, RetryPolicy};
-use crate::backend::Backend;
+use crate::backend::models::GetObjectMeta;
+use crate::backend::{Backend, BoxByteStream};
 use crate::cache::entry::CacheEntry;
 use crate::cache::key::CacheKey;
 use crate::cache::metadata::CacheMeta;
@@ -14,29 +18,14 @@ use crate::s3::errors::S3Error;
 use crate::s3::headers::{common_headers, get_object_headers, with_cache_status};
 use crate::s3::ops::ParsedRequest;
 
-/// Build an HTTP response from object data with the given cache status.
-fn build_get_response(
-    body: Vec<u8>,
-    content_type: Option<&str>,
-    content_length: Option<i64>,
-    etag: Option<&str>,
-    last_modified: Option<&chrono::DateTime<chrono::Utc>>,
+/// Build an HTTP response from metadata + a streaming body.
+fn build_streaming_response(
+    meta: &GetObjectMeta,
+    body_stream: BoxByteStream,
     request_id: &str,
     cache_status: &str,
 ) -> Response<Body> {
-    use crate::backend::models::GetObjectOutput;
-    use std::collections::HashMap;
-
-    let output = GetObjectOutput {
-        body: vec![], // not used for headers
-        content_type: content_type.map(|s| s.to_string()),
-        content_length,
-        etag: etag.map(|s| s.to_string()),
-        last_modified: last_modified.cloned(),
-        metadata: HashMap::new(),
-    };
-
-    let mut headers = get_object_headers(&output);
+    let mut headers = get_object_headers(meta);
     let common = common_headers(request_id);
     headers.extend(common);
     with_cache_status(&mut headers, cache_status);
@@ -45,70 +34,81 @@ fn build_get_response(
     for (k, v) in headers.iter() {
         response = response.header(k, v);
     }
-    response.body(Body::from(body)).unwrap()
+    response.body(Body::from_stream(body_stream)).unwrap()
 }
 
-/// Build response from a CacheEntry.
-fn build_cache_response(
+/// Build an HTTP response from metadata + an already-constructed Body.
+fn build_meta_response(
+    meta: &GetObjectMeta,
+    body: Body,
+    request_id: &str,
+    cache_status: &str,
+) -> Response<Body> {
+    let mut headers = get_object_headers(meta);
+    let common = common_headers(request_id);
+    headers.extend(common);
+    with_cache_status(&mut headers, cache_status);
+
+    let mut response = Response::builder().status(200);
+    for (k, v) in headers.iter() {
+        response = response.header(k, v);
+    }
+    response.body(body).unwrap()
+}
+
+/// Open a cached body file and return a boxed stream of chunks.
+async fn open_file_stream(
+    path: &std::path::Path,
+) -> Result<BoxByteStream, std::io::Error> {
+    let file = tokio::fs::File::open(path).await?;
+    Ok(Box::pin(ReaderStream::new(file)))
+}
+
+/// Build response from a CacheEntry (streams from disk, no buffering).
+async fn build_cache_response(
     entry: &CacheEntry,
     request_id: &str,
     cache_status: &str,
 ) -> Response<Body> {
-    build_get_response(
-        entry.body.clone(),
-        entry.meta.content_type.as_deref(),
-        Some(entry.meta.content_length),
-        entry.meta.etag.as_deref(),
-        entry.meta.last_modified.as_ref(),
-        request_id,
-        cache_status,
-    )
-}
+    let meta = GetObjectMeta {
+        content_type: entry.meta.content_type.clone(),
+        content_length: Some(entry.meta.content_length),
+        etag: entry.meta.etag.clone(),
+        last_modified: entry.meta.last_modified,
+        metadata: HashMap::new(),
+    };
 
-/// Fetch from backend with retry, returning the GetObjectOutput.
-async fn fetch_from_backend<B: Backend>(
-    state: &Arc<AppState<B, impl CacheStore>>,
-    key: &str,
-) -> Result<crate::backend::models::GetObjectOutput, crate::error::ProxyError> {
-    let backend = state.backend.clone();
-    let bucket = state.backend_bucket.clone();
-    let key = key.to_string();
-    let policy = RetryPolicy::for_reads(
-        state.config.get_max_attempts,
-        state.config.retry_base_backoff_ms,
-    );
+    let body_path = entry.body_path.clone();
+    match open_file_stream(&body_path).await {
+        Ok(stream) => {
+            let mut headers = get_object_headers(&meta);
+            let common = common_headers(request_id);
+            headers.extend(common);
+            with_cache_status(&mut headers, cache_status);
 
-    with_retry(&policy, "get_object", |_attempt| {
-        let backend = backend.clone();
-        let bucket = bucket.clone();
-        let key = key.clone();
-        async move { backend.get_object(&bucket, &key).await }
-    })
-    .await
-}
-
-/// Build a CacheMeta from a GetObjectOutput for cache filling.
-fn build_cache_meta<B: Backend, C: CacheStore>(
-    state: &AppState<B, C>,
-    key: &str,
-    output: &crate::backend::models::GetObjectOutput,
-) -> CacheMeta {
-    CacheMeta {
-        bucket: state.backend_bucket.clone(),
-        key: key.to_string(),
-        etag: output.etag.clone(),
-        last_modified: output.last_modified,
-        content_type: output.content_type.clone(),
-        content_length: output.body.len() as i64,
-        cache_written_at: chrono::Utc::now(),
-        last_accessed_at: chrono::Utc::now(),
-        hit_count: 0,
-        source_status: 200,
+            let mut response = Response::builder().status(200);
+            for (k, v) in headers.iter() {
+                response = response.header(k, v);
+            }
+            response.body(Body::from_stream(stream)).unwrap()
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %body_path.display(),
+                "failed to open cache body file"
+            );
+            let s3err = S3Error::internal_error(
+                &format!("cache read error: {}", e),
+                request_id,
+            );
+            s3err.to_response()
+        }
     }
 }
 
 /// Handle a GetObject request with caching, singleflight, and stale-on-error.
-pub async fn handle_get<B: Backend, C: CacheStore>(
+pub async fn handle_get<B: Backend + 'static, C: CacheStore + 'static>(
     state: &Arc<AppState<B, C>>,
     parsed: &ParsedRequest,
     key: &str,
@@ -148,7 +148,7 @@ pub async fn handle_get<B: Backend, C: CacheStore>(
                 cache_status = "HIT",
                 "serving from cache"
             );
-            return build_cache_response(&entry, &parsed.request_id, "HIT");
+            return build_cache_response(&entry, &parsed.request_id, "HIT").await;
         }
         Ok(None) => {
             // Cache miss, proceed to singleflight
@@ -177,23 +177,21 @@ pub async fn handle_get<B: Backend, C: CacheStore>(
     }
 }
 
-/// Handle passthrough: fetch from backend, no caching.
+/// Handle passthrough: fetch from backend, stream directly, no caching.
 async fn handle_passthrough<B: Backend, C: CacheStore>(
     state: &Arc<AppState<B, C>>,
     parsed: &ParsedRequest,
     key: &str,
     cache_status: &str,
 ) -> Response<Body> {
-    match fetch_from_backend(state, key).await {
-        Ok(output) => build_get_response(
-            output.body,
-            output.content_type.as_deref(),
-            output.content_length,
-            output.etag.as_deref(),
-            output.last_modified.as_ref(),
-            &parsed.request_id,
-            cache_status,
-        ),
+    match state
+        .backend
+        .get_object(&state.backend_bucket, key)
+        .await
+    {
+        Ok((meta, body_stream)) => {
+            build_streaming_response(&meta, body_stream, &parsed.request_id, cache_status)
+        }
         Err(e) => {
             tracing::error!(
                 error = %e,
@@ -211,71 +209,167 @@ async fn handle_passthrough<B: Backend, C: CacheStore>(
     }
 }
 
-/// Leader path: fetch from backend, fill cache if appropriate, serve response.
-async fn handle_leader<B: Backend, C: CacheStore>(
+/// Leader path: fetch from backend, tee stream to cache + client.
+async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
     state: &Arc<AppState<B, C>>,
     parsed: &ParsedRequest,
     key: &str,
     cache_key: &CacheKey,
     waiter: crate::cache::FlightWaiter,
 ) -> Response<Body> {
-    let result = fetch_from_backend(state, key).await;
+    let result = state
+        .backend
+        .get_object(&state.backend_bucket, key)
+        .await;
 
     match result {
-        Ok(output) => {
-            let body_len = output.body.len() as u64;
+        Ok((meta, body_stream)) => {
+            let body_len = meta.content_length.unwrap_or(0) as u64;
             let is_size_cacheable = state.policy.is_size_cacheable(body_len);
 
             if is_size_cacheable {
-                // Fill cache
-                let meta = build_cache_meta(state.as_ref(), key, &output);
-                match state.cache.begin_fill(cache_key).await {
-                    Ok(guard) => {
-                        if let Err(e) = state
-                            .cache
-                            .commit_fill(guard, output.body.clone(), meta)
-                            .await
-                        {
-                            tracing::warn!(
-                                error = %e,
-                                operation = "GetObject",
-                                key = key,
-                                "failed to commit cache fill"
-                            );
+                // Tee: stream to client AND write to cache
+                let (tx, rx) =
+                    tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
+
+                let temp_body_path = PathBuf::from(&state.config.cache_dir)
+                    .join("tmp")
+                    .join(format!("{}.body", uuid::Uuid::new_v4()));
+
+                let cache = state.cache.clone();
+                let cache_key_owned = cache_key.clone();
+                let cache_meta = CacheMeta {
+                    bucket: state.backend_bucket.clone(),
+                    key: key.to_string(),
+                    etag: meta.etag.clone(),
+                    last_modified: meta.last_modified,
+                    content_type: meta.content_type.clone(),
+                    content_length: meta.content_length.unwrap_or(0),
+                    cache_written_at: chrono::Utc::now(),
+                    last_accessed_at: chrono::Utc::now(),
+                    hit_count: 0,
+                    source_status: 200,
+                };
+                let temp_path_clone = temp_body_path.clone();
+
+                // Spawn tee task
+                tokio::spawn(async move {
+                    use futures::StreamExt;
+                    use tokio::io::AsyncWriteExt;
+
+                    let mut file = match tokio::fs::File::create(&temp_path_clone).await {
+                        Ok(f) => f,
+                        Err(e) => {
+                            tracing::warn!("cache fill: failed to create temp file: {}", e);
+                            // Drain stream to client without caching
+                            let mut stream = body_stream;
+                            while let Some(chunk) = stream.next().await {
+                                let _ = tx.send(chunk).await;
+                            }
+                            waiter.complete().await;
+                            return;
+                        }
+                    };
+
+                    let mut stream = body_stream;
+                    let mut cache_ok = true;
+
+                    while let Some(chunk_result) = stream.next().await {
+                        match chunk_result {
+                            Ok(chunk) => {
+                                if cache_ok {
+                                    if let Err(e) = file.write_all(&chunk).await {
+                                        tracing::warn!("cache fill: write error: {}", e);
+                                        cache_ok = false;
+                                    }
+                                }
+                                // Send to client; if client disconnected, still
+                                // continue writing to disk so cache fills for followers.
+                                let _ = tx.send(Ok(chunk)).await;
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Err(std::io::Error::new(
+                                        std::io::ErrorKind::Other,
+                                        e.to_string(),
+                                    )))
+                                    .await;
+                                cache_ok = false;
+                                break;
+                            }
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            operation = "GetObject",
-                            key = key,
-                            "failed to begin cache fill"
-                        );
+
+                    // Drop sender so the client body ends
+                    drop(tx);
+
+                    if cache_ok {
+                        if let Err(e) = file.sync_all().await {
+                            tracing::warn!("cache fill: fsync error: {}", e);
+                            let _ = tokio::fs::remove_file(&temp_path_clone).await;
+                            waiter.complete().await;
+                            return;
+                        }
+                        drop(file);
+
+                        match cache.begin_fill(&cache_key_owned).await {
+                            Ok(guard) => {
+                                if let Err(e) = cache
+                                    .commit_fill(guard, temp_path_clone.clone(), cache_meta)
+                                    .await
+                                {
+                                    tracing::warn!("cache fill: commit error: {}", e);
+                                    let _ =
+                                        tokio::fs::remove_file(&temp_path_clone).await;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("cache fill: begin_fill error: {}", e);
+                                let _ = tokio::fs::remove_file(&temp_path_clone).await;
+                            }
+                        }
+                    } else {
+                        let _ = tokio::fs::remove_file(&temp_path_clone).await;
                     }
-                }
+
+                    waiter.complete().await;
+                });
+
+                // Build response from channel receiver
+                let body = Body::from_stream(
+                    tokio_stream::wrappers::ReceiverStream::new(rx),
+                );
+
+                tracing::info!(
+                    request_id = %parsed.request_id,
+                    operation = "GetObject",
+                    key = key,
+                    cache_status = "MISS",
+                    cached = true,
+                    "serving from backend (tee to cache)"
+                );
+
+                build_meta_response(&meta, body, &parsed.request_id, "MISS")
+            } else {
+                // Too large to cache, stream directly
+                waiter.complete().await;
+
+                tracing::info!(
+                    request_id = %parsed.request_id,
+                    operation = "GetObject",
+                    key = key,
+                    cache_status = "MISS",
+                    cached = false,
+                    "served from backend (too large to cache)"
+                );
+
+                build_streaming_response(
+                    &meta,
+                    body_stream,
+                    &parsed.request_id,
+                    "MISS",
+                )
             }
-
-            // Signal followers
-            waiter.complete().await;
-
-            tracing::info!(
-                request_id = %parsed.request_id,
-                operation = "GetObject",
-                key = key,
-                cache_status = "MISS",
-                cached = is_size_cacheable,
-                "served from backend"
-            );
-
-            build_get_response(
-                output.body,
-                output.content_type.as_deref(),
-                output.content_length,
-                output.etag.as_deref(),
-                output.last_modified.as_ref(),
-                &parsed.request_id,
-                "MISS",
-            )
         }
         Err(e) => {
             // Backend failed. Try serving stale from cache if configured.
@@ -290,7 +384,12 @@ async fn handle_leader<B: Backend, C: CacheStore>(
                         error = %e,
                         "serving stale cache entry on backend error"
                     );
-                    return build_cache_response(&stale_entry, &parsed.request_id, "STALE");
+                    return build_cache_response(
+                        &stale_entry,
+                        &parsed.request_id,
+                        "STALE",
+                    )
+                    .await;
                 }
             }
 
@@ -313,7 +412,7 @@ async fn handle_leader<B: Backend, C: CacheStore>(
 }
 
 /// Follower path: wait for leader, then re-read from cache or fetch directly.
-async fn handle_follower<B: Backend, C: CacheStore>(
+async fn handle_follower<B: Backend + 'static, C: CacheStore + 'static>(
     state: &Arc<AppState<B, C>>,
     parsed: &ParsedRequest,
     key: &str,
@@ -333,7 +432,7 @@ async fn handle_follower<B: Backend, C: CacheStore>(
                 cache_status = "HIT",
                 "follower served from cache after leader"
             );
-            build_cache_response(&entry, &parsed.request_id, "HIT")
+            build_cache_response(&entry, &parsed.request_id, "HIT").await
         }
         _ => {
             // Leader may have failed or object was too large to cache.
@@ -370,6 +469,8 @@ mod tests {
             amz_date: None,
             amz_content_sha256: None,
             range: None,
+            user_metadata: HashMap::new(),
+            extra_amz_headers: HashMap::new(),
         }
     }
 
@@ -380,13 +481,7 @@ mod tests {
         let cache_key = CacheKey::new("test-backend", key);
         let meta = test_cache_meta("test-backend", key, &body);
 
-        let cache = MockCache::new().with_entry(
-            &cache_key,
-            crate::cache::entry::CacheEntry {
-                meta,
-                body: body.clone(),
-            },
-        );
+        let cache = MockCache::new().with_entry(&cache_key, &body, meta);
 
         let state = build_app_state(MockBackend::new(), cache, MockAuth::allow_all());
         let parsed = make_parsed(key);
@@ -431,11 +526,14 @@ mod tests {
             .unwrap();
         assert_eq!(resp_body.as_ref(), body.as_slice());
 
-        // Verify cache was filled
+        // Verify cache was filled: wait a moment for the tee task to complete
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let cache_key = CacheKey::new("test-backend", key);
         let cached = state.cache.lookup(&cache_key).await.unwrap();
         assert!(cached.is_some());
-        assert_eq!(cached.unwrap().body, body);
+        let entry = cached.unwrap();
+        let cached_body = tokio::fs::read(&entry.body_path).await.unwrap();
+        assert_eq!(cached_body, body);
     }
 
     #[tokio::test]
@@ -497,13 +595,7 @@ mod tests {
         }));
 
         // Cache has a stale entry
-        let cache = MockCache::new().with_entry(
-            &cache_key,
-            crate::cache::entry::CacheEntry {
-                meta,
-                body: stale_body.clone(),
-            },
-        );
+        let cache = MockCache::new().with_entry(&cache_key, &stale_body, meta);
 
         let state = build_app_state(backend, cache, MockAuth::allow_all());
         let parsed = make_parsed(key);

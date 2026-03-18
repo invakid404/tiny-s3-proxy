@@ -6,6 +6,8 @@ pub mod metadata;
 pub mod policy;
 pub mod singleflight;
 
+use std::path::PathBuf;
+
 use crate::error::ProxyError;
 use entry::CacheEntry;
 use key::CacheKey;
@@ -23,10 +25,11 @@ pub trait CacheStore: Send + Sync {
     fn begin_fill(&self, key: &CacheKey) -> impl std::future::Future<Output = Result<FillGuard, ProxyError>> + Send;
 
     /// Commit a completed fill to the cache.
+    /// `temp_body_path` is a fully-written temp file that will be renamed into the cache.
     fn commit_fill(
         &self,
         guard: FillGuard,
-        data: Vec<u8>,
+        temp_body_path: PathBuf,
         meta: CacheMeta,
     ) -> impl std::future::Future<Output = Result<(), ProxyError>> + Send;
 

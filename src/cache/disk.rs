@@ -177,14 +177,16 @@ impl CacheStore for DiskCache {
         let body_path = self.body_path(key);
         let meta_path = self.meta_path(key);
 
-        // Check if both files exist
-        if !body_path.exists() || !meta_path.exists() {
+        // Check if both files exist (use async try_exists to avoid blocking)
+        if !tokio::fs::try_exists(&body_path).await.unwrap_or(false)
+            || !tokio::fs::try_exists(&meta_path).await.unwrap_or(false)
+        {
             let mut s = self.stats.write().await;
             s.miss_count += 1;
             return Ok(None);
         }
 
-        // Read metadata
+        // Read metadata only (small JSON file)
         let meta_bytes =
             tokio::fs::read(&meta_path)
                 .await
@@ -196,14 +198,6 @@ impl CacheStore for DiskCache {
             serde_json::from_slice(&meta_bytes).map_err(|e| ProxyError::Cache {
                 source: Box::new(e),
                 operation: "parse metadata".into(),
-            })?;
-
-        // Read body
-        let body = tokio::fs::read(&body_path)
-            .await
-            .map_err(|e| ProxyError::Cache {
-                source: Box::new(e),
-                operation: "read body".into(),
             })?;
 
         // Update access metadata (best-effort)
@@ -219,7 +213,7 @@ impl CacheStore for DiskCache {
             s.hit_count += 1;
         }
 
-        Ok(Some(CacheEntry { meta, body }))
+        Ok(Some(CacheEntry { meta, body_path }))
     }
 
     async fn begin_fill(&self, key: &CacheKey) -> Result<FillGuard, ProxyError> {
@@ -233,31 +227,17 @@ impl CacheStore for DiskCache {
     async fn commit_fill(
         &self,
         guard: FillGuard,
-        data: Vec<u8>,
+        temp_body_path: PathBuf,
         meta: CacheMeta,
     ) -> Result<(), ProxyError> {
         let id = uuid::Uuid::new_v4();
 
-        // Write body to temp file
-        let temp_body = guard.temp_dir.join(format!("{}.body", id));
-        tokio::fs::write(&temp_body, &data)
+        // The body file has already been written and fsynced by the caller.
+        // Get its size for stats.
+        let body_size = tokio::fs::metadata(&temp_body_path)
             .await
-            .map_err(|e| ProxyError::Cache {
-                source: Box::new(e),
-                operation: "write temp body".into(),
-            })?;
-
-        // fsync body
-        let file = tokio::fs::File::open(&temp_body)
-            .await
-            .map_err(|e| ProxyError::Cache {
-                source: Box::new(e),
-                operation: "open temp body for fsync".into(),
-            })?;
-        file.sync_all().await.map_err(|e| ProxyError::Cache {
-            source: Box::new(e),
-            operation: "fsync temp body".into(),
-        })?;
+            .map(|m| m.len())
+            .unwrap_or(0);
 
         // Write metadata to temp file
         let temp_meta = guard.temp_dir.join(format!("{}.meta.json", id));
@@ -300,7 +280,7 @@ impl CacheStore for DiskCache {
         }
 
         // Atomic rename
-        tokio::fs::rename(&temp_body, &final_body)
+        tokio::fs::rename(&temp_body_path, &final_body)
             .await
             .map_err(|e| ProxyError::Cache {
                 source: Box::new(e),
@@ -317,7 +297,7 @@ impl CacheStore for DiskCache {
         {
             let mut s = self.stats.write().await;
             s.entry_count += 1;
-            s.total_bytes += data.len() as u64 + meta_bytes.len() as u64;
+            s.total_bytes += body_size + meta_bytes.len() as u64;
             s.fill_count += 1;
         }
 
@@ -380,6 +360,7 @@ impl CacheStore for DiskCache {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use tokio::io::AsyncWriteExt;
 
     fn test_policy() -> CachePolicy {
         CachePolicy::new(
@@ -412,6 +393,16 @@ mod tests {
         }
     }
 
+    /// Helper: write body data to a temp file in the cache's tmp dir and return its path.
+    async fn write_temp_body(cache_dir: &std::path::Path, data: &[u8]) -> PathBuf {
+        let tmp_dir = cache_dir.join("tmp");
+        let temp_path = tmp_dir.join(format!("{}.body", uuid::Uuid::new_v4()));
+        let mut f = tokio::fs::File::create(&temp_path).await.unwrap();
+        f.write_all(data).await.unwrap();
+        f.sync_all().await.unwrap();
+        temp_path
+    }
+
     #[tokio::test]
     async fn test_lookup_empty_cache_returns_none() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -438,16 +429,19 @@ mod tests {
         let body = b"console.log('hello');".to_vec();
         let meta = test_meta(body.len());
 
-        // Fill
+        // Write body to temp file, then commit
+        let temp_path = write_temp_body(tmp.path(), &body).await;
         let guard = cache.begin_fill(&key).await.unwrap();
         cache
-            .commit_fill(guard, body.clone(), meta.clone())
+            .commit_fill(guard, temp_path, meta.clone())
             .await
             .unwrap();
 
         // Lookup
         let entry = cache.lookup(&key).await.unwrap().expect("should hit");
-        assert_eq!(entry.body, body);
+        // Verify body by reading from body_path
+        let read_body = tokio::fs::read(&entry.body_path).await.unwrap();
+        assert_eq!(read_body, body);
         assert_eq!(entry.meta.bucket, "test-bucket");
         assert_eq!(entry.meta.key, "script_bundle/app.js");
         assert_eq!(entry.meta.etag, Some("\"abc123\"".into()));
@@ -470,9 +464,10 @@ mod tests {
         let meta = test_meta(body.len());
 
         // Fill
+        let temp_path = write_temp_body(tmp.path(), &body).await;
         let guard = cache.begin_fill(&key).await.unwrap();
         cache
-            .commit_fill(guard, body.clone(), meta)
+            .commit_fill(guard, temp_path, meta)
             .await
             .unwrap();
 
@@ -502,8 +497,9 @@ mod tests {
         let body = b"test data".to_vec();
         let meta = test_meta(body.len());
 
+        let temp_path = write_temp_body(tmp.path(), &body).await;
         let guard = cache.begin_fill(&key).await.unwrap();
-        cache.commit_fill(guard, body, meta).await.unwrap();
+        cache.commit_fill(guard, temp_path, meta).await.unwrap();
 
         // Verify filesystem layout
         let hash = key.hash();
@@ -559,9 +555,10 @@ mod tests {
         // Fill
         let body = b"test body content".to_vec();
         let meta = test_meta(body.len());
+        let temp_path = write_temp_body(tmp.path(), &body).await;
         let guard = cache.begin_fill(&key).await.unwrap();
         cache
-            .commit_fill(guard, body.clone(), meta)
+            .commit_fill(guard, temp_path, meta)
             .await
             .unwrap();
 
@@ -596,23 +593,28 @@ mod tests {
 
         let cache1 = cache.clone();
         let cache2 = cache.clone();
+        let tmp_path = tmp.path().to_path_buf();
 
-        let h1 = tokio::spawn(async move {
-            let body = b"content a".to_vec();
-            let meta = CacheMeta {
-                bucket: "bucket".into(),
-                key: "script_bundle/a.js".into(),
-                etag: None,
-                last_modified: None,
-                content_type: None,
-                content_length: body.len() as i64,
-                cache_written_at: Utc::now(),
-                last_accessed_at: Utc::now(),
-                hit_count: 0,
-                source_status: 200,
-            };
-            let guard = cache1.begin_fill(&key1).await.unwrap();
-            cache1.commit_fill(guard, body, meta).await.unwrap();
+        let h1 = tokio::spawn({
+            let tmp_path = tmp_path.clone();
+            async move {
+                let body = b"content a".to_vec();
+                let meta = CacheMeta {
+                    bucket: "bucket".into(),
+                    key: "script_bundle/a.js".into(),
+                    etag: None,
+                    last_modified: None,
+                    content_type: None,
+                    content_length: body.len() as i64,
+                    cache_written_at: Utc::now(),
+                    last_accessed_at: Utc::now(),
+                    hit_count: 0,
+                    source_status: 200,
+                };
+                let temp_path = write_temp_body(&tmp_path, &body).await;
+                let guard = cache1.begin_fill(&key1).await.unwrap();
+                cache1.commit_fill(guard, temp_path, meta).await.unwrap();
+            }
         });
 
         let h2 = tokio::spawn(async move {
@@ -629,8 +631,9 @@ mod tests {
                 hit_count: 0,
                 source_status: 200,
             };
+            let temp_path = write_temp_body(&tmp_path, &body).await;
             let guard = cache2.begin_fill(&key2).await.unwrap();
-            cache2.commit_fill(guard, body, meta).await.unwrap();
+            cache2.commit_fill(guard, temp_path, meta).await.unwrap();
         });
 
         h1.await.unwrap();
@@ -641,8 +644,10 @@ mod tests {
 
         let entry1 = cache.lookup(&key1).await.unwrap().expect("a should exist");
         let entry2 = cache.lookup(&key2).await.unwrap().expect("b should exist");
-        assert_eq!(entry1.body, b"content a");
-        assert_eq!(entry2.body, b"content b");
+        let body1 = tokio::fs::read(&entry1.body_path).await.unwrap();
+        let body2 = tokio::fs::read(&entry2.body_path).await.unwrap();
+        assert_eq!(body1, b"content a");
+        assert_eq!(body2, b"content b");
 
         let s = cache.stats().await;
         assert_eq!(s.entry_count, 2);
@@ -661,15 +666,17 @@ mod tests {
         let body = vec![42u8; 1_024 * 1_024];
         let meta = test_meta(body.len());
 
+        let temp_path = write_temp_body(tmp.path(), &body).await;
         let guard = cache.begin_fill(&key).await.unwrap();
         cache
-            .commit_fill(guard, body.clone(), meta)
+            .commit_fill(guard, temp_path, meta)
             .await
             .unwrap();
 
         let entry = cache.lookup(&key).await.unwrap().expect("should hit");
-        assert_eq!(entry.body.len(), 1_024 * 1_024);
-        assert_eq!(entry.body, body);
+        let read_body = tokio::fs::read(&entry.body_path).await.unwrap();
+        assert_eq!(read_body.len(), 1_024 * 1_024);
+        assert_eq!(read_body, body);
     }
 
     #[tokio::test]
@@ -684,8 +691,9 @@ mod tests {
             let key = test_key();
             let body = b"existing data".to_vec();
             let meta = test_meta(body.len());
+            let temp_path = write_temp_body(tmp.path(), &body).await;
             let guard = cache.begin_fill(&key).await.unwrap();
-            cache.commit_fill(guard, body, meta).await.unwrap();
+            cache.commit_fill(guard, temp_path, meta).await.unwrap();
         }
 
         // Second instance: should load stats from disk

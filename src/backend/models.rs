@@ -2,10 +2,9 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
-#[derive(Debug)]
-pub struct GetObjectOutput {
-    /// The full object body. For v1, we buffer the whole body; can switch to streaming later.
-    pub body: Vec<u8>,
+/// Metadata from a GET response (no body).
+#[derive(Debug, Clone)]
+pub struct GetObjectMeta {
     pub content_type: Option<String>,
     pub content_length: Option<i64>,
     pub etag: Option<String>,

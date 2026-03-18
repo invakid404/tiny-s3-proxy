@@ -142,6 +142,8 @@ mod tests {
             amz_date: None,
             amz_content_sha256: None,
             range: None,
+            user_metadata: std::collections::HashMap::new(),
+            extra_amz_headers: std::collections::HashMap::new(),
         }
     }
 
@@ -189,13 +191,7 @@ mod tests {
         let cache_key = crate::cache::key::CacheKey::new("test-backend", key);
         let meta = test_cache_meta("test-backend", key, b"cached body");
 
-        let cache = MockCache::new().with_entry(
-            &cache_key,
-            crate::cache::entry::CacheEntry {
-                meta,
-                body: b"cached body".to_vec(),
-            },
-        );
+        let cache = MockCache::new().with_entry(&cache_key, b"cached body", meta);
 
         let state = build_app_state(MockBackend::new(), cache, MockAuth::allow_all());
         let parsed = make_parsed(key);

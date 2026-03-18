@@ -162,6 +162,23 @@ pub fn parse_request<B>(req: &Request<B>) -> ParsedRequest {
 
     let content_length = header_str(req, "content-length").and_then(|v| v.parse::<u64>().ok());
 
+    // Scan for x-amz-meta-* user metadata and other x-amz-* headers to forward.
+    let mut user_metadata = HashMap::new();
+    let mut extra_amz_headers = HashMap::new();
+    for (name, value) in req.headers() {
+        let name_lower = name.as_str();
+        if let Ok(v) = value.to_str() {
+            if name_lower.starts_with("x-amz-meta-") {
+                user_metadata.insert(name_lower.to_string(), v.to_string());
+            } else if name_lower.starts_with("x-amz-")
+                && name_lower != "x-amz-date"
+                && name_lower != "x-amz-content-sha256"
+            {
+                extra_amz_headers.insert(name_lower.to_string(), v.to_string());
+            }
+        }
+    }
+
     ParsedRequest {
         operation,
         request_id: request_id::generate(),
@@ -172,6 +189,8 @@ pub fn parse_request<B>(req: &Request<B>) -> ParsedRequest {
         amz_date: header_str(req, "x-amz-date"),
         amz_content_sha256: header_str(req, "x-amz-content-sha256"),
         range: header_str(req, "range"),
+        user_metadata,
+        extra_amz_headers,
     }
 }
 
@@ -413,5 +432,63 @@ mod tests {
             Some("UNSIGNED-PAYLOAD")
         );
         assert_eq!(parsed.range.as_deref(), Some("bytes=0-99"));
+    }
+
+    #[test]
+    fn test_user_metadata_headers_extracted() {
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/mybucket/mykey")
+            .header("x-amz-meta-author", "alice")
+            .header("x-amz-meta-version", "42")
+            .body(())
+            .unwrap();
+        let parsed = parse_request(&req);
+        assert_eq!(parsed.user_metadata.len(), 2);
+        assert_eq!(
+            parsed.user_metadata.get("x-amz-meta-author").unwrap(),
+            "alice"
+        );
+        assert_eq!(
+            parsed.user_metadata.get("x-amz-meta-version").unwrap(),
+            "42"
+        );
+    }
+
+    #[test]
+    fn test_extra_amz_headers_extracted() {
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/mybucket/mykey")
+            .header("x-amz-storage-class", "REDUCED_REDUNDANCY")
+            .header("x-amz-date", "20240101T000000Z")
+            .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+            .body(())
+            .unwrap();
+        let parsed = parse_request(&req);
+        // x-amz-date and x-amz-content-sha256 should NOT appear in extra_amz_headers
+        assert_eq!(parsed.extra_amz_headers.len(), 1);
+        assert_eq!(
+            parsed.extra_amz_headers.get("x-amz-storage-class").unwrap(),
+            "REDUCED_REDUNDANCY"
+        );
+        assert!(!parsed.extra_amz_headers.contains_key("x-amz-date"));
+        assert!(!parsed
+            .extra_amz_headers
+            .contains_key("x-amz-content-sha256"));
+    }
+
+    #[test]
+    fn test_user_metadata_not_in_extra_amz() {
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/mybucket/mykey")
+            .header("x-amz-meta-custom", "value")
+            .body(())
+            .unwrap();
+        let parsed = parse_request(&req);
+        // x-amz-meta-* should be in user_metadata, NOT in extra_amz_headers
+        assert_eq!(parsed.user_metadata.len(), 1);
+        assert!(parsed.extra_amz_headers.is_empty());
     }
 }

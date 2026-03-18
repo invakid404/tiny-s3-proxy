@@ -1,39 +1,60 @@
-use http::header::HeaderValue;
+use std::collections::HashMap;
+
+use http::header::{HeaderName, HeaderValue};
 use http::HeaderMap;
 
-use crate::backend::models::{GetObjectOutput, HeadObjectOutput};
+use crate::backend::models::{GetObjectMeta, HeadObjectOutput};
 
 /// Format a DateTime to RFC 7231 (HTTP-date) format.
 fn format_last_modified(dt: &chrono::DateTime<chrono::Utc>) -> String {
     dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
 }
 
+/// Build response headers for `x-amz-meta-*` user metadata.
+pub fn metadata_headers(metadata: &HashMap<String, String>) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for (k, v) in metadata {
+        if k.starts_with("x-amz-meta-")
+            && let (Ok(name), Ok(val)) = (
+                HeaderName::from_bytes(k.as_bytes()),
+                HeaderValue::from_str(v),
+            )
+        {
+            headers.insert(name, val);
+        }
+    }
+    headers
+}
+
 /// Build response headers for a successful GetObject response.
-pub fn get_object_headers(output: &GetObjectOutput) -> HeaderMap {
+pub fn get_object_headers(meta: &GetObjectMeta) -> HeaderMap {
     let mut headers = HeaderMap::new();
 
-    if let Some(ref ct) = output.content_type {
+    if let Some(ref ct) = meta.content_type {
         if let Ok(val) = HeaderValue::from_str(ct) {
             headers.insert("content-type", val);
         }
     }
 
-    if let Some(cl) = output.content_length {
+    if let Some(cl) = meta.content_length {
         headers.insert("content-length", HeaderValue::from(cl));
     }
 
-    if let Some(ref etag) = output.etag {
+    if let Some(ref etag) = meta.etag {
         if let Ok(val) = HeaderValue::from_str(etag) {
             headers.insert("etag", val);
         }
     }
 
-    if let Some(ref dt) = output.last_modified {
+    if let Some(ref dt) = meta.last_modified {
         let formatted = format_last_modified(dt);
         if let Ok(val) = HeaderValue::from_str(&formatted) {
             headers.insert("last-modified", val);
         }
     }
+
+    // Include x-amz-meta-* user metadata
+    headers.extend(metadata_headers(&meta.metadata));
 
     headers
 }
@@ -64,6 +85,9 @@ pub fn head_object_headers(output: &HeadObjectOutput) -> HeaderMap {
             headers.insert("last-modified", val);
         }
     }
+
+    // Include x-amz-meta-* user metadata
+    headers.extend(metadata_headers(&output.metadata));
 
     headers
 }
@@ -106,19 +130,17 @@ pub fn with_cache_status(headers: &mut HeaderMap, status: &str) {
 mod tests {
     use super::*;
     use chrono::TimeZone;
-    use std::collections::HashMap;
 
     #[test]
     fn test_get_object_headers_includes_all() {
-        let output = GetObjectOutput {
-            body: vec![],
+        let meta = GetObjectMeta {
             content_type: Some("application/json".to_string()),
             content_length: Some(256),
             etag: Some("\"abc123\"".to_string()),
             last_modified: Some(chrono::Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()),
             metadata: HashMap::new(),
         };
-        let headers = get_object_headers(&output);
+        let headers = get_object_headers(&meta);
         assert_eq!(headers.get("content-type").unwrap(), "application/json");
         assert_eq!(headers.get("content-length").unwrap(), "256");
         assert_eq!(headers.get("etag").unwrap(), "\"abc123\"");
@@ -189,18 +211,71 @@ mod tests {
 
     #[test]
     fn test_get_object_headers_missing_optional_fields() {
-        let output = GetObjectOutput {
-            body: vec![],
+        let meta = GetObjectMeta {
             content_type: None,
             content_length: None,
             etag: None,
             last_modified: None,
             metadata: HashMap::new(),
         };
-        let headers = get_object_headers(&output);
+        let headers = get_object_headers(&meta);
         assert!(headers.get("content-type").is_none());
         assert!(headers.get("content-length").is_none());
         assert!(headers.get("etag").is_none());
         assert!(headers.get("last-modified").is_none());
+    }
+
+    #[test]
+    fn test_metadata_headers_produces_correct_headermap() {
+        let mut metadata = HashMap::new();
+        metadata.insert("x-amz-meta-author".to_string(), "alice".to_string());
+        metadata.insert("x-amz-meta-version".to_string(), "42".to_string());
+        // Non x-amz-meta-* keys should be skipped
+        metadata.insert("x-amz-storage-class".to_string(), "STANDARD".to_string());
+
+        let headers = metadata_headers(&metadata);
+        assert_eq!(headers.get("x-amz-meta-author").unwrap(), "alice");
+        assert_eq!(headers.get("x-amz-meta-version").unwrap(), "42");
+        // x-amz-storage-class is NOT x-amz-meta-*, so should not be included
+        assert!(headers.get("x-amz-storage-class").is_none());
+    }
+
+    #[test]
+    fn test_metadata_headers_empty() {
+        let metadata = HashMap::new();
+        let headers = metadata_headers(&metadata);
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn test_get_object_headers_includes_metadata() {
+        let mut metadata = HashMap::new();
+        metadata.insert("x-amz-meta-custom".to_string(), "value".to_string());
+        let meta = GetObjectMeta {
+            content_type: Some("text/plain".to_string()),
+            content_length: Some(100),
+            etag: None,
+            last_modified: None,
+            metadata,
+        };
+        let headers = get_object_headers(&meta);
+        assert_eq!(headers.get("x-amz-meta-custom").unwrap(), "value");
+        assert_eq!(headers.get("content-type").unwrap(), "text/plain");
+    }
+
+    #[test]
+    fn test_head_object_headers_includes_metadata() {
+        let mut metadata = HashMap::new();
+        metadata.insert("x-amz-meta-tag".to_string(), "test".to_string());
+        let output = HeadObjectOutput {
+            content_type: None,
+            content_length: Some(200),
+            etag: None,
+            last_modified: None,
+            metadata,
+        };
+        let headers = head_object_headers(&output);
+        assert_eq!(headers.get("x-amz-meta-tag").unwrap(), "test");
+        assert_eq!(headers.get("content-length").unwrap(), "200");
     }
 }

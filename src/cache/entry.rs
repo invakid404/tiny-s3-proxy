@@ -1,8 +1,10 @@
+use std::path::PathBuf;
+
 use super::metadata::CacheMeta;
 
-/// A cache entry combining metadata and body data.
+/// A cache entry with metadata and a path to the body file on disk.
 #[derive(Debug)]
 pub struct CacheEntry {
     pub meta: CacheMeta,
-    pub body: Vec<u8>,
+    pub body_path: PathBuf,
 }

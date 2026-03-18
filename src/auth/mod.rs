@@ -43,6 +43,8 @@ mod tests {
             amz_date: None,
             amz_content_sha256: None,
             range: None,
+            user_metadata: std::collections::HashMap::new(),
+            extra_amz_headers: std::collections::HashMap::new(),
         }
     }
 
