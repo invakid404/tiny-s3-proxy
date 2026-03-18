@@ -54,7 +54,7 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
     );
 
     // 2. Read the body bytes (needed for signing and forwarding).
-    let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
+    let body_bytes = match axum::body::to_bytes(body, state.config.max_request_body_bytes as usize).await {
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::error!(error = %e, "passthrough: failed to read request body");

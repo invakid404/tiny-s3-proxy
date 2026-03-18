@@ -69,7 +69,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config: config.clone(),
         frontend_bucket: Arc::from(config.frontend_bucket.as_str()),
         backend_bucket: Arc::from(config.backend_bucket.as_str()),
-        http_client: reqwest::Client::new(),
+        http_client: reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_millis(config.upstream_connect_timeout_ms))
+            .timeout(std::time::Duration::from_millis(config.upstream_request_timeout_ms))
+            .build()
+            .expect("failed to build HTTP client"),
     });
 
     // 7. Spawn eviction loop

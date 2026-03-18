@@ -80,7 +80,7 @@ pub async fn handle_upload_part<B: Backend, C: CacheStore>(
     body: Body,
 ) -> Response<Body> {
     // Read body bytes
-    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+    let body_bytes = match axum::body::to_bytes(body, state.config.max_request_body_bytes as usize).await {
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::error!(

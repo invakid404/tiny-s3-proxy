@@ -56,6 +56,7 @@ pub struct Config {
     pub retry_base_backoff_ms: u64,
     pub upstream_connect_timeout_ms: u64,
     pub upstream_request_timeout_ms: u64,
+    pub max_request_body_bytes: u64,
 }
 
 impl Config {
@@ -102,6 +103,7 @@ impl Config {
             retry_base_backoff_ms: parse_u64_env("RETRY_BASE_BACKOFF_MS", 100)?,
             upstream_connect_timeout_ms: parse_u64_env("UPSTREAM_CONNECT_TIMEOUT_MS", 5000)?,
             upstream_request_timeout_ms: parse_u64_env("UPSTREAM_REQUEST_TIMEOUT_MS", 30000)?,
+            max_request_body_bytes: parse_u64_env("MAX_REQUEST_BODY_BYTES", 5_368_709_120)?, // 5 GiB default
         })
     }
 }

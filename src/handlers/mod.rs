@@ -640,6 +640,7 @@ pub mod test_utils {
             retry_base_backoff_ms: 10,
             upstream_connect_timeout_ms: 5000,
             upstream_request_timeout_ms: 30000,
+            max_request_body_bytes: 5_368_709_120,
         }
     }
 
