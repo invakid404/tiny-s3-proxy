@@ -61,7 +61,7 @@ async fn open_file_stream(
     path: &std::path::Path,
 ) -> Result<BoxByteStream, std::io::Error> {
     let file = tokio::fs::File::open(path).await?;
-    Ok(Box::pin(ReaderStream::new(file)))
+    Ok(Box::pin(ReaderStream::with_capacity(file, 65536))) // 64KB chunks
 }
 
 /// Build response from a CacheEntry (streams from disk, no buffering).
@@ -138,7 +138,7 @@ pub async fn handle_get<B: Backend + 'static, C: CacheStore + 'static>(
     }
 
     // Try cache lookup
-    let cache_key = CacheKey::new(&state.backend_bucket, key);
+    let cache_key = CacheKey::new(&*state.backend_bucket, key);
     match state.cache.lookup(&cache_key).await {
         Ok(Some(entry)) => {
             tracing::info!(
@@ -234,12 +234,12 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
 
                 let temp_body_path = PathBuf::from(&state.config.cache_dir)
                     .join("tmp")
-                    .join(format!("{}.body", uuid::Uuid::new_v4()));
+                    .join(format!("{}-{}.body", std::process::id(), crate::request_id::generate()));
 
                 let cache = state.cache.clone();
                 let cache_key_owned = cache_key.clone();
                 let cache_meta = CacheMeta {
-                    bucket: state.backend_bucket.clone(),
+                    bucket: state.backend_bucket.to_string(),
                     key: key.to_string(),
                     etag: meta.etag.clone(),
                     last_modified: meta.last_modified,
@@ -254,7 +254,7 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
 
                 // Spawn tee task
                 tokio::spawn(async move {
-                    use futures::StreamExt;
+                    use futures_util::StreamExt;
                     use tokio::io::AsyncWriteExt;
 
                     let mut file = match tokio::fs::File::create(&temp_path_clone).await {

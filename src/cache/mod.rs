@@ -7,6 +7,7 @@ pub mod policy;
 pub mod singleflight;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::ProxyError;
 use entry::CacheEntry;
@@ -36,8 +37,8 @@ pub trait CacheStore: Send + Sync {
     /// Remove a cached entry.
     fn purge(&self, key: &CacheKey) -> impl std::future::Future<Output = Result<bool, ProxyError>> + Send;
 
-    /// Get current cache statistics.
-    fn stats(&self) -> impl std::future::Future<Output = CacheStats> + Send;
+    /// Get current cache statistics snapshot.
+    fn stats(&self) -> impl std::future::Future<Output = CacheStatsSnapshot> + Send;
 }
 
 /// Guard returned by begin_fill. Holds the temp file path.
@@ -47,9 +48,47 @@ pub struct FillGuard {
     pub temp_dir: std::path::PathBuf,
 }
 
-/// Cache statistics for metrics/admin.
-#[derive(Debug, Clone, Default)]
+/// Cache statistics for metrics/admin, using atomics for lock-free updates.
+#[derive(Debug)]
 pub struct CacheStats {
+    pub total_bytes: AtomicU64,
+    pub entry_count: AtomicU64,
+    pub hit_count: AtomicU64,
+    pub miss_count: AtomicU64,
+    pub fill_count: AtomicU64,
+    pub eviction_count: AtomicU64,
+}
+
+impl Default for CacheStats {
+    fn default() -> Self {
+        Self {
+            total_bytes: AtomicU64::new(0),
+            entry_count: AtomicU64::new(0),
+            hit_count: AtomicU64::new(0),
+            miss_count: AtomicU64::new(0),
+            fill_count: AtomicU64::new(0),
+            eviction_count: AtomicU64::new(0),
+        }
+    }
+}
+
+impl CacheStats {
+    /// Snapshot the current stats into a plain struct for reporting.
+    pub fn snapshot(&self) -> CacheStatsSnapshot {
+        CacheStatsSnapshot {
+            total_bytes: self.total_bytes.load(Ordering::Relaxed),
+            entry_count: self.entry_count.load(Ordering::Relaxed),
+            hit_count: self.hit_count.load(Ordering::Relaxed),
+            miss_count: self.miss_count.load(Ordering::Relaxed),
+            fill_count: self.fill_count.load(Ordering::Relaxed),
+            eviction_count: self.eviction_count.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Cloneable snapshot of cache statistics for reporting.
+#[derive(Debug, Clone, Default)]
+pub struct CacheStatsSnapshot {
     pub total_bytes: u64,
     pub entry_count: u64,
     pub hit_count: u64,

@@ -37,7 +37,7 @@ pub async fn handle_delete<B: Backend, C: CacheStore>(
     match result {
         Ok(()) => {
             // Purge cache for this key (best-effort)
-            let cache_key = CacheKey::new(&state.backend_bucket, key);
+            let cache_key = CacheKey::new(&*state.backend_bucket, key);
             if let Err(e) = state.cache.purge(&cache_key).await {
                 tracing::warn!(
                     error = %e,

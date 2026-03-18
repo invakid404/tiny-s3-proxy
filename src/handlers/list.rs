@@ -21,7 +21,7 @@ pub async fn handle_list<B: Backend, C: CacheStore>(
     is_v2: bool,
 ) -> Response<Body> {
     let input = ListObjectsInput {
-        bucket: state.backend_bucket.clone(),
+        bucket: state.backend_bucket.to_string(),
         prefix: params.prefix.clone(),
         delimiter: params.delimiter.clone(),
         max_keys: params.max_keys,

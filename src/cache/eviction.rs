@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::atomic::Ordering;
 
 use crate::cache::metadata::CacheMeta;
 
@@ -23,7 +23,7 @@ pub async fn run_eviction_loop(
     cache_dir: PathBuf,
     max_bytes: u64,
     interval_secs: u64,
-    stats: Arc<RwLock<CacheStats>>,
+    stats: Arc<CacheStats>,
 ) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
     loop {
@@ -111,10 +111,10 @@ async fn collect_candidates(
 pub async fn run_eviction_pass(
     cache_dir: &PathBuf,
     max_bytes: u64,
-    stats: &Arc<RwLock<CacheStats>>,
+    stats: &Arc<CacheStats>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let objects_dir = cache_dir.join("objects");
-    if !objects_dir.exists() {
+    if !tokio::fs::try_exists(&objects_dir).await.unwrap_or(false) {
         return Ok(());
     }
 
@@ -128,9 +128,8 @@ pub async fn run_eviction_pass(
 
     if total_size <= max_bytes {
         // Update stats with accurate count from disk scan
-        let mut s = stats.write().await;
-        s.total_bytes = total_size;
-        s.entry_count = candidates.len() as u64;
+        stats.total_bytes.store(total_size, Ordering::Relaxed);
+        stats.entry_count.store(candidates.len() as u64, Ordering::Relaxed);
         return Ok(());
     }
 
@@ -152,11 +151,10 @@ pub async fn run_eviction_pass(
         );
     }
 
-    // Update stats
-    let mut s = stats.write().await;
-    s.total_bytes = current_size;
-    s.entry_count = candidates.len() as u64 - evicted;
-    s.eviction_count += evicted;
+    // Update stats atomically
+    stats.total_bytes.store(current_size, Ordering::Relaxed);
+    stats.entry_count.store(candidates.len() as u64 - evicted, Ordering::Relaxed);
+    stats.eviction_count.fetch_add(evicted, Ordering::Relaxed);
 
     if evicted > 0 {
         tracing::info!(evicted, current_size, max_bytes, "eviction pass complete");
@@ -178,7 +176,7 @@ mod tests {
         body: &[u8],
         last_accessed_at: chrono::DateTime<Utc>,
     ) {
-        let hash = key.hash();
+        let hash = key.hash_hex();
         let (d1, d2) = key.dir_prefix();
         let dir = cache_dir.join("objects").join(&d1).join(&d2);
         tokio::fs::create_dir_all(&dir).await.unwrap();
@@ -200,7 +198,7 @@ mod tests {
             hit_count: 0,
             source_status: 200,
         };
-        let meta_json = serde_json::to_vec_pretty(&meta).unwrap();
+        let meta_json = serde_json::to_vec(&meta).unwrap();
         tokio::fs::write(&meta_path, &meta_json).await.unwrap();
     }
 
@@ -216,13 +214,13 @@ mod tests {
         let body = b"small body";
         setup_cache_entry(&cache_dir, &key, body, Utc::now()).await;
 
-        let stats = Arc::new(RwLock::new(CacheStats::default()));
+        let stats = Arc::new(CacheStats::default());
 
         // Set limit very high
         run_eviction_pass(&cache_dir, 1_000_000, &stats).await.unwrap();
 
         // Entry should still exist
-        let hash = key.hash();
+        let hash = key.hash_hex();
         let (d1, d2) = key.dir_prefix();
         let body_path = cache_dir
             .join("objects")
@@ -231,9 +229,9 @@ mod tests {
             .join(format!("{}.body", hash));
         assert!(body_path.exists());
 
-        let s = stats.read().await;
-        assert_eq!(s.entry_count, 1);
-        assert_eq!(s.eviction_count, 0);
+        let snap = stats.snapshot();
+        assert_eq!(snap.entry_count, 1);
+        assert_eq!(snap.eviction_count, 0);
     }
 
     #[tokio::test]
@@ -270,13 +268,13 @@ mod tests {
         .await;
         setup_cache_entry(&cache_dir, &key_new, &body, now).await;
 
-        let stats = Arc::new(RwLock::new(CacheStats::default()));
+        let stats = Arc::new(CacheStats::default());
 
         // Set limit so only ~1 entry fits (body + meta ~= 1200 bytes each, so ~1500 is one entry)
         run_eviction_pass(&cache_dir, 1500, &stats).await.unwrap();
 
         // The oldest entries should be evicted, newest should remain
-        let hash_old = key_old.hash();
+        let hash_old = key_old.hash_hex();
         let (d1, d2) = key_old.dir_prefix();
         let body_path_old = cache_dir
             .join("objects")
@@ -288,7 +286,7 @@ mod tests {
             "oldest entry should have been evicted"
         );
 
-        let hash_new = key_new.hash();
+        let hash_new = key_new.hash_hex();
         let (d1, d2) = key_new.dir_prefix();
         let body_path_new = cache_dir
             .join("objects")
@@ -297,9 +295,9 @@ mod tests {
             .join(format!("{}.body", hash_new));
         assert!(body_path_new.exists(), "newest entry should remain");
 
-        let s = stats.read().await;
-        assert!(s.eviction_count >= 1, "at least one entry evicted");
-        assert_eq!(s.entry_count, 1);
+        let snap = stats.snapshot();
+        assert!(snap.eviction_count >= 1, "at least one entry evicted");
+        assert_eq!(snap.entry_count, 1);
     }
 
     #[tokio::test]
@@ -307,7 +305,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let cache_dir = tmp.path().to_path_buf();
         // Don't even create the objects dir
-        let stats = Arc::new(RwLock::new(CacheStats::default()));
+        let stats = Arc::new(CacheStats::default());
 
         // Should not error
         let result = run_eviction_pass(&cache_dir, 1000, &stats).await;
@@ -322,13 +320,13 @@ mod tests {
             .await
             .unwrap();
 
-        let stats = Arc::new(RwLock::new(CacheStats::default()));
+        let stats = Arc::new(CacheStats::default());
 
         let result = run_eviction_pass(&cache_dir, 1000, &stats).await;
         assert!(result.is_ok());
 
-        let s = stats.read().await;
-        assert_eq!(s.entry_count, 0);
-        assert_eq!(s.total_bytes, 0);
+        let snap = stats.snapshot();
+        assert_eq!(snap.entry_count, 0);
+        assert_eq!(snap.total_bytes, 0);
     }
 }

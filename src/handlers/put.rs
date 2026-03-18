@@ -39,7 +39,7 @@ pub async fn handle_put<B: Backend, C: CacheStore>(
     };
 
     let input = PutObjectInput {
-        bucket: state.backend_bucket.clone(),
+        bucket: state.backend_bucket.to_string(),
         key: key.to_string(),
         body: body_bytes.clone(),
         content_type: parsed.content_type.clone(),
@@ -70,7 +70,7 @@ pub async fn handle_put<B: Backend, C: CacheStore>(
     match result {
         Ok(output) => {
             // Purge cache for this key (best-effort)
-            let cache_key = CacheKey::new(&state.backend_bucket, key);
+            let cache_key = CacheKey::new(&*state.backend_bucket, key);
             if let Err(e) = state.cache.purge(&cache_key).await {
                 tracing::warn!(
                     error = %e,

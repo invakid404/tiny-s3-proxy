@@ -144,8 +144,9 @@ async fn build_proxy_stack(
         auth: authenticator,
         policy: cache_policy,
         config: Arc::new(config),
-        frontend_bucket: TEST_BUCKET.to_string(),
-        backend_bucket: TEST_BUCKET.to_string(),
+        frontend_bucket: Arc::from(TEST_BUCKET),
+        backend_bucket: Arc::from(TEST_BUCKET),
+        http_client: reqwest::Client::new(),
     });
 
     // Build axum router
@@ -484,7 +485,7 @@ async fn test_list_objects_v2() {
         build_proxy_stack(&backend_endpoint).await;
 
     // PUT a few objects with a unique prefix per test run
-    let prefix = format!("list-{}/", uuid::Uuid::new_v4());
+    let prefix = format!("list-{}-{}/", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
     let key_a = format!("{}a.txt", prefix);
     let key_b = format!("{}b.txt", prefix);
     let key_c = format!("{}c.txt", prefix);

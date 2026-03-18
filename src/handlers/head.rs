@@ -23,7 +23,7 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
 ) -> Response<Body> {
     // Try cache first if key is cacheable
     if state.policy.is_cacheable(key) {
-        let cache_key = CacheKey::new(&state.backend_bucket, key);
+        let cache_key = CacheKey::new(&*state.backend_bucket, key);
         match state.cache.lookup(&cache_key).await {
             Ok(Some(entry)) => {
                 tracing::info!(

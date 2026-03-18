@@ -67,8 +67,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         auth,
         policy: cache_policy,
         config: config.clone(),
-        frontend_bucket: config.frontend_bucket.clone(),
-        backend_bucket: config.backend_bucket.clone(),
+        frontend_bucket: Arc::from(config.frontend_bucket.as_str()),
+        backend_bucket: Arc::from(config.backend_bucket.as_str()),
+        http_client: reqwest::Client::new(),
     });
 
     // 7. Spawn eviction loop

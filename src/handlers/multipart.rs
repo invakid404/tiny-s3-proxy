@@ -99,7 +99,7 @@ pub async fn handle_upload_part<B: Backend, C: CacheStore>(
     };
 
     let input = UploadPartInput {
-        bucket: state.backend_bucket.clone(),
+        bucket: state.backend_bucket.to_string(),
         key: key.to_string(),
         upload_id: upload_id.to_string(),
         part_number,
@@ -208,7 +208,7 @@ pub async fn handle_complete_multipart<B: Backend, C: CacheStore>(
     };
 
     let input = CompleteMultipartInput {
-        bucket: state.backend_bucket.clone(),
+        bucket: state.backend_bucket.to_string(),
         key: key.to_string(),
         upload_id: upload_id.to_string(),
         parts,
@@ -219,7 +219,7 @@ pub async fn handle_complete_multipart<B: Backend, C: CacheStore>(
     match result {
         Ok(output) => {
             // Purge cache for the final object key (best-effort)
-            let cache_key = CacheKey::new(&state.backend_bucket, key);
+            let cache_key = CacheKey::new(&*state.backend_bucket, key);
             if let Err(e) = state.cache.purge(&cache_key).await {
                 tracing::warn!(
                     error = %e,

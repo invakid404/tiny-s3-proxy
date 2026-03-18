@@ -33,8 +33,9 @@ pub struct AppState<B: Backend, C: CacheStore> {
     pub auth: Arc<dyn Authenticator>,
     pub policy: CachePolicy,
     pub config: Arc<Config>,
-    pub frontend_bucket: String,
-    pub backend_bucket: String,
+    pub frontend_bucket: Arc<str>,
+    pub backend_bucket: Arc<str>,
+    pub http_client: reqwest::Client,
 }
 
 /// Main S3 request handler. All S3 API calls go through this function.
@@ -97,7 +98,7 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
 
     // Check bucket is allowed (must match frontend_bucket)
     let op_bucket = parsed.operation.bucket();
-    if op_bucket != state.frontend_bucket {
+    if op_bucket != &*state.frontend_bucket {
         let s3err = S3Error::no_such_bucket(op_bucket, &parsed.request_id);
         let response = s3err.to_response();
         record_metrics(op_name, &response, start);
@@ -159,12 +160,22 @@ fn rewrite_bucket_in_path(path: &str, frontend_bucket: &str, backend_bucket: &st
     }
 }
 
+/// Map common HTTP status codes to static strings, avoiding allocation.
+fn status_str(status: http::StatusCode) -> &'static str {
+    match status.as_u16() {
+        200 => "200", 204 => "204", 206 => "206",
+        400 => "400", 403 => "403", 404 => "404",
+        500 => "500", 501 => "501", 502 => "502", 503 => "503", 504 => "504",
+        _ => "other",
+    }
+}
+
 /// Record request metrics (counter + histogram + in-flight + cache + response size).
 fn record_metrics(operation: &'static str, response: &Response<Body>, start: Instant) {
     gauge!("s3proxy_in_flight_requests").decrement(1.0);
 
     let duration = start.elapsed().as_secs_f64();
-    let status = response.status().as_u16().to_string();
+    let status = status_str(response.status());
     counter!("s3proxy_requests_total", "operation" => operation, "status" => status).increment(1);
     histogram!("s3proxy_request_duration_seconds", "operation" => operation).record(duration);
 
@@ -198,7 +209,7 @@ pub mod test_utils {
     use crate::cache::entry::CacheEntry;
     use crate::cache::key::CacheKey;
     use crate::cache::metadata::CacheMeta;
-    use crate::cache::{CacheStats, CacheStore, FillGuard};
+    use crate::cache::{CacheStatsSnapshot, CacheStore, FillGuard};
     use crate::error::ProxyError;
     use crate::s3::ops::ParsedRequest;
 
@@ -213,7 +224,7 @@ pub mod test_utils {
 
     /// Convert a Vec<u8> into a BoxByteStream (single-chunk stream).
     fn vec_to_stream(data: Vec<u8>) -> BoxByteStream {
-        let stream = futures::stream::once(async move {
+        let stream = futures_util::stream::once(async move {
             Ok::<Bytes, std::io::Error>(Bytes::from(data))
         });
         Box::pin(stream)
@@ -500,16 +511,19 @@ pub mod test_utils {
 
         /// Add a cache entry, writing the body to a temp file.
         pub fn with_entry(self, key: &CacheKey, body: &[u8], meta: CacheMeta) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static MOCK_COUNTER: AtomicU64 = AtomicU64::new(0);
+            let id = MOCK_COUNTER.fetch_add(1, Ordering::Relaxed);
             let body_path = self
                 .temp_dir
                 .path()
-                .join(format!("{}.body", uuid::Uuid::new_v4()));
+                .join(format!("{}.body", id));
             std::fs::write(&body_path, body).expect("write mock body");
             let entry = CacheEntry {
                 meta,
                 body_path,
             };
-            self.entries.lock().unwrap().insert(key.hash(), entry);
+            self.entries.lock().unwrap().insert(key.hash_hex(), entry);
             self
         }
     }
@@ -517,7 +531,7 @@ pub mod test_utils {
     impl CacheStore for MockCache {
         async fn lookup(&self, key: &CacheKey) -> Result<Option<CacheEntry>, ProxyError> {
             let entries = self.entries.lock().unwrap();
-            let entry = entries.get(&key.hash()).map(|e| CacheEntry {
+            let entry = entries.get(&key.hash_hex()).map(|e| CacheEntry {
                 meta: e.meta.clone(),
                 body_path: e.body_path.clone(),
             });
@@ -547,18 +561,18 @@ pub mod test_utils {
             self.entries
                 .lock()
                 .unwrap()
-                .insert(guard.key.hash(), entry);
+                .insert(guard.key.hash_hex(), entry);
             Ok(())
         }
 
         async fn purge(&self, key: &CacheKey) -> Result<bool, ProxyError> {
             self.purge_calls.lock().unwrap().push(key.clone());
-            let removed = self.entries.lock().unwrap().remove(&key.hash()).is_some();
+            let removed = self.entries.lock().unwrap().remove(&key.hash_hex()).is_some();
             Ok(removed)
         }
 
-        async fn stats(&self) -> CacheStats {
-            CacheStats::default()
+        async fn stats(&self) -> CacheStatsSnapshot {
+            CacheStatsSnapshot::default()
         }
     }
 
@@ -650,8 +664,9 @@ pub mod test_utils {
                 config.cacheable_prefixes.clone(),
                 config.cache_max_object_bytes,
             ),
-            frontend_bucket: config.frontend_bucket.clone(),
-            backend_bucket: config.backend_bucket.clone(),
+            frontend_bucket: Arc::from(config.frontend_bucket.as_str()),
+            backend_bucket: Arc::from(config.backend_bucket.as_str()),
+            http_client: reqwest::Client::new(),
             config: Arc::new(config),
         })
     }

@@ -157,9 +157,8 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
     // Apply signing instructions (adds Authorization, x-amz-date, etc.).
     signing_instructions.apply_to_request_http1x(&mut signable_request);
 
-    // 5. Send the request via reqwest.
-    let reqwest_client = reqwest::Client::new();
-    let mut req_builder = reqwest_client.request(
+    // 5. Send the request via reqwest (reuse client from AppState).
+    let mut req_builder = state.http_client.request(
         reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET),
         &upstream_url,
     );
@@ -171,9 +170,9 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
         }
     }
 
-    // Set the body.
+    // Set the body (Bytes clone is O(1), no need for .to_vec()).
     if !body_bytes.is_empty() {
-        req_builder = req_builder.body(body_bytes.to_vec());
+        req_builder = req_builder.body(body_bytes);
     }
 
     let upstream_resp = match req_builder.send().await {

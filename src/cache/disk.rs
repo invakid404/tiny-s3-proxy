@@ -1,13 +1,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::atomic::Ordering;
 
 use crate::cache::entry::CacheEntry;
 use crate::cache::key::CacheKey;
 use crate::cache::metadata::CacheMeta;
 use crate::cache::policy::CachePolicy;
 use crate::cache::singleflight::SingleFlight;
-use crate::cache::{CacheStats, CacheStore, FillGuard};
+use crate::cache::{CacheStats, CacheStatsSnapshot, CacheStore, FillGuard};
 use crate::error::ProxyError;
 
 /// Disk-backed implementation of `CacheStore`.
@@ -20,7 +20,7 @@ pub struct DiskCache {
     max_bytes: u64,
     #[allow(dead_code)]
     policy: CachePolicy,
-    stats: Arc<RwLock<CacheStats>>,
+    stats: Arc<CacheStats>,
     singleflight: Arc<SingleFlight>,
 }
 
@@ -53,7 +53,7 @@ impl DiskCache {
             cache_dir,
             max_bytes,
             policy,
-            stats: Arc::new(RwLock::new(stats)),
+            stats: Arc::new(stats),
             singleflight: Arc::new(SingleFlight::new()),
         })
     }
@@ -61,7 +61,7 @@ impl DiskCache {
     /// Scan the objects directory to compute initial stats.
     async fn scan_existing_stats(cache_dir: &PathBuf) -> Result<CacheStats, ProxyError> {
         let objects_dir = cache_dir.join("objects");
-        let mut stats = CacheStats::default();
+        let stats = CacheStats::default();
 
         let mut d1_entries = match tokio::fs::read_dir(&objects_dir).await {
             Ok(entries) => entries,
@@ -123,13 +123,13 @@ impl DiskCache {
                     // Only count .body files to avoid double-counting
                     if file_name.ends_with(".body") {
                         if let Ok(metadata) = tokio::fs::metadata(&file_path).await {
-                            stats.total_bytes += metadata.len();
-                            stats.entry_count += 1;
+                            stats.total_bytes.fetch_add(metadata.len(), Ordering::Relaxed);
+                            stats.entry_count.fetch_add(1, Ordering::Relaxed);
                         }
                         // Also add the size of the corresponding .meta.json
                         let meta_path = file_path.with_extension("meta.json");
                         if let Ok(metadata) = tokio::fs::metadata(&meta_path).await {
-                            stats.total_bytes += metadata.len();
+                            stats.total_bytes.fetch_add(metadata.len(), Ordering::Relaxed);
                         }
                     }
                 }
@@ -139,26 +139,14 @@ impl DiskCache {
         Ok(stats)
     }
 
-    /// Build the path to the body file for a given key.
-    fn body_path(&self, key: &CacheKey) -> PathBuf {
-        let hash = key.hash();
-        let (d1, d2) = key.dir_prefix();
-        self.cache_dir
-            .join("objects")
-            .join(d1)
-            .join(d2)
-            .join(format!("{}.body", hash))
-    }
-
-    /// Build the path to the metadata file for a given key.
-    fn meta_path(&self, key: &CacheKey) -> PathBuf {
-        let hash = key.hash();
-        let (d1, d2) = key.dir_prefix();
-        self.cache_dir
-            .join("objects")
-            .join(d1)
-            .join(d2)
-            .join(format!("{}.meta.json", hash))
+    /// Build paths for the body and metadata files for a given key.
+    /// Computes the hash once and derives both paths.
+    fn paths_for_key(&self, key: &CacheKey) -> (PathBuf, PathBuf) {
+        let hash = key.hash_hex();
+        let dir = self.cache_dir.join("objects").join(&hash[..2]).join(&hash[2..4]);
+        let body = dir.join(format!("{hash}.body"));
+        let meta = dir.join(format!("{hash}.meta.json"));
+        (body, meta)
     }
 
     /// Get a reference to the singleflight instance.
@@ -167,51 +155,44 @@ impl DiskCache {
     }
 
     /// Get a reference to the stats.
-    pub fn stats_ref(&self) -> &Arc<RwLock<CacheStats>> {
+    pub fn stats_ref(&self) -> &Arc<CacheStats> {
         &self.stats
     }
 }
 
 impl CacheStore for DiskCache {
     async fn lookup(&self, key: &CacheKey) -> Result<Option<CacheEntry>, ProxyError> {
-        let body_path = self.body_path(key);
-        let meta_path = self.meta_path(key);
+        let (body_path, meta_path) = self.paths_for_key(key);
 
-        // Check if both files exist (use async try_exists to avoid blocking)
-        if !tokio::fs::try_exists(&body_path).await.unwrap_or(false)
-            || !tokio::fs::try_exists(&meta_path).await.unwrap_or(false)
-        {
-            let mut s = self.stats.write().await;
-            s.miss_count += 1;
+        // Single syscall: try to read metadata. NotFound = cache miss.
+        let meta_bytes = match tokio::fs::read(&meta_path).await {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.stats.miss_count.fetch_add(1, Ordering::Relaxed);
+                return Ok(None);
+            }
+            Err(e) => {
+                self.stats.miss_count.fetch_add(1, Ordering::Relaxed);
+                return Err(ProxyError::Cache {
+                    source: Box::new(e),
+                    operation: "read metadata".into(),
+                });
+            }
+        };
+
+        let meta: CacheMeta = serde_json::from_slice(&meta_bytes).map_err(|e| ProxyError::Cache {
+            source: Box::new(e),
+            operation: "parse metadata".into(),
+        })?;
+
+        // Verify body file exists (cheap stat, not a full read)
+        if !tokio::fs::try_exists(&body_path).await.unwrap_or(false) {
+            self.stats.miss_count.fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         }
 
-        // Read metadata only (small JSON file)
-        let meta_bytes =
-            tokio::fs::read(&meta_path)
-                .await
-                .map_err(|e| ProxyError::Cache {
-                    source: Box::new(e),
-                    operation: "read metadata".into(),
-                })?;
-        let mut meta: CacheMeta =
-            serde_json::from_slice(&meta_bytes).map_err(|e| ProxyError::Cache {
-                source: Box::new(e),
-                operation: "parse metadata".into(),
-            })?;
-
-        // Update access metadata (best-effort)
-        meta.last_accessed_at = chrono::Utc::now();
-        meta.hit_count += 1;
-        if let Ok(updated_json) = serde_json::to_vec_pretty(&meta) {
-            let _ = tokio::fs::write(&meta_path, &updated_json).await;
-        }
-
-        // Update stats
-        {
-            let mut s = self.stats.write().await;
-            s.hit_count += 1;
-        }
+        // Record hit — NO disk write, just atomic counter
+        self.stats.hit_count.fetch_add(1, Ordering::Relaxed);
 
         Ok(Some(CacheEntry { meta, body_path }))
     }
@@ -230,7 +211,9 @@ impl CacheStore for DiskCache {
         temp_body_path: PathBuf,
         meta: CacheMeta,
     ) -> Result<(), ProxyError> {
-        let id = uuid::Uuid::new_v4();
+        static COMMIT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COMMIT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
 
         // The body file has already been written and fsynced by the caller.
         // Get its size for stats.
@@ -239,9 +222,9 @@ impl CacheStore for DiskCache {
             .map(|m| m.len())
             .unwrap_or(0);
 
-        // Write metadata to temp file
-        let temp_meta = guard.temp_dir.join(format!("{}.meta.json", id));
-        let meta_bytes = serde_json::to_vec_pretty(&meta).map_err(|e| ProxyError::Cache {
+        // Write metadata to temp file (use compact JSON, not pretty-printed)
+        let temp_meta = guard.temp_dir.join(format!("{pid}-{id}.meta.json"));
+        let meta_bytes = serde_json::to_vec(&meta).map_err(|e| ProxyError::Cache {
             source: Box::new(e),
             operation: "serialize metadata".into(),
         })?;
@@ -268,8 +251,7 @@ impl CacheStore for DiskCache {
             })?;
 
         // Create parent directories for final location
-        let final_body = self.body_path(&guard.key);
-        let final_meta = self.meta_path(&guard.key);
+        let (final_body, final_meta) = self.paths_for_key(&guard.key);
         if let Some(parent) = final_body.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -293,22 +275,22 @@ impl CacheStore for DiskCache {
                 operation: "rename metadata".into(),
             })?;
 
-        // Update stats
-        {
-            let mut s = self.stats.write().await;
-            s.entry_count += 1;
-            s.total_bytes += body_size + meta_bytes.len() as u64;
-            s.fill_count += 1;
-        }
+        // Update stats atomically
+        self.stats.entry_count.fetch_add(1, Ordering::Relaxed);
+        self.stats.total_bytes.fetch_add(body_size + meta_bytes.len() as u64, Ordering::Relaxed);
+        self.stats.fill_count.fetch_add(1, Ordering::Relaxed);
 
         Ok(())
     }
 
     async fn purge(&self, key: &CacheKey) -> Result<bool, ProxyError> {
-        let body_path = self.body_path(key);
-        let meta_path = self.meta_path(key);
+        let (body_path, meta_path) = self.paths_for_key(key);
 
-        if !body_path.exists() && !meta_path.exists() {
+        // Use async filesystem checks instead of blocking .exists()
+        let body_exists = tokio::fs::try_exists(&body_path).await.unwrap_or(false);
+        let meta_exists = tokio::fs::try_exists(&meta_path).await.unwrap_or(false);
+
+        if !body_exists && !meta_exists {
             return Ok(false);
         }
 
@@ -323,7 +305,7 @@ impl CacheStore for DiskCache {
             .unwrap_or(0);
 
         let mut removed = false;
-        if body_path.exists() {
+        if body_exists {
             tokio::fs::remove_file(&body_path)
                 .await
                 .map_err(|e| ProxyError::Cache {
@@ -332,7 +314,7 @@ impl CacheStore for DiskCache {
                 })?;
             removed = true;
         }
-        if meta_path.exists() {
+        if meta_exists {
             tokio::fs::remove_file(&meta_path)
                 .await
                 .map_err(|e| ProxyError::Cache {
@@ -343,16 +325,20 @@ impl CacheStore for DiskCache {
         }
 
         if removed {
-            let mut s = self.stats.write().await;
-            s.entry_count = s.entry_count.saturating_sub(1);
-            s.total_bytes = s.total_bytes.saturating_sub(body_size + meta_size);
+            // Atomically update stats
+            self.stats.entry_count.fetch_sub(1, Ordering::Relaxed);
+            // Use fetch_sub with saturating logic: load, compute, store via compare_exchange loop
+            let total_removed = body_size + meta_size;
+            let _ = self.stats.total_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(total_removed))
+            });
         }
 
         Ok(removed)
     }
 
-    async fn stats(&self) -> CacheStats {
-        self.stats.read().await.clone()
+    async fn stats(&self) -> CacheStatsSnapshot {
+        self.stats.snapshot()
     }
 }
 
@@ -395,8 +381,13 @@ mod tests {
 
     /// Helper: write body data to a temp file in the cache's tmp dir and return its path.
     async fn write_temp_body(cache_dir: &std::path::Path, data: &[u8]) -> PathBuf {
+        use std::sync::atomic::AtomicU64;
+        static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
         let tmp_dir = cache_dir.join("tmp");
-        let temp_path = tmp_dir.join(format!("{}.body", uuid::Uuid::new_v4()));
+        let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let temp_path = tmp_dir.join(format!("{pid}-{id}.body"));
         let mut f = tokio::fs::File::create(&temp_path).await.unwrap();
         f.write_all(data).await.unwrap();
         f.sync_all().await.unwrap();
@@ -448,8 +439,8 @@ mod tests {
         assert_eq!(entry.meta.content_type, Some("application/javascript".into()));
         assert_eq!(entry.meta.content_length, body.len() as i64);
         assert_eq!(entry.meta.source_status, 200);
-        // hit_count should be incremented
-        assert_eq!(entry.meta.hit_count, 1);
+        // hit_count is no longer incremented on-disk per hit, stays at 0 in meta
+        assert_eq!(entry.meta.hit_count, 0);
     }
 
     #[tokio::test]
@@ -502,7 +493,7 @@ mod tests {
         cache.commit_fill(guard, temp_path, meta).await.unwrap();
 
         // Verify filesystem layout
-        let hash = key.hash();
+        let hash = key.hash_hex();
         let (d1, d2) = key.dir_prefix();
 
         let body_path = tmp
