@@ -29,6 +29,7 @@ pub struct PutObjectInput {
     pub content_type: Option<String>,
     pub content_md5: Option<String>,
     pub metadata: HashMap<String, String>,
+    pub extra_amz_headers: HashMap<String, String>,
 }
 
 #[derive(Debug)]

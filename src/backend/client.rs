@@ -256,6 +256,7 @@ impl Backend for S3Backend {
             let content_type = req.content_type.clone();
             let content_md5 = req.content_md5.clone();
             let metadata = req.metadata.clone();
+            let extra_amz_headers = req.extra_amz_headers.clone();
             let body = body_bytes.clone();
             async move {
                 let mut builder = client
@@ -274,7 +275,19 @@ impl Backend for S3Backend {
                     builder = builder.metadata(k, v);
                 }
 
+                // Forward extra x-amz-* headers as custom headers.
                 let resp = builder
+                    .customize()
+                    .mutate_request(move |req| {
+                        for (k, v) in &extra_amz_headers {
+                            if let (Ok(name), Ok(val)) = (
+                                http::header::HeaderName::from_bytes(k.as_bytes()),
+                                http::header::HeaderValue::from_str(v),
+                            ) {
+                                req.headers_mut().insert(name, val);
+                            }
+                        }
+                    })
                     .send()
                     .await
                     .map_err(|e| map_sdk_error(e, "put_object"))?;

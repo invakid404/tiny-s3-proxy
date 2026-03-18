@@ -372,6 +372,7 @@ pub mod test_utils {
                 content_type: req.content_type.clone(),
                 content_md5: req.content_md5.clone(),
                 metadata: req.metadata.clone(),
+                extra_amz_headers: req.extra_amz_headers.clone(),
             });
             self.put_response
                 .lock()

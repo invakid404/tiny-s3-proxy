@@ -44,6 +44,7 @@ pub async fn handle_put<B: Backend, C: CacheStore>(
         content_type: parsed.content_type.clone(),
         content_md5: parsed.content_md5.clone(),
         metadata: parsed.user_metadata.clone(),
+        extra_amz_headers: parsed.extra_amz_headers.clone(),
     };
 
     // Retry handled by the backend client
