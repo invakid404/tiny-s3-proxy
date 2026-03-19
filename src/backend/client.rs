@@ -318,6 +318,9 @@ macro_rules! extract_write_extra_headers {
         if let Some(v) = $resp.checksum_sha256() {
             extra.insert("x-amz-checksum-sha256".into(), v.to_string());
         }
+        if let Some(v) = $resp.checksum_crc64_nvme() {
+            extra.insert("x-amz-checksum-crc64nvme".into(), v.to_string());
+        }
         // Request charged
         if let Some(v) = $resp.request_charged() {
             extra.insert("x-amz-request-charged".into(), v.as_str().to_string());
@@ -332,6 +335,9 @@ macro_rules! extract_write_extra_headers_full {
     ($resp:expr, $extra:expr) => {
         if let Some(v) = $resp.expiration() {
             $extra.insert("x-amz-expiration".into(), v.to_string());
+        }
+        if let Some(v) = $resp.checksum_type() {
+            $extra.insert("x-amz-checksum-type".into(), v.as_str().to_string());
         }
     };
 }
