@@ -69,9 +69,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config: config.clone(),
         frontend_bucket: Arc::from(config.frontend_bucket.as_str()),
         backend_bucket: Arc::from(config.backend_bucket.as_str()),
+        // Passthrough client uses connect + read timeouts but no hard total
+        // timeout, so large streamed uploads/downloads are not cut off by
+        // a global deadline. The connect timeout guards against unreachable
+        // backends, and the read timeout guards against stalled connections.
         http_client: reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_millis(config.upstream_connect_timeout_ms))
-            .timeout(std::time::Duration::from_millis(config.upstream_request_timeout_ms))
+            .read_timeout(std::time::Duration::from_millis(config.upstream_request_timeout_ms))
             .build()
             .expect("failed to build HTTP client"),
     });
