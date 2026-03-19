@@ -379,6 +379,9 @@ fn has_unsupported_write_modifiers(
         "x-amz-grant-read",
         "x-amz-grant-read-acp",
         "x-amz-grant-write-acp",
+        // Append-mode PUTs have different semantics (conditional offset writes,
+        // x-amz-object-size in the response) that the typed path wasn't designed for.
+        "x-amz-write-offset-bytes",
     ];
     extra_amz.keys().any(|k| OPERATION_MODIFYING.contains(&k.as_str()))
 }
