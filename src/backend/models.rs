@@ -105,6 +105,9 @@ pub struct ObjectInfo {
 #[derive(Debug)]
 pub struct CreateMultipartOutput {
     pub upload_id: String,
+    /// SSE, checksum, and other write-response headers captured from the SDK
+    /// response. See `extract_write_extra_headers!` in client.rs.
+    pub extra_headers: HashMap<String, String>,
 }
 
 #[derive(Debug)]

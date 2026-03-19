@@ -147,12 +147,7 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
             }
         }
         S3Operation::PutObject { key, .. } => {
-            // The typed PutObject path already forwards extra_amz_headers via
-            // customize().mutate_request(), so only standard HTTP conditional
-            // headers (not in extra_amz_headers) need to trigger passthrough.
-            if parts.headers.contains_key("if-match")
-                || parts.headers.contains_key("if-none-match")
-            {
+            if has_unsupported_write_modifiers(&parsed.extra_amz_headers, &parts.headers) {
                 let raw_path = parts.uri.path();
                 let rewritten = rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
                 let query = parts.uri.query();
@@ -362,14 +357,9 @@ fn has_unsupported_write_modifiers(
         "x-amz-object-lock-retain-until-date",
         "x-amz-object-lock-legal-hold",
         "x-amz-website-redirect-location",
-        "x-amz-checksum-algorithm",
-        "x-amz-checksum-crc32",
-        "x-amz-checksum-crc32c",
-        "x-amz-checksum-crc64nvme",
-        "x-amz-checksum-sha1",
-        "x-amz-checksum-sha256",
-        "x-amz-checksum-type",
-        "x-amz-sdk-checksum-algorithm",
+        // Checksum headers are NOT listed here: the typed path forwards them
+        // on the request via extra_amz_headers + customize().mutate_request(),
+        // and the response captures them via extract_write_extra_headers!.
         "x-amz-mp-object-size",
         "x-amz-if-match-last-modified-time",
         "x-amz-if-match-size",

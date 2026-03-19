@@ -50,6 +50,14 @@ pub async fn handle_create_multipart<B: Backend, C: CacheStore>(
             for (k, v) in headers.iter() {
                 response = response.header(k, v);
             }
+            for (k, v) in &output.extra_headers {
+                if let (Ok(name), Ok(val)) = (
+                    http::header::HeaderName::from_bytes(k.as_bytes()),
+                    http::header::HeaderValue::from_str(v),
+                ) {
+                    response = response.header(name, val);
+                }
+            }
             response
                 .header("content-type", "application/xml")
                 .body(Body::from(xml))
@@ -440,6 +448,7 @@ mod tests {
         let backend =
             MockBackend::new().with_create_multipart(Ok(CreateMultipartOutput {
                 upload_id: "new-upload-id".to_string(),
+                extra_headers: std::collections::HashMap::new(),
             }));
 
         let state = build_app_state(backend, MockCache::new(), MockAuth::allow_all());

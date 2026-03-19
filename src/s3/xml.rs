@@ -188,12 +188,23 @@ pub fn parse_complete_multipart_body(xml_body: &[u8]) -> Result<Vec<CompletedPar
                     "CompleteMultipartUpload" if depth == 0 => {
                         found_root = true;
                     }
-                    "Part" if found_root => {
+                    // Part must be a direct child of the root (depth 1).
+                    "Part" if found_root && depth == 1 => {
                         inside_part = true;
                         current_part_number = None;
                         current_etag = None;
                     }
-                    "PartNumber" | "ETag" if inside_part => {
+                    // PartNumber/ETag must be direct children of Part (depth 2).
+                    "PartNumber" if inside_part && depth == 2 => {
+                        if current_part_number.is_some() {
+                            return Err("Duplicate PartNumber in Part element".to_string());
+                        }
+                        current_element = name;
+                    }
+                    "ETag" if inside_part && depth == 2 => {
+                        if current_etag.is_some() {
+                            return Err("Duplicate ETag in Part element".to_string());
+                        }
                         current_element = name;
                     }
                     _ => {}
@@ -520,6 +531,30 @@ mod tests {
         let result = parse_complete_multipart_body(body);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Missing CompleteMultipartUpload root element"));
+    }
+
+    #[test]
+    fn test_parse_complete_multipart_part_wrong_depth_rejected() {
+        // Part nested inside a wrapper element (depth 2 instead of 1).
+        let body = b"<CompleteMultipartUpload><Wrapper><Part><PartNumber>1</PartNumber><ETag>\"e\"</ETag></Part></Wrapper></CompleteMultipartUpload>";
+        let result = parse_complete_multipart_body(body);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_complete_multipart_duplicate_part_number_rejected() {
+        let body = b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><PartNumber>2</PartNumber><ETag>\"e\"</ETag></Part></CompleteMultipartUpload>";
+        let result = parse_complete_multipart_body(body);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Duplicate PartNumber"));
+    }
+
+    #[test]
+    fn test_parse_complete_multipart_duplicate_etag_rejected() {
+        let body = b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag><ETag>\"b\"</ETag></Part></CompleteMultipartUpload>";
+        let result = parse_complete_multipart_body(body);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Duplicate ETag"));
     }
 
     #[test]

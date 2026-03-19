@@ -627,7 +627,28 @@ impl Backend for S3Backend {
             })?
             .to_string();
 
-        Ok(CreateMultipartOutput { upload_id })
+        // CreateMultipartUploadOutput has a different accessor set than data
+        // responses (no individual checksums, no expiration), so extract directly.
+        let mut extra_headers = HashMap::new();
+        if let Some(v) = resp.server_side_encryption() {
+            extra_headers.insert("x-amz-server-side-encryption".into(), v.as_str().to_string());
+        }
+        if let Some(v) = resp.ssekms_key_id() {
+            extra_headers.insert("x-amz-server-side-encryption-aws-kms-key-id".into(), v.to_string());
+        }
+        if resp.bucket_key_enabled().unwrap_or(false) {
+            extra_headers.insert("x-amz-server-side-encryption-bucket-key-enabled".into(), "true".into());
+        }
+        if let Some(v) = resp.checksum_algorithm() {
+            extra_headers.insert("x-amz-checksum-algorithm".into(), v.as_str().to_string());
+        }
+        if let Some(v) = resp.checksum_type() {
+            extra_headers.insert("x-amz-checksum-type".into(), v.as_str().to_string());
+        }
+        if let Some(v) = resp.request_charged() {
+            extra_headers.insert("x-amz-request-charged".into(), v.as_str().to_string());
+        }
+        Ok(CreateMultipartOutput { upload_id, extra_headers })
     }
 
     async fn upload_part(&self, req: UploadPartInput) -> Result<UploadPartOutput, ProxyError> {
