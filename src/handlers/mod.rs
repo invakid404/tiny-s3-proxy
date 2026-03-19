@@ -118,8 +118,33 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
 
     // Dispatch to handler based on operation
     let response = match &parsed.operation {
-        S3Operation::GetObject { key, .. } => get::handle_get(&state, &parsed, key).await,
-        S3Operation::HeadObject { key, .. } => head::handle_head(&state, &parsed, key).await,
+        S3Operation::GetObject { key, .. } => {
+            if has_unsupported_get_modifiers(&parts.headers) {
+                // Route through raw passthrough to preserve headers like Range,
+                // If-Match, If-None-Match, SSE-C, etc. that the typed backend
+                // API cannot carry.
+                let path = format!("/{}/{}", state.frontend_bucket, key);
+                let rewritten = rewrite_bucket_in_path(&path, &state.frontend_bucket, &state.backend_bucket);
+                let query = parts.uri.query();
+                passthrough::handle_passthrough(
+                    &state, "GET", &rewritten, query, &parts.headers, body, &parsed.request_id,
+                ).await
+            } else {
+                get::handle_get(&state, &parsed, key).await
+            }
+        }
+        S3Operation::HeadObject { key, .. } => {
+            if has_unsupported_get_modifiers(&parts.headers) {
+                let path = format!("/{}/{}", state.frontend_bucket, key);
+                let rewritten = rewrite_bucket_in_path(&path, &state.frontend_bucket, &state.backend_bucket);
+                let query = parts.uri.query();
+                passthrough::handle_passthrough(
+                    &state, "HEAD", &rewritten, query, &parts.headers, body, &parsed.request_id,
+                ).await
+            } else {
+                head::handle_head(&state, &parsed, key).await
+            }
+        }
         S3Operation::PutObject { key, .. } => put::handle_put(&state, &parsed, key, body).await,
         S3Operation::DeleteObject { key, .. } => {
             delete::handle_delete(&state, &parsed, key).await
@@ -203,6 +228,20 @@ fn record_metrics(operation: &'static str, response: &Response<Body>, start: Ins
     {
         histogram!("s3proxy_response_size_bytes", "operation" => operation).record(size);
     }
+}
+
+/// Check if the request contains headers that the typed GET/HEAD backend
+/// API cannot forward. When present, the request must go through the raw
+/// HTTP passthrough to preserve semantics.
+fn has_unsupported_get_modifiers(headers: &http::HeaderMap) -> bool {
+    headers.contains_key("range")
+        || headers.contains_key("if-match")
+        || headers.contains_key("if-none-match")
+        || headers.contains_key("if-modified-since")
+        || headers.contains_key("if-unmodified-since")
+        || headers.contains_key("x-amz-request-payer")
+        || headers.contains_key("x-amz-expected-bucket-owner")
+        || headers.keys().any(|k| k.as_str().starts_with("x-amz-server-side-encryption-customer-"))
 }
 
 #[cfg(test)]
@@ -634,7 +673,7 @@ pub mod test_utils {
             frontend_bucket: "test-frontend".to_string(),
             auth_mode: AuthMode::TrustedInternal,
             allowed_frontend_keys: vec![],
-            backend_endpoint: "https://example.com".to_string(),
+            backend_endpoint: "http://127.0.0.1:1".to_string(),
             backend_region: "auto".to_string(),
             backend_bucket: "test-backend".to_string(),
             backend_access_key_id: "AKID".to_string(),

@@ -112,7 +112,9 @@ pub async fn handle_get<B: Backend + 'static, C: CacheStore + 'static>(
     parsed: &ParsedRequest,
     key: &str,
 ) -> Response<Body> {
-    // Range requests bypass cache entirely
+    // Range requests are routed through raw passthrough at the dispatch layer
+    // (handlers/mod.rs) to preserve the Range header. This is a defensive
+    // fallback for any edge case where a ranged request reaches this handler.
     if parsed.range.is_some() {
         tracing::info!(
             request_id = %parsed.request_id,
@@ -201,7 +203,7 @@ async fn handle_passthrough<B: Backend, C: CacheStore>(
             let s3err = S3Error::from_proxy_error(
                 &e,
                 &parsed.request_id,
-                Some(&format!("/{}/{}", state.backend_bucket, key)),
+                Some(&format!("/{}/{}", state.frontend_bucket, key)),
             );
             s3err.to_response()
         }
@@ -371,6 +373,7 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
         Err(e) => {
             // Backend failed. Try serving stale from cache if configured.
             if state.config.cache_serve_stale_on_error
+                && e.is_transient()
                 && let Ok(Some(stale_entry)) = state.cache.lookup(cache_key).await
             {
                 waiter.complete().await;
@@ -401,7 +404,7 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
             let s3err = S3Error::from_proxy_error(
                 &e,
                 &parsed.request_id,
-                Some(&format!("/{}/{}", state.backend_bucket, key)),
+                Some(&format!("/{}/{}", state.frontend_bucket, key)),
             );
             s3err.to_response()
         }

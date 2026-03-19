@@ -59,6 +59,17 @@ impl ProxyError {
         }
     }
 
+    /// Whether this error is transient (worth retrying or serving stale for).
+    /// Returns false for semantic errors like 404/403 where stale data would
+    /// hide a real state change from the client.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            ProxyError::Backend { .. } | ProxyError::Timeout { .. } => true,
+            ProxyError::UpstreamS3 { status_code, .. } => *status_code >= 500,
+            _ => false,
+        }
+    }
+
     /// Map this error to an S3-compatible error code string.
     pub fn s3_error_code(&self) -> &str {
         match self {
