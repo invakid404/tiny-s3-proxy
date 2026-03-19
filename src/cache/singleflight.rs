@@ -17,7 +17,14 @@ pub enum FlightResult {
 pub struct FlightWaiter {
     key: CacheKey,
     sender: broadcast::Sender<()>,
-    registry: Arc<Mutex<HashMap<CacheKey, broadcast::Sender<()>>>>,
+    generation: u64,
+    registry: Arc<Mutex<HashMap<CacheKey, FlightEntry>>>,
+}
+
+/// Registry entry pairing a broadcast sender with the generation that created it.
+struct FlightEntry {
+    sender: broadcast::Sender<()>,
+    generation: u64,
 }
 
 impl std::fmt::Debug for FlightWaiter {
@@ -32,7 +39,14 @@ impl FlightWaiter {
     /// Signal that the fill is complete. All followers will be woken.
     pub async fn complete(self) {
         let _ = self.sender.send(());
-        self.registry.lock().await.remove(&self.key);
+        // Only remove the registry entry if it still belongs to this flight.
+        // A cancel() + new try_acquire() may have replaced it with a newer entry.
+        let mut registry = self.registry.lock().await;
+        if let Some(entry) = registry.get(&self.key)
+            && entry.generation == self.generation
+        {
+            registry.remove(&self.key);
+        }
     }
 }
 
@@ -40,17 +54,24 @@ impl Drop for FlightWaiter {
     fn drop(&mut self) {
         // When the leader drops without calling complete(), the broadcast sender
         // will be dropped, causing RecvError::Closed for followers.
-        // Clean up the registry using try_lock to avoid spawning tasks
-        // (which may not run if the runtime is shutting down).
+        // Only remove the registry entry if it still belongs to this flight.
         if let Ok(mut registry) = self.registry.try_lock() {
-            registry.remove(&self.key);
+            if let Some(entry) = registry.get(&self.key)
+                && entry.generation == self.generation
+            {
+                registry.remove(&self.key);
+            }
         } else {
-            // If we can't get the lock synchronously, spawn a cleanup task.
-            // This is best-effort; in test shutdown scenarios it may not run.
             let registry = self.registry.clone();
             let key = self.key.clone();
+            let flight_gen = self.generation;
             tokio::spawn(async move {
-                registry.lock().await.remove(&key);
+                let mut registry = registry.lock().await;
+                if let Some(entry) = registry.get(&key)
+                    && entry.generation == flight_gen
+                {
+                    registry.remove(&key);
+                }
             });
         }
     }
@@ -62,7 +83,8 @@ impl Drop for FlightWaiter {
 /// one becomes the leader (and should fetch from the backend). All others
 /// become followers and wait for the leader to signal completion.
 pub struct SingleFlight {
-    registry: Arc<Mutex<HashMap<CacheKey, broadcast::Sender<()>>>>,
+    registry: Arc<Mutex<HashMap<CacheKey, FlightEntry>>>,
+    next_generation: std::sync::atomic::AtomicU64,
 }
 
 impl Default for SingleFlight {
@@ -75,6 +97,7 @@ impl SingleFlight {
     pub fn new() -> Self {
         Self {
             registry: Arc::new(Mutex::new(HashMap::new())),
+            next_generation: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
@@ -84,17 +107,19 @@ impl SingleFlight {
     /// `Follower` if another request is already in flight.
     pub async fn try_acquire(&self, key: &CacheKey) -> FlightResult {
         let mut registry = self.registry.lock().await;
-        if let Some(sender) = registry.get(key) {
+        if let Some(entry) = registry.get(key) {
             FlightResult::Follower {
-                receiver: sender.subscribe(),
+                receiver: entry.sender.subscribe(),
             }
         } else {
             let (sender, _) = broadcast::channel(1);
-            registry.insert(key.clone(), sender.clone());
+            let generation = self.next_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            registry.insert(key.clone(), FlightEntry { sender: sender.clone(), generation });
             FlightResult::Leader {
                 waiter: FlightWaiter {
                     key: key.clone(),
                     sender,
+                    generation,
                     registry: self.registry.clone(),
                 },
             }
@@ -102,6 +127,8 @@ impl SingleFlight {
     }
 
     /// Cancel an in-flight operation for a key (used when purging).
+    /// Only removes the entry; cleanup of the old leader's waiter is
+    /// handled by its generation-guarded complete()/Drop.
     pub async fn cancel(&self, key: &CacheKey) {
         self.registry.lock().await.remove(key);
     }
