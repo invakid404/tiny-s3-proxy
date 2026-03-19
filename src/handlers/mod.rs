@@ -146,7 +146,23 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
                 head::handle_head(&state, &parsed, key).await
             }
         }
-        S3Operation::PutObject { key, .. } => put::handle_put(&state, &parsed, key, body).await,
+        S3Operation::PutObject { key, .. } => {
+            // The typed PutObject path already forwards extra_amz_headers via
+            // customize().mutate_request(), so only standard HTTP conditional
+            // headers (not in extra_amz_headers) need to trigger passthrough.
+            if parts.headers.contains_key("if-match")
+                || parts.headers.contains_key("if-none-match")
+            {
+                let raw_path = parts.uri.path();
+                let rewritten = rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
+                let query = parts.uri.query();
+                passthrough::handle_passthrough(
+                    &state, "PUT", &rewritten, query, &parts.headers, body, &parsed.request_id,
+                ).await
+            } else {
+                put::handle_put(&state, &parsed, key, body).await
+            }
+        }
         S3Operation::DeleteObject { key, .. } => {
             if has_unsupported_write_modifiers(&parsed.extra_amz_headers, &parts.headers) {
                 let raw_path = parts.uri.path();
