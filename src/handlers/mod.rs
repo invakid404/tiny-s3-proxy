@@ -283,15 +283,41 @@ fn has_unsupported_get_modifiers(headers: &http::HeaderMap) -> bool {
 }
 
 /// Check if the request contains write-side x-amz-* headers that the typed
-/// multipart backend API does not forward. When present, the request must go
-/// through raw passthrough so the headers reach the backend.
+/// path does not forward. Uses a whitelist of known operation-modifying
+/// headers to avoid false positives from benign SDK headers like
+/// x-amz-user-agent that trigger passthrough unnecessarily.
 fn has_unsupported_write_modifiers(extra_amz: &std::collections::HashMap<String, String>) -> bool {
-    // Headers the typed multipart path already handles or that are benign:
-    const HANDLED: &[&str] = &[
-        "x-amz-content-sha256", "x-amz-date", "x-amz-security-token",
-        "x-amz-decoded-content-length",
+    const OPERATION_MODIFYING: &[&str] = &[
+        "x-amz-storage-class",
+        "x-amz-server-side-encryption",
+        "x-amz-server-side-encryption-aws-kms-key-id",
+        "x-amz-server-side-encryption-context",
+        "x-amz-server-side-encryption-bucket-key-enabled",
+        "x-amz-server-side-encryption-customer-algorithm",
+        "x-amz-server-side-encryption-customer-key",
+        "x-amz-server-side-encryption-customer-key-md5",
+        "x-amz-request-payer",
+        "x-amz-expected-bucket-owner",
+        "x-amz-bypass-governance-retention",
+        "x-amz-mfa",
+        "x-amz-tagging",
+        "x-amz-object-lock-mode",
+        "x-amz-object-lock-retain-until-date",
+        "x-amz-object-lock-legal-hold",
+        "x-amz-website-redirect-location",
+        "x-amz-checksum-algorithm",
+        "x-amz-checksum-crc32",
+        "x-amz-checksum-crc32c",
+        "x-amz-checksum-crc64nvme",
+        "x-amz-checksum-sha1",
+        "x-amz-checksum-sha256",
+        "x-amz-acl",
+        "x-amz-grant-full-control",
+        "x-amz-grant-read",
+        "x-amz-grant-read-acp",
+        "x-amz-grant-write-acp",
     ];
-    extra_amz.keys().any(|k| !HANDLED.contains(&k.as_str()))
+    extra_amz.keys().any(|k| OPERATION_MODIFYING.contains(&k.as_str()))
 }
 
 #[cfg(test)]
