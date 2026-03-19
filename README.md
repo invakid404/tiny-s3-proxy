@@ -8,9 +8,9 @@ Sits between your application and an S3-compatible backend (R2, MinIO, etc.) and
 
 1. **Caches GET responses on disk** for configured prefixes, so repeated reads never hit the backend.
 2. **Coalesces concurrent cache misses** — if 20 workers request the same uncached object simultaneously, one request hits the backend. The rest wait and read from the freshly-filled cache.
-3. **Serves stale on backend failure** — if the backend is down and there's a cached copy, you get data instead of an error.
+3. **Serves stale on transient backend failure** — if the backend returns a 5xx error or times out and there's a cached copy, you get data instead of an error. Semantic errors like 404 or 403 are not masked by stale data.
 
-Everything else (PUT, DELETE, LIST, multipart, any S3 operation the proxy doesn't explicitly handle) passes through to the backend with retries.
+Everything else (PUT, DELETE, LIST, multipart, any S3 operation the proxy doesn't explicitly handle) passes through to the backend with re-signing and retries.
 
 ## Why it exists
 
@@ -33,9 +33,19 @@ DELETE /bucket/key?uploadId=U            → AbortMultipartUpload
 anything else                            → raw passthrough with SigV4 re-signing
 ```
 
-GET responses for cacheable prefixes (default: `script_bundle/`, `bun_bundle/`, `tar/`) are streamed to disk and to the client simultaneously. Cache hits stream directly from disk — the proxy never buffers a full object in memory.
+Requests are also routed through raw passthrough when they carry headers or query parameters the typed path cannot forward:
 
-Writes (PUT, DELETE, multipart completion) purge the cache for the affected key immediately.
+- **GET/HEAD** with `Range`, `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, SSE-C headers, `x-amz-checksum-mode`, `x-amz-request-payer`, or `x-amz-expected-bucket-owner`
+- **GET/HEAD** with `?versionId`, `?partNumber`, or response-override query parameters
+- **PUT** with `x-amz-copy-source` (CopyObject / UploadPartCopy)
+- **PUT/DELETE/multipart** with operation-modifying `x-amz-*` headers not handled by the typed path (storage class, SSE, governance bypass, MFA, etc.)
+- **GET** `?uploadId` (ListParts), **GET** `?uploads` (ListMultipartUploads), and incomplete multipart query combinations
+
+GET responses for cacheable prefixes (default: `script_bundle/`, `bun_bundle/`, `tar/`) are streamed to disk and to the client simultaneously. Cache hits stream directly from disk — the proxy never buffers a full object in memory for reads.
+
+Writes (PUT, DELETE, multipart completion) purge the cache for the affected key immediately. If the on-disk purge fails, a durable poison marker is written so subsequent reads bypass the stale entry until it is cleaned up.
+
+The proxy preserves the full set of standard S3 response headers through both fresh and cached paths, including `Content-Encoding`, `Cache-Control`, `Content-Disposition`, `Content-Language`, version IDs, SSE state, checksums, and other metadata. Write paths forward `Content-Encoding`, `Content-Disposition`, `Content-Language`, `Cache-Control`, and `Expires` to the backend alongside user metadata.
 
 ## Quick start
 
@@ -89,8 +99,8 @@ All configuration is via environment variables.
 | `BACKEND_BUCKET` | *required* | Actual backend bucket name |
 | `BACKEND_ACCESS_KEY_ID` | *required* | Backend credentials |
 | `BACKEND_SECRET_ACCESS_KEY` | *required* | Backend credentials |
-| `BACKEND_USE_PATH_STYLE` | `true` | Use path-style S3 addressing |
-| `BACKEND_ALLOW_HTTP` | `false` | Allow plaintext HTTP to backend |
+| `BACKEND_USE_PATH_STYLE` | `true` | Use path-style S3 addressing. When `false`, the typed SDK path uses virtual-hosted-style and passthrough rewrites URLs to `bucket.endpoint/key` format |
+| `BACKEND_ALLOW_HTTP` | `false` | Allow plaintext HTTP to backend. Rejected at startup if endpoint is `http://` and this is not set |
 
 ### Cache
 
@@ -98,29 +108,29 @@ All configuration is via environment variables.
 |---|---|---|
 | `CACHE_DIR` | `/cache` | Disk cache directory |
 | `CACHE_MAX_BYTES` | `10737418240` (10 GB) | Maximum cache size on disk |
-| `CACHE_MAX_OBJECT_BYTES` | `536870912` (512 MB) | Maximum single object size to cache |
+| `CACHE_MAX_OBJECT_BYTES` | `536870912` (512 MB) | Maximum single object size to cache. Objects with unknown `Content-Length` are not cached |
 | `CACHEABLE_PREFIXES` | `script_bundle/,bun_bundle/,tar/` | Object key prefixes to cache |
-| `CACHE_SERVE_STALE_ON_ERROR` | `true` | Serve stale cache entries when backend fails |
+| `CACHE_SERVE_STALE_ON_ERROR` | `true` | Serve stale cache entries on transient backend errors (5xx, timeouts). Semantic errors like 404/403 are never masked |
 | `CACHE_EVICTION_INTERVAL_SECS` | `300` | Seconds between LRU eviction passes |
 
 ### Request Limits
 
 | Variable | Default | Description |
 |---|---|---|
-| `MAX_REQUEST_BODY_BYTES` | `268435456` (256 MiB) | Maximum request body size for PUT, UploadPart, and passthrough. Returns `EntityTooLarge` if exceeded. Increase with caution — each in-flight upload buffers this much memory. |
+| `MAX_REQUEST_BODY_BYTES` | `268435456` (256 MiB) | Maximum request body size for PUT, UploadPart, and passthrough. Returns `EntityTooLarge` if exceeded. Each in-flight upload buffers this much memory (retry uses O(1) `Bytes::clone`, not a data copy) |
 
 ### Retry
 
 | Variable | Default | Description |
 |---|---|---|
-| `GET_MAX_ATTEMPTS` | `3` | Retry attempts for GET |
-| `HEAD_MAX_ATTEMPTS` | `3` | Retry attempts for HEAD |
+| `GET_MAX_ATTEMPTS` | `3` | Retry attempts for GET (typed and passthrough) |
+| `HEAD_MAX_ATTEMPTS` | `3` | Retry attempts for HEAD (typed and passthrough) |
 | `LIST_MAX_ATTEMPTS` | `3` | Retry attempts for LIST |
 | `PUT_MAX_ATTEMPTS` | `1` | Retry attempts for PUT |
-| `DELETE_MAX_ATTEMPTS` | `2` | Retry attempts for DELETE |
-| `RETRY_BASE_BACKOFF_MS` | `100` | Base backoff for exponential retry |
+| `DELETE_MAX_ATTEMPTS` | `2` | Retry attempts for DELETE (typed and passthrough) |
+| `RETRY_BASE_BACKOFF_MS` | `100` | Base backoff for exponential retry (applies to both typed and passthrough paths) |
 | `UPSTREAM_CONNECT_TIMEOUT_MS` | `5000` | Backend connect timeout |
-| `UPSTREAM_REQUEST_TIMEOUT_MS` | `30000` | Backend request timeout |
+| `UPSTREAM_REQUEST_TIMEOUT_MS` | `30000` | Backend read-idle timeout (typed path uses this as request timeout; passthrough uses it as read timeout so streaming is not cut off) |
 
 ## Security
 
@@ -130,11 +140,15 @@ All configuration is via environment variables.
 
 - **`trusted_internal`** (default): All requests are accepted. Use this when the proxy is behind a VPC, service mesh, or other network boundary that already authenticates callers.
 
-- **`access_key_allowlist`**: Requests must include a SigV4 `Authorization` header whose `Credential=` field contains an access key ID present in `ALLOWED_FRONTEND_KEYS`. **The proxy does NOT verify the SigV4 signature, request hash, date, or signed headers.** This mode provides coarse-grained access control — not cryptographic authentication. It exists as a lightweight gate for multi-tenant internal environments where network isolation is the primary security boundary.
+- **`access_key_allowlist`**: Requests must include a valid SigV4 `Authorization` header (`AWS4-HMAC-SHA256 Credential=AKID/...`) with an access key ID present in `ALLOWED_FRONTEND_KEYS`. **The proxy does NOT verify the SigV4 signature, request hash, date, or signed headers.** It validates the scheme and field structure but not the cryptographic MAC. This mode provides coarse-grained access control — not cryptographic authentication. It exists as a lightweight gate for multi-tenant internal environments where network isolation is the primary security boundary.
 
-In both modes, the proxy re-signs all backend requests with its own `BACKEND_ACCESS_KEY_ID` / `BACKEND_SECRET_ACCESS_KEY`. Inbound signatures are never validated against client secrets.
+In both modes, the proxy re-signs all backend requests with its own `BACKEND_ACCESS_KEY_ID` / `BACKEND_SECRET_ACCESS_KEY`. Inbound signatures are never validated against client secrets. Client-side auth/signing headers (`x-amz-security-token`, `x-amz-credential`, `x-amz-signature`, etc.) are stripped before forwarding to the backend.
 
 If you need actual signature verification with per-client secrets, implement a full SigV4 validator or place the proxy behind an authenticating reverse proxy.
+
+### Cache invalidation
+
+Writes (PUT, DELETE, multipart completion) purge the affected key from the on-disk cache. If the purge fails after one retry, a durable `.poisoned` marker file is written next to the cache entry. While the marker exists, `lookup()` treats the key as a miss so stale data is never served. The marker is cleared on successful purge, cache refill, or eviction. The marker survives process restarts.
 
 ## Admin endpoints
 
@@ -173,10 +187,11 @@ Cache hit rate: `rate(s3proxy_cache_total{status="HIT"}[5m]) / rate(s3proxy_cach
 
 ### Design decisions
 
-- **Typed operation routing**, not a raw HTTP tunnel. Every S3 operation is parsed and dispatched explicitly. Unknown operations fall through to a raw passthrough with SigV4 re-signing.
-- **Streaming everywhere**. GET responses stream from backend to client (and to disk for cache fills) without buffering the full object in memory. Cache hits stream from disk.
-- **Lock-free hot path**. Cache statistics use atomic counters. No metadata is written to disk on cache hits. The singleflight registry is the only mutex in the read path.
-- **Path-style only**. No virtual-hosted-style bucket addressing.
+- **Typed operation routing**, not a raw HTTP tunnel. Every S3 operation is parsed and dispatched explicitly. Unknown operations and requests with headers/query parameters the typed path cannot forward fall through to raw passthrough with S3-specific SigV4 re-signing (single percent-encoding, no path normalization, `x-amz-content-sha256` payload hash).
+- **Streaming reads**. GET responses stream from backend to client (and to disk for cache fills) without buffering the full object in memory. Cache hits stream from disk. Write paths buffer the body in memory (capped by `MAX_REQUEST_BODY_BYTES`) for retry support — `Bytes::clone` is O(1) reference-counted.
+- **LRU eviction with throttled access-time updates**. Cache hits update `last_accessed_at` on disk at most once per hour via atomic temp-file rename, balancing eviction accuracy with I/O overhead.
+- **Generation-based cache invalidation**. Concurrent writes and cache fills are coordinated through per-key generation counters. A fill that started before a write is automatically rejected at commit time, preventing stale data from being re-cached after a PUT/DELETE.
+- **Path-style and virtual-hosted-style**. Typed SDK operations honor `BACKEND_USE_PATH_STYLE`. Passthrough requests construct virtual-hosted-style URLs (`bucket.endpoint/key`) when path-style is disabled.
 
 ## Testing
 
