@@ -269,6 +269,7 @@ fn has_unsupported_get_modifiers(headers: &http::HeaderMap) -> bool {
         || headers.contains_key("if-unmodified-since")
         || headers.contains_key("x-amz-request-payer")
         || headers.contains_key("x-amz-expected-bucket-owner")
+        || headers.contains_key("x-amz-checksum-mode")
         || headers.keys().any(|k| k.as_str().starts_with("x-amz-server-side-encryption-customer-"))
 }
 

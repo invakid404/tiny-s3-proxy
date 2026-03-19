@@ -173,6 +173,98 @@ fn to_chrono(dt: &aws_smithy_types::DateTime) -> Option<chrono::DateTime<chrono:
     chrono::DateTime::from_timestamp(dt.secs(), dt.subsec_nanos())
 }
 
+/// Extract additional S3 response headers from the SDK response object.
+/// Both GetObjectOutput and HeadObjectOutput expose the same accessor names,
+/// so this macro works for both types. This is the single source of truth for
+/// which headers the typed path captures.
+macro_rules! extract_extra_headers {
+    ($resp:expr) => {{
+        let mut extra = HashMap::new();
+        // Standard content headers
+        if let Some(v) = $resp.content_encoding() {
+            extra.insert("content-encoding".into(), v.to_string());
+        }
+        if let Some(v) = $resp.content_disposition() {
+            extra.insert("content-disposition".into(), v.to_string());
+        }
+        if let Some(v) = $resp.content_language() {
+            extra.insert("content-language".into(), v.to_string());
+        }
+        if let Some(v) = $resp.cache_control() {
+            extra.insert("cache-control".into(), v.to_string());
+        }
+        if let Some(v) = $resp.expires_string() {
+            extra.insert("expires".into(), v.to_string());
+        }
+        if let Some(v) = $resp.accept_ranges() {
+            extra.insert("accept-ranges".into(), v.to_string());
+        }
+        // Versioning / lifecycle / replication
+        if let Some(v) = $resp.version_id() {
+            extra.insert("x-amz-version-id".into(), v.to_string());
+        }
+        if $resp.delete_marker().unwrap_or(false) {
+            extra.insert("x-amz-delete-marker".into(), "true".into());
+        }
+        if let Some(v) = $resp.expiration() {
+            extra.insert("x-amz-expiration".into(), v.to_string());
+        }
+        if let Some(v) = $resp.restore() {
+            extra.insert("x-amz-restore".into(), v.to_string());
+        }
+        if let Some(v) = $resp.replication_status() {
+            extra.insert("x-amz-replication-status".into(), v.as_str().to_string());
+        }
+        // Encryption
+        if let Some(v) = $resp.server_side_encryption() {
+            extra.insert("x-amz-server-side-encryption".into(), v.as_str().to_string());
+        }
+        if let Some(v) = $resp.ssekms_key_id() {
+            extra.insert("x-amz-server-side-encryption-aws-kms-key-id".into(), v.to_string());
+        }
+        if let Some(v) = $resp.sse_customer_algorithm() {
+            extra.insert("x-amz-server-side-encryption-customer-algorithm".into(), v.to_string());
+        }
+        if let Some(v) = $resp.sse_customer_key_md5() {
+            extra.insert("x-amz-server-side-encryption-customer-key-md5".into(), v.to_string());
+        }
+        // Storage / object-lock
+        if let Some(v) = $resp.storage_class() {
+            extra.insert("x-amz-storage-class".into(), v.as_str().to_string());
+        }
+        if let Some(v) = $resp.object_lock_mode() {
+            extra.insert("x-amz-object-lock-mode".into(), v.as_str().to_string());
+        }
+        if let Some(v) = $resp.object_lock_retain_until_date() {
+            extra.insert("x-amz-object-lock-retain-until-date".into(), format!("{v}"));
+        }
+        if let Some(v) = $resp.object_lock_legal_hold_status() {
+            extra.insert("x-amz-object-lock-legal-hold".into(), v.as_str().to_string());
+        }
+        // Multipart / redirect
+        if let Some(v) = $resp.parts_count() {
+            extra.insert("x-amz-mp-parts-count".into(), v.to_string());
+        }
+        if let Some(v) = $resp.website_redirect_location() {
+            extra.insert("x-amz-website-redirect-location".into(), v.to_string());
+        }
+        // Checksums
+        if let Some(v) = $resp.checksum_crc32() {
+            extra.insert("x-amz-checksum-crc32".into(), v.to_string());
+        }
+        if let Some(v) = $resp.checksum_crc32_c() {
+            extra.insert("x-amz-checksum-crc32c".into(), v.to_string());
+        }
+        if let Some(v) = $resp.checksum_sha1() {
+            extra.insert("x-amz-checksum-sha1".into(), v.to_string());
+        }
+        if let Some(v) = $resp.checksum_sha256() {
+            extra.insert("x-amz-checksum-sha256".into(), v.to_string());
+        }
+        extra
+    }};
+}
+
 impl Backend for S3Backend {
     async fn get_object(&self, bucket: &str, key: &str) -> Result<(GetObjectMeta, BoxByteStream), ProxyError> {
         let bucket = bucket.to_string();
@@ -210,37 +302,7 @@ impl Backend for S3Backend {
                         .collect::<HashMap<String, String>>()
                 })
                 .unwrap_or_default(),
-            extra_headers: {
-                let mut extra = HashMap::new();
-                if let Some(v) = resp.content_encoding() {
-                    extra.insert("content-encoding".to_string(), v.to_string());
-                }
-                if let Some(v) = resp.content_disposition() {
-                    extra.insert("content-disposition".to_string(), v.to_string());
-                }
-                if let Some(v) = resp.content_language() {
-                    extra.insert("content-language".to_string(), v.to_string());
-                }
-                if let Some(v) = resp.cache_control() {
-                    extra.insert("cache-control".to_string(), v.to_string());
-                }
-                if let Some(v) = resp.expires_string() {
-                    extra.insert("expires".to_string(), v.to_string());
-                }
-                if let Some(v) = resp.version_id() {
-                    extra.insert("x-amz-version-id".to_string(), v.to_string());
-                }
-                if let Some(v) = resp.server_side_encryption() {
-                    extra.insert("x-amz-server-side-encryption".to_string(), v.as_str().to_string());
-                }
-                if let Some(v) = resp.storage_class() {
-                    extra.insert("x-amz-storage-class".to_string(), v.as_str().to_string());
-                }
-                if let Some(v) = resp.accept_ranges() {
-                    extra.insert("accept-ranges".to_string(), v.to_string());
-                }
-                extra
-            },
+            extra_headers: extract_extra_headers!(resp),
         };
 
         // Convert ByteStream → AsyncRead → Stream<Item = Result<Bytes, io::Error>>
@@ -278,37 +340,7 @@ impl Backend for S3Backend {
                     })
                     .unwrap_or_default();
 
-                let extra_headers = {
-                    let mut extra = HashMap::new();
-                    if let Some(v) = resp.content_encoding() {
-                        extra.insert("content-encoding".to_string(), v.to_string());
-                    }
-                    if let Some(v) = resp.content_disposition() {
-                        extra.insert("content-disposition".to_string(), v.to_string());
-                    }
-                    if let Some(v) = resp.content_language() {
-                        extra.insert("content-language".to_string(), v.to_string());
-                    }
-                    if let Some(v) = resp.cache_control() {
-                        extra.insert("cache-control".to_string(), v.to_string());
-                    }
-                    if let Some(v) = resp.expires_string() {
-                        extra.insert("expires".to_string(), v.to_string());
-                    }
-                    if let Some(v) = resp.version_id() {
-                        extra.insert("x-amz-version-id".to_string(), v.to_string());
-                    }
-                    if let Some(v) = resp.server_side_encryption() {
-                        extra.insert("x-amz-server-side-encryption".to_string(), v.as_str().to_string());
-                    }
-                    if let Some(v) = resp.storage_class() {
-                        extra.insert("x-amz-storage-class".to_string(), v.as_str().to_string());
-                    }
-                    if let Some(v) = resp.accept_ranges() {
-                        extra.insert("accept-ranges".to_string(), v.to_string());
-                    }
-                    extra
-                };
+                let extra_headers = extract_extra_headers!(resp);
 
                 Ok(HeadObjectOutput {
                     content_type,
