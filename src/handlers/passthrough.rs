@@ -102,7 +102,14 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
     );
     let identity = credentials.into();
 
-    let signing_settings = SigningSettings::default();
+    // Use S3-specific signing settings: single URI encoding (S3 doesn't
+    // double-encode), no path normalization (preserve // and . in keys),
+    // and include the x-amz-content-sha256 payload hash header.
+    let mut signing_settings = SigningSettings::default();
+    signing_settings.uri_path_normalization_mode =
+        aws_sigv4::http_request::UriPathNormalizationMode::Disabled;
+    signing_settings.payload_checksum_kind =
+        aws_sigv4::http_request::PayloadChecksumKind::XAmzSha256;
     let signing_params = match SigningParams::builder()
         .identity(&identity)
         .region(&state.config.backend_region)
@@ -179,10 +186,18 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
         Ok(resp) => resp,
         Err(e) => {
             tracing::error!(error = %e, "passthrough: upstream request failed");
-            let s3err = S3Error::internal_error(
-                &format!("upstream request failed: {}", e),
-                request_id,
-            );
+            // Classify the transport error so clients get the right retry signal.
+            let proxy_err = if e.is_timeout() {
+                crate::error::ProxyError::Timeout {
+                    operation: "passthrough".into(),
+                }
+            } else {
+                crate::error::ProxyError::Backend {
+                    source: format!("{e}").into(),
+                    operation: "passthrough".into(),
+                }
+            };
+            let s3err = S3Error::from_proxy_error(&proxy_err, request_id, None);
             return s3err.to_response();
         }
     };
