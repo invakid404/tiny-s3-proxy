@@ -14,7 +14,7 @@ use axum::extract::State;
 use http::{Request, Response};
 use metrics::{counter, gauge, histogram};
 
-use crate::auth::Authenticator;
+use crate::auth::RequestGate;
 use crate::backend::Backend;
 use crate::cache::policy::CachePolicy;
 use crate::cache::{CacheStore, SingleFlight};
@@ -30,7 +30,7 @@ pub struct AppState<B: Backend, C: CacheStore> {
     pub backend: Arc<B>,
     pub cache: Arc<C>,
     pub singleflight: Arc<SingleFlight>,
-    pub auth: Arc<dyn Authenticator>,
+    pub auth: Arc<dyn RequestGate>,
     pub policy: CachePolicy,
     pub config: Arc<Config>,
     pub frontend_bucket: Arc<str>,
@@ -63,7 +63,7 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
     }
 
     // Auth check (applies to ALL operations including passthrough)
-    if let Err(e) = state.auth.authenticate(&parsed) {
+    if let Err(e) = state.auth.check_access(&parsed) {
         let s3err = S3Error::from_proxy_error(&e, &parsed.request_id, None);
         let response = s3err.to_response();
         record_metrics(op_name, &response, start);
@@ -214,7 +214,7 @@ pub mod test_utils {
     use bytes::Bytes;
     use chrono::Utc;
 
-    use crate::auth::Authenticator;
+    use crate::auth::RequestGate;
     use crate::backend::models::*;
     use crate::backend::{Backend, BoxByteStream};
     use crate::cache::entry::CacheEntry;
@@ -607,8 +607,8 @@ pub mod test_utils {
         }
     }
 
-    impl Authenticator for MockAuth {
-        fn authenticate(&self, _req: &ParsedRequest) -> Result<(), ProxyError> {
+    impl RequestGate for MockAuth {
+        fn check_access(&self, _req: &ParsedRequest) -> Result<(), ProxyError> {
             if self.allow {
                 Ok(())
             } else {
@@ -655,7 +655,7 @@ pub mod test_utils {
             retry_base_backoff_ms: 10,
             upstream_connect_timeout_ms: 5000,
             upstream_request_timeout_ms: 30000,
-            max_request_body_bytes: 5_368_709_120,
+            max_request_body_bytes: 268_435_456,
         }
     }
 

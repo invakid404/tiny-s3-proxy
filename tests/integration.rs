@@ -114,7 +114,7 @@ async fn build_proxy_stack(
         retry_base_backoff_ms: 50,
         upstream_connect_timeout_ms: 5000,
         upstream_request_timeout_ms: 30000,
-        max_request_body_bytes: 5_368_709_120,
+        max_request_body_bytes: 268_435_456,
     };
 
     // Build backend
@@ -136,7 +136,7 @@ async fn build_proxy_stack(
     .expect("build disk cache");
 
     let singleflight = Arc::new(cache::SingleFlight::new());
-    let authenticator = Arc::from(auth::create_authenticator(&config));
+    let authenticator = Arc::from(auth::create_request_gate(&config));
 
     let state = Arc::new(handlers::AppState {
         backend: Arc::new(s3_backend),

@@ -1,4 +1,4 @@
-use crate::auth::Authenticator;
+use crate::auth::RequestGate;
 use crate::error::ProxyError;
 use crate::s3::ops::ParsedRequest;
 
@@ -30,8 +30,8 @@ impl AccessKeyAllowlistAuth {
     }
 }
 
-impl Authenticator for AccessKeyAllowlistAuth {
-    fn authenticate(&self, req: &ParsedRequest) -> Result<(), ProxyError> {
+impl RequestGate for AccessKeyAllowlistAuth {
+    fn check_access(&self, req: &ParsedRequest) -> Result<(), ProxyError> {
         let authorization = req
             .authorization
             .as_deref()
@@ -118,14 +118,14 @@ mod tests {
     fn test_valid_access_key_accepted() {
         let auth = AccessKeyAllowlistAuth::new(vec!["AKID1234567890AB".to_string()]);
         let req = make_request(Some(&sigv4_header("AKID1234567890AB")));
-        assert!(auth.authenticate(&req).is_ok());
+        assert!(auth.check_access(&req).is_ok());
     }
 
     #[test]
     fn test_unknown_access_key_rejected() {
         let auth = AccessKeyAllowlistAuth::new(vec!["AKID1234567890AB".to_string()]);
         let req = make_request(Some(&sigv4_header("UNKNOWN_KEY")));
-        let err = auth.authenticate(&req).unwrap_err();
+        let err = auth.check_access(&req).unwrap_err();
         match err {
             ProxyError::Auth { message } => {
                 assert!(message.contains("not in allowlist"), "got: {}", message);
@@ -138,7 +138,7 @@ mod tests {
     fn test_missing_authorization_rejected() {
         let auth = AccessKeyAllowlistAuth::new(vec!["AKID1234567890AB".to_string()]);
         let req = make_request(None);
-        let err = auth.authenticate(&req).unwrap_err();
+        let err = auth.check_access(&req).unwrap_err();
         match err {
             ProxyError::Auth { message } => {
                 assert!(
@@ -155,7 +155,7 @@ mod tests {
     fn test_malformed_authorization_rejected() {
         let auth = AccessKeyAllowlistAuth::new(vec!["AKID1234567890AB".to_string()]);
         let req = make_request(Some("Bearer some-token"));
-        let err = auth.authenticate(&req).unwrap_err();
+        let err = auth.check_access(&req).unwrap_err();
         match err {
             ProxyError::Auth { message } => {
                 assert!(message.contains("malformed"), "got: {}", message);
@@ -168,7 +168,7 @@ mod tests {
     fn test_empty_allowlist_rejects_everything() {
         let auth = AccessKeyAllowlistAuth::new(vec![]);
         let req = make_request(Some(&sigv4_header("AKID1234567890AB")));
-        let err = auth.authenticate(&req).unwrap_err();
+        let err = auth.check_access(&req).unwrap_err();
         match err {
             ProxyError::Auth { message } => {
                 assert!(message.contains("not in allowlist"), "got: {}", message);
@@ -185,7 +185,7 @@ mod tests {
             "KEY3".to_string(),
         ]);
         let req = make_request(Some(&sigv4_header("KEY1")));
-        assert!(auth.authenticate(&req).is_ok());
+        assert!(auth.check_access(&req).is_ok());
     }
 
     #[test]
@@ -196,7 +196,7 @@ mod tests {
             "KEY3".to_string(),
         ]);
         let req = make_request(Some(&sigv4_header("KEY2")));
-        assert!(auth.authenticate(&req).is_ok());
+        assert!(auth.check_access(&req).is_ok());
     }
 
     #[test]
@@ -207,7 +207,7 @@ mod tests {
             "KEY3".to_string(),
         ]);
         let req = make_request(Some(&sigv4_header("KEY3")));
-        assert!(auth.authenticate(&req).is_ok());
+        assert!(auth.check_access(&req).is_ok());
     }
 
     #[test]
@@ -218,7 +218,7 @@ mod tests {
                        SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
                        Signature=abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
         let req = make_request(Some(header));
-        assert!(auth.authenticate(&req).is_ok());
+        assert!(auth.check_access(&req).is_ok());
     }
 
     // --- Tests for extract_access_key_id ---

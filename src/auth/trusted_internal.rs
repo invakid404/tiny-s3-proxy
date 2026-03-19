@@ -1,4 +1,4 @@
-use crate::auth::Authenticator;
+use crate::auth::RequestGate;
 use crate::error::ProxyError;
 use crate::s3::ops::ParsedRequest;
 
@@ -19,8 +19,8 @@ impl Default for TrustedInternalAuth {
     }
 }
 
-impl Authenticator for TrustedInternalAuth {
-    fn authenticate(&self, _req: &ParsedRequest) -> Result<(), ProxyError> {
+impl RequestGate for TrustedInternalAuth {
+    fn check_access(&self, _req: &ParsedRequest) -> Result<(), ProxyError> {
         Ok(())
     }
 }
@@ -53,7 +53,7 @@ mod tests {
     fn test_accepts_request_without_authorization() {
         let auth = TrustedInternalAuth::new();
         let req = make_request(None);
-        assert!(auth.authenticate(&req).is_ok());
+        assert!(auth.check_access(&req).is_ok());
     }
 
     #[test]
@@ -63,13 +63,13 @@ mod tests {
             "AWS4-HMAC-SHA256 Credential=AKID1234567890AB/20240101/us-east-1/s3/aws4_request, \
              SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=abcdef",
         ));
-        assert!(auth.authenticate(&req).is_ok());
+        assert!(auth.check_access(&req).is_ok());
     }
 
     #[test]
     fn test_accepts_request_with_garbage_authorization() {
         let auth = TrustedInternalAuth::new();
         let req = make_request(Some("garbage-value"));
-        assert!(auth.authenticate(&req).is_ok());
+        assert!(auth.check_access(&req).is_ok());
     }
 }

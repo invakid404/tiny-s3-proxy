@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Arc::new(config);
 
     // 3. Create auth
-    let auth = Arc::from(auth::create_authenticator(&config));
+    let auth = Arc::from(auth::create_request_gate(&config));
 
     // 4. Create backend
     let backend = backend::client::S3Backend::from_config(&config).await?;

@@ -77,8 +77,8 @@ All configuration is via environment variables.
 | `S3_LISTEN_ADDR` | `0.0.0.0:8080` | S3 API listen address |
 | `ADMIN_LISTEN_ADDR` | `0.0.0.0:9090` | Admin/metrics listen address |
 | `FRONTEND_BUCKET` | *required* | Bucket name clients use |
-| `AUTH_MODE` | `trusted_internal` | `trusted_internal` or `access_key_allowlist` |
-| `ALLOWED_FRONTEND_KEYS` | | Comma-separated access key IDs (for `access_key_allowlist` mode) |
+| `AUTH_MODE` | `trusted_internal` | Access control mode: `trusted_internal` (allow all) or `access_key_allowlist` (check access-key ID against allowlist — does NOT verify SigV4 signatures) |
+| `ALLOWED_FRONTEND_KEYS` | | Comma-separated access key IDs for allowlist mode. NOTE: only the key ID is checked, not the signature — see security section below |
 
 ### Backend
 
@@ -103,6 +103,12 @@ All configuration is via environment variables.
 | `CACHE_SERVE_STALE_ON_ERROR` | `true` | Serve stale cache entries when backend fails |
 | `CACHE_EVICTION_INTERVAL_SECS` | `300` | Seconds between LRU eviction passes |
 
+### Request Limits
+
+| Variable | Default | Description |
+|---|---|---|
+| `MAX_REQUEST_BODY_BYTES` | `268435456` (256 MiB) | Maximum request body size for PUT, UploadPart, and passthrough. Returns `EntityTooLarge` if exceeded. Increase with caution — each in-flight upload buffers this much memory. |
+
 ### Retry
 
 | Variable | Default | Description |
@@ -115,6 +121,20 @@ All configuration is via environment variables.
 | `RETRY_BASE_BACKOFF_MS` | `100` | Base backoff for exponential retry |
 | `UPSTREAM_CONNECT_TIMEOUT_MS` | `5000` | Backend connect timeout |
 | `UPSTREAM_REQUEST_TIMEOUT_MS` | `30000` | Backend request timeout |
+
+## Security
+
+### Access control modes
+
+`tiny-s3-proxy` supports two access control modes via `AUTH_MODE`:
+
+- **`trusted_internal`** (default): All requests are accepted. Use this when the proxy is behind a VPC, service mesh, or other network boundary that already authenticates callers.
+
+- **`access_key_allowlist`**: Requests must include a SigV4 `Authorization` header whose `Credential=` field contains an access key ID present in `ALLOWED_FRONTEND_KEYS`. **The proxy does NOT verify the SigV4 signature, request hash, date, or signed headers.** This mode provides coarse-grained access control — not cryptographic authentication. It exists as a lightweight gate for multi-tenant internal environments where network isolation is the primary security boundary.
+
+In both modes, the proxy re-signs all backend requests with its own `BACKEND_ACCESS_KEY_ID` / `BACKEND_SECRET_ACCESS_KEY`. Inbound signatures are never validated against client secrets.
+
+If you need actual signature verification with per-client secrets, implement a full SigV4 validator or place the proxy behind an authenticating reverse proxy.
 
 ## Admin endpoints
 

@@ -5,13 +5,19 @@ use crate::config::{AuthMode, Config};
 use crate::error::ProxyError;
 use crate::s3::ops::ParsedRequest;
 
-/// Trait for authenticating inbound S3 requests.
-pub trait Authenticator: Send + Sync {
-    fn authenticate(&self, req: &ParsedRequest) -> Result<(), ProxyError>;
+/// Trait for gating inbound S3 requests.
+///
+/// Implementations range from "allow everything" (TrustedInternal) to
+/// "check access-key allowlist" (AccessKeyAllowlist). None of the built-in
+/// implementations perform cryptographic signature verification — they are
+/// access-control gates, not authenticators. See each implementation's docs
+/// for its specific security guarantees.
+pub trait RequestGate: Send + Sync {
+    fn check_access(&self, req: &ParsedRequest) -> Result<(), ProxyError>;
 }
 
-/// Create the appropriate authenticator based on configuration.
-pub fn create_authenticator(config: &Config) -> Box<dyn Authenticator> {
+/// Create the appropriate request gate based on configuration.
+pub fn create_request_gate(config: &Config) -> Box<dyn RequestGate> {
     match config.auth_mode {
         AuthMode::TrustedInternal => Box::new(trusted_internal::TrustedInternalAuth::new()),
         AuthMode::AccessKeyAllowlist => Box::new(allowlist::AccessKeyAllowlistAuth::new(
@@ -76,32 +82,32 @@ mod tests {
             retry_base_backoff_ms: 100,
             upstream_connect_timeout_ms: 5000,
             upstream_request_timeout_ms: 30000,
-            max_request_body_bytes: 5_368_709_120,
+            max_request_body_bytes: 268_435_456,
         }
     }
 
     #[test]
-    fn test_create_authenticator_trusted_internal() {
+    fn test_create_request_gate_trusted_internal() {
         let config = test_config(AuthMode::TrustedInternal, vec![]);
-        let authenticator = create_authenticator(&config);
+        let gate = create_request_gate(&config);
         // TrustedInternal accepts everything
         let req = make_request();
-        assert!(authenticator.authenticate(&req).is_ok());
+        assert!(gate.check_access(&req).is_ok());
     }
 
     #[test]
-    fn test_create_authenticator_allowlist_accepts_known_key() {
+    fn test_create_request_gate_allowlist_accepts_known_key() {
         let config = test_config(AuthMode::AccessKeyAllowlist, vec!["TESTKEY".to_string()]);
-        let authenticator = create_authenticator(&config);
+        let gate = create_request_gate(&config);
         let req = make_request();
-        assert!(authenticator.authenticate(&req).is_ok());
+        assert!(gate.check_access(&req).is_ok());
     }
 
     #[test]
-    fn test_create_authenticator_allowlist_rejects_unknown_key() {
+    fn test_create_request_gate_allowlist_rejects_unknown_key() {
         let config = test_config(AuthMode::AccessKeyAllowlist, vec!["OTHERKEY".to_string()]);
-        let authenticator = create_authenticator(&config);
+        let gate = create_request_gate(&config);
         let req = make_request();
-        assert!(authenticator.authenticate(&req).is_err());
+        assert!(gate.check_access(&req).is_err());
     }
 }
