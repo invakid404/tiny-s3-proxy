@@ -187,7 +187,7 @@ Cache hit rate: `rate(s3proxy_cache_total{status="HIT"}[5m]) / rate(s3proxy_cach
 
 ### Design decisions
 
-- **Typed operation routing**, not a raw HTTP tunnel. Every S3 operation is parsed and dispatched explicitly. Unknown operations and requests with headers/query parameters the typed path cannot forward fall through to raw passthrough with S3-specific SigV4 re-signing (single percent-encoding, no path normalization, `x-amz-content-sha256` payload hash).
+- **Typed operation routing**, not a raw HTTP tunnel. Every S3 operation is parsed and dispatched explicitly. Unknown operations and requests with headers/query parameters the typed path cannot forward fall through to a locked-down raw passthrough (no redirect following, no system proxy, S3-specific SigV4 re-signing with single percent-encoding, no path normalization, `x-amz-content-sha256` payload hash). Invalid query parameters (e.g. `list-type=3`, `max-keys=abc`) are also routed through passthrough so the backend returns the appropriate error.
 - **Streaming reads**. GET responses stream from backend to client (and to disk for cache fills) without buffering the full object in memory. Cache hits stream from disk. Write paths buffer the body in memory (capped by `MAX_REQUEST_BODY_BYTES`) for retry support — `Bytes::clone` is O(1) reference-counted.
 - **LRU eviction with throttled access-time updates**. Cache hits update `last_accessed_at` on disk at most once per hour via atomic temp-file rename, balancing eviction accuracy with I/O overhead.
 - **Generation-based cache invalidation**. Concurrent writes and cache fills are coordinated through per-key generation counters. A fill that started before a write is automatically rejected at commit time, preventing stale data from being re-cached after a PUT/DELETE.
@@ -203,7 +203,9 @@ cargo test
 cargo test -- --ignored
 ```
 
-The integration tests use [testcontainers](https://github.com/testcontainers/testcontainers-rs) to spin up [VersityGW](https://github.com/versity/versitygw) as an S3-compatible backend, build the full proxy stack in-process, and exercise end-to-end S3 operations.
+The integration tests use [testcontainers](https://github.com/testcontainers/testcontainers-rs) to spin up [VersityGW](https://github.com/versity/versitygw) as an S3-compatible backend, build the full proxy stack in-process, and exercise end-to-end S3 operations including CRUD, caching, cache purge, multipart, and bucket validation.
+
+**CI recommendation**: run `cargo test -- --ignored` in your CI pipeline with Docker available. The integration suite catches real proxy/backend/cache interaction bugs that unit tests cannot.
 
 ## License
 
