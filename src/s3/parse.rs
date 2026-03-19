@@ -93,19 +93,78 @@ pub fn parse_request<B>(req: &Request<B>) -> ParsedRequest {
         } else {
         // Operations on objects.
         //
-        // Multipart-related query parameters (uploadId, partNumber, uploads)
-        // change the operation semantics entirely. We must handle them first
-        // and route any unrecognized combination through passthrough rather
-        // than letting it fall through to a plain object operation.
-        match method {
-            // GET ?uploadId=... is ListParts — not a plain GetObject.
-            // GET ?partNumber=... is a part-level read (no typed handler).
-            "GET" | "HEAD" if query.contains_key("uploadId") || query.contains_key("partNumber") => {
-                S3Operation::Unsupported {
+        // Multipart control parameters (uploads, uploadId, partNumber) change
+        // the operation semantics entirely. If ANY of them are present, we only
+        // accept the exact valid combinations; everything else is Unsupported
+        // to prevent stray params from turning into unintended object operations.
+        let has_multipart_params = query.contains_key("uploads")
+            || query.contains_key("uploadId")
+            || query.contains_key("partNumber");
+
+        if has_multipart_params {
+            match method {
+                "PUT" if query.contains_key("partNumber") && query.contains_key("uploadId")
+                    && !query.contains_key("uploads") =>
+                {
+                    if req.headers().contains_key("x-amz-copy-source") {
+                        S3Operation::Unsupported {
+                            method: method.to_string(),
+                            path: path.to_string(),
+                        }
+                    } else {
+                        let part_number = query
+                            .get("partNumber")
+                            .and_then(|v| v.parse::<i32>().ok())
+                            .unwrap_or(0);
+                        let upload_id = query.get("uploadId").cloned().unwrap_or_default();
+                        S3Operation::UploadPart {
+                            bucket: bucket.to_string(),
+                            key,
+                            part_number,
+                            upload_id,
+                        }
+                    }
+                }
+                "POST" if query.contains_key("uploads")
+                    && !query.contains_key("uploadId")
+                    && !query.contains_key("partNumber") =>
+                {
+                    S3Operation::CreateMultipartUpload {
+                        bucket: bucket.to_string(),
+                        key,
+                    }
+                }
+                "POST" if query.contains_key("uploadId")
+                    && !query.contains_key("uploads")
+                    && !query.contains_key("partNumber") =>
+                {
+                    let upload_id = query.get("uploadId").cloned().unwrap_or_default();
+                    S3Operation::CompleteMultipartUpload {
+                        bucket: bucket.to_string(),
+                        key,
+                        upload_id,
+                    }
+                }
+                "DELETE" if query.contains_key("uploadId")
+                    && !query.contains_key("uploads")
+                    && !query.contains_key("partNumber") =>
+                {
+                    let upload_id = query.get("uploadId").cloned().unwrap_or_default();
+                    S3Operation::AbortMultipartUpload {
+                        bucket: bucket.to_string(),
+                        key,
+                        upload_id,
+                    }
+                }
+                // Any other method/param combination with multipart params is invalid.
+                _ => S3Operation::Unsupported {
                     method: method.to_string(),
                     path: path.to_string(),
-                }
+                },
             }
+        } else {
+        // Plain object operations (no multipart params).
+        match method {
             "GET" => S3Operation::GetObject {
                 bucket: bucket.to_string(),
                 key,
@@ -115,27 +174,7 @@ pub fn parse_request<B>(req: &Request<B>) -> ParsedRequest {
                 key,
             },
             "PUT" => {
-                // CopyObject and UploadPartCopy use x-amz-copy-source.
                 if req.headers().contains_key("x-amz-copy-source") {
-                    S3Operation::Unsupported {
-                        method: method.to_string(),
-                        path: path.to_string(),
-                    }
-                } else if query.contains_key("partNumber") && query.contains_key("uploadId") {
-                    let part_number = query
-                        .get("partNumber")
-                        .and_then(|v| v.parse::<i32>().ok())
-                        .unwrap_or(0);
-                    let upload_id = query.get("uploadId").cloned().unwrap_or_default();
-                    S3Operation::UploadPart {
-                        bucket: bucket.to_string(),
-                        key,
-                        part_number,
-                        upload_id,
-                    }
-                } else if query.contains_key("partNumber") || query.contains_key("uploadId") {
-                    // Incomplete multipart PUT — only one of the two params.
-                    // Don't silently treat as PutObject.
                     S3Operation::Unsupported {
                         method: method.to_string(),
                         path: path.to_string(),
@@ -147,43 +186,15 @@ pub fn parse_request<B>(req: &Request<B>) -> ParsedRequest {
                     }
                 }
             }
-            "POST" => {
-                if query.contains_key("uploads") {
-                    S3Operation::CreateMultipartUpload {
-                        bucket: bucket.to_string(),
-                        key,
-                    }
-                } else if let Some(upload_id) = query.get("uploadId") {
-                    S3Operation::CompleteMultipartUpload {
-                        bucket: bucket.to_string(),
-                        key,
-                        upload_id: upload_id.clone(),
-                    }
-                } else {
-                    S3Operation::Unsupported {
-                        method: method.to_string(),
-                        path: path.to_string(),
-                    }
-                }
-            }
-            "DELETE" => {
-                if let Some(upload_id) = query.get("uploadId") {
-                    S3Operation::AbortMultipartUpload {
-                        bucket: bucket.to_string(),
-                        key,
-                        upload_id: upload_id.clone(),
-                    }
-                } else {
-                    S3Operation::DeleteObject {
-                        bucket: bucket.to_string(),
-                        key,
-                    }
-                }
-            }
+            "DELETE" => S3Operation::DeleteObject {
+                bucket: bucket.to_string(),
+                key,
+            },
             _ => S3Operation::Unsupported {
                 method: method.to_string(),
                 path: path.to_string(),
             },
+        }
         }
         }
     } else {
