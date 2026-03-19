@@ -148,7 +148,16 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
         }
         S3Operation::PutObject { key, .. } => put::handle_put(&state, &parsed, key, body).await,
         S3Operation::DeleteObject { key, .. } => {
-            delete::handle_delete(&state, &parsed, key).await
+            if has_unsupported_write_modifiers(&parsed.extra_amz_headers) {
+                let raw_path = parts.uri.path();
+                let rewritten = rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
+                let query = parts.uri.query();
+                passthrough::handle_passthrough(
+                    &state, "DELETE", &rewritten, query, &parts.headers, body, &parsed.request_id,
+                ).await
+            } else {
+                delete::handle_delete(&state, &parsed, key).await
+            }
         }
         S3Operation::ListObjectsV1 { params, .. }
         | S3Operation::ListObjectsV2 { params, .. } => {

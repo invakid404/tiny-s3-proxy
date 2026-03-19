@@ -243,8 +243,19 @@ pub fn parse_request<B>(req: &Request<B>) -> ParsedRequest {
                 // AWS SDK expects bare keys in its metadata() builder method.
                 user_metadata.insert(bare_key.to_string(), v.to_string());
             } else if name_lower.starts_with("x-amz-")
-                && name_lower != "x-amz-date"
-                && name_lower != "x-amz-content-sha256"
+                // Skip auth/signing headers — the proxy re-signs with its own
+                // credentials, so forwarding these would corrupt the backend request.
+                && !matches!(
+                    name_lower,
+                    "x-amz-date"
+                        | "x-amz-content-sha256"
+                        | "x-amz-security-token"
+                        | "x-amz-credential"
+                        | "x-amz-signature"
+                        | "x-amz-algorithm"
+                        | "x-amz-signedheaders"
+                        | "x-amz-decoded-content-length"
+                )
             {
                 extra_amz_headers.insert(name_lower.to_string(), v.to_string());
             }
