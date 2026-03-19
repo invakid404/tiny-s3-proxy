@@ -199,25 +199,39 @@ pub fn parse_request<B>(req: &Request<B>) -> ParsedRequest {
                         path: path.to_string(),
                     }
                 } else {
-                    let params = ListParams {
-                        prefix: query.get("prefix").cloned(),
-                        delimiter: query.get("delimiter").cloned(),
-                        max_keys: query.get("max-keys").and_then(|v| v.parse().ok()),
-                        continuation_token: query.get("continuation-token").cloned(),
-                        marker: query.get("marker").cloned(),
-                        start_after: query.get("start-after").cloned(),
-                        encoding_type: query.get("encoding-type").cloned(),
-                    };
+                    // Validate list-type: only "2" (V2) or absent (V1) are valid.
+                    // Any other value (e.g. "3") goes through passthrough so the
+                    // backend returns the appropriate error.
+                    let list_type = query.get("list-type").map(|v| v.as_str());
+                    let max_keys_invalid = query.get("max-keys")
+                        .is_some_and(|v| v.parse::<i32>().is_err());
 
-                    if query.get("list-type").map(|v| v.as_str()) == Some("2") {
-                        S3Operation::ListObjectsV2 {
-                            bucket: bucket.to_string(),
-                            params,
+                    if matches!(list_type, Some(v) if v != "2") || max_keys_invalid {
+                        S3Operation::Unsupported {
+                            method: method.to_string(),
+                            path: path.to_string(),
                         }
                     } else {
-                        S3Operation::ListObjectsV1 {
-                            bucket: bucket.to_string(),
-                            params,
+                        let params = ListParams {
+                            prefix: query.get("prefix").cloned(),
+                            delimiter: query.get("delimiter").cloned(),
+                            max_keys: query.get("max-keys").and_then(|v| v.parse().ok()),
+                            continuation_token: query.get("continuation-token").cloned(),
+                            marker: query.get("marker").cloned(),
+                            start_after: query.get("start-after").cloned(),
+                            encoding_type: query.get("encoding-type").cloned(),
+                        };
+
+                        if list_type == Some("2") {
+                            S3Operation::ListObjectsV2 {
+                                bucket: bucket.to_string(),
+                                params,
+                            }
+                        } else {
+                            S3Operation::ListObjectsV1 {
+                                bucket: bucket.to_string(),
+                                params,
+                            }
                         }
                     }
                 }
