@@ -64,7 +64,7 @@ pub async fn handle_create_multipart<B: Backend, C: CacheStore>(
             let s3err = S3Error::from_proxy_error(
                 &e,
                 &parsed.request_id,
-                Some(&format!("/{}/{}", state.backend_bucket, key)),
+                Some(&format!("/{}/{}", state.frontend_bucket, key)),
             );
             s3err.to_response()
         }
@@ -151,7 +151,7 @@ pub async fn handle_upload_part<B: Backend, C: CacheStore>(
             let s3err = S3Error::from_proxy_error(
                 &e,
                 &parsed.request_id,
-                Some(&format!("/{}/{}", state.backend_bucket, key)),
+                Some(&format!("/{}/{}", state.frontend_bucket, key)),
             );
             s3err.to_response()
         }
@@ -261,7 +261,7 @@ pub async fn handle_complete_multipart<B: Backend, C: CacheStore>(
             let s3err = S3Error::from_proxy_error(
                 &e,
                 &parsed.request_id,
-                Some(&format!("/{}/{}", state.backend_bucket, key)),
+                Some(&format!("/{}/{}", state.frontend_bucket, key)),
             );
             s3err.to_response()
         }
@@ -308,7 +308,7 @@ pub async fn handle_abort_multipart<B: Backend, C: CacheStore>(
             let s3err = S3Error::from_proxy_error(
                 &e,
                 &parsed.request_id,
-                Some(&format!("/{}/{}", state.backend_bucket, key)),
+                Some(&format!("/{}/{}", state.frontend_bucket, key)),
             );
             s3err.to_response()
         }

@@ -36,6 +36,11 @@ pub async fn handle_list<B: Backend, C: CacheStore>(
 
     match result {
         Ok(output) => {
+            // Rewrite the bucket name from backend to frontend so clients
+            // see the bucket name they addressed, not the internal backend name.
+            let mut output = output;
+            output.name = state.frontend_bucket.to_string();
+
             let xml = if is_v2 {
                 serialize_list_objects_v2(&output)
             } else {
@@ -70,7 +75,7 @@ pub async fn handle_list<B: Backend, C: CacheStore>(
             let s3err = S3Error::from_proxy_error(
                 &e,
                 &parsed.request_id,
-                Some(&format!("/{}", state.backend_bucket)),
+                Some(&format!("/{}", state.frontend_bucket)),
             );
             s3err.to_response()
         }

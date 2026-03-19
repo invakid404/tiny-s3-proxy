@@ -13,11 +13,28 @@ pub struct S3Error {
 
 impl S3Error {
     /// Create from a ProxyError.
+    ///
+    /// Uses stable, client-facing messages instead of raw internal error strings.
+    /// Detailed error context is available in server-side logs.
     pub fn from_proxy_error(err: &ProxyError, request_id: &str, resource: Option<&str>) -> Self {
+        let message = match err {
+            ProxyError::Backend { .. } => "A backend error occurred. Please retry the request.".to_string(),
+            ProxyError::Timeout { .. } => "The request to the backend timed out. Please retry.".to_string(),
+            ProxyError::UpstreamS3 { s3_code, .. } => {
+                // Use a stable message; the specific S3 code is in <Code>.
+                format!("The backend returned an error: {s3_code}")
+            }
+            ProxyError::Auth { .. } => "Access Denied".to_string(),
+            ProxyError::Cache { .. } => "An internal cache error occurred.".to_string(),
+            ProxyError::Internal { .. } => "An internal error occurred.".to_string(),
+            // For InvalidRequest and UnsupportedOperation, the message is already user-facing.
+            _ => err.to_string(),
+        };
+
         S3Error {
             http_status: err.status_code(),
             code: err.s3_error_code().to_string(),
-            message: err.to_string(),
+            message,
             resource: resource.map(|s| s.to_string()),
             request_id: request_id.to_string(),
         }
