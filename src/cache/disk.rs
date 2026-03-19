@@ -281,6 +281,11 @@ impl DiskCache {
                 })?;
         }
 
+        // Check for pre-existing entry so stats can be updated by delta, not
+        // blindly incremented (avoids double-counting on refills over poisoned keys).
+        let old_body_size = tokio::fs::metadata(&final_body).await.map(|m| m.len()).unwrap_or(0);
+        let old_meta_size = tokio::fs::metadata(&final_meta).await.map(|m| m.len()).unwrap_or(0);
+
         // Re-check generation under lock and do atomic rename while holding it.
         // purge() also acquires this lock before incrementing, so the check +
         // rename is atomic with respect to invalidation.
@@ -316,9 +321,24 @@ impl DiskCache {
         // Fresh content published — clear any stale poison marker for this key.
         let _ = tokio::fs::remove_file(&self.poison_path_for_key(&guard.key)).await;
 
-        // Update stats atomically (outside lock)
-        self.stats.entry_count.fetch_add(1, Ordering::Relaxed);
-        self.stats.total_bytes.fetch_add(body_size + meta_bytes.len() as u64, Ordering::Relaxed);
+        // Update stats: only increment entry_count if this is a new entry
+        // (not overwriting an existing one, e.g. after a poisoned-key refill).
+        let new_size = body_size + meta_bytes.len() as u64;
+        if old_body_size > 0 || old_meta_size > 0 {
+            // Overwrite: replace old size with new size, entry_count unchanged.
+            let old_size = old_body_size + old_meta_size;
+            if new_size >= old_size {
+                self.stats.total_bytes.fetch_add(new_size - old_size, Ordering::Relaxed);
+            } else {
+                let _ = self.stats.total_bytes.fetch_update(
+                    Ordering::Relaxed, Ordering::Relaxed,
+                    |c| Some(c.saturating_sub(old_size - new_size)),
+                );
+            }
+        } else {
+            self.stats.entry_count.fetch_add(1, Ordering::Relaxed);
+            self.stats.total_bytes.fetch_add(new_size, Ordering::Relaxed);
+        }
         self.stats.fill_count.fetch_add(1, Ordering::Relaxed);
 
         Ok(())
