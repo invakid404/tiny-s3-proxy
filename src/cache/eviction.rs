@@ -145,41 +145,43 @@ pub async fn run_eviction_pass(
     let total_size: u64 = candidates.iter().map(|c| c.size).sum();
 
     if total_size <= max_bytes {
-        // Under limit — no eviction needed. Reconcile stats from the disk
-        // scan since no entries are being removed (no race with commit_fill).
-        stats.total_bytes.store(total_size, Ordering::Relaxed);
-        stats.entry_count.store(candidates.len() as u64, Ordering::Relaxed);
+        // Under limit — no eviction needed, no stats reconciliation.
+        // Stats are maintained incrementally by commit_fill and purge.
         return Ok(());
     }
 
-    // Evict oldest entries until under limit. Stats are adjusted
-    // incrementally per entry (not via a bulk store) so concurrent
-    // commit_fill stats updates are not overwritten.
+    // Evict oldest entries until under limit. For each eviction, stat the
+    // ACTUAL files being deleted (not the pre-scan snapshot) so concurrent
+    // commit_fill replacements don't cause size mismatches.
     let mut current_size = total_size;
     let mut evicted = 0u64;
     for candidate in &candidates {
         if current_size <= max_bytes {
             break;
         }
+        // Stat the actual files about to be deleted to get their real sizes.
+        let actual_body = tokio::fs::metadata(&candidate.body_path).await.map(|m| m.len()).unwrap_or(0);
+        let actual_meta = tokio::fs::metadata(&candidate.meta_path).await.map(|m| m.len()).unwrap_or(0);
+
         let body_removed = tokio::fs::remove_file(&candidate.body_path).await.is_ok();
         let meta_removed = tokio::fs::remove_file(&candidate.meta_path).await.is_ok();
         if body_removed && meta_removed {
             let poison_path = candidate.body_path.with_extension("poisoned");
             let _ = tokio::fs::remove_file(&poison_path).await;
-            current_size -= candidate.size;
+            let removed_size = actual_body + actual_meta;
+            current_size = current_size.saturating_sub(removed_size);
             evicted += 1;
-            // Adjust stats incrementally.
             let _ = stats.entry_count.fetch_update(
                 Ordering::Relaxed, Ordering::Relaxed,
                 |c| Some(c.saturating_sub(1)),
             );
             let _ = stats.total_bytes.fetch_update(
                 Ordering::Relaxed, Ordering::Relaxed,
-                |c| Some(c.saturating_sub(candidate.size)),
+                |c| Some(c.saturating_sub(removed_size)),
             );
             tracing::debug!(
                 path = %candidate.body_path.display(),
-                size = candidate.size,
+                size = removed_size,
                 "evicted cache entry"
             );
         } else {
@@ -254,7 +256,9 @@ mod tests {
         let body = b"small body";
         setup_cache_entry(&cache_dir, &key, body, Utc::now()).await;
 
+        // Pre-populate stats (in real usage, DiskCache::new scans on startup).
         let stats = Arc::new(CacheStats::default());
+        stats.entry_count.store(1, Ordering::Relaxed);
 
         // Set limit very high
         run_eviction_pass(&cache_dir, 1_000_000, &stats).await.unwrap();

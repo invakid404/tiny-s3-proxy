@@ -11,15 +11,10 @@ use crate::cache::singleflight::SingleFlight;
 use crate::cache::{CacheStats, CacheStatsSnapshot, CacheStore, FillGuard};
 use crate::error::ProxyError;
 
-/// Tracks in-flight fills for serializing same-key publishers.
-///
-/// `active_fills` is a reference count of outstanding `FillGuard`s per key.
-/// `generation_counters` maps each active key to a lock-free `AtomicU64`
-/// that `purge()` can bump without acquiring the mutex.
+/// Tracks in-flight fills for serializing same-key file operations.
 #[derive(Default)]
 struct FillState {
     active_fills: HashMap<CacheKey, usize>,
-    generation_counters: HashMap<CacheKey, Arc<std::sync::atomic::AtomicU64>>,
 }
 
 /// Disk-backed implementation of `CacheStore`.
@@ -35,9 +30,12 @@ pub struct DiskCache {
     stats: Arc<CacheStats>,
     singleflight: Arc<SingleFlight>,
     /// Serializes same-key file operations (old-entry removal, rename, stats).
-    /// Generation counters inside are `AtomicU64` so `purge()` can bump them
-    /// without waiting behind a fill that holds the mutex.
     fill_state: tokio::sync::Mutex<FillState>,
+    /// Per-key generation counters for cache invalidation. Stored in a
+    /// SEPARATE RwLock from fill_state so purge() can bump a counter with
+    /// only a brief read lock, even while commit_fill holds fill_state for
+    /// file operations. This eliminates the stale-fill-after-purge window.
+    generation_counters: tokio::sync::RwLock<HashMap<CacheKey, Arc<std::sync::atomic::AtomicU64>>>,
 }
 
 impl DiskCache {
@@ -72,6 +70,7 @@ impl DiskCache {
             stats: Arc::new(stats),
             singleflight: Arc::new(SingleFlight::new()),
             fill_state: tokio::sync::Mutex::new(FillState::default()),
+            generation_counters: tokio::sync::RwLock::new(HashMap::new()),
         })
     }
 
@@ -197,7 +196,8 @@ impl DiskCache {
             *count -= 1;
             if *count == 0 {
                 state.active_fills.remove(key);
-                state.generation_counters.remove(key);
+                // Clean up generation counter from the separate RwLock.
+                self.generation_counters.write().await.remove(key);
             }
         }
     }
@@ -210,11 +210,10 @@ impl DiskCache {
         temp_body_path: PathBuf,
         meta: CacheMeta,
     ) -> Result<(), ProxyError> {
-        // Early check: read the generation counter lock-free to bail fast.
+        // Early check: read generation counter via RwLock (no fill_state needed).
         {
-            let state = self.fill_state.lock().await;
-            let current_gen = state.generation_counters
-                .get(&guard.key)
+            let gens = self.generation_counters.read().await;
+            let current_gen = gens.get(&guard.key)
                 .map(|c| c.load(Ordering::Acquire))
                 .unwrap_or(0);
             if current_gen != guard.generation {
@@ -276,28 +275,35 @@ impl DiskCache {
                 })?;
         }
 
-        // Check generation BEFORE acquiring the file-operations lock.
-        // The generation counter is an AtomicU64, so purge() can bump it
-        // without waiting behind a fill that holds the mutex.
-        {
-            let state = self.fill_state.lock().await;
-            let current_gen = state.generation_counters
-                .get(&guard.key)
-                .map(|c| c.load(Ordering::Acquire))
-                .unwrap_or(0);
-            if current_gen != guard.generation {
-                tracing::info!(
-                    key = %guard.key.object_key,
-                    "cache fill rejected (pre-publish): key invalidated during fill"
-                );
-                drop(state);
-                let _ = tokio::fs::remove_file(&temp_body_path).await;
-                let _ = tokio::fs::remove_file(&temp_meta).await;
-                return Ok(());
-            }
+        // Grab generation counter Arc via RwLock (purge writes here without
+        // needing fill_state, so it never blocks behind a publish).
+        let gen_counter = self.generation_counters.read().await
+            .get(&guard.key).cloned();
 
-            // Under lock: remove old entry, rename, update stats atomically.
-            // This serializes overlapping fills for the same key.
+        // Helper to check generation.
+        let generation_changed = |counter: &Option<Arc<std::sync::atomic::AtomicU64>>| -> bool {
+            counter.as_ref()
+                .map(|c| c.load(Ordering::Acquire))
+                .unwrap_or(0)
+                != guard.generation
+        };
+
+        // Pre-publish generation check (no fill_state needed).
+        if generation_changed(&gen_counter) {
+            tracing::info!(
+                key = %guard.key.object_key,
+                "cache fill rejected (pre-publish): key invalidated during fill"
+            );
+            let _ = tokio::fs::remove_file(&temp_body_path).await;
+            let _ = tokio::fs::remove_file(&temp_meta).await;
+            return Ok(());
+        }
+
+        // Acquire fill_state for file operations + stats (serializes same-key fills).
+        {
+            let _state = self.fill_state.lock().await;
+
+            // Remove old entry and subtract its actual on-disk sizes.
             let old_body_size = tokio::fs::metadata(&final_body).await.map(|m| m.len()).unwrap_or(0);
             let old_meta_size = tokio::fs::metadata(&final_meta).await.map(|m| m.len()).unwrap_or(0);
             if old_body_size > 0 || old_meta_size > 0 {
@@ -313,13 +319,9 @@ impl DiskCache {
                 );
             }
 
-            // Re-check generation after file removal but before publish.
-            // purge() may have bumped it while we were doing I/O above.
-            let current_gen = state.generation_counters
-                .get(&guard.key)
-                .map(|c| c.load(Ordering::Acquire))
-                .unwrap_or(0);
-            if current_gen != guard.generation {
+            // Re-check generation after old-entry removal. purge() can bump
+            // this at any time since it doesn't need fill_state.
+            if generation_changed(&gen_counter) {
                 tracing::info!(
                     key = %guard.key.object_key,
                     "cache fill rejected (late check): key invalidated during publish prep"
@@ -329,6 +331,7 @@ impl DiskCache {
                 return Ok(());
             }
 
+            // Atomic rename — publish the new cache entry.
             tokio::fs::rename(&temp_body_path, &final_body)
                 .await
                 .map_err(|e| ProxyError::Cache {
@@ -461,10 +464,15 @@ impl CacheStore for DiskCache {
     }
 
     async fn begin_fill(&self, key: &CacheKey) -> Result<FillGuard, ProxyError> {
-        let generation = {
+        // Track active fill under fill_state.
+        {
             let mut state = self.fill_state.lock().await;
             *state.active_fills.entry(key.clone()).or_insert(0) += 1;
-            let counter = state.generation_counters
+        }
+        // Read/create generation counter under the separate RwLock.
+        let generation = {
+            let mut gens = self.generation_counters.write().await;
+            let counter = gens
                 .entry(key.clone())
                 .or_insert_with(|| Arc::new(std::sync::atomic::AtomicU64::new(0)));
             counter.load(Ordering::Acquire)
@@ -497,13 +505,11 @@ impl CacheStore for DiskCache {
     }
 
     async fn purge(&self, key: &CacheKey) -> Result<bool, ProxyError> {
-        // Grab the generation counter Arc (if any active fill exists) under
-        // a brief lock, then bump it AFTER releasing the mutex. The atomic
-        // bump does not need the lock, so purge never blocks behind a fill's
-        // publish critical section.
+        // Bump the generation counter via the RwLock (read lock only — does
+        // NOT need fill_state). purge() never blocks behind a fill's publish.
         let counter_arc = {
-            let state = self.fill_state.lock().await;
-            state.generation_counters.get(key).cloned()
+            let gens = self.generation_counters.read().await;
+            gens.get(key).cloned()
         };
         if let Some(counter) = counter_arc {
             counter.fetch_add(1, Ordering::Release);
