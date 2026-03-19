@@ -134,17 +134,23 @@ impl S3Error {
     /// Create an error from a body-read failure. Returns EntityTooLarge for
     /// limit violations, IncompleteBody for stream/transport errors.
     pub fn from_body_error(e: &axum::Error, request_id: &str) -> Self {
-        let msg = e.to_string();
-        if msg.contains("length limit") || msg.contains("LengthLimitError") {
-            Self::entity_too_large(&format!("request body exceeded size limit: {e}"), request_id)
-        } else {
-            S3Error {
-                http_status: StatusCode::BAD_REQUEST,
-                code: "IncompleteBody".to_string(),
-                message: format!("failed to read request body: {e}"),
-                resource: None,
-                request_id: request_id.to_string(),
+        // Walk the error source chain looking for the typed LengthLimitError.
+        let mut source: Option<&dyn std::error::Error> = Some(e);
+        while let Some(err) = source {
+            if err.downcast_ref::<http_body_util::LengthLimitError>().is_some() {
+                return Self::entity_too_large(
+                    "request body exceeded the configured size limit",
+                    request_id,
+                );
             }
+            source = err.source();
+        }
+        S3Error {
+            http_status: StatusCode::BAD_REQUEST,
+            code: "IncompleteBody".to_string(),
+            message: format!("failed to read request body: {e}"),
+            resource: None,
+            request_id: request_id.to_string(),
         }
     }
 

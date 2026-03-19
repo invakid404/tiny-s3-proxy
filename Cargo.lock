@@ -3165,6 +3165,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "http 1.4.0",
+ "http-body-util",
  "metrics",
  "metrics-exporter-prometheus",
  "percent-encoding",
