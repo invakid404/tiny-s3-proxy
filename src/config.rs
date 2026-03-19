@@ -185,15 +185,38 @@ mod tests {
     // Env var tests must run serially since they modify process-global state.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// All environment variable names that Config::from_env() reads.
+    const ALL_CONFIG_VARS: &[&str] = &[
+        "S3_LISTEN_ADDR", "ADMIN_LISTEN_ADDR", "FRONTEND_BUCKET",
+        "AUTH_MODE", "ALLOWED_FRONTEND_KEYS",
+        "BACKEND_ENDPOINT", "BACKEND_REGION", "BACKEND_BUCKET",
+        "BACKEND_ACCESS_KEY_ID", "BACKEND_SECRET_ACCESS_KEY",
+        "BACKEND_USE_PATH_STYLE", "BACKEND_ALLOW_HTTP",
+        "CACHE_DIR", "CACHE_MAX_BYTES", "CACHE_MAX_OBJECT_BYTES",
+        "CACHEABLE_PREFIXES", "CACHE_SERVE_STALE_ON_ERROR",
+        "CACHE_EVICTION_INTERVAL_SECS",
+        "GET_MAX_ATTEMPTS", "HEAD_MAX_ATTEMPTS", "LIST_MAX_ATTEMPTS",
+        "PUT_MAX_ATTEMPTS", "DELETE_MAX_ATTEMPTS", "RETRY_BASE_BACKOFF_MS",
+        "UPSTREAM_CONNECT_TIMEOUT_MS", "UPSTREAM_REQUEST_TIMEOUT_MS",
+        "MAX_REQUEST_BODY_BYTES",
+    ];
+
     fn with_env_vars<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
         let _guard = ENV_LOCK.lock().unwrap();
 
-        // Save originals and set new values.
-        let originals: Vec<_> = vars.iter().map(|(k, _)| (*k, env::var(k).ok())).collect();
+        // Snapshot ALL config vars (not just the ones being set), then clear
+        // the full surface so tests don't depend on the outer process env.
+        let originals: Vec<_> = ALL_CONFIG_VARS
+            .iter()
+            .map(|k| (*k, env::var(k).ok()))
+            .collect();
 
         // SAFETY: Tests run serially under ENV_LOCK, so no other thread
         // is reading env vars concurrently.
         unsafe {
+            for k in ALL_CONFIG_VARS {
+                env::remove_var(k);
+            }
             for (k, v) in vars {
                 env::set_var(k, v);
             }
@@ -201,7 +224,7 @@ mod tests {
 
         f();
 
-        // Restore originals.
+        // Restore ALL originals.
         // SAFETY: Same serialization guarantee via ENV_LOCK.
         unsafe {
             for (k, original) in &originals {
