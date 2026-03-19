@@ -269,6 +269,16 @@ fn status_str(status: http::StatusCode) -> &'static str {
 }
 
 /// Record request metrics (counter + histogram + in-flight + cache + response size).
+///
+/// Metrics are recorded at handler completion, before the response body is
+/// streamed to the client. For streamed GET/passthrough responses, this means:
+/// - `request_duration_seconds` measures handler-setup time (backend fetch +
+///   cache logic), not end-to-end transfer time. This is intentional: setup
+///   time reflects proxy performance, while transfer time is dominated by
+///   client bandwidth and is not actionable.
+/// - `in_flight_requests` decrements before the body finishes streaming. For
+///   a caching proxy with mostly small/fast responses this is a minor
+///   inaccuracy that avoids the complexity of wrapping every response body.
 fn record_metrics(operation: &'static str, response: &Response<Body>, start: Instant) {
     gauge!("s3proxy_in_flight_requests").decrement(1.0);
 

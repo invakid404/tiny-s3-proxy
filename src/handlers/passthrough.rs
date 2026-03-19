@@ -15,18 +15,48 @@ use crate::handlers::AppState;
 use crate::s3::errors::S3Error;
 use crate::s3::headers::common_headers;
 
-/// Headers that must NOT be forwarded from the original request because
-/// they will be set by the SigV4 signer or are hop-by-hop.
-const SKIP_HEADERS: &[&str] = &[
+/// Standard HTTP hop-by-hop headers (RFC 9110, Section 7.6.1) that MUST be
+/// consumed by an intermediary and MUST NOT be forwarded end-to-end.
+const HOP_BY_HOP_HEADERS: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// Additional request-side headers that must not be forwarded because they
+/// are set by the SigV4 signer or managed by the HTTP client.
+const SKIP_REQUEST_HEADERS: &[&str] = &[
     "authorization",
     "x-amz-date",
     "x-amz-content-sha256",
     "x-amz-security-token",
     "host",
-    "connection",
-    "transfer-encoding",
     "content-length", // reqwest sets this from body
 ];
+
+/// Collect header names nominated as hop-by-hop by `Connection` headers.
+/// Per RFC 9110 Section 7.6.1, each token in `Connection` names a header
+/// that the sender considers hop-by-hop and that MUST be removed by the
+/// first intermediary.
+fn collect_connection_nominated(headers: &http::HeaderMap) -> Vec<String> {
+    let mut nominated = Vec::new();
+    for conn_val in headers.get_all("connection") {
+        if let Ok(s) = conn_val.to_str() {
+            for token in s.split(',') {
+                let name = token.trim().to_lowercase();
+                if !name.is_empty() {
+                    nominated.push(name);
+                }
+            }
+        }
+    }
+    nominated
+}
 
 /// Handle an unsupported S3 operation by proxying the raw HTTP request
 /// to the backend, re-signing it with the backend credentials.
@@ -90,10 +120,15 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
         .method(method)
         .uri(&upstream_url);
 
-    // Copy non-auth headers from the original request.
+    // Copy headers from the original request, stripping SigV4/auth headers,
+    // standard hop-by-hop headers, and any headers nominated by Connection.
+    let connection_nominated = collect_connection_nominated(original_headers);
     for (name, value) in original_headers {
         let name_lower = name.as_str().to_lowercase();
-        if SKIP_HEADERS.contains(&name_lower.as_str()) {
+        if SKIP_REQUEST_HEADERS.contains(&name_lower.as_str())
+            || HOP_BY_HOP_HEADERS.contains(&name_lower.as_str())
+            || connection_nominated.iter().any(|h| h == &name_lower)
+        {
             continue;
         }
         req_builder = req_builder.header(name, value);
@@ -286,8 +321,16 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
 
     let mut response = Response::builder().status(status.as_u16());
 
-    // Copy upstream response headers.
+    // Copy upstream response headers, stripping hop-by-hop headers that
+    // pertain to the proxy-to-backend connection, not the client connection.
+    let resp_connection_nominated = collect_connection_nominated(&resp_headers);
     for (name, value) in &resp_headers {
+        let name_lower = name.as_str();
+        if HOP_BY_HOP_HEADERS.contains(&name_lower)
+            || resp_connection_nominated.iter().any(|h| h.as_str() == name_lower)
+        {
+            continue;
+        }
         response = response.header(name, value);
     }
 

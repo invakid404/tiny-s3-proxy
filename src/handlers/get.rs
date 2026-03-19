@@ -221,6 +221,12 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
     cache_key: &CacheKey,
     waiter: crate::cache::FlightWaiter,
 ) -> Response<Body> {
+    // Register fill BEFORE the backend fetch so that any purge() during
+    // the round-trip bumps the generation counter, causing commit_fill to
+    // reject the stale response. Without this, a purge during the GET
+    // would find no active fill entry to invalidate.
+    let fill_guard = state.cache.begin_fill(cache_key).await.ok();
+
     let result = state
         .backend
         .get_object(&state.backend_bucket, key)
@@ -245,12 +251,6 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                     .join(format!("{}-{}.body", std::process::id(), crate::request_id::generate()));
 
                 let cache = state.cache.clone();
-                let cache_key_owned = cache_key.clone();
-
-                // Capture the fill guard BEFORE downloading starts, so the
-                // generation reflects the pre-fetch state. If a purge happens
-                // during the download, commit_fill will detect the mismatch.
-                let fill_guard = cache.begin_fill(&cache_key_owned).await.ok();
 
                 let cache_meta = CacheMeta {
                     bucket: state.backend_bucket.to_string(),
@@ -371,7 +371,10 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
 
                 build_meta_response(&meta, body, &parsed.request_id, "MISS")
             } else {
-                // Too large to cache, stream directly
+                // Too large to cache — abort the pre-registered fill.
+                if let Some(guard) = fill_guard {
+                    state.cache.abort_fill(guard).await;
+                }
                 waiter.complete().await;
 
                 tracing::info!(
@@ -392,7 +395,11 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
             }
         }
         Err(e) => {
-            // Backend failed. Try serving stale from cache if configured.
+            // Backend failed — abort the pre-registered fill.
+            if let Some(guard) = fill_guard {
+                state.cache.abort_fill(guard).await;
+            }
+            // Try serving stale from cache if configured.
             if state.config.cache_serve_stale_on_error
                 && e.is_transient()
                 && let Ok(Some(stale_entry)) = state.cache.lookup(cache_key).await

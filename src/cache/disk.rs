@@ -11,11 +11,17 @@ use crate::cache::singleflight::SingleFlight;
 use crate::cache::{CacheStats, CacheStatsSnapshot, CacheStore, FillGuard};
 use crate::error::ProxyError;
 
-/// Per-key fill tracking: refcount + generation counter in one struct.
-/// Both fields are atomic so they can be read/written through shared `Arc`.
+/// Per-key fill tracking: refcount + generation counter + commit lock.
+/// Both counter fields are atomic so they can be read/written through shared
+/// `Arc`. The commit lock serializes same-key file operations during
+/// `commit_fill` without blocking unrelated keys.
 struct FillEntry {
     refcount: std::sync::atomic::AtomicUsize,
     generation: std::sync::atomic::AtomicU64,
+    /// Per-key mutex serializing the critical section of `commit_fill`
+    /// (old-entry removal, rename, stats update). Only same-key operations
+    /// need serialization — different keys write to different file paths.
+    commit_lock: tokio::sync::Mutex<()>,
 }
 
 /// Disk-backed implementation of `CacheStore`.
@@ -30,13 +36,11 @@ pub struct DiskCache {
     policy: CachePolicy,
     stats: Arc<CacheStats>,
     singleflight: Arc<SingleFlight>,
-    /// Serializes same-key file operations (old-entry removal, rename, stats).
-    fill_state: tokio::sync::Mutex<()>,
-    /// Per-key fill tracking: refcount + generation counter. The entry's
-    /// existence means there's an active fill. purge() takes a read lock
-    /// to bump the generation atomically without blocking behind fill_state.
-    /// begin_fill takes a write lock to create/increment entries atomically,
-    /// so purge cannot slip between registration and counter creation.
+    /// Per-key fill tracking: refcount + generation counter + commit lock.
+    /// purge() takes a read lock to bump the generation atomically without
+    /// blocking behind any per-key commit_lock. begin_fill takes a write
+    /// lock to create/increment entries atomically, so purge cannot slip
+    /// between registration and counter creation.
     active_fills: tokio::sync::RwLock<HashMap<CacheKey, Arc<FillEntry>>>,
 }
 
@@ -71,7 +75,6 @@ impl DiskCache {
             policy,
             stats: Arc::new(stats),
             singleflight: Arc::new(SingleFlight::new()),
-            fill_state: tokio::sync::Mutex::new(()),
             active_fills: tokio::sync::RwLock::new(HashMap::new()),
         })
     }
@@ -289,9 +292,26 @@ impl DiskCache {
             }
         }
 
-        // Acquire fill_state for file operations + stats (serializes same-key fills).
+        // Acquire per-key commit lock. The FillEntry Arc is cloned so the
+        // lock outlives the brief active_fills read lock. Different keys
+        // proceed concurrently; only same-key operations serialize.
+        let fill_entry = {
+            let fills = self.active_fills.read().await;
+            fills.get(&guard.key).cloned()
+        };
+        let fill_entry = match fill_entry {
+            Some(e) => e,
+            None => {
+                // Shouldn't happen (refcount > 0 keeps the entry alive),
+                // but treat as invalidated defensively.
+                tracing::warn!(key = %guard.key.object_key, "cache fill rejected: fill entry missing");
+                let _ = tokio::fs::remove_file(&temp_body_path).await;
+                let _ = tokio::fs::remove_file(&temp_meta).await;
+                return Ok(());
+            }
+        };
         {
-            let _state = self.fill_state.lock().await;
+            let _commit_lock = fill_entry.commit_lock.lock().await;
 
             // Best-effort incremental stat adjustment: subtract the old entry's
             // size before replacing it. This may race with eviction (which could
@@ -467,6 +487,7 @@ impl CacheStore for DiskCache {
                 Arc::new(FillEntry {
                     refcount: std::sync::atomic::AtomicUsize::new(0),
                     generation: std::sync::atomic::AtomicU64::new(0),
+                    commit_lock: tokio::sync::Mutex::new(()),
                 })
             });
             entry.refcount.fetch_add(1, Ordering::Relaxed);

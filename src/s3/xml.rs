@@ -175,6 +175,7 @@ pub fn parse_complete_multipart_body(xml_body: &[u8]) -> Result<Vec<CompletedPar
     let mut current_part_number: Option<i32> = None;
     let mut current_etag: Option<String> = None;
     let mut inside_part = false;
+    let mut found_root = false;
     let mut current_element = String::new();
     let mut buf = Vec::new();
 
@@ -183,7 +184,10 @@ pub fn parse_complete_multipart_body(xml_body: &[u8]) -> Result<Vec<CompletedPar
             Ok(Event::Start(ref e)) => {
                 let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                 match name.as_str() {
-                    "Part" => {
+                    "CompleteMultipartUpload" => {
+                        found_root = true;
+                    }
+                    "Part" if found_root => {
                         inside_part = true;
                         current_part_number = None;
                         current_etag = None;
@@ -192,6 +196,14 @@ pub fn parse_complete_multipart_body(xml_body: &[u8]) -> Result<Vec<CompletedPar
                         current_element = name;
                     }
                     _ => {}
+                }
+            }
+            Ok(Event::Empty(ref e)) => {
+                // Self-closing <CompleteMultipartUpload/> — valid root but
+                // will have zero parts, caught by the post-parse check.
+                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                if name == "CompleteMultipartUpload" {
+                    found_root = true;
                 }
             }
             Ok(Event::Text(ref e)) => {
@@ -232,6 +244,13 @@ pub fn parse_complete_multipart_body(xml_body: &[u8]) -> Result<Vec<CompletedPar
             _ => {}
         }
         buf.clear();
+    }
+
+    if !found_root {
+        return Err("Missing CompleteMultipartUpload root element".to_string());
+    }
+    if parts.is_empty() {
+        return Err("No Part elements found in CompleteMultipartUpload".to_string());
     }
 
     Ok(parts)
@@ -464,6 +483,37 @@ mod tests {
         assert_eq!(parts[0].etag, "\"etag1\"");
         assert_eq!(parts[1].part_number, 2);
         assert_eq!(parts[1].etag, "\"etag2\"");
+    }
+
+    #[test]
+    fn test_parse_complete_multipart_wrong_root_rejected() {
+        let body = b"<NotCompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"e\"</ETag></Part></NotCompleteMultipartUpload>";
+        let result = parse_complete_multipart_body(body);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Missing CompleteMultipartUpload root element"));
+    }
+
+    #[test]
+    fn test_parse_complete_multipart_empty_body_rejected() {
+        let body = b"";
+        let result = parse_complete_multipart_body(body);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_complete_multipart_empty_parts_rejected() {
+        let body = b"<CompleteMultipartUpload></CompleteMultipartUpload>";
+        let result = parse_complete_multipart_body(body);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("No Part elements"));
+    }
+
+    #[test]
+    fn test_parse_complete_multipart_self_closing_root_rejected() {
+        let body = b"<CompleteMultipartUpload/>";
+        let result = parse_complete_multipart_body(body);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("No Part elements"));
     }
 
     #[test]
