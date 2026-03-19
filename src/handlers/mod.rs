@@ -185,7 +185,7 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
             }
         }
         S3Operation::CreateMultipartUpload { key, .. } => {
-            if has_unsupported_write_modifiers(&parsed.extra_amz_headers, &parts.headers) {
+            if has_unsupported_multipart_modifiers(&parsed.extra_amz_headers, &parts.headers) {
                 let raw_path = parts.uri.path();
                 let rewritten = rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
                 let query = parts.uri.query();
@@ -202,7 +202,7 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
             upload_id,
             ..
         } => {
-            if has_unsupported_write_modifiers(&parsed.extra_amz_headers, &parts.headers) {
+            if has_unsupported_multipart_modifiers(&parsed.extra_amz_headers, &parts.headers) {
                 let raw_path = parts.uri.path();
                 let rewritten = rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
                 let query = parts.uri.query();
@@ -215,7 +215,7 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
             }
         }
         S3Operation::CompleteMultipartUpload { key, upload_id, .. } => {
-            if has_unsupported_write_modifiers(&parsed.extra_amz_headers, &parts.headers) {
+            if has_unsupported_multipart_modifiers(&parsed.extra_amz_headers, &parts.headers) {
                 let raw_path = parts.uri.path();
                 let rewritten = rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
                 let query = parts.uri.query();
@@ -227,7 +227,7 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
             }
         }
         S3Operation::AbortMultipartUpload { key, upload_id, .. } => {
-            if has_unsupported_write_modifiers(&parsed.extra_amz_headers, &parts.headers) {
+            if has_unsupported_multipart_modifiers(&parsed.extra_amz_headers, &parts.headers) {
                 let raw_path = parts.uri.path();
                 let rewritten = rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
                 let query = parts.uri.query();
@@ -325,55 +325,89 @@ fn has_unsupported_get_modifiers(headers: &http::HeaderMap) -> bool {
 /// does not forward. Inspects both the parsed `extra_amz_headers` and the
 /// raw HTTP header map (for standard headers like If-Match/If-None-Match
 /// that are not stored in extra_amz_headers).
+/// Headers that modify write semantics and cannot be preserved by any typed
+/// path. Shared base for both PutObject and multipart gates.
+const WRITE_MODIFYING_BASE: &[&str] = &[
+    "x-amz-storage-class",
+    "x-amz-server-side-encryption",
+    "x-amz-server-side-encryption-aws-kms-key-id",
+    "x-amz-server-side-encryption-context",
+    "x-amz-server-side-encryption-bucket-key-enabled",
+    "x-amz-server-side-encryption-customer-algorithm",
+    "x-amz-server-side-encryption-customer-key",
+    "x-amz-server-side-encryption-customer-key-md5",
+    "x-amz-request-payer",
+    "x-amz-expected-bucket-owner",
+    "x-amz-bypass-governance-retention",
+    "x-amz-mfa",
+    "x-amz-tagging",
+    "x-amz-object-lock-mode",
+    "x-amz-object-lock-retain-until-date",
+    "x-amz-object-lock-legal-hold",
+    "x-amz-website-redirect-location",
+    "x-amz-mp-object-size",
+    "x-amz-if-match-last-modified-time",
+    "x-amz-if-match-size",
+    "x-amz-if-match-initiated-time",
+    "x-amz-acl",
+    "x-amz-grant-full-control",
+    "x-amz-grant-read",
+    "x-amz-grant-read-acp",
+    "x-amz-grant-write-acp",
+    // Append-mode PUTs have different semantics (conditional offset writes,
+    // x-amz-object-size in the response) that the typed path wasn't designed for.
+    "x-amz-write-offset-bytes",
+];
+
+/// Additional checksum headers that the typed multipart paths don't forward.
+/// The typed PutObject path handles these end-to-end (request forwarded via
+/// extra_amz_headers + customize().mutate_request(), response captured via
+/// extract_write_extra_headers!), but CreateMultipartUpload, UploadPart, and
+/// CompleteMultipartUpload do NOT forward checksum request headers, so they
+/// must route to passthrough when these are present.
+const MULTIPART_CHECKSUM_HEADERS: &[&str] = &[
+    "x-amz-checksum-algorithm",
+    "x-amz-checksum-crc32",
+    "x-amz-checksum-crc32c",
+    "x-amz-checksum-crc64nvme",
+    "x-amz-checksum-sha1",
+    "x-amz-checksum-sha256",
+    "x-amz-checksum-type",
+    "x-amz-sdk-checksum-algorithm",
+];
+
+/// Check for standard HTTP conditionals that typed write paths don't forward.
+fn has_unsupported_http_conditionals(raw_headers: &http::HeaderMap) -> bool {
+    raw_headers.contains_key("if-match")
+        || raw_headers.contains_key("if-none-match")
+}
+
+/// Gate for PutObject and DeleteObject. Checksum headers are NOT gated here
+/// because the typed PutObject path forwards them end-to-end.
 fn has_unsupported_write_modifiers(
     extra_amz: &std::collections::HashMap<String, String>,
     raw_headers: &http::HeaderMap,
 ) -> bool {
-    // Standard HTTP headers the typed write/delete/multipart paths don't forward.
-    if raw_headers.contains_key("if-match")
-        || raw_headers.contains_key("if-none-match")
-    {
+    if has_unsupported_http_conditionals(raw_headers) {
         return true;
     }
+    extra_amz.keys().any(|k| WRITE_MODIFYING_BASE.contains(&k.as_str()))
+}
 
-    // x-amz-* headers that modify write/delete/multipart semantics and the
-    // typed path cannot forward. Uses a whitelist to avoid false positives
-    // from benign SDK headers like x-amz-user-agent.
-    const OPERATION_MODIFYING: &[&str] = &[
-        "x-amz-storage-class",
-        "x-amz-server-side-encryption",
-        "x-amz-server-side-encryption-aws-kms-key-id",
-        "x-amz-server-side-encryption-context",
-        "x-amz-server-side-encryption-bucket-key-enabled",
-        "x-amz-server-side-encryption-customer-algorithm",
-        "x-amz-server-side-encryption-customer-key",
-        "x-amz-server-side-encryption-customer-key-md5",
-        "x-amz-request-payer",
-        "x-amz-expected-bucket-owner",
-        "x-amz-bypass-governance-retention",
-        "x-amz-mfa",
-        "x-amz-tagging",
-        "x-amz-object-lock-mode",
-        "x-amz-object-lock-retain-until-date",
-        "x-amz-object-lock-legal-hold",
-        "x-amz-website-redirect-location",
-        // Checksum headers are NOT listed here: the typed path forwards them
-        // on the request via extra_amz_headers + customize().mutate_request(),
-        // and the response captures them via extract_write_extra_headers!.
-        "x-amz-mp-object-size",
-        "x-amz-if-match-last-modified-time",
-        "x-amz-if-match-size",
-        "x-amz-if-match-initiated-time",
-        "x-amz-acl",
-        "x-amz-grant-full-control",
-        "x-amz-grant-read",
-        "x-amz-grant-read-acp",
-        "x-amz-grant-write-acp",
-        // Append-mode PUTs have different semantics (conditional offset writes,
-        // x-amz-object-size in the response) that the typed path wasn't designed for.
-        "x-amz-write-offset-bytes",
-    ];
-    extra_amz.keys().any(|k| OPERATION_MODIFYING.contains(&k.as_str()))
+/// Gate for multipart operations. Includes checksum headers because the typed
+/// multipart paths (CreateMultipartUpload, UploadPart, CompleteMultipartUpload)
+/// don't forward checksum request headers or XML checksum elements.
+fn has_unsupported_multipart_modifiers(
+    extra_amz: &std::collections::HashMap<String, String>,
+    raw_headers: &http::HeaderMap,
+) -> bool {
+    if has_unsupported_http_conditionals(raw_headers) {
+        return true;
+    }
+    extra_amz.keys().any(|k| {
+        WRITE_MODIFYING_BASE.contains(&k.as_str())
+            || MULTIPART_CHECKSUM_HEADERS.contains(&k.as_str())
+    })
 }
 
 /// Check if the LIST request contains query params or headers that the typed
