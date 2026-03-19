@@ -205,8 +205,11 @@ pub fn parse_request<B>(req: &Request<B>) -> ParsedRequest {
                     let list_type = query.get("list-type").map(|v| v.as_str());
                     let max_keys_invalid = query.get("max-keys")
                         .is_some_and(|v| v.parse::<i32>().is_err());
+                    // S3 only accepts encoding-type=url; anything else is InvalidArgument.
+                    let encoding_type_invalid = query.get("encoding-type")
+                        .is_some_and(|v| v != "url");
 
-                    if matches!(list_type, Some(v) if v != "2") || max_keys_invalid {
+                    if matches!(list_type, Some(v) if v != "2") || max_keys_invalid || encoding_type_invalid {
                         S3Operation::Unsupported {
                             method: method.to_string(),
                             path: path.to_string(),
