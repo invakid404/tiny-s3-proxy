@@ -286,6 +286,56 @@ macro_rules! extract_extra_headers {
     }};
 }
 
+/// Extract response headers that appear on write responses (PutObject,
+/// UploadPart, CompleteMultipartUpload). Covers SSE, checksums, expiration,
+/// and request-charged — the metadata that typed write callers lose without
+/// passthrough.
+macro_rules! extract_write_extra_headers {
+    ($resp:expr) => {{
+        let mut extra = HashMap::new();
+        // Encryption (SSE-C headers omitted: requests with SSE-C route through
+        // passthrough via has_unsupported_write_modifiers, so the typed path
+        // never produces sse_customer_algorithm / sse_customer_key_md5).
+        if let Some(v) = $resp.server_side_encryption() {
+            extra.insert("x-amz-server-side-encryption".into(), v.as_str().to_string());
+        }
+        if let Some(v) = $resp.ssekms_key_id() {
+            extra.insert("x-amz-server-side-encryption-aws-kms-key-id".into(), v.to_string());
+        }
+        if $resp.bucket_key_enabled().unwrap_or(false) {
+            extra.insert("x-amz-server-side-encryption-bucket-key-enabled".into(), "true".into());
+        }
+        // Checksums
+        if let Some(v) = $resp.checksum_crc32() {
+            extra.insert("x-amz-checksum-crc32".into(), v.to_string());
+        }
+        if let Some(v) = $resp.checksum_crc32_c() {
+            extra.insert("x-amz-checksum-crc32c".into(), v.to_string());
+        }
+        if let Some(v) = $resp.checksum_sha1() {
+            extra.insert("x-amz-checksum-sha1".into(), v.to_string());
+        }
+        if let Some(v) = $resp.checksum_sha256() {
+            extra.insert("x-amz-checksum-sha256".into(), v.to_string());
+        }
+        // Request charged
+        if let Some(v) = $resp.request_charged() {
+            extra.insert("x-amz-request-charged".into(), v.as_str().to_string());
+        }
+        extra
+    }};
+}
+
+/// Supplementary write-response headers only present on PutObject and
+/// CompleteMultipartUpload (not UploadPart).
+macro_rules! extract_write_extra_headers_full {
+    ($resp:expr, $extra:expr) => {
+        if let Some(v) = $resp.expiration() {
+            $extra.insert("x-amz-expiration".into(), v.to_string());
+        }
+    };
+}
+
 /// Extract HEAD-only response headers not present on GetObjectOutput.
 macro_rules! extract_head_extra_headers {
     ($resp:expr, $extra:expr) => {
@@ -453,9 +503,12 @@ impl Backend for S3Backend {
                     .await
                     .map_err(|e| map_sdk_error(e, "put_object"))?;
 
+                let mut extra_headers = extract_write_extra_headers!(&resp);
+                extract_write_extra_headers_full!(&resp, extra_headers);
                 Ok(PutObjectOutput {
                     etag: resp.e_tag().map(|s| s.to_string()),
                     version_id: resp.version_id().map(|s| s.to_string()),
+                    extra_headers,
                 })
             }
         })
@@ -597,7 +650,8 @@ impl Backend for S3Backend {
             })?
             .to_string();
 
-        Ok(UploadPartOutput { etag })
+        let extra_headers = extract_write_extra_headers!(&resp);
+        Ok(UploadPartOutput { etag, extra_headers })
     }
 
     async fn complete_multipart_upload(
@@ -630,10 +684,13 @@ impl Backend for S3Backend {
             .await
             .map_err(|e| map_sdk_error(e, "complete_multipart_upload"))?;
 
+        let mut extra_headers = extract_write_extra_headers!(&resp);
+        extract_write_extra_headers_full!(&resp, extra_headers);
         Ok(CompleteMultipartOutput {
             etag: resp.e_tag().map(|s| s.to_string()),
             location: resp.location().map(|s| s.to_string()),
             version_id: resp.version_id().map(|s| s.to_string()),
+            extra_headers,
         })
     }
 

@@ -136,6 +136,14 @@ pub async fn handle_upload_part<B: Backend, C: CacheStore>(
             for (k, v) in headers.iter() {
                 response = response.header(k, v);
             }
+            for (k, v) in &output.extra_headers {
+                if let (Ok(name), Ok(val)) = (
+                    http::header::HeaderName::from_bytes(k.as_bytes()),
+                    http::header::HeaderValue::from_str(v),
+                ) {
+                    response = response.header(name, val);
+                }
+            }
             response.body(Body::empty()).unwrap()
         }
         Err(e) => {
@@ -256,6 +264,14 @@ pub async fn handle_complete_multipart<B: Backend, C: CacheStore>(
             }
             if let Some(ref vid) = output.version_id {
                 response = response.header("x-amz-version-id", vid);
+            }
+            for (k, v) in &output.extra_headers {
+                if let (Ok(name), Ok(val)) = (
+                    http::header::HeaderName::from_bytes(k.as_bytes()),
+                    http::header::HeaderValue::from_str(v),
+                ) {
+                    response = response.header(name, val);
+                }
             }
             response
                 .header("content-type", "application/xml")
@@ -445,6 +461,7 @@ mod tests {
         let key = "uploads/file.bin";
         let backend = MockBackend::new().with_upload_part(Ok(UploadPartOutput {
             etag: "\"part-etag\"".to_string(),
+            extra_headers: std::collections::HashMap::new(),
         }));
 
         let state = build_app_state(backend, MockCache::new(), MockAuth::allow_all());
@@ -468,6 +485,7 @@ mod tests {
                 etag: Some("\"final-etag\"".to_string()),
                 location: None,
                 version_id: None,
+                extra_headers: std::collections::HashMap::new(),
             }));
 
         let cache_key = crate::cache::key::CacheKey::new("test-backend", key);

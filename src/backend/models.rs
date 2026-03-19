@@ -49,6 +49,9 @@ pub struct PutObjectInput {
 pub struct PutObjectOutput {
     pub etag: Option<String>,
     pub version_id: Option<String>,
+    /// SSE, checksum, expiration, and other write-response headers captured
+    /// from the SDK response. See `extract_write_extra_headers!` in client.rs.
+    pub extra_headers: HashMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -117,6 +120,9 @@ pub struct UploadPartInput {
 #[derive(Debug)]
 pub struct UploadPartOutput {
     pub etag: String,
+    /// SSE, checksum, and other write-response headers captured from the SDK
+    /// response. See `extract_write_extra_headers!` in client.rs.
+    pub extra_headers: HashMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -138,4 +144,7 @@ pub struct CompleteMultipartOutput {
     pub etag: Option<String>,
     pub location: Option<String>,
     pub version_id: Option<String>,
+    /// SSE, checksum, expiration, and other write-response headers captured
+    /// from the SDK response. See `extract_write_extra_headers!` in client.rs.
+    pub extra_headers: HashMap<String, String>,
 }

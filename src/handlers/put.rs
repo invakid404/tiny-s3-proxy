@@ -96,6 +96,14 @@ pub async fn handle_put<B: Backend, C: CacheStore>(
             if let Some(ref vid) = output.version_id {
                 response = response.header("x-amz-version-id", vid);
             }
+            for (k, v) in &output.extra_headers {
+                if let (Ok(name), Ok(val)) = (
+                    http::header::HeaderName::from_bytes(k.as_bytes()),
+                    http::header::HeaderValue::from_str(v),
+                ) {
+                    response = response.header(name, val);
+                }
+            }
             response.body(Body::empty()).unwrap()
         }
         Err(e) => {
@@ -152,6 +160,7 @@ mod tests {
         let backend = MockBackend::new().with_put(Ok(crate::backend::models::PutObjectOutput {
             etag: Some("\"new-etag\"".to_string()),
             version_id: None,
+            extra_headers: std::collections::HashMap::new(),
         }));
 
         let cache = MockCache::new().with_entry(&cache_key, b"old content", meta);
@@ -198,6 +207,7 @@ mod tests {
         let backend = MockBackend::new().with_put(Ok(crate::backend::models::PutObjectOutput {
             etag: Some("\"etag\"".to_string()),
             version_id: None,
+            extra_headers: std::collections::HashMap::new(),
         }));
 
         let state = build_app_state(backend, MockCache::new(), MockAuth::allow_all());
