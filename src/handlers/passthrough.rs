@@ -197,9 +197,9 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
     // and backoff as the typed backend path. Non-idempotent methods are sent
     // once to avoid duplicate side effects.
     let (is_idempotent, max_attempts, base_backoff_ms) = match method {
-        "GET" => (true, state.config.get_max_attempts, state.config.retry_base_backoff_ms),
-        "HEAD" => (true, state.config.head_max_attempts, state.config.retry_base_backoff_ms),
-        "DELETE" => (true, state.config.delete_max_attempts, state.config.retry_base_backoff_ms),
+        "GET" => (true, state.config.get_max_attempts.max(1), state.config.retry_base_backoff_ms),
+        "HEAD" => (true, state.config.head_max_attempts.max(1), state.config.retry_base_backoff_ms),
+        "DELETE" => (true, state.config.delete_max_attempts.max(1), state.config.retry_base_backoff_ms),
         _ => (false, 1, 0),
     };
 
@@ -228,7 +228,7 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
                     && attempt < max_attempts
                     && matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
                 {
-                    let delay = base_backoff_ms * 2u64.pow(attempt - 1);
+                    let delay = base_backoff_ms.saturating_mul(2u64.saturating_pow(attempt - 1)).min(30_000);
                     tracing::warn!(
                         status,
                         attempt,
@@ -244,7 +244,7 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
             }
             Err(e) => {
                 if attempt < max_attempts {
-                    let delay = base_backoff_ms * 2u64.pow(attempt - 1);
+                    let delay = base_backoff_ms.saturating_mul(2u64.saturating_pow(attempt - 1)).min(30_000);
                     tracing::warn!(
                         error = %e,
                         attempt,
