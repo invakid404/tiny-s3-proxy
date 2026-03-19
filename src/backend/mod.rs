@@ -28,6 +28,7 @@ pub trait Backend: Send + Sync {
         key: &str,
         content_type: Option<&str>,
         metadata: &std::collections::HashMap<String, String>,
+        content_headers: &std::collections::HashMap<String, String>,
     ) -> impl std::future::Future<Output = Result<CreateMultipartOutput, ProxyError>> + Send;
     fn upload_part(&self, req: UploadPartInput) -> impl std::future::Future<Output = Result<UploadPartOutput, ProxyError>> + Send;
     fn complete_multipart_upload(

@@ -52,6 +52,7 @@ pub async fn handle_put<B: Backend, C: CacheStore>(
         content_md5: parsed.content_md5.clone(),
         metadata: parsed.user_metadata.clone(),
         extra_amz_headers: parsed.extra_amz_headers.clone(),
+        content_headers: parsed.content_headers.clone(),
     };
 
     // Retry handled by the backend client
@@ -59,15 +60,18 @@ pub async fn handle_put<B: Backend, C: CacheStore>(
 
     match result {
         Ok(output) => {
-            // Purge cache for this key (best-effort)
+            // Purge cache for this key (best-effort with one retry)
             let cache_key = CacheKey::new(&*state.backend_bucket, key);
             if let Err(e) = state.cache.purge(&cache_key).await {
-                tracing::warn!(
-                    error = %e,
-                    operation = "PutObject",
-                    key = key,
-                    "failed to purge cache"
-                );
+                tracing::warn!(error = %e, key = key, "cache purge failed, retrying once");
+                if let Err(e2) = state.cache.purge(&cache_key).await {
+                    tracing::error!(
+                        error = %e2,
+                        operation = "PutObject",
+                        key = key,
+                        "cache purge failed on retry — stale data may persist until eviction"
+                    );
+                }
             }
             state.singleflight.cancel(&cache_key).await;
 
@@ -127,6 +131,7 @@ mod tests {
             range: None,
             user_metadata: HashMap::new(),
             extra_amz_headers: HashMap::new(),
+            content_headers: HashMap::new(),
         }
     }
 

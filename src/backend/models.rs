@@ -41,6 +41,8 @@ pub struct PutObjectInput {
     pub content_md5: Option<String>,
     pub metadata: HashMap<String, String>,
     pub extra_amz_headers: HashMap<String, String>,
+    /// Standard content headers to forward (content-encoding, content-disposition, etc.).
+    pub content_headers: HashMap<String, String>,
 }
 
 #[derive(Debug)]

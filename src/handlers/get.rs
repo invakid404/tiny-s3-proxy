@@ -64,11 +64,14 @@ async fn open_file_stream(
 }
 
 /// Build response from a CacheEntry (streams from disk, no buffering).
+/// Try to build a response from a cached entry. Returns `None` if the body
+/// file has disappeared (e.g. eviction/purge race), signaling the caller
+/// should fall back to the backend rather than returning a 500.
 async fn build_cache_response(
     entry: &CacheEntry,
     request_id: &str,
     cache_status: &str,
-) -> Response<Body> {
+) -> Option<Response<Body>> {
     let meta = GetObjectMeta {
         content_type: entry.meta.content_type.clone(),
         content_length: Some(entry.meta.content_length),
@@ -90,19 +93,15 @@ async fn build_cache_response(
             for (k, v) in headers.iter() {
                 response = response.header(k, v);
             }
-            response.body(Body::from_stream(stream)).unwrap()
+            Some(response.body(Body::from_stream(stream)).unwrap())
         }
         Err(e) => {
             tracing::warn!(
                 error = %e,
                 path = %body_path.display(),
-                "failed to open cache body file"
+                "cache body file disappeared after lookup; treating as miss"
             );
-            let s3err = S3Error::internal_error(
-                &format!("cache read error: {}", e),
-                request_id,
-            );
-            s3err.to_response()
+            None
         }
     }
 }
@@ -150,7 +149,10 @@ pub async fn handle_get<B: Backend + 'static, C: CacheStore + 'static>(
                 cache_status = "HIT",
                 "serving from cache"
             );
-            return build_cache_response(&entry, &parsed.request_id, "HIT").await;
+            if let Some(resp) = build_cache_response(&entry, &parsed.request_id, "HIT").await {
+                return resp;
+            }
+            // Body file disappeared — fall through to backend
         }
         Ok(None) => {
             // Cache miss, proceed to singleflight
@@ -395,7 +397,6 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                 && e.is_transient()
                 && let Ok(Some(stale_entry)) = state.cache.lookup(cache_key).await
             {
-                waiter.complete().await;
                 tracing::warn!(
                     request_id = %parsed.request_id,
                     operation = "GetObject",
@@ -404,15 +405,19 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                     error = %e,
                     "serving stale cache entry on backend error"
                 );
-                return build_cache_response(
+                if let Some(resp) = build_cache_response(
                     &stale_entry,
                     &parsed.request_id,
                     "STALE",
                 )
-                .await;
+                .await {
+                    waiter.complete().await;
+                    return resp;
+                }
+                // Stale body disappeared — fall through to error
             }
 
-            // No stale entry available
+            // No stale entry available (or stale body disappeared)
             waiter.complete().await;
             tracing::error!(
                 error = %e,
@@ -451,7 +456,17 @@ async fn handle_follower<B: Backend + 'static, C: CacheStore + 'static>(
                 cache_status = "HIT",
                 "follower served from cache after leader"
             );
-            build_cache_response(&entry, &parsed.request_id, "HIT").await
+            if let Some(resp) = build_cache_response(&entry, &parsed.request_id, "HIT").await {
+                return resp;
+            }
+            // Body file disappeared — fall through to direct backend fetch
+            tracing::info!(
+                request_id = %parsed.request_id,
+                operation = "GetObject",
+                key = key,
+                "follower cache body disappeared, fetching from backend"
+            );
+            return handle_passthrough(state, parsed, key, "MISS").await;
         }
         _ => {
             // Leader may have failed or object was too large to cache.
@@ -491,6 +506,7 @@ mod tests {
             range: None,
             user_metadata: HashMap::new(),
             extra_amz_headers: HashMap::new(),
+            content_headers: HashMap::new(),
         }
     }
 

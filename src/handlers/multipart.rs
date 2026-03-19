@@ -28,6 +28,7 @@ pub async fn handle_create_multipart<B: Backend, C: CacheStore>(
             key,
             parsed.content_type.as_deref(),
             &parsed.user_metadata,
+            &parsed.content_headers,
         )
         .await;
 
@@ -213,15 +214,18 @@ pub async fn handle_complete_multipart<B: Backend, C: CacheStore>(
 
     match result {
         Ok(output) => {
-            // Purge cache for the final object key (best-effort)
+            // Purge cache for the final object key (best-effort with one retry)
             let cache_key = CacheKey::new(&*state.backend_bucket, key);
             if let Err(e) = state.cache.purge(&cache_key).await {
-                tracing::warn!(
-                    error = %e,
-                    operation = "CompleteMultipartUpload",
-                    key = key,
-                    "failed to purge cache"
-                );
+                tracing::warn!(error = %e, key = key, "cache purge failed, retrying once");
+                if let Err(e2) = state.cache.purge(&cache_key).await {
+                    tracing::error!(
+                        error = %e2,
+                        operation = "CompleteMultipartUpload",
+                        key = key,
+                        "cache purge failed on retry — stale data may persist until eviction"
+                    );
+                }
             }
             state.singleflight.cancel(&cache_key).await;
 
@@ -341,6 +345,7 @@ mod tests {
             range: None,
             user_metadata: std::collections::HashMap::new(),
             extra_amz_headers: std::collections::HashMap::new(),
+            content_headers: std::collections::HashMap::new(),
         }
     }
 
@@ -362,6 +367,7 @@ mod tests {
             range: None,
             user_metadata: std::collections::HashMap::new(),
             extra_amz_headers: std::collections::HashMap::new(),
+            content_headers: std::collections::HashMap::new(),
         }
     }
 
@@ -382,6 +388,7 @@ mod tests {
             range: None,
             user_metadata: std::collections::HashMap::new(),
             extra_amz_headers: std::collections::HashMap::new(),
+            content_headers: std::collections::HashMap::new(),
         }
     }
 
@@ -402,6 +409,7 @@ mod tests {
             range: None,
             user_metadata: std::collections::HashMap::new(),
             extra_amz_headers: std::collections::HashMap::new(),
+            content_headers: std::collections::HashMap::new(),
         }
     }
 

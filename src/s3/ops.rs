@@ -78,6 +78,9 @@ pub struct ParsedRequest {
     pub user_metadata: std::collections::HashMap<String, String>,
     /// Other `x-amz-*` headers that should be forwarded (e.g. `x-amz-storage-class`).
     pub extra_amz_headers: std::collections::HashMap<String, String>,
+    /// Standard content headers to forward on write paths (content-encoding,
+    /// content-disposition, content-language, cache-control, expires).
+    pub content_headers: std::collections::HashMap<String, String>,
 }
 
 impl S3Operation {

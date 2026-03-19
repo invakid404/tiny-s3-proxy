@@ -466,6 +466,7 @@ pub mod test_utils {
                 content_md5: req.content_md5.clone(),
                 metadata: req.metadata.clone(),
                 extra_amz_headers: req.extra_amz_headers.clone(),
+                content_headers: req.content_headers.clone(),
             });
             self.put_response
                 .lock()
@@ -518,6 +519,7 @@ pub mod test_utils {
             _key: &str,
             _content_type: Option<&str>,
             _metadata: &std::collections::HashMap<String, String>,
+            _content_headers: &std::collections::HashMap<String, String>,
         ) -> Result<CreateMultipartOutput, ProxyError> {
             self.create_multipart_response
                 .lock()

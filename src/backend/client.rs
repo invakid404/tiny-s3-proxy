@@ -397,6 +397,7 @@ impl Backend for S3Backend {
             let content_md5 = req.content_md5.clone();
             let metadata = req.metadata.clone();
             let extra_amz_headers = req.extra_amz_headers.clone();
+            let content_headers = req.content_headers.clone();
             let body = body_bytes.clone();
             async move {
                 let mut builder = client
@@ -415,7 +416,22 @@ impl Backend for S3Backend {
                     builder = builder.metadata(k, v);
                 }
 
-                // Forward extra x-amz-* headers as custom headers.
+                // Forward standard content headers via typed SDK setters.
+                if let Some(v) = content_headers.get("content-encoding") {
+                    builder = builder.content_encoding(v);
+                }
+                if let Some(v) = content_headers.get("content-disposition") {
+                    builder = builder.content_disposition(v);
+                }
+                if let Some(v) = content_headers.get("content-language") {
+                    builder = builder.content_language(v);
+                }
+                if let Some(v) = content_headers.get("cache-control") {
+                    builder = builder.cache_control(v);
+                }
+
+                // Forward extra x-amz-* headers and `expires` as raw headers.
+                let expires_val = content_headers.get("expires").cloned();
                 let resp = builder
                     .customize()
                     .mutate_request(move |req| {
@@ -426,6 +442,11 @@ impl Backend for S3Backend {
                             ) {
                                 req.headers_mut().insert(name, val);
                             }
+                        }
+                        if let Some(exp) = &expires_val
+                            && let Ok(val) = http::header::HeaderValue::from_str(exp)
+                        {
+                            req.headers_mut().insert(http::header::EXPIRES, val);
                         }
                     })
                     .send()
@@ -487,6 +508,7 @@ impl Backend for S3Backend {
         key: &str,
         content_type: Option<&str>,
         metadata: &HashMap<String, String>,
+        content_headers: &HashMap<String, String>,
     ) -> Result<CreateMultipartOutput, ProxyError> {
         let mut builder = self
             .client
@@ -501,10 +523,39 @@ impl Backend for S3Backend {
             builder = builder.metadata(k, v);
         }
 
-        let resp = builder
-            .send()
-            .await
-            .map_err(|e| map_sdk_error(e, "create_multipart_upload"))?;
+        // Forward standard content headers via typed SDK setters.
+        if let Some(v) = content_headers.get("content-encoding") {
+            builder = builder.content_encoding(v);
+        }
+        if let Some(v) = content_headers.get("content-disposition") {
+            builder = builder.content_disposition(v);
+        }
+        if let Some(v) = content_headers.get("content-language") {
+            builder = builder.content_language(v);
+        }
+        if let Some(v) = content_headers.get("cache-control") {
+            builder = builder.cache_control(v);
+        }
+
+        // Forward `expires` as a raw header via customize.
+        let expires_val = content_headers.get("expires").cloned();
+        let resp = if let Some(exp) = expires_val {
+            builder
+                .customize()
+                .mutate_request(move |req| {
+                    if let Ok(val) = http::header::HeaderValue::from_str(&exp) {
+                        req.headers_mut().insert(http::header::EXPIRES, val);
+                    }
+                })
+                .send()
+                .await
+                .map_err(|e| map_sdk_error(e, "create_multipart_upload"))?
+        } else {
+            builder
+                .send()
+                .await
+                .map_err(|e| map_sdk_error(e, "create_multipart_upload"))?
+        };
 
         let upload_id = resp
             .upload_id()

@@ -102,6 +102,7 @@ mod tests {
             range: None,
             user_metadata: std::collections::HashMap::new(),
             extra_amz_headers: std::collections::HashMap::new(),
+            content_headers: std::collections::HashMap::new(),
         }
     }
 
