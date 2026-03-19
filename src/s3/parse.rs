@@ -93,6 +93,16 @@ pub fn parse_request<B>(req: &Request<B>) -> ParsedRequest {
         } else {
         // Operations on objects
         match method {
+            "GET" | "HEAD" if query.contains_key("partNumber") => {
+                // Read-side partNumber (without uploadId) retrieves a single part
+                // of a multipart object. The typed backend interface doesn't carry
+                // this parameter, so route through passthrough to avoid silently
+                // dropping it.
+                S3Operation::Unsupported {
+                    method: method.to_string(),
+                    path: path.to_string(),
+                }
+            }
             "GET" => S3Operation::GetObject {
                 bucket: bucket.to_string(),
                 key,
@@ -585,5 +595,27 @@ mod tests {
         let req = build_request("GET", "/mybucket/mykey?response-content-type=text/plain");
         let parsed = parse_request(&req);
         assert!(matches!(parsed.operation, S3Operation::Unsupported { .. }));
+    }
+
+    #[test]
+    fn test_get_with_part_number_is_unsupported() {
+        let req = build_request("GET", "/mybucket/mykey?partNumber=3");
+        let parsed = parse_request(&req);
+        assert!(matches!(parsed.operation, S3Operation::Unsupported { .. }));
+    }
+
+    #[test]
+    fn test_head_with_part_number_is_unsupported() {
+        let req = build_request("HEAD", "/mybucket/mykey?partNumber=3");
+        let parsed = parse_request(&req);
+        assert!(matches!(parsed.operation, S3Operation::Unsupported { .. }));
+    }
+
+    #[test]
+    fn test_put_with_part_number_and_upload_id_is_upload_part() {
+        // partNumber + uploadId on PUT is still UploadPart (not Unsupported)
+        let req = build_request("PUT", "/mybucket/mykey?partNumber=1&uploadId=abc");
+        let parsed = parse_request(&req);
+        assert!(matches!(parsed.operation, S3Operation::UploadPart { .. }));
     }
 }
