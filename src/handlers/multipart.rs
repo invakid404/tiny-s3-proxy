@@ -100,10 +100,7 @@ pub async fn handle_upload_part<B: Backend, C: CacheStore>(
                 key = key,
                 "failed to read request body"
             );
-            let s3err = S3Error::entity_too_large(
-                &format!("failed to read request body: {}", e),
-                &parsed.request_id,
-            );
+            let s3err = S3Error::from_body_error(&e, &parsed.request_id);
             return s3err.to_response();
         }
     };
@@ -168,7 +165,7 @@ pub async fn handle_complete_multipart<B: Backend, C: CacheStore>(
     body: Body,
 ) -> Response<Body> {
     // Read body XML
-    let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
+    let body_bytes = match axum::body::to_bytes(body, state.config.max_request_body_bytes as usize).await {
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::error!(
@@ -177,10 +174,7 @@ pub async fn handle_complete_multipart<B: Backend, C: CacheStore>(
                 key = key,
                 "failed to read request body"
             );
-            let s3err = S3Error::entity_too_large(
-                &format!("failed to read request body: {}", e),
-                &parsed.request_id,
-            );
+            let s3err = S3Error::from_body_error(&e, &parsed.request_id);
             return s3err.to_response();
         }
     };

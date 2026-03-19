@@ -80,10 +80,7 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::error!(error = %e, "passthrough: failed to read request body");
-            let s3err = S3Error::entity_too_large(
-                &format!("failed to read request body: {}", e),
-                request_id,
-            );
+            let s3err = S3Error::from_body_error(&e, request_id);
             return s3err.to_response();
         }
     };

@@ -36,10 +36,7 @@ pub async fn handle_put<B: Backend, C: CacheStore>(
                 key = key,
                 "failed to read request body"
             );
-            let s3err = S3Error::entity_too_large(
-                &format!("failed to read request body: {}", e),
-                &parsed.request_id,
-            );
+            let s3err = S3Error::from_body_error(&e, &parsed.request_id);
             return s3err.to_response();
         }
     };

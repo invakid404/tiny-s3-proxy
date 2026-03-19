@@ -131,6 +131,23 @@ impl S3Error {
         }
     }
 
+    /// Create an error from a body-read failure. Returns EntityTooLarge for
+    /// limit violations, IncompleteBody for stream/transport errors.
+    pub fn from_body_error(e: &axum::Error, request_id: &str) -> Self {
+        let msg = e.to_string();
+        if msg.contains("length limit") || msg.contains("LengthLimitError") {
+            Self::entity_too_large(&format!("request body exceeded size limit: {e}"), request_id)
+        } else {
+            S3Error {
+                http_status: StatusCode::BAD_REQUEST,
+                code: "IncompleteBody".to_string(),
+                message: format!("failed to read request body: {e}"),
+                resource: None,
+                request_id: request_id.to_string(),
+            }
+        }
+    }
+
     /// Create a MalformedXML error (HTTP 400).
     pub fn malformed_xml(message: &str, request_id: &str) -> Self {
         S3Error {
