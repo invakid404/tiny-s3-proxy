@@ -455,13 +455,14 @@ impl Backend for S3Backend {
 
                 Ok(PutObjectOutput {
                     etag: resp.e_tag().map(|s| s.to_string()),
+                    version_id: resp.version_id().map(|s| s.to_string()),
                 })
             }
         })
         .await
     }
 
-    async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), ProxyError> {
+    async fn delete_object(&self, bucket: &str, key: &str) -> Result<DeleteObjectOutput, ProxyError> {
         let bucket = bucket.to_string();
         let key = key.to_string();
 
@@ -470,7 +471,7 @@ impl Backend for S3Backend {
             let bucket = bucket.clone();
             let key = key.clone();
             async move {
-                client
+                let resp = client
                     .delete_object()
                     .bucket(&bucket)
                     .key(&key)
@@ -478,7 +479,10 @@ impl Backend for S3Backend {
                     .await
                     .map_err(|e| map_sdk_error(e, "delete_object"))?;
 
-                Ok(())
+                Ok(DeleteObjectOutput {
+                    delete_marker: resp.delete_marker,
+                    version_id: resp.version_id().map(|s| s.to_string()),
+                })
             }
         })
         .await
@@ -629,6 +633,7 @@ impl Backend for S3Backend {
         Ok(CompleteMultipartOutput {
             etag: resp.e_tag().map(|s| s.to_string()),
             location: resp.location().map(|s| s.to_string()),
+            version_id: resp.version_id().map(|s| s.to_string()),
         })
     }
 

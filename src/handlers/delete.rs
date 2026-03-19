@@ -21,7 +21,7 @@ pub async fn handle_delete<B: Backend, C: CacheStore>(
     let result = state.backend.delete_object(&state.backend_bucket, key).await;
 
     match result {
-        Ok(()) => {
+        Ok(output) => {
             // Purge cache for this key (best-effort with one retry)
             let cache_key = CacheKey::new(&*state.backend_bucket, key);
             if let Err(e) = state.cache.purge(&cache_key).await {
@@ -56,6 +56,12 @@ pub async fn handle_delete<B: Backend, C: CacheStore>(
             let mut response = Response::builder().status(204);
             for (k, v) in headers.iter() {
                 response = response.header(k, v);
+            }
+            if let Some(ref vid) = output.version_id {
+                response = response.header("x-amz-version-id", vid);
+            }
+            if let Some(true) = output.delete_marker {
+                response = response.header("x-amz-delete-marker", "true");
             }
             response.body(Body::empty()).unwrap()
         }
@@ -109,7 +115,10 @@ mod tests {
         let cache_key = CacheKey::new("test-backend", key);
         let meta = test_cache_meta("test-backend", key, b"cached data");
 
-        let backend = MockBackend::new().with_delete(Ok(()));
+        let backend = MockBackend::new().with_delete(Ok(crate::backend::models::DeleteObjectOutput {
+            delete_marker: None,
+            version_id: None,
+        }));
         let cache = MockCache::new().with_entry(&cache_key, b"cached data", meta);
 
         let state = build_app_state(backend, cache, MockAuth::allow_all());

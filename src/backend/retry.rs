@@ -10,6 +10,10 @@ pub struct RetryPolicy {
     pub max_attempts: u32,
     pub base_backoff: Duration,
     pub retryable_status_codes: Vec<u16>,
+    /// Whether transport-level errors (Backend, Timeout) are retryable.
+    /// Safe for reads and idempotent writes. Unsafe for non-idempotent writes
+    /// where a timed-out request may have already been committed by the backend.
+    pub retry_transport_errors: bool,
 }
 
 impl RetryPolicy {
@@ -20,6 +24,7 @@ impl RetryPolicy {
             max_attempts,
             base_backoff: Duration::from_millis(base_backoff_ms),
             retryable_status_codes: vec![408, 429, 500, 502, 503, 504],
+            retry_transport_errors: true,
         }
     }
 
@@ -30,17 +35,21 @@ impl RetryPolicy {
             max_attempts,
             base_backoff: Duration::from_millis(base_backoff_ms),
             retryable_status_codes: vec![408, 429, 500, 502, 503, 504],
+            retry_transport_errors: true,
         }
     }
 
     /// Create retry policy for non-idempotent writes (PUT).
-    /// Non-idempotent writes get limited retries since they may have side effects.
+    /// Transport errors (timeouts, disconnects) are NOT retried because the
+    /// first attempt may have already been committed by the backend.
     pub fn for_writes(max_attempts: u32, base_backoff_ms: u64) -> Self {
         Self {
             max_attempts,
             base_backoff: Duration::from_millis(base_backoff_ms),
-            // Only retry on errors that clearly indicate the request was not processed.
+            // Only retry on HTTP status codes that clearly indicate the
+            // request was not processed.
             retryable_status_codes: vec![408, 429, 503],
+            retry_transport_errors: false,
         }
     }
 
@@ -50,18 +59,23 @@ impl RetryPolicy {
             max_attempts: 1,
             base_backoff: Duration::from_millis(0),
             retryable_status_codes: vec![],
+            retry_transport_errors: false,
         }
     }
 }
 
-/// Check if a ProxyError is retryable.
+/// Check if a ProxyError is retryable according to the given policy.
 ///
-/// Backend/network errors and timeouts are always retryable.
+/// Transport-level errors (Backend, Timeout) are only retryable when the
+/// policy allows it (`retry_transport_errors`). This is safe for reads and
+/// idempotent writes but dangerous for non-idempotent writes where a
+/// timed-out request may have already been committed by the backend.
+///
 /// UpstreamS3 errors are retryable only if their status code is in the policy's list.
-/// Auth errors, invalid requests, and unsupported operations are not.
+/// Auth errors, invalid requests, and unsupported operations are never retryable.
 pub fn is_retryable(policy: &RetryPolicy, err: &ProxyError) -> bool {
     match err {
-        ProxyError::Backend { .. } | ProxyError::Timeout { .. } => true,
+        ProxyError::Backend { .. } | ProxyError::Timeout { .. } => policy.retry_transport_errors,
         ProxyError::UpstreamS3 { status_code, .. } => {
             policy.retryable_status_codes.contains(status_code)
         }
@@ -186,6 +200,21 @@ mod tests {
             operation: "get_object".into(),
         };
         assert!(is_retryable(&policy, &err));
+    }
+
+    #[test]
+    fn test_write_policy_does_not_retry_transport_errors() {
+        let policy = RetryPolicy::for_writes(3, 100);
+        let backend_err = ProxyError::Backend {
+            source: "connection reset".into(),
+            operation: "put_object".into(),
+        };
+        assert!(!is_retryable(&policy, &backend_err));
+
+        let timeout_err = ProxyError::Timeout {
+            operation: "put_object".into(),
+        };
+        assert!(!is_retryable(&policy, &timeout_err));
     }
 
     #[test]

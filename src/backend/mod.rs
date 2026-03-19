@@ -20,7 +20,7 @@ pub trait Backend: Send + Sync {
     fn get_object(&self, bucket: &str, key: &str) -> impl std::future::Future<Output = Result<(GetObjectMeta, BoxByteStream), ProxyError>> + Send;
     fn head_object(&self, bucket: &str, key: &str) -> impl std::future::Future<Output = Result<HeadObjectOutput, ProxyError>> + Send;
     fn put_object(&self, req: PutObjectInput) -> impl std::future::Future<Output = Result<PutObjectOutput, ProxyError>> + Send;
-    fn delete_object(&self, bucket: &str, key: &str) -> impl std::future::Future<Output = Result<(), ProxyError>> + Send;
+    fn delete_object(&self, bucket: &str, key: &str) -> impl std::future::Future<Output = Result<DeleteObjectOutput, ProxyError>> + Send;
     fn list_objects(&self, req: ListObjectsInput) -> impl std::future::Future<Output = Result<ListObjectsOutput, ProxyError>> + Send;
     fn create_multipart_upload(
         &self,

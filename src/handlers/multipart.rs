@@ -254,6 +254,9 @@ pub async fn handle_complete_multipart<B: Backend, C: CacheStore>(
             for (k, v) in headers.iter() {
                 response = response.header(k, v);
             }
+            if let Some(ref vid) = output.version_id {
+                response = response.header("x-amz-version-id", vid);
+            }
             response
                 .header("content-type", "application/xml")
                 .body(Body::from(xml))
@@ -464,6 +467,7 @@ mod tests {
             MockBackend::new().with_complete_multipart(Ok(CompleteMultipartOutput {
                 etag: Some("\"final-etag\"".to_string()),
                 location: None,
+                version_id: None,
             }));
 
         let cache_key = crate::cache::key::CacheKey::new("test-backend", key);

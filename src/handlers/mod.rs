@@ -177,8 +177,17 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
         }
         S3Operation::ListObjectsV1 { params, .. }
         | S3Operation::ListObjectsV2 { params, .. } => {
-            let is_v2 = matches!(&parsed.operation, S3Operation::ListObjectsV2 { .. });
-            list::handle_list(&state, &parsed, params, is_v2).await
+            if has_unsupported_list_modifiers(parts.uri.query(), &parts.headers) {
+                let raw_path = parts.uri.path();
+                let rewritten = rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
+                let query = parts.uri.query();
+                passthrough::handle_passthrough(
+                    &state, "GET", &rewritten, query, &parts.headers, body, &parsed.request_id,
+                ).await
+            } else {
+                let is_v2 = matches!(&parsed.operation, S3Operation::ListObjectsV2 { .. });
+                list::handle_list(&state, &parsed, params, is_v2).await
+            }
         }
         S3Operation::CreateMultipartUpload { key, .. } => {
             if has_unsupported_write_modifiers(&parsed.extra_amz_headers, &parts.headers) {
@@ -374,6 +383,24 @@ fn has_unsupported_write_modifiers(
     extra_amz.keys().any(|k| OPERATION_MODIFYING.contains(&k.as_str()))
 }
 
+/// Check if the LIST request contains query params or headers that the typed
+/// list path doesn't model. When present, the request must go through raw
+/// passthrough so the backend can handle them.
+fn has_unsupported_list_modifiers(query: Option<&str>, headers: &http::HeaderMap) -> bool {
+    // Query parameters the typed LIST path doesn't forward.
+    if let Some(q) = query {
+        for pair in q.split('&') {
+            let key = pair.split('=').next().unwrap_or("");
+            if key == "fetch-owner" || key == "optional-object-attributes" {
+                return true;
+            }
+        }
+    }
+    // Headers the typed LIST path doesn't forward.
+    headers.contains_key("x-amz-request-payer")
+        || headers.contains_key("x-amz-expected-bucket-owner")
+}
+
 #[cfg(test)]
 pub mod test_utils {
     use std::collections::HashMap;
@@ -414,7 +441,7 @@ pub mod test_utils {
         pub get_response: Mutex<Option<Result<MockGetResponse, ProxyError>>>,
         pub head_response: Mutex<Option<Result<HeadObjectOutput, ProxyError>>>,
         pub put_response: Mutex<Option<Result<PutObjectOutput, ProxyError>>>,
-        pub delete_response: Mutex<Option<Result<(), ProxyError>>>,
+        pub delete_response: Mutex<Option<Result<DeleteObjectOutput, ProxyError>>>,
         pub list_response: Mutex<Option<Result<ListObjectsOutput, ProxyError>>>,
         pub create_multipart_response: Mutex<Option<Result<CreateMultipartOutput, ProxyError>>>,
         pub upload_part_response: Mutex<Option<Result<UploadPartOutput, ProxyError>>>,
@@ -458,7 +485,7 @@ pub mod test_utils {
             self
         }
 
-        pub fn with_delete(self, resp: Result<(), ProxyError>) -> Self {
+        pub fn with_delete(self, resp: Result<DeleteObjectOutput, ProxyError>) -> Self {
             *self.delete_response.lock().unwrap() = Some(resp);
             self
         }
@@ -569,7 +596,7 @@ pub mod test_utils {
                 })
         }
 
-        async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), ProxyError> {
+        async fn delete_object(&self, bucket: &str, key: &str) -> Result<DeleteObjectOutput, ProxyError> {
             self.delete_calls
                 .lock()
                 .unwrap()

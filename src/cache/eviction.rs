@@ -115,14 +115,30 @@ async fn collect_candidates(
                     continue;
                 }
 
-                // Read and parse metadata
+                // Read and parse metadata. Corrupt/unreadable metadata is
+                // treated as a broken entry — delete both files so the entry
+                // doesn't leak disk space indefinitely outside of eviction's
+                // accounting.
+                let hash_for_cleanup = file_name.trim_end_matches(".meta.json");
                 let meta_bytes = match tokio::fs::read(&file_path).await {
                     Ok(b) => b,
-                    Err(_) => continue,
+                    Err(e) => {
+                        let body = d2_path.join(format!("{}.body", hash_for_cleanup));
+                        let _ = tokio::fs::remove_file(&file_path).await;
+                        let _ = tokio::fs::remove_file(&body).await;
+                        tracing::warn!(path = %file_path.display(), error = %e, "removed corrupt cache entry: unreadable metadata");
+                        continue;
+                    }
                 };
                 let meta: CacheMeta = match serde_json::from_slice(&meta_bytes) {
                     Ok(m) => m,
-                    Err(_) => continue,
+                    Err(e) => {
+                        let body = d2_path.join(format!("{}.body", hash_for_cleanup));
+                        let _ = tokio::fs::remove_file(&file_path).await;
+                        let _ = tokio::fs::remove_file(&body).await;
+                        tracing::warn!(path = %file_path.display(), error = %e, "removed corrupt cache entry: invalid metadata JSON");
+                        continue;
+                    }
                 };
 
                 let hash = file_name.trim_end_matches(".meta.json");

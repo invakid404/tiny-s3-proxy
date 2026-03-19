@@ -333,7 +333,7 @@ impl DiskCache {
                 );
             }
 
-            // Re-check generation — purge() can bump via read lock on active_fills.
+            // Re-check generation — purge() bumps it under the same commit_lock.
             {
                 let fills = self.active_fills.read().await;
                 let cur_gen = fills.get(&guard.key).map(|e| e.generation.load(Ordering::Acquire)).unwrap_or(0);
@@ -402,10 +402,19 @@ impl CacheStore for DiskCache {
             }
         };
 
-        let meta: CacheMeta = serde_json::from_slice(&meta_bytes).map_err(|e| ProxyError::Cache {
-            source: Box::new(e),
-            operation: "parse metadata".into(),
-        })?;
+        let meta: CacheMeta = match serde_json::from_slice(&meta_bytes) {
+            Ok(m) => m,
+            Err(e) => {
+                // Corrupt metadata — delete the whole entry and treat as miss.
+                // Without cleanup, this entry would leak disk space indefinitely
+                // since the eviction scan also skips unreadable metadata.
+                tracing::warn!(key = %key.object_key, error = %e, "corrupt cache metadata, cleaning up");
+                let _ = tokio::fs::remove_file(&meta_path).await;
+                let _ = tokio::fs::remove_file(&body_path).await;
+                self.stats.miss_count.fetch_add(1, Ordering::Relaxed);
+                return Ok(None);
+            }
+        };
 
         // Defense in depth: verify the metadata actually belongs to this key.
         // A hash collision (extremely unlikely with 64-bit ahash) would
@@ -521,14 +530,24 @@ impl CacheStore for DiskCache {
     }
 
     async fn purge(&self, key: &CacheKey) -> Result<bool, ProxyError> {
-        // Bump the generation counter via a read lock on active_fills.
-        // purge() never blocks behind a fill's publish (which holds fill_state).
-        {
+        // Look up the per-key fill entry. If an active fill exists, acquire
+        // its commit_lock so we serialize against commit_fill's publish step,
+        // then bump the generation inside the critical section. This prevents
+        // the race where purge bumps the generation after commit_fill's final
+        // check but before the rename.
+        let fill_entry = {
             let fills = self.active_fills.read().await;
-            if let Some(entry) = fills.get(key) {
+            fills.get(key).cloned()
+        };
+        let _commit_lock = match fill_entry {
+            Some(ref entry) => {
+                let guard = entry.commit_lock.lock().await;
                 entry.generation.fetch_add(1, Ordering::Release);
+                Some(guard)
             }
-        }
+            // No active fill — nothing to synchronize with.
+            None => None,
+        };
 
         let (body_path, meta_path) = self.paths_for_key(key);
 

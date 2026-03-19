@@ -48,6 +48,13 @@ pub struct PutObjectInput {
 #[derive(Debug)]
 pub struct PutObjectOutput {
     pub etag: Option<String>,
+    pub version_id: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct DeleteObjectOutput {
+    pub delete_marker: Option<bool>,
+    pub version_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -130,4 +137,5 @@ pub struct CompleteMultipartInput {
 pub struct CompleteMultipartOutput {
     pub etag: Option<String>,
     pub location: Option<String>,
+    pub version_id: Option<String>,
 }
