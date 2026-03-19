@@ -281,11 +281,30 @@ impl DiskCache {
                 })?;
         }
 
-        // Re-check generation under lock, sample pre-existing sizes, and do
-        // the atomic rename all while holding the lock. This prevents eviction
-        // from removing the old entry between the size check and the rename,
-        // which would cause the new-vs-overwrite decision to be stale.
-        let (old_body_size, old_meta_size) = {
+        // Remove any pre-existing entry for this key and adjust stats BEFORE
+        // publishing the new one. This avoids the need to detect overwrites:
+        // we always treat the publish as a new entry. If eviction already
+        // removed the old files, remove_file fails silently and no stats are
+        // subtracted (which is correct — eviction already subtracted them).
+        {
+            let obs = tokio::fs::metadata(&final_body).await.map(|m| m.len()).unwrap_or(0);
+            let oms = tokio::fs::metadata(&final_meta).await.map(|m| m.len()).unwrap_or(0);
+            if obs > 0 || oms > 0 {
+                let _ = tokio::fs::remove_file(&final_body).await;
+                let _ = tokio::fs::remove_file(&final_meta).await;
+                let _ = self.stats.entry_count.fetch_update(
+                    Ordering::Relaxed, Ordering::Relaxed,
+                    |c| Some(c.saturating_sub(1)),
+                );
+                let _ = self.stats.total_bytes.fetch_update(
+                    Ordering::Relaxed, Ordering::Relaxed,
+                    |c| Some(c.saturating_sub(obs + oms)),
+                );
+            }
+        }
+
+        // Re-check generation under lock and do atomic rename.
+        {
             let state = self.fill_state.lock().await;
             if state.generations.get(&guard.key).copied().unwrap_or(0) != guard.generation {
                 tracing::info!(
@@ -298,11 +317,6 @@ impl DiskCache {
                 return Ok(());
             }
 
-            // Sample pre-existing sizes under lock before overwriting.
-            let obs = tokio::fs::metadata(&final_body).await.map(|m| m.len()).unwrap_or(0);
-            let oms = tokio::fs::metadata(&final_meta).await.map(|m| m.len()).unwrap_or(0);
-
-            // Atomic rename — publish the cache entry while holding the lock.
             tokio::fs::rename(&temp_body_path, &final_body)
                 .await
                 .map_err(|e| ProxyError::Cache {
@@ -316,29 +330,15 @@ impl DiskCache {
                     operation: "rename metadata".into(),
                 });
             }
-
-            (obs, oms)
-        };
+        }
 
         // Fresh content published — clear any stale poison marker for this key.
         let _ = tokio::fs::remove_file(&self.poison_path_for_key(&guard.key)).await;
 
-        // Update stats by delta: only increment entry_count for new entries.
+        // Stats: always treat as a new entry (old one was removed above).
         let new_size = body_size + meta_bytes.len() as u64;
-        if old_body_size > 0 || old_meta_size > 0 {
-            let old_size = old_body_size + old_meta_size;
-            if new_size >= old_size {
-                self.stats.total_bytes.fetch_add(new_size - old_size, Ordering::Relaxed);
-            } else {
-                let _ = self.stats.total_bytes.fetch_update(
-                    Ordering::Relaxed, Ordering::Relaxed,
-                    |c| Some(c.saturating_sub(old_size - new_size)),
-                );
-            }
-        } else {
-            self.stats.entry_count.fetch_add(1, Ordering::Relaxed);
-            self.stats.total_bytes.fetch_add(new_size, Ordering::Relaxed);
-        }
+        self.stats.entry_count.fetch_add(1, Ordering::Relaxed);
+        self.stats.total_bytes.fetch_add(new_size, Ordering::Relaxed);
         self.stats.fill_count.fetch_add(1, Ordering::Relaxed);
 
         Ok(())
