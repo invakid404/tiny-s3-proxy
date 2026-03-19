@@ -102,10 +102,15 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
     );
     let identity = credentials.into();
 
-    // Use S3-specific signing settings: single URI encoding (S3 doesn't
-    // double-encode), no path normalization (preserve // and . in keys),
-    // and include the x-amz-content-sha256 payload hash header.
+    // S3-specific signing settings:
+    // - Single URI-encoding: S3 does NOT double-encode, unlike generic SigV4.
+    //   The URI we sign is already percent-encoded from the client request, so
+    //   we must not re-encode it during canonicalization.
+    // - No path normalization: preserve // and . segments in object keys.
+    // - Payload checksum: include x-amz-content-sha256 header as S3 requires.
     let mut signing_settings = SigningSettings::default();
+    signing_settings.percent_encoding_mode =
+        aws_sigv4::http_request::PercentEncodingMode::Single;
     signing_settings.uri_path_normalization_mode =
         aws_sigv4::http_request::UriPathNormalizationMode::Disabled;
     signing_settings.payload_checksum_kind =
