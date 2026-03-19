@@ -1,5 +1,4 @@
-use ahash::AHasher;
-use std::hash::{Hash, Hasher};
+use std::fmt::Write;
 
 /// A cache key derived from bucket + object key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -17,28 +16,31 @@ impl CacheKey {
     }
 
     /// Returns a hex-encoded hash for filesystem paths.
-    /// Uses ahash (AES-NI accelerated) instead of SHA-256 for speed.
     ///
-    /// # Stability
-    /// `AHasher::default()` uses fixed PI-digit constants as keys (NOT per-process
-    /// random seeds), so hashes are stable across restarts of the same binary.
-    /// However, ahash does not guarantee stability across library versions or
-    /// platforms. A dependency update could change the output, causing existing
-    /// cache entries to become unreachable ("orphaned"). This is safe because:
-    /// - The eviction loop and startup scan both detect and remove orphan `.body`
-    ///   files that lack matching `.meta.json`, so orphaned entries are cleaned up.
-    /// - After one full eviction sweep the cache re-converges with no manual intervention.
-    /// - The cache is ephemeral by design; data loss only means a temporary miss storm.
+    /// Uses SHA-256 (truncated to 128 bits / 32 hex chars) for collision
+    /// resistance and unconditional stability across restarts, library
+    /// upgrades, and platforms. The AWS SDK already depends on the `sha2`
+    /// crate transitively, so this adds no new dependency weight.
     ///
-    /// If stronger durability guarantees are needed (e.g. surviving rolling upgrades
-    /// without a cold-cache spike), replace ahash with a stable hash like SHA-256.
+    /// The input is `bucket + "\0" + object_key`, where the null byte
+    /// prevents ambiguous concatenation (e.g. bucket "a" + key "bc" vs
+    /// bucket "ab" + key "c").
     pub fn hash_hex(&self) -> String {
-        let mut hasher = AHasher::default();
-        self.bucket.hash(&mut hasher);
-        0u8.hash(&mut hasher); // null separator
-        self.object_key.hash(&mut hasher);
-        let h = hasher.finish();
-        format!("{h:016x}")
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(self.bucket.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(self.object_key.as_bytes());
+        let result = hasher.finalize();
+        // Truncate to 128 bits (16 bytes / 32 hex chars) for shorter filenames.
+        // Birthday bound is ~2^64 entries for 50% collision probability, far
+        // beyond any realistic cache size. The metadata identity check in
+        // lookup() provides additional defense in depth.
+        let mut hex = String::with_capacity(32);
+        for byte in &result[..16] {
+            write!(hex, "{byte:02x}").unwrap();
+        }
+        hex
     }
 
     /// Returns the two-level directory prefix (first 2 + next 2 hex chars).
@@ -61,21 +63,22 @@ mod tests {
     }
 
     #[test]
+    fn test_hash_stable_across_calls() {
+        // SHA-256 is deterministic — this is the fundamental guarantee.
+        let key = CacheKey::new("test-bucket", "test-key");
+        let h1 = key.hash_hex();
+        let h2 = key.hash_hex();
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
     fn test_different_inputs_different_hashes() {
         let key1 = CacheKey::new("bucket-a", "key1");
         let key2 = CacheKey::new("bucket-a", "key2");
         let key3 = CacheKey::new("bucket-b", "key1");
 
-        assert_ne!(
-            key1.hash_hex(),
-            key2.hash_hex(),
-            "different keys should differ"
-        );
-        assert_ne!(
-            key1.hash_hex(),
-            key3.hash_hex(),
-            "different buckets should differ"
-        );
+        assert_ne!(key1.hash_hex(), key2.hash_hex(), "different keys should differ");
+        assert_ne!(key1.hash_hex(), key3.hash_hex(), "different buckets should differ");
         assert_ne!(key2.hash_hex(), key3.hash_hex());
     }
 
@@ -83,8 +86,8 @@ mod tests {
     fn test_hash_is_hex_and_correct_length() {
         let key = CacheKey::new("b", "k");
         let h = key.hash_hex();
-        // ahash u64 hex output is 16 chars.
-        assert_eq!(h.len(), 16);
+        // SHA-256 truncated to 128 bits = 32 hex chars
+        assert_eq!(h.len(), 32);
         assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
@@ -101,11 +104,8 @@ mod tests {
 
     #[test]
     fn test_null_separator_prevents_collisions() {
-        // "bucket\0" + "key" vs "bucket" + "\0key" should differ
-        // because the null byte is always between bucket and key fields.
         let key1 = CacheKey::new("abc", "def");
         let key2 = CacheKey::new("abc\0", "def");
-        // These should produce different hashes due to the extra null.
         assert_ne!(key1.hash_hex(), key2.hash_hex());
     }
 }
