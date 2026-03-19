@@ -454,6 +454,8 @@ impl CacheStore for DiskCache {
         let meta_exists = tokio::fs::try_exists(&meta_path).await.unwrap_or(false);
 
         if !body_exists && !meta_exists {
+            // Still clear any leftover poison marker — the stale entry is gone.
+            let _ = tokio::fs::remove_file(&self.poison_path_for_key(key)).await;
             return Ok(false);
         }
 
@@ -505,12 +507,18 @@ impl CacheStore for DiskCache {
         Ok(removed)
     }
 
-    async fn poison(&self, key: &CacheKey) {
+    async fn poison(&self, key: &CacheKey) -> Result<(), ProxyError> {
         let path = self.poison_path_for_key(key);
         if let Some(parent) = path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
+            tokio::fs::create_dir_all(parent).await.map_err(|e| ProxyError::Cache {
+                source: Box::new(e),
+                operation: "create poison marker dir".into(),
+            })?;
         }
-        let _ = tokio::fs::write(&path, b"").await;
+        tokio::fs::write(&path, b"").await.map_err(|e| ProxyError::Cache {
+            source: Box::new(e),
+            operation: "write poison marker".into(),
+        })
     }
 
     async fn stats(&self) -> CacheStatsSnapshot {

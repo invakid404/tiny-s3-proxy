@@ -674,8 +674,8 @@ pub mod test_utils {
             Ok(removed)
         }
 
-        async fn poison(&self, _key: &CacheKey) {
-            // No-op for mock — no internal state to poison.
+        async fn poison(&self, _key: &CacheKey) -> Result<(), crate::error::ProxyError> {
+            Ok(())
         }
 
         async fn stats(&self) -> CacheStatsSnapshot {

@@ -33,7 +33,14 @@ pub async fn handle_delete<B: Backend, C: CacheStore>(
                         key = key,
                         "cache purge failed on retry — poisoning key to block stale reads"
                     );
-                    state.cache.poison(&cache_key).await;
+                    if let Err(e3) = state.cache.poison(&cache_key).await {
+                        tracing::error!(
+                            error = %e3,
+                            operation = "DeleteObject",
+                            key = key,
+                            "CRITICAL: cache purge AND poison marker both failed — stale data may be served"
+                        );
+                    }
                 }
             }
             state.singleflight.cancel(&cache_key).await;
