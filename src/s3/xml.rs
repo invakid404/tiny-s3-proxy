@@ -176,6 +176,7 @@ pub fn parse_complete_multipart_body(xml_body: &[u8]) -> Result<Vec<CompletedPar
     let mut current_etag: Option<String> = None;
     let mut inside_part = false;
     let mut found_root = false;
+    let mut depth: u32 = 0;
     let mut current_element = String::new();
     let mut buf = Vec::new();
 
@@ -184,7 +185,7 @@ pub fn parse_complete_multipart_body(xml_body: &[u8]) -> Result<Vec<CompletedPar
             Ok(Event::Start(ref e)) => {
                 let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                 match name.as_str() {
-                    "CompleteMultipartUpload" => {
+                    "CompleteMultipartUpload" if depth == 0 => {
                         found_root = true;
                     }
                     "Part" if found_root => {
@@ -197,14 +198,17 @@ pub fn parse_complete_multipart_body(xml_body: &[u8]) -> Result<Vec<CompletedPar
                     }
                     _ => {}
                 }
+                depth += 1;
             }
             Ok(Event::Empty(ref e)) => {
-                // Self-closing <CompleteMultipartUpload/> — valid root but
-                // will have zero parts, caught by the post-parse check.
+                // Self-closing <CompleteMultipartUpload/> at depth 0 is a
+                // valid root but will have zero parts, caught by the
+                // post-parse check. Nested occurrences are ignored.
                 let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                if name == "CompleteMultipartUpload" {
+                if name == "CompleteMultipartUpload" && depth == 0 {
                     found_root = true;
                 }
+                // Empty elements don't change depth (no matching End).
             }
             Ok(Event::Text(ref e)) => {
                 if inside_part {
@@ -227,6 +231,7 @@ pub fn parse_complete_multipart_body(xml_body: &[u8]) -> Result<Vec<CompletedPar
                 }
             }
             Ok(Event::End(ref e)) => {
+                depth = depth.saturating_sub(1);
                 let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                 if name == "Part" && inside_part {
                     let part_number = current_part_number
@@ -506,6 +511,15 @@ mod tests {
         let result = parse_complete_multipart_body(body);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No Part elements"));
+    }
+
+    #[test]
+    fn test_parse_complete_multipart_nested_root_rejected() {
+        // CompleteMultipartUpload nested inside another element is not a valid root.
+        let body = b"<Wrapper><CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"e\"</ETag></Part></CompleteMultipartUpload></Wrapper>";
+        let result = parse_complete_multipart_body(body);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Missing CompleteMultipartUpload root element"));
     }
 
     #[test]

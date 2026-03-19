@@ -163,8 +163,8 @@ The admin listener (default `:9090`) exposes:
 | Metric | Type | Labels | Description |
 |---|---|---|---|
 | `s3proxy_requests_total` | counter | `operation`, `status`, `method` | Total requests |
-| `s3proxy_request_duration_seconds` | histogram | `operation` | Request latency |
-| `s3proxy_in_flight_requests` | gauge | | Currently processing |
+| `s3proxy_request_duration_seconds` | histogram | `operation` | Handler-setup latency (backend fetch + cache logic; excludes response body transfer) |
+| `s3proxy_in_flight_requests` | gauge | | Handlers currently executing (decrements before streamed body completes) |
 | `s3proxy_cache_total` | counter | `status` | Cache outcomes (`HIT`, `MISS`, `BYPASS`, `STALE`) |
 | `s3proxy_request_size_bytes` | histogram | `operation` | Inbound body size |
 | `s3proxy_response_size_bytes` | histogram | `operation` | Outbound body size |
