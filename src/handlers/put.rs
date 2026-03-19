@@ -19,10 +19,12 @@ pub async fn handle_put<B: Backend, C: CacheStore>(
     key: &str,
     body: Body,
 ) -> Response<Body> {
-    // NOTE: Bodies are fully buffered because the backend client's retry logic
-    // needs to clone and resend the body on failure. For truly large objects,
-    // clients should use multipart upload with bounded part sizes. The
-    // configurable max_request_body_bytes limit prevents OOM.
+    // NOTE: Bodies are fully buffered in memory. The retry logic uses
+    // Bytes::clone() which is O(1) (reference-counted, no data copy), so
+    // retries do not multiply memory usage. The configurable
+    // max_request_body_bytes (default 256 MiB) caps per-request memory; set
+    // it based on expected concurrent uploads and available RAM. For objects
+    // larger than the limit, clients should use multipart upload.
 
     // Read body bytes
     let body_bytes = match axum::body::to_bytes(body, state.config.max_request_body_bytes as usize).await {

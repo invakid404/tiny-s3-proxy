@@ -103,7 +103,7 @@ impl Config {
             retry_base_backoff_ms: parse_u64_env("RETRY_BASE_BACKOFF_MS", 100)?,
             upstream_connect_timeout_ms: parse_u64_env("UPSTREAM_CONNECT_TIMEOUT_MS", 5000)?,
             upstream_request_timeout_ms: parse_u64_env("UPSTREAM_REQUEST_TIMEOUT_MS", 30000)?,
-            max_request_body_bytes: parse_u64_env("MAX_REQUEST_BODY_BYTES", 5_368_709_120)?, // 5 GiB default
+            max_request_body_bytes: parse_u64_env("MAX_REQUEST_BODY_BYTES", 268_435_456)?, // 256 MiB default
         })
     }
 }

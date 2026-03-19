@@ -8,6 +8,8 @@ use crate::s3::ops::{ListParams, ParsedRequest, S3Operation};
 /// S3 subresource query parameters that change the meaning of an operation.
 /// When present, the request is NOT a simple object GET/PUT/DELETE and must
 /// be routed as Unsupported (passthrough) to avoid misclassifying it.
+/// This includes versioning params, response-override params, and all
+/// resource-level subresources.
 const S3_SUBRESOURCE_PARAMS: &[&str] = &[
     "acl", "cors", "delete", "encryption", "intelligent-tiering",
     "inventory", "legal-hold", "lifecycle", "location", "logging",
@@ -15,6 +17,12 @@ const S3_SUBRESOURCE_PARAMS: &[&str] = &[
     "requestPayment", "restore", "retention", "select", "tagging",
     "torrent", "versioning", "versions", "website", "accelerate",
     "analytics",
+    // Versioning
+    "versionId",
+    // GET response-override parameters (change response headers)
+    "response-content-type", "response-content-disposition",
+    "response-content-encoding", "response-content-language",
+    "response-expires", "response-cache-control",
 ];
 
 /// Parse query string into key-value pairs.
@@ -563,5 +571,19 @@ mod tests {
             }
             other => panic!("Expected ListObjectsV1, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_get_with_version_id_is_unsupported() {
+        let req = build_request("GET", "/mybucket/mykey?versionId=abc123");
+        let parsed = parse_request(&req);
+        assert!(matches!(parsed.operation, S3Operation::Unsupported { .. }));
+    }
+
+    #[test]
+    fn test_get_with_response_override_is_unsupported() {
+        let req = build_request("GET", "/mybucket/mykey?response-content-type=text/plain");
+        let parsed = parse_request(&req);
+        assert!(matches!(parsed.operation, S3Operation::Unsupported { .. }));
     }
 }
