@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -10,6 +10,18 @@ use crate::cache::policy::CachePolicy;
 use crate::cache::singleflight::SingleFlight;
 use crate::cache::{CacheStats, CacheStatsSnapshot, CacheStore, FillGuard};
 use crate::error::ProxyError;
+
+/// Tracks in-flight fills and per-key invalidation generations.
+///
+/// The `active_fills` set contains keys that have an outstanding `FillGuard`
+/// (between `begin_fill` and `commit_fill`). `purge()` only creates a
+/// generation entry when the purged key has an active fill, so `generations`
+/// is bounded by the number of concurrent fills — not total purges.
+#[derive(Default)]
+struct FillState {
+    active_fills: HashSet<CacheKey>,
+    generations: HashMap<CacheKey, u64>,
+}
 
 /// Disk-backed implementation of `CacheStore`.
 ///
@@ -23,11 +35,17 @@ pub struct DiskCache {
     policy: CachePolicy,
     stats: Arc<CacheStats>,
     singleflight: Arc<SingleFlight>,
-    /// Per-key generation counter for cache invalidation. Incremented by purge(),
-    /// captured by begin_fill(), and re-checked by commit_fill() immediately
-    /// before publishing. This prevents the race where an in-flight GET re-caches
-    /// stale data after a concurrent write/delete.
-    fill_generations: tokio::sync::Mutex<HashMap<CacheKey, u64>>,
+    /// Cache invalidation state, protected by a single mutex to ensure
+    /// atomicity between generation checks and cache publishing.
+    ///
+    /// `active_fills` tracks keys with in-flight fill operations. `purge()`
+    /// only creates a generation entry when an active fill exists for that key,
+    /// so the map is bounded by the number of concurrent fills (not total purges).
+    ///
+    /// `generations` maps keys to a counter that is bumped by `purge()` and
+    /// captured by `begin_fill()`. `commit_fill()` re-checks the counter
+    /// under this lock immediately before the atomic rename.
+    fill_state: tokio::sync::Mutex<FillState>,
 }
 
 impl DiskCache {
@@ -61,7 +79,7 @@ impl DiskCache {
             policy,
             stats: Arc::new(stats),
             singleflight: Arc::new(SingleFlight::new()),
-            fill_generations: tokio::sync::Mutex::new(HashMap::new()),
+            fill_state: tokio::sync::Mutex::new(FillState::default()),
         })
     }
 
@@ -177,6 +195,13 @@ impl DiskCache {
     pub fn stats_ref(&self) -> &Arc<CacheStats> {
         &self.stats
     }
+
+    /// Remove a key from the active fills set and clean up its generation entry.
+    async fn finish_fill(&self, key: &CacheKey) {
+        let mut state = self.fill_state.lock().await;
+        state.active_fills.remove(key);
+        state.generations.remove(key);
+    }
 }
 
 impl CacheStore for DiskCache {
@@ -232,8 +257,9 @@ impl CacheStore for DiskCache {
 
     async fn begin_fill(&self, key: &CacheKey) -> Result<FillGuard, ProxyError> {
         let generation = {
-            let gens = self.fill_generations.lock().await;
-            gens.get(key).copied().unwrap_or(0)
+            let mut state = self.fill_state.lock().await;
+            state.active_fills.insert(key.clone());
+            state.generations.get(key).copied().unwrap_or(0)
         };
         let temp_dir = self.cache_dir.join("tmp");
         Ok(FillGuard {
@@ -251,12 +277,15 @@ impl CacheStore for DiskCache {
     ) -> Result<(), ProxyError> {
         // Early check: bail fast if already invalidated (avoids unnecessary I/O).
         {
-            let gens = self.fill_generations.lock().await;
-            if gens.get(&guard.key).copied().unwrap_or(0) != guard.generation {
+            let gens = self.fill_state.lock().await;
+            if gens.generations.get(&guard.key).copied().unwrap_or(0) != guard.generation {
                 tracing::info!(
                     key = %guard.key.object_key,
                     "cache fill rejected (early check): key invalidated during fill"
                 );
+                // Don't remove from active_fills yet — that happens in the final block.
+                drop(gens);
+                self.finish_fill(&guard.key).await;
                 let _ = tokio::fs::remove_file(&temp_body_path).await;
                 return Ok(());
             }
@@ -315,12 +344,15 @@ impl CacheStore for DiskCache {
         // purge() also acquires this lock before incrementing, so the check +
         // rename is atomic with respect to invalidation.
         {
-            let mut gens = self.fill_generations.lock().await;
-            if gens.get(&guard.key).copied().unwrap_or(0) != guard.generation {
+            let mut state = self.fill_state.lock().await;
+            if state.generations.get(&guard.key).copied().unwrap_or(0) != guard.generation {
                 tracing::info!(
                     key = %guard.key.object_key,
                     "cache fill rejected (pre-publish): key invalidated during fill"
                 );
+                state.active_fills.remove(&guard.key);
+                state.generations.remove(&guard.key);
+                drop(state);
                 let _ = tokio::fs::remove_file(&temp_body_path).await;
                 let _ = tokio::fs::remove_file(&temp_meta).await;
                 return Ok(());
@@ -341,9 +373,9 @@ impl CacheStore for DiskCache {
                 });
             }
 
-            // Fill succeeded — clean up the generation entry to bound map growth.
-            // If a new purge arrives after this point, it will re-add the entry.
-            gens.remove(&guard.key);
+            // Fill complete — remove from active set and clean up generation.
+            state.active_fills.remove(&guard.key);
+            state.generations.remove(&guard.key);
         }
 
         // Update stats atomically (outside lock)
@@ -355,12 +387,15 @@ impl CacheStore for DiskCache {
     }
 
     async fn purge(&self, key: &CacheKey) -> Result<bool, ProxyError> {
-        // Bump the generation counter so any in-flight fill that captured an
-        // older generation will be rejected at commit time.
+        // Only bump the generation counter if there's an active fill for this
+        // key. This bounds the map to the number of concurrent fills — a purge
+        // without a concurrent fill has nothing to invalidate.
         {
-            let mut gens = self.fill_generations.lock().await;
-            let counter = gens.entry(key.clone()).or_insert(0);
-            *counter += 1;
+            let mut state = self.fill_state.lock().await;
+            if state.active_fills.contains(key) {
+                let counter = state.generations.entry(key.clone()).or_insert(0);
+                *counter += 1;
+            }
         }
 
         let (body_path, meta_path) = self.paths_for_key(key);
