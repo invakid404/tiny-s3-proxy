@@ -156,7 +156,16 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
             list::handle_list(&state, &parsed, params, is_v2).await
         }
         S3Operation::CreateMultipartUpload { key, .. } => {
-            multipart::handle_create_multipart(&state, &parsed, key).await
+            if has_unsupported_write_modifiers(&parsed.extra_amz_headers) {
+                let raw_path = parts.uri.path();
+                let rewritten = rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
+                let query = parts.uri.query();
+                passthrough::handle_passthrough(
+                    &state, "POST", &rewritten, query, &parts.headers, body, &parsed.request_id,
+                ).await
+            } else {
+                multipart::handle_create_multipart(&state, &parsed, key).await
+            }
         }
         S3Operation::UploadPart {
             key,
@@ -164,11 +173,29 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
             upload_id,
             ..
         } => {
-            multipart::handle_upload_part(&state, &parsed, key, *part_number, upload_id, body)
-                .await
+            if has_unsupported_write_modifiers(&parsed.extra_amz_headers) {
+                let raw_path = parts.uri.path();
+                let rewritten = rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
+                let query = parts.uri.query();
+                passthrough::handle_passthrough(
+                    &state, "PUT", &rewritten, query, &parts.headers, body, &parsed.request_id,
+                ).await
+            } else {
+                multipart::handle_upload_part(&state, &parsed, key, *part_number, upload_id, body)
+                    .await
+            }
         }
         S3Operation::CompleteMultipartUpload { key, upload_id, .. } => {
-            multipart::handle_complete_multipart(&state, &parsed, key, upload_id, body).await
+            if has_unsupported_write_modifiers(&parsed.extra_amz_headers) {
+                let raw_path = parts.uri.path();
+                let rewritten = rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
+                let query = parts.uri.query();
+                passthrough::handle_passthrough(
+                    &state, "POST", &rewritten, query, &parts.headers, body, &parsed.request_id,
+                ).await
+            } else {
+                multipart::handle_complete_multipart(&state, &parsed, key, upload_id, body).await
+            }
         }
         S3Operation::AbortMultipartUpload { key, upload_id, .. } => {
             multipart::handle_abort_multipart(&state, &parsed, key, upload_id).await
@@ -243,6 +270,18 @@ fn has_unsupported_get_modifiers(headers: &http::HeaderMap) -> bool {
         || headers.contains_key("x-amz-request-payer")
         || headers.contains_key("x-amz-expected-bucket-owner")
         || headers.keys().any(|k| k.as_str().starts_with("x-amz-server-side-encryption-customer-"))
+}
+
+/// Check if the request contains write-side x-amz-* headers that the typed
+/// multipart backend API does not forward. When present, the request must go
+/// through raw passthrough so the headers reach the backend.
+fn has_unsupported_write_modifiers(extra_amz: &std::collections::HashMap<String, String>) -> bool {
+    // Headers the typed multipart path already handles or that are benign:
+    const HANDLED: &[&str] = &[
+        "x-amz-content-sha256", "x-amz-date", "x-amz-security-token",
+        "x-amz-decoded-content-length",
+    ];
+    extra_amz.keys().any(|k| !HANDLED.contains(&k.as_str()))
 }
 
 #[cfg(test)]
@@ -391,6 +430,7 @@ pub mod test_utils {
                         etag: mock.etag.clone(),
                         last_modified: Some(Utc::now()),
                         metadata: HashMap::new(),
+                        extra_headers: HashMap::new(),
                     };
                     let stream = vec_to_stream(mock.body);
                     Ok((meta, stream))
@@ -746,6 +786,7 @@ pub mod test_utils {
             hit_count: 0,
             source_status: 200,
             metadata: HashMap::new(),
+            extra_headers: HashMap::new(),
         }
     }
 }

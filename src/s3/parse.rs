@@ -112,7 +112,15 @@ pub fn parse_request<B>(req: &Request<B>) -> ParsedRequest {
                 key,
             },
             "PUT" => {
-                if query.contains_key("partNumber") && query.contains_key("uploadId") {
+                // CopyObject and UploadPartCopy use x-amz-copy-source.
+                // The typed backend has no copy model, so route through passthrough
+                // which preserves the header and gets the correct response shape.
+                if req.headers().contains_key("x-amz-copy-source") {
+                    S3Operation::Unsupported {
+                        method: method.to_string(),
+                        path: path.to_string(),
+                    }
+                } else if query.contains_key("partNumber") && query.contains_key("uploadId") {
                     let part_number = query
                         .get("partNumber")
                         .and_then(|v| v.parse::<i32>().ok())
@@ -617,5 +625,24 @@ mod tests {
         let req = build_request("PUT", "/mybucket/mykey?partNumber=1&uploadId=abc");
         let parsed = parse_request(&req);
         assert!(matches!(parsed.operation, S3Operation::UploadPart { .. }));
+    }
+
+    #[test]
+    fn test_put_with_copy_source_is_unsupported() {
+        let req = http::Request::builder()
+            .method("PUT")
+            .uri("/mybucket/dest-key")
+            .header("x-amz-copy-source", "/mybucket/source-key")
+            .body(())
+            .unwrap();
+        let parsed = parse_request(&req);
+        assert!(matches!(parsed.operation, S3Operation::Unsupported { .. }));
+    }
+
+    #[test]
+    fn test_put_without_copy_source_is_put_object() {
+        let req = build_request("PUT", "/mybucket/mykey");
+        let parsed = parse_request(&req);
+        assert!(matches!(parsed.operation, S3Operation::PutObject { .. }));
     }
 }
