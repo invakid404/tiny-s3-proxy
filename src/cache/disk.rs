@@ -46,10 +46,7 @@ pub struct DiskCache {
     /// captured by `begin_fill()`. `commit_fill()` re-checks the counter
     /// under this lock immediately before the atomic rename.
     fill_state: tokio::sync::Mutex<FillState>,
-    /// Keys where purge failed after retries. lookup() returns miss for
-    /// poisoned keys so stale data is never served after a successful write.
-    /// Entries are removed when a subsequent purge or eviction succeeds.
-    poisoned_keys: tokio::sync::Mutex<std::collections::HashSet<CacheKey>>,
+
 }
 
 impl DiskCache {
@@ -84,7 +81,6 @@ impl DiskCache {
             stats: Arc::new(stats),
             singleflight: Arc::new(SingleFlight::new()),
             fill_state: tokio::sync::Mutex::new(FillState::default()),
-            poisoned_keys: tokio::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -189,6 +185,15 @@ impl DiskCache {
         let body = dir.join(format!("{hash}.body"));
         let meta = dir.join(format!("{hash}.meta.json"));
         (body, meta)
+    }
+
+    /// Path for the durable poison marker for a key. A `.poisoned` file next
+    /// to the entry signals that a purge failed and the entry must not be served.
+    /// This survives process restarts, unlike an in-memory set.
+    fn poison_path_for_key(&self, key: &CacheKey) -> PathBuf {
+        let hash = key.hash_hex();
+        let dir = self.cache_dir.join("objects").join(&hash[..2]).join(&hash[2..4]);
+        dir.join(format!("{hash}.poisoned"))
     }
 
     /// Get a reference to the singleflight instance.
@@ -317,6 +322,9 @@ impl DiskCache {
             }
         }
 
+        // Fresh content published — clear any stale poison marker for this key.
+        let _ = tokio::fs::remove_file(&self.poison_path_for_key(&guard.key)).await;
+
         // Update stats atomically (outside lock)
         self.stats.entry_count.fetch_add(1, Ordering::Relaxed);
         self.stats.total_bytes.fetch_add(body_size + meta_bytes.len() as u64, Ordering::Relaxed);
@@ -328,10 +336,9 @@ impl DiskCache {
 
 impl CacheStore for DiskCache {
     async fn lookup(&self, key: &CacheKey) -> Result<Option<CacheEntry>, ProxyError> {
-        // If the key was poisoned (purge failed after a write), treat as miss
-        // so stale data is never served. The entry will be cleaned up by
-        // eviction or a future successful purge.
-        if self.poisoned_keys.lock().await.contains(key) {
+        // If the key was poisoned (purge failed after a write), treat as miss.
+        // The .poisoned marker is durable on disk so it survives restarts.
+        if tokio::fs::try_exists(&self.poison_path_for_key(key)).await.unwrap_or(false) {
             self.stats.miss_count.fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         }
@@ -491,16 +498,19 @@ impl CacheStore for DiskCache {
             });
         }
 
-        // If purge succeeded, clear any poison marker for this key.
-        if removed {
-            self.poisoned_keys.lock().await.remove(key);
-        }
+        // Always clear the poison marker: if files were removed the stale data
+        // is gone, and if they were already absent there's nothing stale to block.
+        let _ = tokio::fs::remove_file(&self.poison_path_for_key(key)).await;
 
         Ok(removed)
     }
 
     async fn poison(&self, key: &CacheKey) {
-        self.poisoned_keys.lock().await.insert(key.clone());
+        let path = self.poison_path_for_key(key);
+        if let Some(parent) = path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        let _ = tokio::fs::write(&path, b"").await;
     }
 
     async fn stats(&self) -> CacheStatsSnapshot {

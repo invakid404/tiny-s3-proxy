@@ -64,20 +64,22 @@ async fn collect_candidates(
                 };
 
                 if !file_name.ends_with(".meta.json") {
-                    // Clean up orphan .body files: body exists but no matching metadata.
-                    // This can happen if the hash algorithm changes across builds or if
-                    // the process crashed between body and metadata writes in commit_fill.
+                    // Clean up orphan .body files and stale .poisoned markers.
                     if file_name.ends_with(".body") {
                         let hash = file_name.trim_end_matches(".body");
                         let meta_path = d2_path.join(format!("{}.meta.json", hash));
                         if !tokio::fs::try_exists(&meta_path).await.unwrap_or(true) {
                             let size = tokio::fs::metadata(&file_path).await.map(|m| m.len()).unwrap_or(0);
                             let _ = tokio::fs::remove_file(&file_path).await;
-                            tracing::debug!(
-                                path = %file_path.display(),
-                                size,
-                                "removed orphan body file (no matching metadata)"
-                            );
+                            tracing::debug!(path = %file_path.display(), size, "removed orphan body file");
+                        }
+                    } else if file_name.ends_with(".poisoned") {
+                        // Clean up orphan poison markers (no matching meta/body).
+                        let hash = file_name.trim_end_matches(".poisoned");
+                        let meta_path = d2_path.join(format!("{}.meta.json", hash));
+                        if !tokio::fs::try_exists(&meta_path).await.unwrap_or(true) {
+                            let _ = tokio::fs::remove_file(&file_path).await;
+                            tracing::debug!(path = %file_path.display(), "removed orphan poison marker");
                         }
                     }
                     continue;
@@ -159,6 +161,9 @@ pub async fn run_eviction_pass(
         let body_removed = tokio::fs::remove_file(&candidate.body_path).await.is_ok();
         let meta_removed = tokio::fs::remove_file(&candidate.meta_path).await.is_ok();
         if body_removed && meta_removed {
+            // Also remove any poison marker for this entry.
+            let poison_path = candidate.body_path.with_extension("poisoned");
+            let _ = tokio::fs::remove_file(&poison_path).await;
             current_size -= candidate.size;
             evicted += 1;
             tracing::debug!(
