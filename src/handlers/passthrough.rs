@@ -170,28 +170,53 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
     signing_instructions.apply_to_request_http1x(&mut signable_request);
 
     // 5. Send the request via reqwest (reuse client from AppState).
-    let mut req_builder = state.http_client.request(
-        reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET),
-        &upstream_url,
-    );
+    // Idempotent methods (GET, HEAD, DELETE) are retried on transport errors
+    // since the body is already buffered and signing is complete. Non-idempotent
+    // methods (PUT, POST) are sent once to avoid duplicate side effects.
+    let is_idempotent = matches!(method, "GET" | "HEAD" | "DELETE");
+    let max_attempts: u32 = if is_idempotent { 3 } else { 1 };
 
-    // Copy all headers from the signed request.
-    for (name, value) in signable_request.headers() {
-        if let Ok(v) = value.to_str() {
-            req_builder = req_builder.header(name.as_str(), v);
+    let mut last_err = None;
+    let mut upstream_resp = None;
+    for attempt in 1..=max_attempts {
+        let mut req_builder = state.http_client.request(
+            reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET),
+            &upstream_url,
+        );
+        for (name, value) in signable_request.headers() {
+            if let Ok(v) = value.to_str() {
+                req_builder = req_builder.header(name.as_str(), v);
+            }
+        }
+        // Bytes clone is O(1) (reference-counted), safe for retries.
+        if !body_bytes.is_empty() {
+            req_builder = req_builder.body(body_bytes.clone());
+        }
+
+        match req_builder.send().await {
+            Ok(resp) => {
+                upstream_resp = Some(resp);
+                break;
+            }
+            Err(e) => {
+                if attempt < max_attempts {
+                    tracing::warn!(
+                        error = %e,
+                        attempt,
+                        max_attempts,
+                        "passthrough: retrying idempotent request"
+                    );
+                }
+                last_err = Some(e);
+            }
         }
     }
 
-    // Set the body (Bytes clone is O(1), no need for .to_vec()).
-    if !body_bytes.is_empty() {
-        req_builder = req_builder.body(body_bytes);
-    }
-
-    let upstream_resp = match req_builder.send().await {
-        Ok(resp) => resp,
-        Err(e) => {
-            tracing::error!(error = %e, "passthrough: upstream request failed");
-            // Classify the transport error so clients get the right retry signal.
+    let upstream_resp = match upstream_resp {
+        Some(resp) => resp,
+        None => {
+            let e = last_err.unwrap();
+            tracing::error!(error = %e, "passthrough: upstream request failed after {max_attempts} attempts");
             let proxy_err = if e.is_timeout() {
                 crate::error::ProxyError::Timeout {
                     operation: "passthrough".into(),
