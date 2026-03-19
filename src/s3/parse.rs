@@ -91,13 +91,16 @@ pub fn parse_request<B>(req: &Request<B>) -> ParsedRequest {
                 path: path.to_string(),
             }
         } else {
-        // Operations on objects
+        // Operations on objects.
+        //
+        // Multipart-related query parameters (uploadId, partNumber, uploads)
+        // change the operation semantics entirely. We must handle them first
+        // and route any unrecognized combination through passthrough rather
+        // than letting it fall through to a plain object operation.
         match method {
-            "GET" | "HEAD" if query.contains_key("partNumber") => {
-                // Read-side partNumber (without uploadId) retrieves a single part
-                // of a multipart object. The typed backend interface doesn't carry
-                // this parameter, so route through passthrough to avoid silently
-                // dropping it.
+            // GET ?uploadId=... is ListParts — not a plain GetObject.
+            // GET ?partNumber=... is a part-level read (no typed handler).
+            "GET" | "HEAD" if query.contains_key("uploadId") || query.contains_key("partNumber") => {
                 S3Operation::Unsupported {
                     method: method.to_string(),
                     path: path.to_string(),
@@ -113,8 +116,6 @@ pub fn parse_request<B>(req: &Request<B>) -> ParsedRequest {
             },
             "PUT" => {
                 // CopyObject and UploadPartCopy use x-amz-copy-source.
-                // The typed backend has no copy model, so route through passthrough
-                // which preserves the header and gets the correct response shape.
                 if req.headers().contains_key("x-amz-copy-source") {
                     S3Operation::Unsupported {
                         method: method.to_string(),
@@ -131,6 +132,13 @@ pub fn parse_request<B>(req: &Request<B>) -> ParsedRequest {
                         key,
                         part_number,
                         upload_id,
+                    }
+                } else if query.contains_key("partNumber") || query.contains_key("uploadId") {
+                    // Incomplete multipart PUT — only one of the two params.
+                    // Don't silently treat as PutObject.
+                    S3Operation::Unsupported {
+                        method: method.to_string(),
+                        path: path.to_string(),
                     }
                 } else {
                     S3Operation::PutObject {
@@ -182,9 +190,10 @@ pub fn parse_request<B>(req: &Request<B>) -> ParsedRequest {
         // Bucket-level operations (no key)
         match method {
             "GET" => {
-                // Check for bucket-level subresource queries
+                // Check for bucket-level subresource queries and multipart listing.
+                // GET ?uploads is ListMultipartUploads — not a list-objects call.
                 let is_subresource = S3_SUBRESOURCE_PARAMS.iter().any(|p| query.contains_key(*p));
-                if is_subresource {
+                if is_subresource || query.contains_key("uploads") {
                     S3Operation::Unsupported {
                         method: method.to_string(),
                         path: path.to_string(),
@@ -242,6 +251,14 @@ pub fn parse_request<B>(req: &Request<B>) -> ParsedRequest {
         }
     }
 
+    // Capture standard content headers that the typed write path needs to forward.
+    let mut content_headers = HashMap::new();
+    for name in &["content-encoding", "content-disposition", "content-language", "cache-control", "expires"] {
+        if let Some(val) = header_str(req, name) {
+            content_headers.insert(name.to_string(), val);
+        }
+    }
+
     ParsedRequest {
         operation,
         request_id: request_id::generate(),
@@ -254,6 +271,7 @@ pub fn parse_request<B>(req: &Request<B>) -> ParsedRequest {
         range: header_str(req, "range"),
         user_metadata,
         extra_amz_headers,
+        content_headers,
     }
 }
 
@@ -644,5 +662,37 @@ mod tests {
         let req = build_request("PUT", "/mybucket/mykey");
         let parsed = parse_request(&req);
         assert!(matches!(parsed.operation, S3Operation::PutObject { .. }));
+    }
+
+    #[test]
+    fn test_get_with_upload_id_is_unsupported() {
+        // GET ?uploadId=... is ListParts, not GetObject
+        let req = build_request("GET", "/mybucket/mykey?uploadId=abc");
+        let parsed = parse_request(&req);
+        assert!(matches!(parsed.operation, S3Operation::Unsupported { .. }));
+    }
+
+    #[test]
+    fn test_get_bucket_uploads_is_unsupported() {
+        // GET /bucket?uploads is ListMultipartUploads, not ListObjects
+        let req = build_request("GET", "/mybucket?uploads");
+        let parsed = parse_request(&req);
+        assert!(matches!(parsed.operation, S3Operation::Unsupported { .. }));
+    }
+
+    #[test]
+    fn test_put_with_only_upload_id_is_unsupported() {
+        // PUT ?uploadId=... without partNumber is an incomplete multipart form
+        let req = build_request("PUT", "/mybucket/mykey?uploadId=abc");
+        let parsed = parse_request(&req);
+        assert!(matches!(parsed.operation, S3Operation::Unsupported { .. }));
+    }
+
+    #[test]
+    fn test_put_with_only_part_number_is_unsupported() {
+        // PUT ?partNumber=1 without uploadId is an incomplete multipart form
+        let req = build_request("PUT", "/mybucket/mykey?partNumber=1");
+        let parsed = parse_request(&req);
+        assert!(matches!(parsed.operation, S3Operation::Unsupported { .. }));
     }
 }
