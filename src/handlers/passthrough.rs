@@ -40,10 +40,32 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
     request_id: &str,
 ) -> Response<Body> {
     // 1. Build the upstream URL.
-    let backend_endpoint = state.config.backend_endpoint.trim_end_matches('/');
-    let upstream_url = match query {
-        Some(q) if !q.is_empty() => format!("{}{}?{}", backend_endpoint, path, q),
-        _ => format!("{}{}", backend_endpoint, path),
+    // When backend_use_path_style is false, rewrite to virtual-hosted-style:
+    //   https://bucket.endpoint/key  instead of  https://endpoint/bucket/key
+    let upstream_url = if !state.config.backend_use_path_style {
+        // path is "/<bucket>/<key>" — extract bucket from first segment.
+        let trimmed = path.strip_prefix('/').unwrap_or(path);
+        let (bucket_part, remainder) = trimmed.split_once('/').unwrap_or((trimmed, ""));
+        let endpoint = state.config.backend_endpoint.trim_end_matches('/');
+        // Insert bucket as a subdomain: https://bucket.host/key
+        let virtual_url = if let Some(stripped) = endpoint.strip_prefix("https://") {
+            format!("https://{bucket_part}.{stripped}/{remainder}")
+        } else if let Some(stripped) = endpoint.strip_prefix("http://") {
+            format!("http://{bucket_part}.{stripped}/{remainder}")
+        } else {
+            // Fallback to path-style if scheme is unrecognized
+            format!("{endpoint}{path}")
+        };
+        match query {
+            Some(q) if !q.is_empty() => format!("{virtual_url}?{q}"),
+            _ => virtual_url,
+        }
+    } else {
+        let backend_endpoint = state.config.backend_endpoint.trim_end_matches('/');
+        match query {
+            Some(q) if !q.is_empty() => format!("{backend_endpoint}{path}?{q}"),
+            _ => format!("{backend_endpoint}{path}"),
+        }
     };
 
     tracing::info!(
@@ -195,6 +217,20 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
 
         match req_builder.send().await {
             Ok(resp) => {
+                // Retry on retryable status codes for idempotent methods.
+                let status = resp.status().as_u16();
+                if is_idempotent
+                    && attempt < max_attempts
+                    && matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+                {
+                    tracing::warn!(
+                        status,
+                        attempt,
+                        max_attempts,
+                        "passthrough: retrying idempotent request on retryable status"
+                    );
+                    continue;
+                }
                 upstream_resp = Some(resp);
                 break;
             }
