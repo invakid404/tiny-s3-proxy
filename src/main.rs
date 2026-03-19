@@ -69,11 +69,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config: config.clone(),
         frontend_bucket: Arc::from(config.frontend_bucket.as_str()),
         backend_bucket: Arc::from(config.backend_bucket.as_str()),
-        // Passthrough client uses connect + read timeouts but no hard total
-        // timeout, so large streamed uploads/downloads are not cut off by
-        // a global deadline. The connect timeout guards against unreachable
-        // backends, and the read timeout guards against stalled connections.
+        // Locked-down passthrough client:
+        // - No redirect following: S3 3xx responses must reach the client unchanged.
+        // - No system proxy: the proxy re-signs requests with backend credentials,
+        //   so honoring HTTP_PROXY/HTTPS_PROXY would leak creds and object data.
+        // - Connect + read timeouts only (no hard total deadline) so streaming
+        //   uploads/downloads are not cut off.
         http_client: reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
             .connect_timeout(std::time::Duration::from_millis(config.upstream_connect_timeout_ms))
             .read_timeout(std::time::Duration::from_millis(config.upstream_request_timeout_ms))
             .build()
@@ -113,17 +117,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let s3_listener = tokio::net::TcpListener::bind(s3_addr).await?;
     let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;
 
-    // Run both servers concurrently; exit if either fails.
+    // Run both servers concurrently; exit with error if either fails.
     tokio::select! {
         result = axum::serve(s3_listener, s3_app) => {
-            if let Err(e) = result {
+            if let Err(e) = &result {
                 tracing::error!(error = %e, "S3 server error");
             }
+            result?;
         }
         result = axum::serve(admin_listener, admin_app) => {
-            if let Err(e) = result {
+            if let Err(e) = &result {
                 tracing::error!(error = %e, "admin server error");
             }
+            result?;
         }
     }
 
