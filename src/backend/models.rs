@@ -11,8 +11,9 @@ pub struct GetObjectMeta {
     pub last_modified: Option<DateTime<Utc>>,
     pub metadata: HashMap<String, String>,
     /// Standard S3 response headers not modeled as explicit fields, captured
-    /// via typed SDK accessors. See `S3_RESPONSE_EXTRA_HEADERS` in client.rs
-    /// for the exact list.
+    /// via typed SDK accessors. See `extract_extra_headers!` in client.rs for
+    /// the exact list (covers every typed accessor on GetObjectOutput as of
+    /// aws-sdk-s3 1.127.0).
     pub extra_headers: HashMap<String, String>,
 }
 
@@ -24,8 +25,10 @@ pub struct HeadObjectOutput {
     pub last_modified: Option<DateTime<Utc>>,
     pub metadata: HashMap<String, String>,
     /// Standard S3 response headers not modeled as explicit fields, captured
-    /// via typed SDK accessors. See `S3_RESPONSE_EXTRA_HEADERS` in client.rs
-    /// for the exact list.
+    /// via typed SDK accessors. See `extract_extra_headers!` +
+    /// `extract_head_extra_headers!` in client.rs for the exact list (covers
+    /// every typed accessor on HeadObjectOutput, including HEAD-only fields
+    /// like archive_status, as of aws-sdk-s3 1.127.0).
     pub extra_headers: HashMap<String, String>,
 }
 

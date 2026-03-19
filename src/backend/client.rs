@@ -173,10 +173,9 @@ fn to_chrono(dt: &aws_smithy_types::DateTime) -> Option<chrono::DateTime<chrono:
     chrono::DateTime::from_timestamp(dt.secs(), dt.subsec_nanos())
 }
 
-/// Extract additional S3 response headers from the SDK response object.
-/// Both GetObjectOutput and HeadObjectOutput expose the same accessor names,
-/// so this macro works for both types. This is the single source of truth for
-/// which headers the typed path captures.
+/// Extract S3 response headers shared by both GetObjectOutput and
+/// HeadObjectOutput into a HashMap. This covers every typed SDK accessor
+/// present on both response types as of aws-sdk-s3 1.127.0.
 macro_rules! extract_extra_headers {
     ($resp:expr) => {{
         let mut extra = HashMap::new();
@@ -198,6 +197,9 @@ macro_rules! extract_extra_headers {
         }
         if let Some(v) = $resp.accept_ranges() {
             extra.insert("accept-ranges".into(), v.to_string());
+        }
+        if let Some(v) = $resp.missing_meta() {
+            extra.insert("x-amz-missing-meta".into(), v.to_string());
         }
         // Versioning / lifecycle / replication
         if let Some(v) = $resp.version_id() {
@@ -228,6 +230,9 @@ macro_rules! extract_extra_headers {
         if let Some(v) = $resp.sse_customer_key_md5() {
             extra.insert("x-amz-server-side-encryption-customer-key-md5".into(), v.to_string());
         }
+        if $resp.bucket_key_enabled().unwrap_or(false) {
+            extra.insert("x-amz-server-side-encryption-bucket-key-enabled".into(), "true".into());
+        }
         // Storage / object-lock
         if let Some(v) = $resp.storage_class() {
             extra.insert("x-amz-storage-class".into(), v.as_str().to_string());
@@ -248,6 +253,10 @@ macro_rules! extract_extra_headers {
         if let Some(v) = $resp.website_redirect_location() {
             extra.insert("x-amz-website-redirect-location".into(), v.to_string());
         }
+        // Tagging
+        if let Some(v) = $resp.tag_count() {
+            extra.insert("x-amz-tagging-count".into(), v.to_string());
+        }
         // Checksums
         if let Some(v) = $resp.checksum_crc32() {
             extra.insert("x-amz-checksum-crc32".into(), v.to_string());
@@ -255,14 +264,29 @@ macro_rules! extract_extra_headers {
         if let Some(v) = $resp.checksum_crc32_c() {
             extra.insert("x-amz-checksum-crc32c".into(), v.to_string());
         }
+        if let Some(v) = $resp.checksum_crc64_nvme() {
+            extra.insert("x-amz-checksum-crc64nvme".into(), v.to_string());
+        }
         if let Some(v) = $resp.checksum_sha1() {
             extra.insert("x-amz-checksum-sha1".into(), v.to_string());
         }
         if let Some(v) = $resp.checksum_sha256() {
             extra.insert("x-amz-checksum-sha256".into(), v.to_string());
         }
+        if let Some(v) = $resp.checksum_type() {
+            extra.insert("x-amz-checksum-type".into(), v.as_str().to_string());
+        }
         extra
     }};
+}
+
+/// Extract HEAD-only response headers not present on GetObjectOutput.
+macro_rules! extract_head_extra_headers {
+    ($resp:expr, $extra:expr) => {
+        if let Some(v) = $resp.archive_status() {
+            $extra.insert("x-amz-archive-status".into(), v.as_str().to_string());
+        }
+    };
 }
 
 impl Backend for S3Backend {
@@ -340,7 +364,8 @@ impl Backend for S3Backend {
                     })
                     .unwrap_or_default();
 
-                let extra_headers = extract_extra_headers!(resp);
+                let mut extra_headers = extract_extra_headers!(resp);
+                extract_head_extra_headers!(resp, extra_headers);
 
                 Ok(HeadObjectOutput {
                     content_type,
