@@ -148,7 +148,7 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
         }
         S3Operation::PutObject { key, .. } => put::handle_put(&state, &parsed, key, body).await,
         S3Operation::DeleteObject { key, .. } => {
-            if has_unsupported_write_modifiers(&parsed.extra_amz_headers) {
+            if has_unsupported_write_modifiers(&parsed.extra_amz_headers, &parts.headers) {
                 let raw_path = parts.uri.path();
                 let rewritten = rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
                 let query = parts.uri.query();
@@ -165,7 +165,7 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
             list::handle_list(&state, &parsed, params, is_v2).await
         }
         S3Operation::CreateMultipartUpload { key, .. } => {
-            if has_unsupported_write_modifiers(&parsed.extra_amz_headers) {
+            if has_unsupported_write_modifiers(&parsed.extra_amz_headers, &parts.headers) {
                 let raw_path = parts.uri.path();
                 let rewritten = rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
                 let query = parts.uri.query();
@@ -182,7 +182,7 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
             upload_id,
             ..
         } => {
-            if has_unsupported_write_modifiers(&parsed.extra_amz_headers) {
+            if has_unsupported_write_modifiers(&parsed.extra_amz_headers, &parts.headers) {
                 let raw_path = parts.uri.path();
                 let rewritten = rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
                 let query = parts.uri.query();
@@ -195,7 +195,7 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
             }
         }
         S3Operation::CompleteMultipartUpload { key, upload_id, .. } => {
-            if has_unsupported_write_modifiers(&parsed.extra_amz_headers) {
+            if has_unsupported_write_modifiers(&parsed.extra_amz_headers, &parts.headers) {
                 let raw_path = parts.uri.path();
                 let rewritten = rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
                 let query = parts.uri.query();
@@ -207,7 +207,16 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
             }
         }
         S3Operation::AbortMultipartUpload { key, upload_id, .. } => {
-            multipart::handle_abort_multipart(&state, &parsed, key, upload_id).await
+            if has_unsupported_write_modifiers(&parsed.extra_amz_headers, &parts.headers) {
+                let raw_path = parts.uri.path();
+                let rewritten = rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
+                let query = parts.uri.query();
+                passthrough::handle_passthrough(
+                    &state, "DELETE", &rewritten, query, &parts.headers, body, &parsed.request_id,
+                ).await
+            } else {
+                multipart::handle_abort_multipart(&state, &parsed, key, upload_id).await
+            }
         }
         S3Operation::Unsupported { .. } => {
             // Already handled above; this branch is unreachable.
@@ -282,11 +291,24 @@ fn has_unsupported_get_modifiers(headers: &http::HeaderMap) -> bool {
         || headers.keys().any(|k| k.as_str().starts_with("x-amz-server-side-encryption-customer-"))
 }
 
-/// Check if the request contains write-side x-amz-* headers that the typed
-/// path does not forward. Uses a whitelist of known operation-modifying
-/// headers to avoid false positives from benign SDK headers like
-/// x-amz-user-agent that trigger passthrough unnecessarily.
-fn has_unsupported_write_modifiers(extra_amz: &std::collections::HashMap<String, String>) -> bool {
+/// Check if the request contains write-side headers that the typed path
+/// does not forward. Inspects both the parsed `extra_amz_headers` and the
+/// raw HTTP header map (for standard headers like If-Match/If-None-Match
+/// that are not stored in extra_amz_headers).
+fn has_unsupported_write_modifiers(
+    extra_amz: &std::collections::HashMap<String, String>,
+    raw_headers: &http::HeaderMap,
+) -> bool {
+    // Standard HTTP headers the typed write/delete/multipart paths don't forward.
+    if raw_headers.contains_key("if-match")
+        || raw_headers.contains_key("if-none-match")
+    {
+        return true;
+    }
+
+    // x-amz-* headers that modify write/delete/multipart semantics and the
+    // typed path cannot forward. Uses a whitelist to avoid false positives
+    // from benign SDK headers like x-amz-user-agent.
     const OPERATION_MODIFYING: &[&str] = &[
         "x-amz-storage-class",
         "x-amz-server-side-encryption",
@@ -311,6 +333,12 @@ fn has_unsupported_write_modifiers(extra_amz: &std::collections::HashMap<String,
         "x-amz-checksum-crc64nvme",
         "x-amz-checksum-sha1",
         "x-amz-checksum-sha256",
+        "x-amz-checksum-type",
+        "x-amz-sdk-checksum-algorithm",
+        "x-amz-mp-object-size",
+        "x-amz-if-match-last-modified-time",
+        "x-amz-if-match-size",
+        "x-amz-if-match-initiated-time",
         "x-amz-acl",
         "x-amz-grant-full-control",
         "x-amz-grant-read",
