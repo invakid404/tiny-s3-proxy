@@ -233,11 +233,14 @@ pub async fn handle_complete_multipart<B: Backend, C: CacheStore>(
                 "multipart upload completed"
             );
 
+            // Omit the backend Location — it contains the internal backend
+            // endpoint/bucket which would leak to clients. The proxy cannot
+            // reliably reconstruct the correct public-facing URL.
             let xml = serialize_complete_multipart(
                 &state.frontend_bucket,
                 key,
                 output.etag.as_deref(),
-                output.location.as_deref(),
+                None,
             );
 
             let headers = common_headers(&parsed.request_id);
