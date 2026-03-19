@@ -11,16 +11,15 @@ use crate::cache::singleflight::SingleFlight;
 use crate::cache::{CacheStats, CacheStatsSnapshot, CacheStore, FillGuard};
 use crate::error::ProxyError;
 
-/// Tracks in-flight fills and per-key invalidation generations.
+/// Tracks in-flight fills for serializing same-key publishers.
 ///
-/// `active_fills` is a reference count of outstanding `FillGuard`s per key,
-/// so overlapping fills (e.g. after singleflight cancel + re-acquire) are
-/// tracked independently. `purge()` only creates a generation entry when
-/// the count is > 0. Both maps are bounded by the number of concurrent fills.
+/// `active_fills` is a reference count of outstanding `FillGuard`s per key.
+/// `generation_counters` maps each active key to a lock-free `AtomicU64`
+/// that `purge()` can bump without acquiring the mutex.
 #[derive(Default)]
 struct FillState {
     active_fills: HashMap<CacheKey, usize>,
-    generations: HashMap<CacheKey, u64>,
+    generation_counters: HashMap<CacheKey, Arc<std::sync::atomic::AtomicU64>>,
 }
 
 /// Disk-backed implementation of `CacheStore`.
@@ -35,18 +34,10 @@ pub struct DiskCache {
     policy: CachePolicy,
     stats: Arc<CacheStats>,
     singleflight: Arc<SingleFlight>,
-    /// Cache invalidation state, protected by a single mutex to ensure
-    /// atomicity between generation checks and cache publishing.
-    ///
-    /// `active_fills` tracks keys with in-flight fill operations. `purge()`
-    /// only creates a generation entry when an active fill exists for that key,
-    /// so the map is bounded by the number of concurrent fills (not total purges).
-    ///
-    /// `generations` maps keys to a counter that is bumped by `purge()` and
-    /// captured by `begin_fill()`. `commit_fill()` re-checks the counter
-    /// under this lock immediately before the atomic rename.
+    /// Serializes same-key file operations (old-entry removal, rename, stats).
+    /// Generation counters inside are `AtomicU64` so `purge()` can bump them
+    /// without waiting behind a fill that holds the mutex.
     fill_state: tokio::sync::Mutex<FillState>,
-
 }
 
 impl DiskCache {
@@ -206,7 +197,7 @@ impl DiskCache {
             *count -= 1;
             if *count == 0 {
                 state.active_fills.remove(key);
-                state.generations.remove(key);
+                state.generation_counters.remove(key);
             }
         }
     }
@@ -219,10 +210,14 @@ impl DiskCache {
         temp_body_path: PathBuf,
         meta: CacheMeta,
     ) -> Result<(), ProxyError> {
-        // Early check: bail fast if already invalidated (avoids unnecessary I/O).
+        // Early check: read the generation counter lock-free to bail fast.
         {
             let state = self.fill_state.lock().await;
-            if state.generations.get(&guard.key).copied().unwrap_or(0) != guard.generation {
+            let current_gen = state.generation_counters
+                .get(&guard.key)
+                .map(|c| c.load(Ordering::Acquire))
+                .unwrap_or(0);
+            if current_gen != guard.generation {
                 tracing::info!(
                     key = %guard.key.object_key,
                     "cache fill rejected (early check): key invalidated during fill"
@@ -281,17 +276,16 @@ impl DiskCache {
                 })?;
         }
 
-        // All stat-mutating operations for this key are serialized under
-        // fill_state: old-entry removal, generation check, rename, and stats
-        // update. This prevents overlapping fills from double-counting and
-        // ensures the old/new size accounting is atomic.
-        //
-        // Eviction runs independently and can still race, but it reconciles
-        // stats from a full disk scan (using store, not fetch_add) at the end
-        // of each pass, so any transient drift self-corrects.
+        // Check generation BEFORE acquiring the file-operations lock.
+        // The generation counter is an AtomicU64, so purge() can bump it
+        // without waiting behind a fill that holds the mutex.
         {
             let state = self.fill_state.lock().await;
-            if state.generations.get(&guard.key).copied().unwrap_or(0) != guard.generation {
+            let current_gen = state.generation_counters
+                .get(&guard.key)
+                .map(|c| c.load(Ordering::Acquire))
+                .unwrap_or(0);
+            if current_gen != guard.generation {
                 tracing::info!(
                     key = %guard.key.object_key,
                     "cache fill rejected (pre-publish): key invalidated during fill"
@@ -302,7 +296,8 @@ impl DiskCache {
                 return Ok(());
             }
 
-            // Remove any pre-existing entry and subtract its sizes.
+            // Under lock: remove old entry, rename, update stats atomically.
+            // This serializes overlapping fills for the same key.
             let old_body_size = tokio::fs::metadata(&final_body).await.map(|m| m.len()).unwrap_or(0);
             let old_meta_size = tokio::fs::metadata(&final_meta).await.map(|m| m.len()).unwrap_or(0);
             if old_body_size > 0 || old_meta_size > 0 {
@@ -318,7 +313,22 @@ impl DiskCache {
                 );
             }
 
-            // Atomic rename — publish the new cache entry.
+            // Re-check generation after file removal but before publish.
+            // purge() may have bumped it while we were doing I/O above.
+            let current_gen = state.generation_counters
+                .get(&guard.key)
+                .map(|c| c.load(Ordering::Acquire))
+                .unwrap_or(0);
+            if current_gen != guard.generation {
+                tracing::info!(
+                    key = %guard.key.object_key,
+                    "cache fill rejected (late check): key invalidated during publish prep"
+                );
+                let _ = tokio::fs::remove_file(&temp_body_path).await;
+                let _ = tokio::fs::remove_file(&temp_meta).await;
+                return Ok(());
+            }
+
             tokio::fs::rename(&temp_body_path, &final_body)
                 .await
                 .map_err(|e| ProxyError::Cache {
@@ -333,7 +343,6 @@ impl DiskCache {
                 });
             }
 
-            // Stats: add the new entry.
             let new_size = body_size + meta_bytes.len() as u64;
             self.stats.entry_count.fetch_add(1, Ordering::Relaxed);
             self.stats.total_bytes.fetch_add(new_size, Ordering::Relaxed);
@@ -455,7 +464,10 @@ impl CacheStore for DiskCache {
         let generation = {
             let mut state = self.fill_state.lock().await;
             *state.active_fills.entry(key.clone()).or_insert(0) += 1;
-            state.generations.get(key).copied().unwrap_or(0)
+            let counter = state.generation_counters
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(std::sync::atomic::AtomicU64::new(0)));
+            counter.load(Ordering::Acquire)
         };
         let temp_dir = self.cache_dir.join("tmp");
         Ok(FillGuard {
@@ -485,15 +497,16 @@ impl CacheStore for DiskCache {
     }
 
     async fn purge(&self, key: &CacheKey) -> Result<bool, ProxyError> {
-        // Only bump the generation counter if there's an active fill for this
-        // key. This bounds the map to the number of concurrent fills — a purge
-        // without a concurrent fill has nothing to invalidate.
-        {
-            let mut state = self.fill_state.lock().await;
-            if state.active_fills.get(key).copied().unwrap_or(0) > 0 {
-                let counter = state.generations.entry(key.clone()).or_insert(0);
-                *counter += 1;
-            }
+        // Grab the generation counter Arc (if any active fill exists) under
+        // a brief lock, then bump it AFTER releasing the mutex. The atomic
+        // bump does not need the lock, so purge never blocks behind a fill's
+        // publish critical section.
+        let counter_arc = {
+            let state = self.fill_state.lock().await;
+            state.generation_counters.get(key).cloned()
+        };
+        if let Some(counter) = counter_arc {
+            counter.fetch_add(1, Ordering::Release);
         }
 
         let (body_path, meta_path) = self.paths_for_key(key);
