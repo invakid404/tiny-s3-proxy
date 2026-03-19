@@ -239,6 +239,12 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
 
                 let cache = state.cache.clone();
                 let cache_key_owned = cache_key.clone();
+
+                // Capture the fill guard BEFORE downloading starts, so the
+                // generation reflects the pre-fetch state. If a purge happens
+                // during the download, commit_fill will detect the mismatch.
+                let fill_guard = cache.begin_fill(&cache_key_owned).await.ok();
+
                 let cache_meta = CacheMeta {
                     bucket: state.backend_bucket.to_string(),
                     key: key.to_string(),
@@ -311,21 +317,17 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                         }
                         drop(file);
 
-                        match cache.begin_fill(&cache_key_owned).await {
-                            Ok(guard) => {
-                                if let Err(e) = cache
-                                    .commit_fill(guard, temp_path_clone.clone(), cache_meta)
-                                    .await
-                                {
-                                    tracing::warn!("cache fill: commit error: {}", e);
-                                    let _ =
-                                        tokio::fs::remove_file(&temp_path_clone).await;
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!("cache fill: begin_fill error: {}", e);
+                        if let Some(guard) = fill_guard {
+                            if let Err(e) = cache
+                                .commit_fill(guard, temp_path_clone.clone(), cache_meta)
+                                .await
+                            {
+                                tracing::warn!("cache fill: commit error: {}", e);
                                 let _ = tokio::fs::remove_file(&temp_path_clone).await;
                             }
+                        } else {
+                            tracing::warn!("cache fill: no fill guard, skipping cache commit");
+                            let _ = tokio::fs::remove_file(&temp_path_clone).await;
                         }
                     } else {
                         let _ = tokio::fs::remove_file(&temp_path_clone).await;

@@ -46,6 +46,9 @@ pub trait CacheStore: Send + Sync {
 pub struct FillGuard {
     pub key: CacheKey,
     pub temp_dir: std::path::PathBuf,
+    /// Generation counter captured at begin_fill time. If the generation
+    /// has changed by commit_fill, the fill is rejected (a purge happened).
+    pub generation: u64,
 }
 
 /// Cache statistics for metrics/admin, using atomics for lock-free updates.

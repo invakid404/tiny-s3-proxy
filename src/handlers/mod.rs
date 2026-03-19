@@ -122,9 +122,10 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
             if has_unsupported_get_modifiers(&parts.headers) {
                 // Route through raw passthrough to preserve headers like Range,
                 // If-Match, If-None-Match, SSE-C, etc. that the typed backend
-                // API cannot carry.
-                let path = format!("/{}/{}", state.frontend_bucket, key);
-                let rewritten = rewrite_bucket_in_path(&path, &state.frontend_bucket, &state.backend_bucket);
+                // API cannot carry. Use the original raw URI path to preserve
+                // percent-encoding (the parsed `key` is already decoded).
+                let raw_path = parts.uri.path();
+                let rewritten = rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
                 let query = parts.uri.query();
                 passthrough::handle_passthrough(
                     &state, "GET", &rewritten, query, &parts.headers, body, &parsed.request_id,
@@ -135,8 +136,8 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
         }
         S3Operation::HeadObject { key, .. } => {
             if has_unsupported_get_modifiers(&parts.headers) {
-                let path = format!("/{}/{}", state.frontend_bucket, key);
-                let rewritten = rewrite_bucket_in_path(&path, &state.frontend_bucket, &state.backend_bucket);
+                let raw_path = parts.uri.path();
+                let rewritten = rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
                 let query = parts.uri.query();
                 passthrough::handle_passthrough(
                     &state, "HEAD", &rewritten, query, &parts.headers, body, &parsed.request_id,
@@ -597,6 +598,7 @@ pub mod test_utils {
             Ok(FillGuard {
                 key: key.clone(),
                 temp_dir: self.temp_dir.path().to_path_buf(),
+                generation: 0,
             })
         }
 

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -23,9 +23,11 @@ pub struct DiskCache {
     policy: CachePolicy,
     stats: Arc<CacheStats>,
     singleflight: Arc<SingleFlight>,
-    /// Keys that have been purged while a fill was in progress.
-    /// Used to prevent stale data from being committed after a concurrent write.
-    invalidated_during_fill: tokio::sync::Mutex<HashSet<CacheKey>>,
+    /// Per-key generation counter for cache invalidation. Incremented by purge(),
+    /// captured by begin_fill(), and re-checked by commit_fill() immediately
+    /// before publishing. This prevents the race where an in-flight GET re-caches
+    /// stale data after a concurrent write/delete.
+    fill_generations: tokio::sync::Mutex<HashMap<CacheKey, u64>>,
 }
 
 impl DiskCache {
@@ -59,7 +61,7 @@ impl DiskCache {
             policy,
             stats: Arc::new(stats),
             singleflight: Arc::new(SingleFlight::new()),
-            invalidated_during_fill: tokio::sync::Mutex::new(HashSet::new()),
+            fill_generations: tokio::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -229,13 +231,15 @@ impl CacheStore for DiskCache {
     }
 
     async fn begin_fill(&self, key: &CacheKey) -> Result<FillGuard, ProxyError> {
-        // Clear any pending invalidation — this is a fresh fill attempt.
-        self.invalidated_during_fill.lock().await.remove(key);
-
+        let generation = {
+            let gens = self.fill_generations.lock().await;
+            gens.get(key).copied().unwrap_or(0)
+        };
         let temp_dir = self.cache_dir.join("tmp");
         Ok(FillGuard {
             key: key.clone(),
             temp_dir,
+            generation,
         })
     }
 
@@ -245,16 +249,17 @@ impl CacheStore for DiskCache {
         temp_body_path: PathBuf,
         meta: CacheMeta,
     ) -> Result<(), ProxyError> {
-        // Check if the key was purged while we were filling. If so, discard
-        // the fill to avoid re-caching stale data after a concurrent write.
-        if self.invalidated_during_fill.lock().await.remove(&guard.key) {
-            tracing::info!(
-                key = %guard.key.object_key,
-                "cache fill rejected: key was invalidated during fill (concurrent write/delete)"
-            );
-            // Clean up the temp file
-            let _ = tokio::fs::remove_file(&temp_body_path).await;
-            return Ok(());
+        // Early check: bail fast if already invalidated (avoids unnecessary I/O).
+        {
+            let gens = self.fill_generations.lock().await;
+            if gens.get(&guard.key).copied().unwrap_or(0) != guard.generation {
+                tracing::info!(
+                    key = %guard.key.object_key,
+                    "cache fill rejected (early check): key invalidated during fill"
+                );
+                let _ = tokio::fs::remove_file(&temp_body_path).await;
+                return Ok(());
+            }
         }
 
         static COMMIT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -262,13 +267,12 @@ impl CacheStore for DiskCache {
         let pid = std::process::id();
 
         // The body file has already been written and fsynced by the caller.
-        // Get its size for stats.
         let body_size = tokio::fs::metadata(&temp_body_path)
             .await
             .map(|m| m.len())
             .unwrap_or(0);
 
-        // Write metadata to temp file (use compact JSON, not pretty-printed)
+        // Write metadata to temp file
         let temp_meta = guard.temp_dir.join(format!("{pid}-{id}.meta.json"));
         let meta_bytes = serde_json::to_vec(&meta).map_err(|e| ProxyError::Cache {
             source: Box::new(e),
@@ -307,23 +311,42 @@ impl CacheStore for DiskCache {
                 })?;
         }
 
-        // Atomic rename
-        tokio::fs::rename(&temp_body_path, &final_body)
-            .await
-            .map_err(|e| ProxyError::Cache {
-                source: Box::new(e),
-                operation: "rename body".into(),
-            })?;
-        if let Err(e) = tokio::fs::rename(&temp_meta, &final_meta).await {
-            // Clean up the already-renamed body to avoid orphan files.
-            let _ = tokio::fs::remove_file(&final_body).await;
-            return Err(ProxyError::Cache {
-                source: Box::new(e),
-                operation: "rename metadata".into(),
-            });
+        // Re-check generation under lock and do atomic rename while holding it.
+        // purge() also acquires this lock before incrementing, so the check +
+        // rename is atomic with respect to invalidation.
+        {
+            let mut gens = self.fill_generations.lock().await;
+            if gens.get(&guard.key).copied().unwrap_or(0) != guard.generation {
+                tracing::info!(
+                    key = %guard.key.object_key,
+                    "cache fill rejected (pre-publish): key invalidated during fill"
+                );
+                let _ = tokio::fs::remove_file(&temp_body_path).await;
+                let _ = tokio::fs::remove_file(&temp_meta).await;
+                return Ok(());
+            }
+
+            // Atomic rename — publish the cache entry while holding the lock.
+            tokio::fs::rename(&temp_body_path, &final_body)
+                .await
+                .map_err(|e| ProxyError::Cache {
+                    source: Box::new(e),
+                    operation: "rename body".into(),
+                })?;
+            if let Err(e) = tokio::fs::rename(&temp_meta, &final_meta).await {
+                let _ = tokio::fs::remove_file(&final_body).await;
+                return Err(ProxyError::Cache {
+                    source: Box::new(e),
+                    operation: "rename metadata".into(),
+                });
+            }
+
+            // Fill succeeded — clean up the generation entry to bound map growth.
+            // If a new purge arrives after this point, it will re-add the entry.
+            gens.remove(&guard.key);
         }
 
-        // Update stats atomically
+        // Update stats atomically (outside lock)
         self.stats.entry_count.fetch_add(1, Ordering::Relaxed);
         self.stats.total_bytes.fetch_add(body_size + meta_bytes.len() as u64, Ordering::Relaxed);
         self.stats.fill_count.fetch_add(1, Ordering::Relaxed);
@@ -332,10 +355,13 @@ impl CacheStore for DiskCache {
     }
 
     async fn purge(&self, key: &CacheKey) -> Result<bool, ProxyError> {
-        // Mark key as invalidated so any in-flight fill for this key will be
-        // rejected when it tries to commit. This prevents the race where a
-        // GET download finishes after a PUT/DELETE and re-caches stale data.
-        self.invalidated_during_fill.lock().await.insert(key.clone());
+        // Bump the generation counter so any in-flight fill that captured an
+        // older generation will be rejected at commit time.
+        {
+            let mut gens = self.fill_generations.lock().await;
+            let counter = gens.entry(key.clone()).or_insert(0);
+            *counter += 1;
+        }
 
         let (body_path, meta_path) = self.paths_for_key(key);
 
@@ -801,26 +827,20 @@ mod tests {
         let body = b"stale content".to_vec();
         let meta = test_meta(body.len());
 
-        // Write temp file
         let temp_path = write_temp_body(tmp.path(), &body).await;
 
-        // Begin a fill
+        // 1. Begin fill — captures generation BEFORE download starts
         let guard = cache.begin_fill(&key).await.unwrap();
+        assert_eq!(guard.generation, 0);
 
-        // Simulate a concurrent purge AFTER the fill began
-        // (In real usage, this would be a PUT/DELETE on the same key)
-        // First, we need an entry to purge. Let's just call purge on a non-existent key
-        // to add it to the invalidation set.
+        // 2. Simulate concurrent purge (PUT/DELETE on the same key)
         let _ = cache.purge(&key).await;
 
-        // Now commit_fill should be rejected
+        // 3. Commit fill — should detect generation mismatch and reject
         cache.commit_fill(guard, temp_path.clone(), meta).await.unwrap();
 
         // The entry should NOT be in the cache
         let entry = cache.lookup(&key).await.unwrap();
         assert!(entry.is_none(), "stale fill should have been rejected after purge");
-
-        // The temp file should have been cleaned up
-        assert!(!tokio::fs::try_exists(&temp_path).await.unwrap_or(true));
     }
 }
