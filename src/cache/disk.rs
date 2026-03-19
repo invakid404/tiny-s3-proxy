@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -22,6 +23,9 @@ pub struct DiskCache {
     policy: CachePolicy,
     stats: Arc<CacheStats>,
     singleflight: Arc<SingleFlight>,
+    /// Keys that have been purged while a fill was in progress.
+    /// Used to prevent stale data from being committed after a concurrent write.
+    invalidated_during_fill: tokio::sync::Mutex<HashSet<CacheKey>>,
 }
 
 impl DiskCache {
@@ -55,6 +59,7 @@ impl DiskCache {
             policy,
             stats: Arc::new(stats),
             singleflight: Arc::new(SingleFlight::new()),
+            invalidated_during_fill: tokio::sync::Mutex::new(HashSet::new()),
         })
     }
 
@@ -224,6 +229,9 @@ impl CacheStore for DiskCache {
     }
 
     async fn begin_fill(&self, key: &CacheKey) -> Result<FillGuard, ProxyError> {
+        // Clear any pending invalidation — this is a fresh fill attempt.
+        self.invalidated_during_fill.lock().await.remove(key);
+
         let temp_dir = self.cache_dir.join("tmp");
         Ok(FillGuard {
             key: key.clone(),
@@ -237,6 +245,18 @@ impl CacheStore for DiskCache {
         temp_body_path: PathBuf,
         meta: CacheMeta,
     ) -> Result<(), ProxyError> {
+        // Check if the key was purged while we were filling. If so, discard
+        // the fill to avoid re-caching stale data after a concurrent write.
+        if self.invalidated_during_fill.lock().await.remove(&guard.key) {
+            tracing::info!(
+                key = %guard.key.object_key,
+                "cache fill rejected: key was invalidated during fill (concurrent write/delete)"
+            );
+            // Clean up the temp file
+            let _ = tokio::fs::remove_file(&temp_body_path).await;
+            return Ok(());
+        }
+
         static COMMIT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COMMIT_COUNTER.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
@@ -312,6 +332,11 @@ impl CacheStore for DiskCache {
     }
 
     async fn purge(&self, key: &CacheKey) -> Result<bool, ProxyError> {
+        // Mark key as invalidated so any in-flight fill for this key will be
+        // rejected when it tries to commit. This prevents the race where a
+        // GET download finishes after a PUT/DELETE and re-caches stale data.
+        self.invalidated_during_fill.lock().await.insert(key.clone());
+
         let (body_path, meta_path) = self.paths_for_key(key);
 
         // Use async filesystem checks instead of blocking .exists()
@@ -763,5 +788,39 @@ mod tests {
             "last_accessed_at should have been updated to now, age: {:?}",
             age
         );
+    }
+
+    #[tokio::test]
+    async fn test_commit_fill_rejected_after_purge() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = DiskCache::new(tmp.path().to_path_buf(), 1_000_000, test_policy())
+            .await
+            .unwrap();
+
+        let key = test_key();
+        let body = b"stale content".to_vec();
+        let meta = test_meta(body.len());
+
+        // Write temp file
+        let temp_path = write_temp_body(tmp.path(), &body).await;
+
+        // Begin a fill
+        let guard = cache.begin_fill(&key).await.unwrap();
+
+        // Simulate a concurrent purge AFTER the fill began
+        // (In real usage, this would be a PUT/DELETE on the same key)
+        // First, we need an entry to purge. Let's just call purge on a non-existent key
+        // to add it to the invalidation set.
+        let _ = cache.purge(&key).await;
+
+        // Now commit_fill should be rejected
+        cache.commit_fill(guard, temp_path.clone(), meta).await.unwrap();
+
+        // The entry should NOT be in the cache
+        let entry = cache.lookup(&key).await.unwrap();
+        assert!(entry.is_none(), "stale fill should have been rejected after purge");
+
+        // The temp file should have been cleaned up
+        assert!(!tokio::fs::try_exists(&temp_path).await.unwrap_or(true));
     }
 }
