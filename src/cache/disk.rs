@@ -366,9 +366,13 @@ impl CacheStore for DiskCache {
             operation: "parse metadata".into(),
         })?;
 
-        // Verify body file exists (cheap stat, not a full read)
+        // Verify body file exists (cheap stat, not a full read).
+        // If the body is gone but metadata remains, clean up the orphan so
+        // cache accounting stays accurate and a future refill doesn't
+        // double-count the entry.
         if !tokio::fs::try_exists(&body_path).await.unwrap_or(false) {
             self.stats.miss_count.fetch_add(1, Ordering::Relaxed);
+            let _ = tokio::fs::remove_file(&meta_path).await;
             return Ok(None);
         }
 
