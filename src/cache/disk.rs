@@ -46,6 +46,10 @@ pub struct DiskCache {
     /// captured by `begin_fill()`. `commit_fill()` re-checks the counter
     /// under this lock immediately before the atomic rename.
     fill_state: tokio::sync::Mutex<FillState>,
+    /// Keys where purge failed after retries. lookup() returns miss for
+    /// poisoned keys so stale data is never served after a successful write.
+    /// Entries are removed when a subsequent purge or eviction succeeds.
+    poisoned_keys: tokio::sync::Mutex<std::collections::HashSet<CacheKey>>,
 }
 
 impl DiskCache {
@@ -80,6 +84,7 @@ impl DiskCache {
             stats: Arc::new(stats),
             singleflight: Arc::new(SingleFlight::new()),
             fill_state: tokio::sync::Mutex::new(FillState::default()),
+            poisoned_keys: tokio::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -323,6 +328,14 @@ impl DiskCache {
 
 impl CacheStore for DiskCache {
     async fn lookup(&self, key: &CacheKey) -> Result<Option<CacheEntry>, ProxyError> {
+        // If the key was poisoned (purge failed after a write), treat as miss
+        // so stale data is never served. The entry will be cleaned up by
+        // eviction or a future successful purge.
+        if self.poisoned_keys.lock().await.contains(key) {
+            self.stats.miss_count.fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        }
+
         let (body_path, meta_path) = self.paths_for_key(key);
 
         // Single syscall: try to read metadata. NotFound = cache miss.
@@ -478,7 +491,16 @@ impl CacheStore for DiskCache {
             });
         }
 
+        // If purge succeeded, clear any poison marker for this key.
+        if removed {
+            self.poisoned_keys.lock().await.remove(key);
+        }
+
         Ok(removed)
+    }
+
+    async fn poison(&self, key: &CacheKey) {
+        self.poisoned_keys.lock().await.insert(key.clone());
     }
 
     async fn stats(&self) -> CacheStatsSnapshot {

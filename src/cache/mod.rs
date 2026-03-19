@@ -41,6 +41,10 @@ pub trait CacheStore: Send + Sync {
     /// Remove a cached entry.
     fn purge(&self, key: &CacheKey) -> impl std::future::Future<Output = Result<bool, ProxyError>> + Send;
 
+    /// Mark a key as poisoned so lookup returns miss until the entry is
+    /// successfully purged or evicted. Used when purge fails after a write.
+    fn poison(&self, key: &CacheKey) -> impl std::future::Future<Output = ()> + Send;
+
     /// Get current cache statistics snapshot.
     fn stats(&self) -> impl std::future::Future<Output = CacheStatsSnapshot> + Send;
 }

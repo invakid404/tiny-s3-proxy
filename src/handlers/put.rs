@@ -69,8 +69,9 @@ pub async fn handle_put<B: Backend, C: CacheStore>(
                         error = %e2,
                         operation = "PutObject",
                         key = key,
-                        "cache purge failed on retry — stale data may persist until eviction"
+                        "cache purge failed on retry — poisoning key to block stale reads"
                     );
+                    state.cache.poison(&cache_key).await;
                 }
             }
             state.singleflight.cancel(&cache_key).await;

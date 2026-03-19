@@ -223,8 +223,9 @@ pub async fn handle_complete_multipart<B: Backend, C: CacheStore>(
                         error = %e2,
                         operation = "CompleteMultipartUpload",
                         key = key,
-                        "cache purge failed on retry — stale data may persist until eviction"
+                        "cache purge failed on retry — poisoning key to block stale reads"
                     );
+                    state.cache.poison(&cache_key).await;
                 }
             }
             state.singleflight.cancel(&cache_key).await;
