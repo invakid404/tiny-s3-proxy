@@ -2,7 +2,7 @@ use crate::auth::RequestGate;
 use crate::error::ProxyError;
 use crate::s3::ops::ParsedRequest;
 
-/// Authenticator that accepts all requests without validation.
+/// Access-control gate that accepts all requests without validation.
 /// Suitable for deployment behind private networking where only
 /// trusted services can reach the proxy.
 pub struct TrustedInternalAuth;

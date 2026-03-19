@@ -2,7 +2,7 @@ use crate::auth::RequestGate;
 use crate::error::ProxyError;
 use crate::s3::ops::ParsedRequest;
 
-/// Authenticator that extracts the access key ID from the SigV4
+/// Access-control gate that extracts the access key ID from the SigV4
 /// Authorization header and checks it against an allowlist.
 ///
 /// # Security Model
