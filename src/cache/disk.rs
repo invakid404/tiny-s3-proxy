@@ -372,7 +372,19 @@ impl CacheStore for DiskCache {
         // double-count the entry.
         if !tokio::fs::try_exists(&body_path).await.unwrap_or(false) {
             self.stats.miss_count.fetch_add(1, Ordering::Relaxed);
-            let _ = tokio::fs::remove_file(&meta_path).await;
+            // Clean up orphan metadata and adjust stats so a future refill
+            // doesn't double-count this entry.
+            if tokio::fs::remove_file(&meta_path).await.is_ok() {
+                let meta_size = meta_bytes.len() as u64;
+                let _ = self.stats.entry_count.fetch_update(
+                    Ordering::Relaxed, Ordering::Relaxed,
+                    |c| Some(c.saturating_sub(1)),
+                );
+                let _ = self.stats.total_bytes.fetch_update(
+                    Ordering::Relaxed, Ordering::Relaxed,
+                    |c| Some(c.saturating_sub(meta_size)),
+                );
+            }
             return Ok(None);
         }
 
