@@ -20,11 +20,11 @@ impl CacheKey {
     /// Uses ahash (AES-NI accelerated) instead of SHA-256 for speed.
     ///
     /// # Stability
-    /// ahash does not guarantee hash stability across library versions or platforms.
-    /// `AHasher::default()` uses fixed (non-random) keys, so hashes are stable within
-    /// a single binary build, but a dependency update could change the output. If that
-    /// happens, existing cache entries become unreachable ("orphaned") — lookups and
-    /// purges won't find them. This is safe because:
+    /// `AHasher::default()` uses fixed PI-digit constants as keys (NOT per-process
+    /// random seeds), so hashes are stable across restarts of the same binary.
+    /// However, ahash does not guarantee stability across library versions or
+    /// platforms. A dependency update could change the output, causing existing
+    /// cache entries to become unreachable ("orphaned"). This is safe because:
     /// - The eviction loop and startup scan both detect and remove orphan `.body`
     ///   files that lack matching `.meta.json`, so orphaned entries are cleaned up.
     /// - After one full eviction sweep the cache re-converges with no manual intervention.

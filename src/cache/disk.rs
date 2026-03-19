@@ -366,6 +366,21 @@ impl CacheStore for DiskCache {
             operation: "parse metadata".into(),
         })?;
 
+        // Defense in depth: verify the metadata actually belongs to this key.
+        // A hash collision (extremely unlikely with 64-bit ahash) would
+        // otherwise serve the wrong object.
+        if meta.bucket != key.bucket || meta.key != key.object_key {
+            tracing::warn!(
+                expected_bucket = %key.bucket,
+                expected_key = %key.object_key,
+                actual_bucket = %meta.bucket,
+                actual_key = %meta.key,
+                "cache hash collision detected — treating as miss"
+            );
+            self.stats.miss_count.fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        }
+
         // Verify body file exists (cheap stat, not a full read).
         // If the body is gone but metadata remains, clean up the orphan so
         // cache accounting stays accurate and a future refill doesn't
@@ -402,12 +417,16 @@ impl CacheStore for DiskCache {
             updated_meta.last_accessed_at = now;
             let meta_path_owned = meta_path.clone();
             let tmp_dir = self.cache_dir.join("tmp");
+            let hash = key.hash_hex();
             tokio::spawn(async move {
+                static ACCESS_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 if let Ok(bytes) = serde_json::to_vec(&updated_meta) {
+                    let counter = ACCESS_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let tmp_path = tmp_dir.join(format!(
-                        "{}-{}.meta.tmp",
+                        "{}-{}-{}.meta.tmp",
                         std::process::id(),
-                        updated_meta.last_accessed_at.timestamp_nanos_opt().unwrap_or(0),
+                        hash,
+                        counter,
                     ));
                     if tokio::fs::write(&tmp_path, &bytes).await.is_ok() {
                         let _ = tokio::fs::rename(&tmp_path, &meta_path_owned).await;
