@@ -36,6 +36,8 @@ async fn start_versitygw() -> (testcontainers::ContainerAsync<GenericImage>, Str
     // NOTE: GenericImage methods (with_entrypoint, with_exposed_port, with_wait_for)
     // must be called before ImageExt methods (with_env_var, with_cmd) since the
     // latter consume the GenericImage into ContainerRequest.
+    // NOTE: Using "latest" means CI results can vary across image updates.
+    // Pin to a specific digest or tag (e.g., "0.4.0") for full reproducibility.
     let container = GenericImage::new("versity/versitygw", "latest")
         .with_entrypoint("sh")
         .with_exposed_port(10000.into())
