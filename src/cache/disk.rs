@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -13,13 +13,13 @@ use crate::error::ProxyError;
 
 /// Tracks in-flight fills and per-key invalidation generations.
 ///
-/// The `active_fills` set contains keys that have an outstanding `FillGuard`
-/// (between `begin_fill` and `commit_fill`). `purge()` only creates a
-/// generation entry when the purged key has an active fill, so `generations`
-/// is bounded by the number of concurrent fills — not total purges.
+/// `active_fills` is a reference count of outstanding `FillGuard`s per key,
+/// so overlapping fills (e.g. after singleflight cancel + re-acquire) are
+/// tracked independently. `purge()` only creates a generation entry when
+/// the count is > 0. Both maps are bounded by the number of concurrent fills.
 #[derive(Default)]
 struct FillState {
-    active_fills: HashSet<CacheKey>,
+    active_fills: HashMap<CacheKey, usize>,
     generations: HashMap<CacheKey, u64>,
 }
 
@@ -196,11 +196,18 @@ impl DiskCache {
         &self.stats
     }
 
-    /// Remove a key from the active fills set and clean up its generation entry.
+    /// Decrement the active fill refcount for a key. When the count reaches
+    /// zero, remove the active_fills and generations entries so future purges
+    /// don't needlessly bump generations for a key with no in-flight fills.
     async fn finish_fill(&self, key: &CacheKey) {
         let mut state = self.fill_state.lock().await;
-        state.active_fills.remove(key);
-        state.generations.remove(key);
+        if let Some(count) = state.active_fills.get_mut(key) {
+            *count -= 1;
+            if *count == 0 {
+                state.active_fills.remove(key);
+                state.generations.remove(key);
+            }
+        }
     }
 
     /// Inner implementation of commit_fill. Separated so the public method
@@ -378,7 +385,7 @@ impl CacheStore for DiskCache {
     async fn begin_fill(&self, key: &CacheKey) -> Result<FillGuard, ProxyError> {
         let generation = {
             let mut state = self.fill_state.lock().await;
-            state.active_fills.insert(key.clone());
+            *state.active_fills.entry(key.clone()).or_insert(0) += 1;
             state.generations.get(key).copied().unwrap_or(0)
         };
         let temp_dir = self.cache_dir.join("tmp");
@@ -414,7 +421,7 @@ impl CacheStore for DiskCache {
         // without a concurrent fill has nothing to invalidate.
         {
             let mut state = self.fill_state.lock().await;
-            if state.active_fills.contains(key) {
+            if state.active_fills.get(key).copied().unwrap_or(0) > 0 {
                 let counter = state.generations.entry(key.clone()).or_insert(0);
                 *counter += 1;
             }
