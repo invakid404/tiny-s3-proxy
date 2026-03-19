@@ -37,6 +37,7 @@ pub async fn run_eviction_loop(
 /// Walk the objects directory and collect all cache entries as eviction candidates.
 async fn collect_candidates(
     objects_dir: &std::path::Path,
+    stats: &Arc<CacheStats>,
 ) -> Result<Vec<EvictionCandidate>, Box<dyn std::error::Error + Send + Sync>> {
     let mut candidates = Vec::new();
 
@@ -70,11 +71,20 @@ async fn collect_candidates(
                         let meta_path = d2_path.join(format!("{}.meta.json", hash));
                         if !tokio::fs::try_exists(&meta_path).await.unwrap_or(true) {
                             let size = tokio::fs::metadata(&file_path).await.map(|m| m.len()).unwrap_or(0);
-                            let _ = tokio::fs::remove_file(&file_path).await;
+                            if tokio::fs::remove_file(&file_path).await.is_ok() {
+                                // Subtract from stats since startup scan counted this.
+                                let _ = stats.total_bytes.fetch_update(
+                                    Ordering::Relaxed, Ordering::Relaxed,
+                                    |c| Some(c.saturating_sub(size)),
+                                );
+                                let _ = stats.entry_count.fetch_update(
+                                    Ordering::Relaxed, Ordering::Relaxed,
+                                    |c| Some(c.saturating_sub(1)),
+                                );
+                            }
                             tracing::debug!(path = %file_path.display(), size, "removed orphan body file");
                         }
                     } else if file_name.ends_with(".poisoned") {
-                        // Clean up orphan poison markers (no matching meta/body).
                         let hash = file_name.trim_end_matches(".poisoned");
                         let meta_path = d2_path.join(format!("{}.meta.json", hash));
                         if !tokio::fs::try_exists(&meta_path).await.unwrap_or(true) {
@@ -88,28 +98,34 @@ async fn collect_candidates(
                 // Read and parse metadata
                 let meta_bytes = match tokio::fs::read(&file_path).await {
                     Ok(b) => b,
-                    Err(_) => continue, // skip unreadable files
+                    Err(_) => continue,
                 };
                 let meta: CacheMeta = match serde_json::from_slice(&meta_bytes) {
                     Ok(m) => m,
-                    Err(_) => continue, // skip unparseable metadata
+                    Err(_) => continue,
                 };
 
-                // Derive body path from meta path
                 let hash = file_name.trim_end_matches(".meta.json");
                 let body_path = d2_path.join(format!("{}.body", hash));
 
-                // Get body file size
                 let body_size = match tokio::fs::metadata(&body_path).await {
                     Ok(m) => m.len(),
                     Err(_) => {
-                        // Body file missing; clean up orphaned metadata
-                        let _ = tokio::fs::remove_file(&file_path).await;
+                        // Body file missing; clean up orphaned metadata and adjust stats.
+                        if tokio::fs::remove_file(&file_path).await.is_ok() {
+                            let _ = stats.entry_count.fetch_update(
+                                Ordering::Relaxed, Ordering::Relaxed,
+                                |c| Some(c.saturating_sub(1)),
+                            );
+                            let _ = stats.total_bytes.fetch_update(
+                                Ordering::Relaxed, Ordering::Relaxed,
+                                |c| Some(c.saturating_sub(meta_bytes.len() as u64)),
+                            );
+                        }
                         continue;
                     }
                 };
 
-                // Include metadata file size in total
                 let meta_size = meta_bytes.len() as u64;
 
                 candidates.push(EvictionCandidate {
@@ -136,7 +152,7 @@ pub async fn run_eviction_pass(
         return Ok(());
     }
 
-    let mut candidates = collect_candidates(&objects_dir).await?;
+    let mut candidates = collect_candidates(&objects_dir, stats).await?;
 
     // Sort by last_accessed_at ascending (oldest first = evicted first)
     candidates.sort_by_key(|c| c.last_accessed_at);
