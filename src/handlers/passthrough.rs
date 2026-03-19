@@ -193,10 +193,15 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
 
     // 5. Send the request via reqwest (reuse client from AppState).
     // Idempotent methods (GET, HEAD, DELETE) are retried on transport errors
-    // since the body is already buffered and signing is complete. Non-idempotent
-    // methods (PUT, POST) are sent once to avoid duplicate side effects.
-    let is_idempotent = matches!(method, "GET" | "HEAD" | "DELETE");
-    let max_attempts: u32 = if is_idempotent { 3 } else { 1 };
+    // and retryable status codes, using the same config-driven attempt counts
+    // and backoff as the typed backend path. Non-idempotent methods are sent
+    // once to avoid duplicate side effects.
+    let (is_idempotent, max_attempts, base_backoff_ms) = match method {
+        "GET" => (true, state.config.get_max_attempts, state.config.retry_base_backoff_ms),
+        "HEAD" => (true, state.config.head_max_attempts, state.config.retry_base_backoff_ms),
+        "DELETE" => (true, state.config.delete_max_attempts, state.config.retry_base_backoff_ms),
+        _ => (false, 1, 0),
+    };
 
     let mut last_err = None;
     let mut upstream_resp = None;
@@ -223,12 +228,15 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
                     && attempt < max_attempts
                     && matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
                 {
+                    let delay = base_backoff_ms * 2u64.pow(attempt - 1);
                     tracing::warn!(
                         status,
                         attempt,
                         max_attempts,
+                        delay_ms = delay,
                         "passthrough: retrying idempotent request on retryable status"
                     );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                     continue;
                 }
                 upstream_resp = Some(resp);
@@ -236,12 +244,15 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
             }
             Err(e) => {
                 if attempt < max_attempts {
+                    let delay = base_backoff_ms * 2u64.pow(attempt - 1);
                     tracing::warn!(
                         error = %e,
                         attempt,
                         max_attempts,
+                        delay_ms = delay,
                         "passthrough: retrying idempotent request"
                     );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 }
                 last_err = Some(e);
             }
