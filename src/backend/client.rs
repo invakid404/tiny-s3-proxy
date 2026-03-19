@@ -198,6 +198,12 @@ macro_rules! extract_extra_headers {
         if let Some(v) = $resp.accept_ranges() {
             extra.insert("accept-ranges".into(), v.to_string());
         }
+        if let Some(v) = $resp.content_range() {
+            extra.insert("content-range".into(), v.to_string());
+        }
+        if let Some(v) = $resp.request_charged() {
+            extra.insert("x-amz-request-charged".into(), v.as_str().to_string());
+        }
         if let Some(v) = $resp.missing_meta() {
             extra.insert("x-amz-missing-meta".into(), v.to_string());
         }
