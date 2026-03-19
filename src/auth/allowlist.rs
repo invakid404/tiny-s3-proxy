@@ -58,7 +58,12 @@ impl RequestGate for AccessKeyAllowlistAuth {
 
 /// Extract the access key ID from a SigV4 Authorization header.
 /// Format: `AWS4-HMAC-SHA256 Credential=AKID/date/region/s3/aws4_request, ...`
+/// Validates the scheme prefix to reject garbage Authorization headers.
 fn extract_access_key_id(authorization: &str) -> Option<&str> {
+    // Require the SigV4 scheme prefix before looking for Credential=.
+    if !authorization.starts_with("AWS4-HMAC-SHA256 ") {
+        return None;
+    }
     let cred_start = authorization.find("Credential=")?;
     let after_cred = &authorization[cred_start + "Credential=".len()..];
     let slash_pos = after_cred.find('/')?;
@@ -253,6 +258,15 @@ mod tests {
         let header =
             "AWS4-HMAC-SHA256 Credential=MYKEY99/20240101/auto/s3/aws4_request, SignedHeaders=host";
         assert_eq!(extract_access_key_id(header), Some("MYKEY99"));
+    }
+
+    #[test]
+    fn test_extract_access_key_id_rejects_wrong_scheme() {
+        // Garbage Authorization with Credential= but no SigV4 scheme
+        assert_eq!(
+            extract_access_key_id("junk Credential=AKID/20240101/us-east-1/s3/aws4_request"),
+            None
+        );
     }
 
     // --- Tests for constant_time_eq ---
