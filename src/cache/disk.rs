@@ -281,15 +281,11 @@ impl DiskCache {
                 })?;
         }
 
-        // Check for pre-existing entry so stats can be updated by delta, not
-        // blindly incremented (avoids double-counting on refills over poisoned keys).
-        let old_body_size = tokio::fs::metadata(&final_body).await.map(|m| m.len()).unwrap_or(0);
-        let old_meta_size = tokio::fs::metadata(&final_meta).await.map(|m| m.len()).unwrap_or(0);
-
-        // Re-check generation under lock and do atomic rename while holding it.
-        // purge() also acquires this lock before incrementing, so the check +
-        // rename is atomic with respect to invalidation.
-        {
+        // Re-check generation under lock, sample pre-existing sizes, and do
+        // the atomic rename all while holding the lock. This prevents eviction
+        // from removing the old entry between the size check and the rename,
+        // which would cause the new-vs-overwrite decision to be stale.
+        let (old_body_size, old_meta_size) = {
             let state = self.fill_state.lock().await;
             if state.generations.get(&guard.key).copied().unwrap_or(0) != guard.generation {
                 tracing::info!(
@@ -301,6 +297,10 @@ impl DiskCache {
                 let _ = tokio::fs::remove_file(&temp_meta).await;
                 return Ok(());
             }
+
+            // Sample pre-existing sizes under lock before overwriting.
+            let obs = tokio::fs::metadata(&final_body).await.map(|m| m.len()).unwrap_or(0);
+            let oms = tokio::fs::metadata(&final_meta).await.map(|m| m.len()).unwrap_or(0);
 
             // Atomic rename — publish the cache entry while holding the lock.
             tokio::fs::rename(&temp_body_path, &final_body)
@@ -316,16 +316,16 @@ impl DiskCache {
                     operation: "rename metadata".into(),
                 });
             }
-        }
+
+            (obs, oms)
+        };
 
         // Fresh content published — clear any stale poison marker for this key.
         let _ = tokio::fs::remove_file(&self.poison_path_for_key(&guard.key)).await;
 
-        // Update stats: only increment entry_count if this is a new entry
-        // (not overwriting an existing one, e.g. after a poisoned-key refill).
+        // Update stats by delta: only increment entry_count for new entries.
         let new_size = body_size + meta_bytes.len() as u64;
         if old_body_size > 0 || old_meta_size > 0 {
-            // Overwrite: replace old size with new size, entry_count unchanged.
             let old_size = old_body_size + old_meta_size;
             if new_size >= old_size {
                 self.stats.total_bytes.fetch_add(new_size - old_size, Ordering::Relaxed);
