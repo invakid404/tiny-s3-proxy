@@ -57,6 +57,16 @@ pub fn get_object_headers(meta: &GetObjectMeta) -> HeaderMap {
     // Include x-amz-meta-* user metadata
     headers.extend(metadata_headers(&meta.metadata));
 
+    // Emit additional S3 response headers captured from the backend.
+    for (k, v) in &meta.extra_headers {
+        if let (Ok(name), Ok(val)) = (
+            HeaderName::from_bytes(k.as_bytes()),
+            HeaderValue::from_str(v),
+        ) {
+            headers.insert(name, val);
+        }
+    }
+
     headers
 }
 
@@ -88,6 +98,16 @@ pub fn head_object_headers(output: &HeadObjectOutput) -> HeaderMap {
 
     // Include x-amz-meta-* user metadata
     headers.extend(metadata_headers(&output.metadata));
+
+    // Emit additional S3 response headers captured from the backend.
+    for (k, v) in &output.extra_headers {
+        if let (Ok(name), Ok(val)) = (
+            HeaderName::from_bytes(k.as_bytes()),
+            HeaderValue::from_str(v),
+        ) {
+            headers.insert(name, val);
+        }
+    }
 
     headers
 }
@@ -139,6 +159,7 @@ mod tests {
             etag: Some("\"abc123\"".to_string()),
             last_modified: Some(chrono::Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()),
             metadata: HashMap::new(),
+            extra_headers: HashMap::new(),
         };
         let headers = get_object_headers(&meta);
         assert_eq!(headers.get("content-type").unwrap(), "application/json");
@@ -158,6 +179,7 @@ mod tests {
             etag: Some("\"def456\"".to_string()),
             last_modified: None,
             metadata: HashMap::new(),
+            extra_headers: HashMap::new(),
         };
         let headers = head_object_headers(&output);
         assert_eq!(headers.get("etag").unwrap(), "\"def456\"");
@@ -217,6 +239,7 @@ mod tests {
             etag: None,
             last_modified: None,
             metadata: HashMap::new(),
+            extra_headers: HashMap::new(),
         };
         let headers = get_object_headers(&meta);
         assert!(headers.get("content-type").is_none());
@@ -253,6 +276,7 @@ mod tests {
             etag: None,
             last_modified: None,
             metadata,
+            extra_headers: HashMap::new(),
         };
         let headers = get_object_headers(&meta);
         assert_eq!(headers.get("x-amz-meta-custom").unwrap(), "value");
@@ -269,6 +293,7 @@ mod tests {
             etag: None,
             last_modified: None,
             metadata,
+            extra_headers: HashMap::new(),
         };
         let headers = head_object_headers(&output);
         assert_eq!(headers.get("x-amz-meta-tag").unwrap(), "test");

@@ -350,14 +350,24 @@ impl CacheStore for DiskCache {
 
         // Update last_accessed_at on disk if older than 1 hour.
         // This is throttled to avoid a disk write on every single cache hit.
+        // Uses temp-file + atomic rename so a crash/ENOSPC during the write
+        // cannot corrupt the live metadata file.
         let now = chrono::Utc::now();
         if now.signed_duration_since(meta.last_accessed_at) > chrono::Duration::hours(1) {
             let mut updated_meta = meta.clone();
             updated_meta.last_accessed_at = now;
             let meta_path_owned = meta_path.clone();
+            let tmp_dir = self.cache_dir.join("tmp");
             tokio::spawn(async move {
                 if let Ok(bytes) = serde_json::to_vec(&updated_meta) {
-                    let _ = tokio::fs::write(&meta_path_owned, &bytes).await;
+                    let tmp_path = tmp_dir.join(format!(
+                        "{}-{}.meta.tmp",
+                        std::process::id(),
+                        updated_meta.last_accessed_at.timestamp_nanos_opt().unwrap_or(0),
+                    ));
+                    if tokio::fs::write(&tmp_path, &bytes).await.is_ok() {
+                        let _ = tokio::fs::rename(&tmp_path, &meta_path_owned).await;
+                    }
                 }
             });
         }
@@ -504,6 +514,7 @@ mod tests {
             hit_count: 0,
             source_status: 200,
             metadata: std::collections::HashMap::new(),
+            extra_headers: std::collections::HashMap::new(),
         }
     }
 
@@ -730,6 +741,7 @@ mod tests {
                     hit_count: 0,
                     source_status: 200,
                     metadata: std::collections::HashMap::new(),
+                    extra_headers: std::collections::HashMap::new(),
                 };
                 let temp_path = write_temp_body(&tmp_path, &body).await;
                 let guard = cache1.begin_fill(&key1).await.unwrap();
@@ -751,6 +763,7 @@ mod tests {
                 hit_count: 0,
                 source_status: 200,
                 metadata: std::collections::HashMap::new(),
+                extra_headers: std::collections::HashMap::new(),
             };
             let temp_path = write_temp_body(&tmp_path, &body).await;
             let guard = cache2.begin_fill(&key2).await.unwrap();

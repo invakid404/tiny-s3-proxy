@@ -10,6 +10,10 @@ pub struct GetObjectMeta {
     pub etag: Option<String>,
     pub last_modified: Option<DateTime<Utc>>,
     pub metadata: HashMap<String, String>,
+    /// Additional S3 response headers not modeled as explicit fields.
+    /// Captures Content-Encoding, Cache-Control, Content-Disposition,
+    /// Content-Language, checksums, SSE headers, etc.
+    pub extra_headers: HashMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -19,6 +23,10 @@ pub struct HeadObjectOutput {
     pub etag: Option<String>,
     pub last_modified: Option<DateTime<Utc>>,
     pub metadata: HashMap<String, String>,
+    /// Additional S3 response headers not modeled as explicit fields.
+    /// Captures Content-Encoding, Cache-Control, Content-Disposition,
+    /// Content-Language, checksums, SSE headers, etc.
+    pub extra_headers: HashMap<String, String>,
 }
 
 #[derive(Debug)]

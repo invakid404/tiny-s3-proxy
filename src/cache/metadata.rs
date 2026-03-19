@@ -18,4 +18,6 @@ pub struct CacheMeta {
     pub source_status: u16,
     #[serde(default)]
     pub metadata: HashMap<String, String>,
+    #[serde(default)]
+    pub extra_headers: HashMap<String, String>,
 }

@@ -210,6 +210,37 @@ impl Backend for S3Backend {
                         .collect::<HashMap<String, String>>()
                 })
                 .unwrap_or_default(),
+            extra_headers: {
+                let mut extra = HashMap::new();
+                if let Some(v) = resp.content_encoding() {
+                    extra.insert("content-encoding".to_string(), v.to_string());
+                }
+                if let Some(v) = resp.content_disposition() {
+                    extra.insert("content-disposition".to_string(), v.to_string());
+                }
+                if let Some(v) = resp.content_language() {
+                    extra.insert("content-language".to_string(), v.to_string());
+                }
+                if let Some(v) = resp.cache_control() {
+                    extra.insert("cache-control".to_string(), v.to_string());
+                }
+                if let Some(v) = resp.expires_string() {
+                    extra.insert("expires".to_string(), v.to_string());
+                }
+                if let Some(v) = resp.version_id() {
+                    extra.insert("x-amz-version-id".to_string(), v.to_string());
+                }
+                if let Some(v) = resp.server_side_encryption() {
+                    extra.insert("x-amz-server-side-encryption".to_string(), v.as_str().to_string());
+                }
+                if let Some(v) = resp.storage_class() {
+                    extra.insert("x-amz-storage-class".to_string(), v.as_str().to_string());
+                }
+                if let Some(v) = resp.accept_ranges() {
+                    extra.insert("accept-ranges".to_string(), v.to_string());
+                }
+                extra
+            },
         };
 
         // Convert ByteStream → AsyncRead → Stream<Item = Result<Bytes, io::Error>>
@@ -247,12 +278,45 @@ impl Backend for S3Backend {
                     })
                     .unwrap_or_default();
 
+                let extra_headers = {
+                    let mut extra = HashMap::new();
+                    if let Some(v) = resp.content_encoding() {
+                        extra.insert("content-encoding".to_string(), v.to_string());
+                    }
+                    if let Some(v) = resp.content_disposition() {
+                        extra.insert("content-disposition".to_string(), v.to_string());
+                    }
+                    if let Some(v) = resp.content_language() {
+                        extra.insert("content-language".to_string(), v.to_string());
+                    }
+                    if let Some(v) = resp.cache_control() {
+                        extra.insert("cache-control".to_string(), v.to_string());
+                    }
+                    if let Some(v) = resp.expires_string() {
+                        extra.insert("expires".to_string(), v.to_string());
+                    }
+                    if let Some(v) = resp.version_id() {
+                        extra.insert("x-amz-version-id".to_string(), v.to_string());
+                    }
+                    if let Some(v) = resp.server_side_encryption() {
+                        extra.insert("x-amz-server-side-encryption".to_string(), v.as_str().to_string());
+                    }
+                    if let Some(v) = resp.storage_class() {
+                        extra.insert("x-amz-storage-class".to_string(), v.as_str().to_string());
+                    }
+                    if let Some(v) = resp.accept_ranges() {
+                        extra.insert("accept-ranges".to_string(), v.to_string());
+                    }
+                    extra
+                };
+
                 Ok(HeadObjectOutput {
                     content_type,
                     content_length,
                     etag,
                     last_modified,
                     metadata,
+                    extra_headers,
                 })
             }
         })

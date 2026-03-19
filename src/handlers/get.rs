@@ -75,6 +75,7 @@ async fn build_cache_response(
         etag: entry.meta.etag.clone(),
         last_modified: entry.meta.last_modified,
         metadata: entry.meta.metadata.clone(),
+        extra_headers: entry.meta.extra_headers.clone(),
     };
 
     let body_path = entry.body_path.clone();
@@ -225,8 +226,12 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
 
     match result {
         Ok((meta, body_stream)) => {
-            let body_len = meta.content_length.unwrap_or(0) as u64;
-            let is_size_cacheable = state.policy.is_size_cacheable(body_len);
+            // Only cache when content_length is known; unknown-length responses
+            // could be arbitrarily large and bypass cache_max_object_bytes.
+            let is_size_cacheable = meta
+                .content_length
+                .map(|len| state.policy.is_size_cacheable(len as u64))
+                .unwrap_or(false);
 
             if is_size_cacheable {
                 // Tee: stream to client AND write to cache
@@ -257,6 +262,7 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                     hit_count: 0,
                     source_status: 200,
                     metadata: meta.metadata.clone(),
+                    extra_headers: meta.extra_headers.clone(),
                 };
                 let temp_path_clone = temp_body_path.clone();
 

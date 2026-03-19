@@ -39,6 +39,7 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
                     etag: entry.meta.etag.clone(),
                     last_modified: entry.meta.last_modified,
                     metadata: entry.meta.metadata.clone(),
+                    extra_headers: entry.meta.extra_headers.clone(),
                 };
 
                 let mut headers = head_object_headers(&head_output);
@@ -143,6 +144,7 @@ mod tests {
                 etag: Some("\"head-etag\"".to_string()),
                 last_modified: None,
                 metadata: HashMap::new(),
+                extra_headers: HashMap::new(),
             }));
 
         let state = build_app_state(backend, MockCache::new(), MockAuth::allow_all());
