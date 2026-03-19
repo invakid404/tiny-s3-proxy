@@ -376,13 +376,14 @@ impl CacheStore for DiskCache {
             // doesn't double-count this entry.
             if tokio::fs::remove_file(&meta_path).await.is_ok() {
                 let meta_size = meta_bytes.len() as u64;
+                let body_size = meta.content_length.max(0) as u64;
                 let _ = self.stats.entry_count.fetch_update(
                     Ordering::Relaxed, Ordering::Relaxed,
                     |c| Some(c.saturating_sub(1)),
                 );
                 let _ = self.stats.total_bytes.fetch_update(
                     Ordering::Relaxed, Ordering::Relaxed,
-                    |c| Some(c.saturating_sub(meta_size)),
+                    |c| Some(c.saturating_sub(meta_size + body_size)),
                 );
             }
             return Ok(None);
