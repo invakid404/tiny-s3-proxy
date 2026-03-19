@@ -602,6 +602,10 @@ pub mod test_utils {
             })
         }
 
+        async fn abort_fill(&self, _guard: FillGuard) {
+            // No-op for mock — no internal state to clean up.
+        }
+
         async fn commit_fill(
             &self,
             guard: FillGuard,

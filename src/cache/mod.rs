@@ -34,6 +34,10 @@ pub trait CacheStore: Send + Sync {
         meta: CacheMeta,
     ) -> impl std::future::Future<Output = Result<(), ProxyError>> + Send;
 
+    /// Abandon a fill without committing. Cleans up internal tracking state.
+    /// Must be called if a FillGuard from begin_fill is not passed to commit_fill.
+    fn abort_fill(&self, guard: FillGuard) -> impl std::future::Future<Output = ()> + Send;
+
     /// Remove a cached entry.
     fn purge(&self, key: &CacheKey) -> impl std::future::Future<Output = Result<bool, ProxyError>> + Send;
 

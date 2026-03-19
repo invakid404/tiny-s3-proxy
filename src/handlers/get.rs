@@ -269,6 +269,9 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                         Ok(f) => f,
                         Err(e) => {
                             tracing::warn!("cache fill: failed to create temp file: {}", e);
+                            if let Some(guard) = fill_guard {
+                                cache.abort_fill(guard).await;
+                            }
                             // Drain stream to client without caching
                             let mut stream = body_stream;
                             while let Some(chunk) = stream.next().await {
@@ -311,6 +314,9 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                     if cache_ok {
                         if let Err(e) = file.sync_all().await {
                             tracing::warn!("cache fill: fsync error: {}", e);
+                            if let Some(guard) = fill_guard {
+                                cache.abort_fill(guard).await;
+                            }
                             let _ = tokio::fs::remove_file(&temp_path_clone).await;
                             waiter.complete().await;
                             return;
@@ -318,6 +324,8 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                         drop(file);
 
                         if let Some(guard) = fill_guard {
+                            // commit_fill always cleans up active_fills internally
+                            // (on success, rejection, and error).
                             if let Err(e) = cache
                                 .commit_fill(guard, temp_path_clone.clone(), cache_meta)
                                 .await
@@ -330,6 +338,9 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                             let _ = tokio::fs::remove_file(&temp_path_clone).await;
                         }
                     } else {
+                        if let Some(guard) = fill_guard {
+                            cache.abort_fill(guard).await;
+                        }
                         let _ = tokio::fs::remove_file(&temp_path_clone).await;
                     }
 

@@ -202,6 +202,116 @@ impl DiskCache {
         state.active_fills.remove(key);
         state.generations.remove(key);
     }
+
+    /// Inner implementation of commit_fill. Separated so the public method
+    /// can guarantee `finish_fill` runs on every exit path.
+    async fn commit_fill_inner(
+        &self,
+        guard: &FillGuard,
+        temp_body_path: PathBuf,
+        meta: CacheMeta,
+    ) -> Result<(), ProxyError> {
+        // Early check: bail fast if already invalidated (avoids unnecessary I/O).
+        {
+            let state = self.fill_state.lock().await;
+            if state.generations.get(&guard.key).copied().unwrap_or(0) != guard.generation {
+                tracing::info!(
+                    key = %guard.key.object_key,
+                    "cache fill rejected (early check): key invalidated during fill"
+                );
+                let _ = tokio::fs::remove_file(&temp_body_path).await;
+                return Ok(());
+            }
+        }
+
+        static COMMIT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COMMIT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+
+        // The body file has already been written and fsynced by the caller.
+        let body_size = tokio::fs::metadata(&temp_body_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        // Write metadata to temp file
+        let temp_meta = guard.temp_dir.join(format!("{pid}-{id}.meta.json"));
+        let meta_bytes = serde_json::to_vec(&meta).map_err(|e| ProxyError::Cache {
+            source: Box::new(e),
+            operation: "serialize metadata".into(),
+        })?;
+        tokio::fs::write(&temp_meta, &meta_bytes)
+            .await
+            .map_err(|e| ProxyError::Cache {
+                source: Box::new(e),
+                operation: "write temp metadata".into(),
+            })?;
+
+        // fsync metadata
+        let meta_file = tokio::fs::File::open(&temp_meta)
+            .await
+            .map_err(|e| ProxyError::Cache {
+                source: Box::new(e),
+                operation: "open temp meta for fsync".into(),
+            })?;
+        meta_file
+            .sync_all()
+            .await
+            .map_err(|e| ProxyError::Cache {
+                source: Box::new(e),
+                operation: "fsync temp metadata".into(),
+            })?;
+
+        // Create parent directories for final location
+        let (final_body, final_meta) = self.paths_for_key(&guard.key);
+        if let Some(parent) = final_body.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| ProxyError::Cache {
+                    source: Box::new(e),
+                    operation: "create object dir".into(),
+                })?;
+        }
+
+        // Re-check generation under lock and do atomic rename while holding it.
+        // purge() also acquires this lock before incrementing, so the check +
+        // rename is atomic with respect to invalidation.
+        {
+            let state = self.fill_state.lock().await;
+            if state.generations.get(&guard.key).copied().unwrap_or(0) != guard.generation {
+                tracing::info!(
+                    key = %guard.key.object_key,
+                    "cache fill rejected (pre-publish): key invalidated during fill"
+                );
+                drop(state);
+                let _ = tokio::fs::remove_file(&temp_body_path).await;
+                let _ = tokio::fs::remove_file(&temp_meta).await;
+                return Ok(());
+            }
+
+            // Atomic rename — publish the cache entry while holding the lock.
+            tokio::fs::rename(&temp_body_path, &final_body)
+                .await
+                .map_err(|e| ProxyError::Cache {
+                    source: Box::new(e),
+                    operation: "rename body".into(),
+                })?;
+            if let Err(e) = tokio::fs::rename(&temp_meta, &final_meta).await {
+                let _ = tokio::fs::remove_file(&final_body).await;
+                return Err(ProxyError::Cache {
+                    source: Box::new(e),
+                    operation: "rename metadata".into(),
+                });
+            }
+        }
+
+        // Update stats atomically (outside lock)
+        self.stats.entry_count.fetch_add(1, Ordering::Relaxed);
+        self.stats.total_bytes.fetch_add(body_size + meta_bytes.len() as u64, Ordering::Relaxed);
+        self.stats.fill_count.fetch_add(1, Ordering::Relaxed);
+
+        Ok(())
+    }
 }
 
 impl CacheStore for DiskCache {
@@ -269,121 +379,23 @@ impl CacheStore for DiskCache {
         })
     }
 
+    async fn abort_fill(&self, guard: FillGuard) {
+        self.finish_fill(&guard.key).await;
+    }
+
     async fn commit_fill(
         &self,
         guard: FillGuard,
         temp_body_path: PathBuf,
         meta: CacheMeta,
     ) -> Result<(), ProxyError> {
-        // Early check: bail fast if already invalidated (avoids unnecessary I/O).
-        {
-            let gens = self.fill_state.lock().await;
-            if gens.generations.get(&guard.key).copied().unwrap_or(0) != guard.generation {
-                tracing::info!(
-                    key = %guard.key.object_key,
-                    "cache fill rejected (early check): key invalidated during fill"
-                );
-                // Don't remove from active_fills yet — that happens in the final block.
-                drop(gens);
-                self.finish_fill(&guard.key).await;
-                let _ = tokio::fs::remove_file(&temp_body_path).await;
-                return Ok(());
-            }
-        }
-
-        static COMMIT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let id = COMMIT_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let pid = std::process::id();
-
-        // The body file has already been written and fsynced by the caller.
-        let body_size = tokio::fs::metadata(&temp_body_path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
-
-        // Write metadata to temp file
-        let temp_meta = guard.temp_dir.join(format!("{pid}-{id}.meta.json"));
-        let meta_bytes = serde_json::to_vec(&meta).map_err(|e| ProxyError::Cache {
-            source: Box::new(e),
-            operation: "serialize metadata".into(),
-        })?;
-        tokio::fs::write(&temp_meta, &meta_bytes)
-            .await
-            .map_err(|e| ProxyError::Cache {
-                source: Box::new(e),
-                operation: "write temp metadata".into(),
-            })?;
-
-        // fsync metadata
-        let meta_file = tokio::fs::File::open(&temp_meta)
-            .await
-            .map_err(|e| ProxyError::Cache {
-                source: Box::new(e),
-                operation: "open temp meta for fsync".into(),
-            })?;
-        meta_file
-            .sync_all()
-            .await
-            .map_err(|e| ProxyError::Cache {
-                source: Box::new(e),
-                operation: "fsync temp metadata".into(),
-            })?;
-
-        // Create parent directories for final location
-        let (final_body, final_meta) = self.paths_for_key(&guard.key);
-        if let Some(parent) = final_body.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| ProxyError::Cache {
-                    source: Box::new(e),
-                    operation: "create object dir".into(),
-                })?;
-        }
-
-        // Re-check generation under lock and do atomic rename while holding it.
-        // purge() also acquires this lock before incrementing, so the check +
-        // rename is atomic with respect to invalidation.
-        {
-            let mut state = self.fill_state.lock().await;
-            if state.generations.get(&guard.key).copied().unwrap_or(0) != guard.generation {
-                tracing::info!(
-                    key = %guard.key.object_key,
-                    "cache fill rejected (pre-publish): key invalidated during fill"
-                );
-                state.active_fills.remove(&guard.key);
-                state.generations.remove(&guard.key);
-                drop(state);
-                let _ = tokio::fs::remove_file(&temp_body_path).await;
-                let _ = tokio::fs::remove_file(&temp_meta).await;
-                return Ok(());
-            }
-
-            // Atomic rename — publish the cache entry while holding the lock.
-            tokio::fs::rename(&temp_body_path, &final_body)
-                .await
-                .map_err(|e| ProxyError::Cache {
-                    source: Box::new(e),
-                    operation: "rename body".into(),
-                })?;
-            if let Err(e) = tokio::fs::rename(&temp_meta, &final_meta).await {
-                let _ = tokio::fs::remove_file(&final_body).await;
-                return Err(ProxyError::Cache {
-                    source: Box::new(e),
-                    operation: "rename metadata".into(),
-                });
-            }
-
-            // Fill complete — remove from active set and clean up generation.
-            state.active_fills.remove(&guard.key);
-            state.generations.remove(&guard.key);
-        }
-
-        // Update stats atomically (outside lock)
-        self.stats.entry_count.fetch_add(1, Ordering::Relaxed);
-        self.stats.total_bytes.fetch_add(body_size + meta_bytes.len() as u64, Ordering::Relaxed);
-        self.stats.fill_count.fetch_add(1, Ordering::Relaxed);
-
-        Ok(())
+        // Delegate to an inner function so we can guarantee finish_fill runs
+        // on every exit path (success, rejection, or error).
+        // Delegate to the inherent method; guarantee finish_fill runs on
+        // every exit path (success, rejection, or error).
+        let result = self.commit_fill_inner(&guard, temp_body_path, meta).await;
+        self.finish_fill(&guard.key).await;
+        result
     }
 
     async fn purge(&self, key: &CacheKey) -> Result<bool, ProxyError> {
