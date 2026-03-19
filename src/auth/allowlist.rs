@@ -60,12 +60,10 @@ impl RequestGate for AccessKeyAllowlistAuth {
 /// Format: `AWS4-HMAC-SHA256 Credential=AKID/date/region/s3/aws4_request, ...`
 /// Validates the scheme prefix to reject garbage Authorization headers.
 fn extract_access_key_id(authorization: &str) -> Option<&str> {
-    // Require the SigV4 scheme prefix before looking for Credential=.
-    if !authorization.starts_with("AWS4-HMAC-SHA256 ") {
-        return None;
-    }
-    let cred_start = authorization.find("Credential=")?;
-    let after_cred = &authorization[cred_start + "Credential=".len()..];
+    // SigV4 format: "AWS4-HMAC-SHA256 Credential=AKID/date/region/service/aws4_request, ..."
+    // The Credential= field must immediately follow the scheme + space.
+    let after_scheme = authorization.strip_prefix("AWS4-HMAC-SHA256 ")?;
+    let after_cred = after_scheme.strip_prefix("Credential=")?;
     let slash_pos = after_cred.find('/')?;
     let key = &after_cred[..slash_pos];
     if key.is_empty() {
@@ -262,9 +260,17 @@ mod tests {
 
     #[test]
     fn test_extract_access_key_id_rejects_wrong_scheme() {
-        // Garbage Authorization with Credential= but no SigV4 scheme
         assert_eq!(
             extract_access_key_id("junk Credential=AKID/20240101/us-east-1/s3/aws4_request"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_access_key_id_rejects_junk_between_scheme_and_credential() {
+        // Scheme is correct but Credential= is not the first field
+        assert_eq!(
+            extract_access_key_id("AWS4-HMAC-SHA256 junk Credential=AKID/20240101/us-east-1/s3/aws4_request"),
             None
         );
     }
