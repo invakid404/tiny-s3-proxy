@@ -64,6 +64,22 @@ async fn collect_candidates(
                 };
 
                 if !file_name.ends_with(".meta.json") {
+                    // Clean up orphan .body files: body exists but no matching metadata.
+                    // This can happen if the hash algorithm changes across builds or if
+                    // the process crashed between body and metadata writes in commit_fill.
+                    if file_name.ends_with(".body") {
+                        let hash = file_name.trim_end_matches(".body");
+                        let meta_path = d2_path.join(format!("{}.meta.json", hash));
+                        if !tokio::fs::try_exists(&meta_path).await.unwrap_or(true) {
+                            let size = tokio::fs::metadata(&file_path).await.map(|m| m.len()).unwrap_or(0);
+                            let _ = tokio::fs::remove_file(&file_path).await;
+                            tracing::debug!(
+                                path = %file_path.display(),
+                                size,
+                                "removed orphan body file (no matching metadata)"
+                            );
+                        }
+                    }
                     continue;
                 }
 

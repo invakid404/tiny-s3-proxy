@@ -120,16 +120,28 @@ impl DiskCache {
                         None => continue,
                     };
 
-                    // Only count .body files to avoid double-counting
                     if file_name.ends_with(".body") {
-                        if let Ok(metadata) = tokio::fs::metadata(&file_path).await {
-                            stats.total_bytes.fetch_add(metadata.len(), Ordering::Relaxed);
-                            stats.entry_count.fetch_add(1, Ordering::Relaxed);
-                        }
-                        // Also add the size of the corresponding .meta.json
-                        let meta_path = file_path.with_extension("meta.json");
-                        if let Ok(metadata) = tokio::fs::metadata(&meta_path).await {
-                            stats.total_bytes.fetch_add(metadata.len(), Ordering::Relaxed);
+                        // Build the expected meta path: replace .body extension
+                        // Note: file_path is like /cache/objects/ab/cd/abcdef1234.body
+                        // The meta would be /cache/objects/ab/cd/abcdef1234.meta.json
+                        let hash = file_name.trim_end_matches(".body");
+                        let meta_path = file_path.parent().unwrap().join(format!("{}.meta.json", hash));
+                        if tokio::fs::try_exists(&meta_path).await.unwrap_or(false) {
+                            // Complete entry: count body + meta
+                            if let Ok(body_meta) = tokio::fs::metadata(&file_path).await {
+                                stats.total_bytes.fetch_add(body_meta.len(), Ordering::Relaxed);
+                                stats.entry_count.fetch_add(1, Ordering::Relaxed);
+                            }
+                            if let Ok(meta_meta) = tokio::fs::metadata(&meta_path).await {
+                                stats.total_bytes.fetch_add(meta_meta.len(), Ordering::Relaxed);
+                            }
+                        } else {
+                            // Orphan body file (no matching metadata): remove it.
+                            let _ = tokio::fs::remove_file(&file_path).await;
+                            tracing::debug!(
+                                path = %file_path.display(),
+                                "removed orphan body file during startup scan"
+                            );
                         }
                     }
                 }

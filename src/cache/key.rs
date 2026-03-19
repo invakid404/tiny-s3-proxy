@@ -25,8 +25,8 @@ impl CacheKey {
     /// a single binary build, but a dependency update could change the output. If that
     /// happens, existing cache entries become unreachable ("orphaned") — lookups and
     /// purges won't find them. This is safe because:
-    /// - The eviction loop walks the filesystem directly (by `.meta.json` pattern),
-    ///   so orphaned entries are still counted and evicted normally.
+    /// - The eviction loop and startup scan both detect and remove orphan `.body`
+    ///   files that lack matching `.meta.json`, so orphaned entries are cleaned up.
     /// - After one full eviction sweep the cache re-converges with no manual intervention.
     /// - The cache is ephemeral by design; data loss only means a temporary miss storm.
     ///
