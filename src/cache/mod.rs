@@ -61,6 +61,22 @@ pub struct FillGuard {
 }
 
 /// Cache statistics for metrics/admin, using atomics for lock-free updates.
+///
+/// ## Reconciliation model
+///
+/// `total_bytes` and `entry_count` follow a "periodic reconciliation" model:
+/// - The eviction scan ([`eviction::run_eviction_loop`]) is the **source of
+///   truth**: it walks the filesystem and overwrites these atomics with
+///   authoritative values on every pass.
+/// - Between scans, `commit_fill`, `purge`, and eviction deletions adjust
+///   these fields incrementally for responsiveness, but concurrent operations
+///   can cause transient drift.
+/// - Any drift self-corrects on the next eviction scan.
+///
+/// This eliminates stat-accounting races that are impossible to fix with
+/// lock-free incremental updates alone (e.g., eviction deleting a file that
+/// `commit_fill` just replaced, or partial removal leaving stats carrying
+/// sizes of deleted fragments).
 #[derive(Debug)]
 pub struct CacheStats {
     pub total_bytes: AtomicU64,

@@ -76,7 +76,9 @@ impl DiskCache {
         })
     }
 
-    /// Scan the objects directory to compute initial stats.
+    /// Scan the objects directory to compute initial stats at startup.
+    /// These provide the baseline; the periodic eviction scan reconciles
+    /// them against filesystem reality on every pass thereafter.
     async fn scan_existing_stats(cache_dir: &std::path::Path) -> Result<CacheStats, ProxyError> {
         let objects_dir = cache_dir.join("objects");
         let stats = CacheStats::default();
@@ -291,6 +293,11 @@ impl DiskCache {
         {
             let _state = self.fill_state.lock().await;
 
+            // Best-effort incremental stat adjustment: subtract the old entry's
+            // size before replacing it. This may race with eviction (which could
+            // delete or replace the same files concurrently), but any drift is
+            // corrected by the periodic eviction scan which reconciles stats
+            // from filesystem reality. See eviction::run_eviction_loop docs.
             let old_body_size = tokio::fs::metadata(&final_body).await.map(|m| m.len()).unwrap_or(0);
             let old_meta_size = tokio::fs::metadata(&final_meta).await.map(|m| m.len()).unwrap_or(0);
             if old_body_size > 0 || old_meta_size > 0 {
@@ -333,6 +340,8 @@ impl DiskCache {
                 });
             }
 
+            // Best-effort: add the new entry's size. The periodic eviction scan
+            // reconciles any drift from concurrent operations.
             let new_size = body_size + meta_bytes.len() as u64;
             self.stats.entry_count.fetch_add(1, Ordering::Relaxed);
             self.stats.total_bytes.fetch_add(new_size, Ordering::Relaxed);
@@ -394,13 +403,11 @@ impl CacheStore for DiskCache {
         }
 
         // Verify body file exists (cheap stat, not a full read).
-        // If the body is gone but metadata remains, clean up the orphan so
-        // cache accounting stays accurate and a future refill doesn't
-        // double-count the entry.
+        // If the body is gone but metadata remains, eagerly clean up the orphan
+        // and do a best-effort stat adjustment. The periodic eviction scan
+        // reconciles any inaccuracy from the estimated body_size.
         if !tokio::fs::try_exists(&body_path).await.unwrap_or(false) {
             self.stats.miss_count.fetch_add(1, Ordering::Relaxed);
-            // Clean up orphan metadata and adjust stats so a future refill
-            // doesn't double-count this entry.
             if tokio::fs::remove_file(&meta_path).await.is_ok() {
                 let meta_size = meta_bytes.len() as u64;
                 let body_size = meta.content_length.max(0) as u64;
@@ -545,7 +552,10 @@ impl CacheStore for DiskCache {
         }
 
         if removed {
-            // Use saturating subtraction to avoid wrapping on partial/orphan entries.
+            // Best-effort incremental stat adjustment. If only one file was
+            // removed (the other errored via `?`), the function already
+            // returned Err above and stats are not adjusted — the periodic
+            // eviction scan reconciles from filesystem reality on the next pass.
             let _ = self.stats.entry_count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_sub(1))
             });

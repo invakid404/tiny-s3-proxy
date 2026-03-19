@@ -17,8 +17,29 @@ struct EvictionCandidate {
 
 /// Run the eviction loop as a background task.
 ///
-/// Periodically scans the cache directory and evicts the least-recently-accessed
-/// entries when the total cache size exceeds `max_bytes`.
+/// Periodically scans the cache directory, reconciles stats against filesystem
+/// reality, and evicts the least-recently-accessed entries when the total cache
+/// size exceeds `max_bytes`.
+///
+/// ## Stats reconciliation model
+///
+/// Cache stats (`total_bytes`, `entry_count`) follow a "periodic reconciliation"
+/// model instead of trying to maintain perfect incremental accuracy:
+///
+/// - **This scan is the source of truth.** [`collect_candidates`] walks the
+///   entire cache directory and computes authoritative totals from the actual
+///   filesystem state, then overwrites the atomics.
+/// - **Between scans, incremental adjustments are best-effort.** `commit_fill`,
+///   `purge`, and eviction deletions adjust stats incrementally for
+///   responsiveness, but concurrent operations can cause transient drift.
+/// - **Any drift self-corrects on the next scan.** Since the eviction loop runs
+///   periodically, stats never stay wrong for long. A few bytes of drift
+///   between scans is acceptable for a caching proxy.
+///
+/// This design eliminates an entire class of stat-accounting races that are
+/// impossible to fix with lock-free incremental updates alone (e.g., eviction
+/// deleting a file that `commit_fill` just replaced, or partial removal leaving
+/// stats carrying sizes of deleted fragments).
 pub async fn run_eviction_loop(
     cache_dir: PathBuf,
     max_bytes: u64,
@@ -34,12 +55,19 @@ pub async fn run_eviction_loop(
     }
 }
 
-/// Walk the objects directory and collect all cache entries as eviction candidates.
+/// Walk the objects directory, collect all cache entries as eviction candidates,
+/// clean up orphans, and **reconcile stats** to match filesystem reality.
+///
+/// After this function returns, `stats.total_bytes` and `stats.entry_count`
+/// reflect the actual on-disk state (minus any concurrent mutations that raced
+/// with the scan — those will be corrected on the next pass).
 async fn collect_candidates(
     objects_dir: &std::path::Path,
     stats: &Arc<CacheStats>,
 ) -> Result<Vec<EvictionCandidate>, Box<dyn std::error::Error + Send + Sync>> {
     let mut candidates = Vec::new();
+    let mut scan_total_bytes: u64 = 0;
+    let mut scan_entry_count: u64 = 0;
 
     // Walk <objects_dir>/<d1>/<d2>/<hash>.meta.json
     let mut d1_entries = tokio::fs::read_dir(objects_dir).await?;
@@ -66,22 +94,14 @@ async fn collect_candidates(
 
                 if !file_name.ends_with(".meta.json") {
                     // Clean up orphan .body files and stale .poisoned markers.
+                    // No stat adjustments needed — orphans are not counted in the
+                    // scan totals, so reconciliation handles them automatically.
                     if file_name.ends_with(".body") {
                         let hash = file_name.trim_end_matches(".body");
                         let meta_path = d2_path.join(format!("{}.meta.json", hash));
                         if !tokio::fs::try_exists(&meta_path).await.unwrap_or(true) {
                             let size = tokio::fs::metadata(&file_path).await.map(|m| m.len()).unwrap_or(0);
-                            if tokio::fs::remove_file(&file_path).await.is_ok() {
-                                // Subtract from stats since startup scan counted this.
-                                let _ = stats.total_bytes.fetch_update(
-                                    Ordering::Relaxed, Ordering::Relaxed,
-                                    |c| Some(c.saturating_sub(size)),
-                                );
-                                let _ = stats.entry_count.fetch_update(
-                                    Ordering::Relaxed, Ordering::Relaxed,
-                                    |c| Some(c.saturating_sub(1)),
-                                );
-                            }
+                            let _ = tokio::fs::remove_file(&file_path).await;
                             tracing::debug!(path = %file_path.display(), size, "removed orphan body file");
                         }
                     } else if file_name.ends_with(".poisoned") {
@@ -111,37 +131,41 @@ async fn collect_candidates(
                 let body_size = match tokio::fs::metadata(&body_path).await {
                     Ok(m) => m.len(),
                     Err(_) => {
-                        // Body file missing; clean up orphaned metadata and adjust stats.
-                        if tokio::fs::remove_file(&file_path).await.is_ok() {
-                            let _ = stats.entry_count.fetch_update(
-                                Ordering::Relaxed, Ordering::Relaxed,
-                                |c| Some(c.saturating_sub(1)),
-                            );
-                            let _ = stats.total_bytes.fetch_update(
-                                Ordering::Relaxed, Ordering::Relaxed,
-                                |c| Some(c.saturating_sub(meta_bytes.len() as u64)),
-                            );
-                        }
+                        // Body file missing; clean up orphaned metadata.
+                        // Not counted in scan totals, so no stat adjustment needed.
+                        let _ = tokio::fs::remove_file(&file_path).await;
                         continue;
                     }
                 };
 
                 let meta_size = meta_bytes.len() as u64;
+                let entry_size = body_size + meta_size;
+
+                // Count this complete entry toward the authoritative scan totals.
+                scan_total_bytes += entry_size;
+                scan_entry_count += 1;
 
                 candidates.push(EvictionCandidate {
                     body_path,
                     meta_path: file_path,
                     last_accessed_at: meta.last_accessed_at,
-                    size: body_size + meta_size,
+                    size: entry_size,
                 });
             }
         }
     }
 
+    // Reconcile: overwrite atomics with the authoritative filesystem totals.
+    // Any drift from concurrent commit_fill/purge since the last reconciliation
+    // is corrected here.
+    stats.total_bytes.store(scan_total_bytes, Ordering::Relaxed);
+    stats.entry_count.store(scan_entry_count, Ordering::Relaxed);
+
     Ok(candidates)
 }
 
-/// Single eviction pass: scan cache, sort by LRU, evict until under limit.
+/// Single eviction pass: scan cache (reconciling stats), sort by LRU, evict
+/// until under limit.
 pub async fn run_eviction_pass(
     cache_dir: &std::path::Path,
     max_bytes: u64,
@@ -152,40 +176,42 @@ pub async fn run_eviction_pass(
         return Ok(());
     }
 
+    // collect_candidates walks the filesystem and reconciles stats.
     let mut candidates = collect_candidates(&objects_dir, stats).await?;
 
     // Sort by last_accessed_at ascending (oldest first = evicted first)
     candidates.sort_by_key(|c| c.last_accessed_at);
 
-    // Calculate current total size
+    // Use the scan-measured total (identical to the reconciled stats value).
     let total_size: u64 = candidates.iter().map(|c| c.size).sum();
 
     if total_size <= max_bytes {
-        // Under limit — no eviction needed, no stats reconciliation.
-        // Stats are maintained incrementally by commit_fill and purge.
         return Ok(());
     }
 
-    // Evict oldest entries until under limit. For each eviction, stat the
-    // ACTUAL files being deleted (not the pre-scan snapshot) so concurrent
-    // commit_fill replacements don't cause size mismatches.
+    // Evict oldest entries until under limit. Stat adjustments here are
+    // best-effort for between-scan responsiveness; the next scan reconciles
+    // any drift from concurrent operations.
     let mut current_size = total_size;
     let mut evicted = 0u64;
     for candidate in &candidates {
         if current_size <= max_bytes {
             break;
         }
-        // Stat the actual files about to be deleted to get their real sizes.
-        let actual_body = tokio::fs::metadata(&candidate.body_path).await.map(|m| m.len()).unwrap_or(0);
-        let actual_meta = tokio::fs::metadata(&candidate.meta_path).await.map(|m| m.len()).unwrap_or(0);
 
         let body_removed = tokio::fs::remove_file(&candidate.body_path).await.is_ok();
         let meta_removed = tokio::fs::remove_file(&candidate.meta_path).await.is_ok();
-        if body_removed && meta_removed {
+        if body_removed || meta_removed {
+            // Clear poison marker whenever either file is removed — the stale
+            // content is (at least partially) gone.
             let poison_path = candidate.body_path.with_extension("poisoned");
             let _ = tokio::fs::remove_file(&poison_path).await;
-            let removed_size = actual_body + actual_meta;
-            current_size = current_size.saturating_sub(removed_size);
+        }
+        if body_removed && meta_removed {
+            // Best-effort: use the scan-measured size. If commit_fill replaced
+            // the files between scan and delete, this may be stale — the next
+            // scan reconciles.
+            current_size = current_size.saturating_sub(candidate.size);
             evicted += 1;
             let _ = stats.entry_count.fetch_update(
                 Ordering::Relaxed, Ordering::Relaxed,
@@ -193,19 +219,20 @@ pub async fn run_eviction_pass(
             );
             let _ = stats.total_bytes.fetch_update(
                 Ordering::Relaxed, Ordering::Relaxed,
-                |c| Some(c.saturating_sub(removed_size)),
+                |c| Some(c.saturating_sub(candidate.size)),
             );
             tracing::debug!(
                 path = %candidate.body_path.display(),
-                size = removed_size,
+                size = candidate.size,
                 "evicted cache entry"
             );
         } else {
+            // Partial removal — stats will reconcile on the next scan.
             tracing::warn!(
                 path = %candidate.body_path.display(),
                 body_removed,
                 meta_removed,
-                "eviction: partial removal, skipping size accounting"
+                "eviction: partial removal, stats reconcile on next scan"
             );
         }
     }
@@ -272,9 +299,8 @@ mod tests {
         let body = b"small body";
         setup_cache_entry(&cache_dir, &key, body, Utc::now()).await;
 
-        // Pre-populate stats (in real usage, DiskCache::new scans on startup).
         let stats = Arc::new(CacheStats::default());
-        stats.entry_count.store(1, Ordering::Relaxed);
+        // Stats start at zero — the scan reconciles them to filesystem reality.
 
         // Set limit very high
         run_eviction_pass(&cache_dir, 1_000_000, &stats).await.unwrap();
@@ -290,7 +316,9 @@ mod tests {
         assert!(body_path.exists());
 
         let snap = stats.snapshot();
+        // Reconciliation should have set entry_count to 1 and total_bytes > 0.
         assert_eq!(snap.entry_count, 1);
+        assert!(snap.total_bytes > 0, "reconciliation should have computed total_bytes");
         assert_eq!(snap.eviction_count, 0);
     }
 
@@ -328,10 +356,8 @@ mod tests {
         .await;
         setup_cache_entry(&cache_dir, &key_new, &body, now).await;
 
-        // Pre-populate stats to match the 3 entries on disk (in real usage,
-        // DiskCache::new() does this via scan_existing_stats).
+        // Stats start at zero — the scan reconciles them from disk.
         let stats = Arc::new(CacheStats::default());
-        stats.entry_count.store(3, Ordering::Relaxed);
 
         // Set limit so only ~1 entry fits (body + meta ~= 1200 bytes each, so ~1500 is one entry)
         run_eviction_pass(&cache_dir, 1500, &stats).await.unwrap();
@@ -391,5 +417,66 @@ mod tests {
         let snap = stats.snapshot();
         assert_eq!(snap.entry_count, 0);
         assert_eq!(snap.total_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn test_reconciliation_corrects_drifted_stats() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+        tokio::fs::create_dir_all(cache_dir.join("objects"))
+            .await
+            .unwrap();
+
+        let key = CacheKey::new("bucket", "script_bundle/item.js");
+        let body = b"some body content";
+        setup_cache_entry(&cache_dir, &key, body, Utc::now()).await;
+
+        // Simulate drifted stats: entry_count and total_bytes are wrong.
+        let stats = Arc::new(CacheStats::default());
+        stats.entry_count.store(99, Ordering::Relaxed);
+        stats.total_bytes.store(999_999, Ordering::Relaxed);
+
+        // Run eviction with a high limit (no eviction needed).
+        run_eviction_pass(&cache_dir, 1_000_000, &stats).await.unwrap();
+
+        // Stats should be reconciled to actual filesystem state.
+        let snap = stats.snapshot();
+        assert_eq!(snap.entry_count, 1, "reconciliation should fix entry_count");
+        assert!(snap.total_bytes < 1000, "reconciliation should fix total_bytes");
+        assert!(snap.total_bytes > 0, "total_bytes should reflect actual files");
+    }
+
+    #[tokio::test]
+    async fn test_orphan_cleanup_without_stat_adjustments() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+        let objects_dir = cache_dir.join("objects");
+        tokio::fs::create_dir_all(&objects_dir).await.unwrap();
+
+        // Create a valid entry
+        let key = CacheKey::new("bucket", "script_bundle/valid.js");
+        let body = b"valid content";
+        setup_cache_entry(&cache_dir, &key, body, Utc::now()).await;
+
+        // Create an orphan body file (no matching metadata)
+        let orphan_dir = objects_dir.join("ab").join("cd");
+        tokio::fs::create_dir_all(&orphan_dir).await.unwrap();
+        let orphan_body = orphan_dir.join("abcd0000dead0000.body");
+        tokio::fs::write(&orphan_body, b"orphan data").await.unwrap();
+
+        // Simulate overstated stats (as if the orphan was still counted).
+        let stats = Arc::new(CacheStats::default());
+        stats.entry_count.store(2, Ordering::Relaxed);
+        stats.total_bytes.store(999_999, Ordering::Relaxed);
+
+        run_eviction_pass(&cache_dir, 1_000_000, &stats).await.unwrap();
+
+        // Orphan should be removed.
+        assert!(!orphan_body.exists(), "orphan body should be cleaned up");
+
+        // Stats should be reconciled to just the valid entry.
+        let snap = stats.snapshot();
+        assert_eq!(snap.entry_count, 1);
+        assert!(snap.total_bytes < 1000);
     }
 }
