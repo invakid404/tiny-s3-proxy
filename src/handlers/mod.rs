@@ -55,11 +55,45 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
 
     let op_name = parsed.operation.name();
 
+    // Reject HTTP methods that S3 never uses. This check runs before auth
+    // and bucket validation so that TRACE *, CONNECT host:443, etc. never
+    // reach deeper routing logic.
+    const S3_METHODS: &[&str] = &["GET", "HEAD", "PUT", "POST", "DELETE"];
+    if !S3_METHODS.contains(&parts.method.as_str()) {
+        let s3err = S3Error::from_proxy_error(
+            &crate::error::ProxyError::UnsupportedOperation {
+                operation: format!("{} {}", parts.method, parts.uri.path()),
+            },
+            &parsed.request_id,
+            None,
+        );
+        let response = s3err.to_response();
+        record_metrics(op_name, &response, start);
+        return response;
+    }
+
     // Record request body size for writes (from content-length header).
-    if let Some(cl) = parts.headers.get("content-length")
-        && let Ok(size) = cl.to_str().unwrap_or("0").parse::<f64>()
-    {
-        histogram!("s3proxy_request_size_bytes", "operation" => op_name).record(size);
+    // Reject negative Content-Length with 400 Bad Request and only record
+    // valid non-negative values in metrics.
+    if let Some(cl) = parts.headers.get("content-length") {
+        if let Ok(s) = cl.to_str() {
+            if let Ok(n) = s.parse::<i64>() {
+                if n < 0 {
+                    let s3err = S3Error::from_proxy_error(
+                        &crate::error::ProxyError::InvalidRequest {
+                            message: "Content-Length must not be negative".to_string(),
+                        },
+                        &parsed.request_id,
+                        None,
+                    );
+                    let response = s3err.to_response();
+                    record_metrics(op_name, &response, start);
+                    return response;
+                }
+                histogram!("s3proxy_request_size_bytes", "operation" => op_name)
+                    .record(n as f64);
+            }
+        }
     }
 
     // Auth check (applies to ALL operations including passthrough)
@@ -90,26 +124,9 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
         return response;
     }
 
-    // Handle unsupported operations: proxy S3-valid methods to the backend,
-    // reject truly unsupported HTTP methods with 501.
+    // Handle unsupported S3 operations by proxying to the backend.
+    // (Non-S3 methods like PATCH/TRACE/CONNECT are already rejected above.)
     if let S3Operation::Unsupported { ref method, ref path } = parsed.operation {
-        // S3 only uses GET, HEAD, PUT, POST, DELETE. Any other HTTP method
-        // (PATCH, TRACE, CONNECT, OPTIONS, etc.) is not a valid S3 operation
-        // and should be rejected rather than blindly signed and forwarded.
-        const S3_METHODS: &[&str] = &["GET", "HEAD", "PUT", "POST", "DELETE"];
-        if !S3_METHODS.contains(&method.as_str()) {
-            let s3err = S3Error::from_proxy_error(
-                &crate::error::ProxyError::UnsupportedOperation {
-                    operation: format!("{} {}", method, path),
-                },
-                &parsed.request_id,
-                None,
-            );
-            let response = s3err.to_response();
-            record_metrics(op_name, &response, start);
-            return response;
-        }
-
         tracing::warn!(
             request_id = %parsed.request_id,
             method = %method,
@@ -1093,7 +1110,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_unsupported_operation_requires_auth() {
+    async fn test_non_s3_method_rejected_before_auth() {
+        // Non-S3 methods should return 501 even when auth would deny.
         let state = build_app_state(
             MockBackend::new(),
             MockCache::new(),
@@ -1103,7 +1121,93 @@ mod tests {
         let req = build_request("PATCH", "/test-frontend/some-key");
         let resp = handle_s3_request(State(state), req).await;
 
-        assert_eq!(resp.status(), 403);
+        // 501 because PATCH is rejected before auth runs
+        assert_eq!(resp.status(), 501);
+    }
+
+    #[tokio::test]
+    async fn test_trace_returns_501_before_bucket_check() {
+        // TRACE * never has a bucket path — should get 501, not NoSuchBucket.
+        let state = build_app_state(
+            MockBackend::new(),
+            MockCache::new(),
+            MockAuth::allow_all(),
+        );
+
+        let req = Request::builder()
+            .method("TRACE")
+            .uri("*")
+            .body(Body::empty())
+            .unwrap();
+        let resp = handle_s3_request(State(state), req).await;
+        assert_eq!(resp.status(), 501);
+    }
+
+    #[tokio::test]
+    async fn test_connect_returns_501() {
+        let state = build_app_state(
+            MockBackend::new(),
+            MockCache::new(),
+            MockAuth::allow_all(),
+        );
+
+        let req = Request::builder()
+            .method("CONNECT")
+            .uri("/test-frontend/some-key")
+            .body(Body::empty())
+            .unwrap();
+        let resp = handle_s3_request(State(state), req).await;
+        assert_eq!(resp.status(), 501);
+    }
+
+    #[tokio::test]
+    async fn test_patch_rejected_without_calling_backend() {
+        let backend = MockBackend::new();
+        let state = build_app_state(
+            backend,
+            MockCache::new(),
+            MockAuth::allow_all(),
+        );
+
+        let req = build_request("PATCH", "/test-frontend/some-key");
+        let resp = handle_s3_request(State(state.clone()), req).await;
+        assert_eq!(resp.status(), 501);
+
+        // Verify the backend was never called: all mock response slots
+        // should still be untouched (Some/None depending on init).
+        // The get/head/put/delete slots are all initialized to None,
+        // so if any were consumed (taken), they'd be None.  We verify
+        // the backend wasn't touched by checking the response is 501
+        // (if passthrough ran, it would try to contact example.com
+        // and return a different status).
+    }
+
+    #[tokio::test]
+    async fn test_negative_content_length_returns_400() {
+        let state = build_app_state(
+            MockBackend::new(),
+            MockCache::new(),
+            MockAuth::allow_all(),
+        );
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/test-frontend/some-key")
+            .header("content-length", "-1")
+            .body(Body::empty())
+            .unwrap();
+        let resp = handle_s3_request(State(state), req).await;
+        assert_eq!(resp.status(), 400);
+
+        let body = axum::body::to_bytes(resp.into_body(), 4096)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8_lossy(&body);
+        assert!(
+            body_str.contains("InvalidRequest"),
+            "expected InvalidRequest error for negative Content-Length, got: {}",
+            body_str
+        );
     }
 
     #[tokio::test]

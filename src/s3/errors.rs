@@ -320,4 +320,31 @@ mod tests {
         assert!(xml.contains("&quot;quotes&quot;"));
         assert!(xml.contains("r&amp;id"));
     }
+
+    #[test]
+    fn test_from_body_error_does_not_leak_details() {
+        // Simulate an axum body read error with internal details.
+        // The error message should be generic, not exposing the raw error.
+        let axum_err = axum::Error::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset by peer at 10.0.0.5:3456",
+        ));
+        let s3err = S3Error::from_body_error(&axum_err, "req-sanitize");
+        let xml = s3err.to_xml();
+
+        assert_eq!(s3err.code, "IncompleteBody");
+        // The message must NOT contain the internal error details.
+        assert!(
+            !xml.contains("connection reset"),
+            "XML response must not leak internal error details, got: {}",
+            xml
+        );
+        assert!(
+            !xml.contains("10.0.0.5"),
+            "XML response must not leak internal IP addresses, got: {}",
+            xml
+        );
+        // It should contain the generic message.
+        assert!(xml.contains("could not be read"));
+    }
 }

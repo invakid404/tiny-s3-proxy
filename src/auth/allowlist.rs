@@ -1,3 +1,5 @@
+use sha2::{Digest, Sha256};
+
 use crate::auth::RequestGate;
 use crate::error::ProxyError;
 use crate::s3::ops::ParsedRequest;
@@ -21,12 +23,23 @@ use crate::s3::ops::ParsedRequest;
 /// environments where network isolation provides the primary security
 /// boundary and the allowlist adds defence-in-depth.
 pub struct AccessKeyAllowlistAuth {
-    allowed_keys: Vec<String>,
+    /// SHA-256 digests of each allowed access key, precomputed at startup.
+    /// Comparisons are always on fixed-size 32-byte digests, eliminating any
+    /// timing side-channel based on key length or content.
+    allowed_digests: Vec<[u8; 32]>,
 }
 
 impl AccessKeyAllowlistAuth {
     pub fn new(allowed_keys: Vec<String>) -> Self {
-        Self { allowed_keys }
+        let allowed_digests = allowed_keys
+            .iter()
+            .map(|k| {
+                let mut h = Sha256::new();
+                h.update(k.as_bytes());
+                h.finalize().into()
+            })
+            .collect();
+        Self { allowed_digests }
     }
 }
 
@@ -44,12 +57,18 @@ impl RequestGate for AccessKeyAllowlistAuth {
                 message: "malformed SigV4 Authorization header".to_string(),
             })?;
 
+        // Hash the incoming access key to a fixed-size SHA-256 digest so
+        // all comparisons are on 32-byte slices, eliminating any timing
+        // side-channel based on key length or content.
+        let mut h = Sha256::new();
+        h.update(access_key_id.as_bytes());
+        let input_digest: [u8; 32] = h.finalize().into();
+
         // Always iterate the entire list so timing does not reveal which
-        // position (if any) matched. The `found` flag accumulates matches
-        // without short-circuiting.
+        // position (if any) matched.
         let mut found = false;
-        for allowed_key in &self.allowed_keys {
-            found |= constant_time_eq(access_key_id, allowed_key);
+        for allowed_digest in &self.allowed_digests {
+            found |= constant_time_eq_bytes(&input_digest, allowed_digest);
         }
 
         if found {
@@ -78,21 +97,15 @@ fn extract_access_key_id(authorization: &str) -> Option<&str> {
     Some(key)
 }
 
-/// Constant-time string comparison to prevent timing attacks.
+/// Constant-time comparison of two equal-length byte slices.
 ///
-/// Always iterates `max(len(a), len(b))` bytes so that neither the
-/// lengths nor the contents leak through timing. A length mismatch
-/// is folded into the accumulator without short-circuiting.
-fn constant_time_eq(a: &str, b: &str) -> bool {
-    let a = a.as_bytes();
-    let b = b.as_bytes();
-    // Fold length mismatch into the result up front — no early return.
-    let mut result: u8 = (a.len() != b.len()) as u8;
-    let max_len = a.len().max(b.len());
-    for i in 0..max_len {
-        let byte_a = if i < a.len() { a[i] } else { 0 };
-        let byte_b = if i < b.len() { b[i] } else { 0 };
-        result |= byte_a ^ byte_b;
+/// Both slices must be the same length (guaranteed by callers that
+/// compare SHA-256 digests). Every byte is XOR'd into the accumulator
+/// with no branches or early exits.
+fn constant_time_eq_bytes(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let mut result: u8 = 0;
+    for i in 0..32 {
+        result |= a[i] ^ b[i];
     }
     result == 0
 }
@@ -290,30 +303,48 @@ mod tests {
         );
     }
 
-    // --- Tests for constant_time_eq ---
+    // --- Tests for constant_time_eq_bytes ---
 
-    #[test]
-    fn test_constant_time_eq_equal_strings() {
-        assert!(constant_time_eq("hello", "hello"));
+    fn sha256(input: &str) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(input.as_bytes());
+        h.finalize().into()
     }
 
     #[test]
-    fn test_constant_time_eq_different_strings() {
-        assert!(!constant_time_eq("hello", "world"));
+    fn test_constant_time_eq_bytes_equal() {
+        let a = sha256("hello");
+        let b = sha256("hello");
+        assert!(constant_time_eq_bytes(&a, &b));
     }
 
     #[test]
-    fn test_constant_time_eq_different_lengths() {
-        assert!(!constant_time_eq("short", "longer"));
+    fn test_constant_time_eq_bytes_different() {
+        let a = sha256("hello");
+        let b = sha256("world");
+        assert!(!constant_time_eq_bytes(&a, &b));
     }
 
     #[test]
-    fn test_constant_time_eq_empty_strings() {
-        assert!(constant_time_eq("", ""));
+    fn test_constant_time_eq_bytes_single_bit_difference() {
+        let mut a = sha256("hello");
+        let b = a;
+        a[0] ^= 1;
+        assert!(!constant_time_eq_bytes(&a, &b));
     }
 
     #[test]
-    fn test_constant_time_eq_single_bit_difference() {
-        assert!(!constant_time_eq("a", "b"));
+    fn test_constant_time_eq_bytes_all_zeros() {
+        let a = [0u8; 32];
+        let b = [0u8; 32];
+        assert!(constant_time_eq_bytes(&a, &b));
+    }
+
+    #[test]
+    fn test_digest_comparison_different_length_keys_rejected() {
+        // Keys of different lengths produce different digests and are rejected.
+        let auth = AccessKeyAllowlistAuth::new(vec!["AKID12345".to_string()]);
+        let req = make_request(Some(&sigv4_header("AKID1234567890AB")));
+        assert!(auth.check_access(&req).is_err());
     }
 }

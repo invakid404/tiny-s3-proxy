@@ -134,9 +134,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;
 
     // Run both servers concurrently with graceful shutdown.
+    // Both listeners receive the same shutdown signal via a watch channel
+    // and are awaited with try_join! so both fully drain before exit.
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
 
-    // Spawn task that waits for OS signal then broadcasts shutdown
     let signal_tx = shutdown_tx.clone();
     tokio::spawn(async move {
         shutdown_signal().await;
@@ -149,22 +150,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let s3_shutdown = async move { let _ = s3_shutdown_rx.changed().await; };
     let admin_shutdown = async move { let _ = admin_shutdown_rx.changed().await; };
 
-    tokio::select! {
-        result = axum::serve(s3_listener, s3_app)
-            .with_graceful_shutdown(s3_shutdown) => {
-            if let Err(e) = &result {
-                tracing::error!(error = %e, "S3 server error");
-            }
-            result?;
-        }
-        result = axum::serve(admin_listener, admin_app)
-            .with_graceful_shutdown(admin_shutdown) => {
-            if let Err(e) = &result {
-                tracing::error!(error = %e, "admin server error");
-            }
-            result?;
-        }
-    }
+    let s3_future = axum::serve(s3_listener, s3_app).with_graceful_shutdown(s3_shutdown);
+    let admin_future = axum::serve(admin_listener, admin_app).with_graceful_shutdown(admin_shutdown);
+
+    let (s3_result, admin_result) = tokio::try_join!(s3_future, admin_future)?;
+    // try_join! returns Ok(((), ())) when both complete. If either returns
+    // Err, it propagates immediately. The graceful shutdown signal ensures
+    // both servers stop accepting new connections and drain in-flight
+    // requests before returning.
+    let _ = (s3_result, admin_result);
 
     tracing::info!("shutdown complete");
 

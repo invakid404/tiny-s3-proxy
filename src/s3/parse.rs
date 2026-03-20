@@ -289,9 +289,7 @@ pub fn parse_request<B>(req: &Request<B>) -> ParsedRequest {
         }
     };
 
-    let content_length = header_str(req, "content-length")
-        .and_then(|v| v.parse::<i64>().ok())
-        .filter(|&v| v >= 0);
+    let content_length = header_str(req, "content-length").and_then(|v| v.parse::<i64>().ok());
 
     // Scan for x-amz-meta-* user metadata and other x-amz-* headers to forward.
     let mut user_metadata = HashMap::new();
