@@ -35,7 +35,7 @@ pub struct DiskCache {
     /// blocking behind any per-key commit_lock. begin_fill takes a write
     /// lock to create/increment entries atomically, so purge cannot slip
     /// between registration and counter creation.
-    active_fills: tokio::sync::RwLock<HashMap<CacheKey, Arc<FillEntry>>>,
+    active_fills: Arc<tokio::sync::RwLock<HashMap<CacheKey, Arc<FillEntry>>>>,
 }
 
 impl DiskCache {
@@ -66,7 +66,7 @@ impl DiskCache {
         Ok(Self {
             cache_dir,
             stats: Arc::new(stats),
-            active_fills: tokio::sync::RwLock::new(HashMap::new()),
+            active_fills: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         })
     }
 
@@ -446,10 +446,10 @@ impl CacheStore for DiskCache {
         // Uses temp-file + atomic rename so a crash/ENOSPC during the write
         // cannot corrupt the live metadata file.
         //
-        // Guard: only rename if the on-disk metadata's cache_written_at still
-        // matches what we read. If a fresh fill published newer metadata
-        // between our read and the rename, the stale update is skipped to
-        // avoid overwriting the newer entry with old headers/ETag.
+        // Guard: acquires the same per-key commit lock that commit_fill uses
+        // so that the check-and-rename cannot interleave with a concurrent
+        // fill. Inside the lock, re-reads the on-disk metadata and only
+        // proceeds if cache_written_at still matches.
         let now = chrono::Utc::now();
         if now.signed_duration_since(meta.last_accessed_at) > chrono::Duration::hours(1) {
             let mut updated_meta = meta.clone();
@@ -458,18 +458,30 @@ impl CacheStore for DiskCache {
             let meta_path_owned = meta_path.clone();
             let tmp_dir = self.cache_dir.join("tmp");
             let hash = key.hash_hex().to_string();
+            let active_fills = self.active_fills.clone();
+            let key_owned = key.clone();
             tokio::spawn(async move {
                 static ACCESS_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+                // Acquire the per-key commit lock (if one exists) to
+                // serialize against concurrent commit_fill operations.
+                let fill_entry = {
+                    let fills = active_fills.read().await;
+                    fills.get(&key_owned).cloned()
+                };
+                let _commit_guard = match &fill_entry {
+                    Some(entry) => Some(entry.commit_lock.lock().await),
+                    None => None,
+                };
+
                 // Re-read current metadata to verify no newer fill overwrote it.
                 if let Ok(current_bytes) = tokio::fs::read(&meta_path_owned).await {
                     if let Ok(current_meta) = serde_json::from_slice::<CacheMeta>(&current_bytes) {
                         if current_meta.cache_written_at != expected_written_at {
-                            // A fresh fill published newer metadata; skip update.
                             return;
                         }
                     }
                 } else {
-                    // Metadata was deleted (purge); skip update.
                     return;
                 }
                 if let Ok(bytes) = serde_json::to_vec(&updated_meta) {

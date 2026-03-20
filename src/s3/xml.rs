@@ -167,16 +167,17 @@ pub fn serialize_list_objects_v1(output: &ListObjectsOutput) -> String {
 /// ```
 /// Fast byte-level check for per-part checksum XML elements inside a
 /// CompleteMultipartUpload body. S3 allows clients to include
-/// `<ChecksumCRC32>`, `<ChecksumCRC32C>`, `<ChecksumSHA1>`, or
-/// `<ChecksumSHA256>` elements per-part for integrity validation.
-/// The typed path drops these, so callers use this to route through
-/// passthrough instead.
+/// `<ChecksumCRC32>`, `<ChecksumCRC32C>`, `<ChecksumSHA1>`,
+/// `<ChecksumSHA256>`, or `<ChecksumCRC64NVME>` elements per-part for
+/// integrity validation. The typed path drops these, so callers use
+/// this to route through passthrough instead.
 pub fn body_has_checksum_elements(xml_body: &[u8]) -> bool {
     // Substring search on the raw bytes is sufficient: these element
     // names never appear in valid ETag or PartNumber values.
     const MARKERS: &[&[u8]] = &[
         b"<ChecksumCRC32>",
         b"<ChecksumCRC32C>",
+        b"<ChecksumCRC64NVME>",
         b"<ChecksumSHA1>",
         b"<ChecksumSHA256>",
     ];
@@ -652,6 +653,12 @@ mod tests {
     #[test]
     fn test_checksum_sha1_detected() {
         let body = b"<Part><ChecksumSHA1>x</ChecksumSHA1></Part>";
+        assert!(body_has_checksum_elements(body));
+    }
+
+    #[test]
+    fn test_checksum_crc64nvme_detected() {
+        let body = b"<Part><ChecksumCRC64NVME>x</ChecksumCRC64NVME></Part>";
         assert!(body_has_checksum_elements(body));
     }
 }
