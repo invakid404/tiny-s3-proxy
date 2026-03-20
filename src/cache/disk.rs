@@ -35,7 +35,13 @@ pub struct DiskCache {
     /// blocking behind any per-key commit_lock. begin_fill takes a write
     /// lock to create/increment entries atomically, so purge cannot slip
     /// between registration and counter creation.
-    active_fills: Arc<tokio::sync::RwLock<HashMap<CacheKey, Arc<FillEntry>>>>,
+    active_fills: tokio::sync::RwLock<HashMap<CacheKey, Arc<FillEntry>>>,
+    /// Per-key metadata-write lock. Both commit_fill (when renaming the
+    /// final .meta.json) and the background access-time updater acquire
+    /// this lock so their read-check-rename sequences cannot interleave.
+    /// Entries are created on demand and never removed (the overhead is
+    /// one Arc<Mutex> per unique key that has ever been written or hit).
+    meta_locks: std::sync::Mutex<HashMap<CacheKey, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl DiskCache {
@@ -66,7 +72,8 @@ impl DiskCache {
         Ok(Self {
             cache_dir,
             stats: Arc::new(stats),
-            active_fills: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            active_fills: tokio::sync::RwLock::new(HashMap::new()),
+            meta_locks: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -173,6 +180,16 @@ impl DiskCache {
         let hash = key.hash_hex();
         let dir = self.cache_dir.join("objects").join(&hash[..2]).join(&hash[2..4]);
         dir.join(format!("{hash}.poisoned"))
+    }
+
+    /// Get or create the per-key metadata-write lock.
+    fn meta_lock_for(&self, key: &CacheKey) -> Arc<tokio::sync::Mutex<()>> {
+        self.meta_locks
+            .lock()
+            .unwrap()
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Get a reference to the stats.
@@ -338,12 +355,19 @@ impl DiskCache {
                     source: Box::new(e),
                     operation: "rename body".into(),
                 })?;
-            if let Err(e) = tokio::fs::rename(&temp_meta, &final_meta).await {
-                let _ = tokio::fs::remove_file(&final_body).await;
-                return Err(ProxyError::Cache {
-                    source: Box::new(e),
-                    operation: "rename metadata".into(),
-                });
+            // Acquire the per-key meta lock so the metadata rename cannot
+            // interleave with a background access-time updater's
+            // read-check-rename sequence.
+            {
+                let meta_lock = self.meta_lock_for(&guard.key);
+                let _meta_guard = meta_lock.lock().await;
+                if let Err(e) = tokio::fs::rename(&temp_meta, &final_meta).await {
+                    let _ = tokio::fs::remove_file(&final_body).await;
+                    return Err(ProxyError::Cache {
+                        source: Box::new(e),
+                        operation: "rename metadata".into(),
+                    });
+                }
             }
 
             // Best-effort: add the new entry's size. The periodic eviction scan
@@ -446,10 +470,10 @@ impl CacheStore for DiskCache {
         // Uses temp-file + atomic rename so a crash/ENOSPC during the write
         // cannot corrupt the live metadata file.
         //
-        // Guard: acquires the same per-key commit lock that commit_fill uses
-        // so that the check-and-rename cannot interleave with a concurrent
-        // fill. Inside the lock, re-reads the on-disk metadata and only
-        // proceeds if cache_written_at still matches.
+        // Guard: acquires a dedicated per-key meta lock (shared with
+        // commit_fill's rename step) so the read-check-rename cannot
+        // interleave with a concurrent fill — regardless of whether an
+        // active_fills entry exists yet.
         let now = chrono::Utc::now();
         if now.signed_duration_since(meta.last_accessed_at) > chrono::Duration::hours(1) {
             let mut updated_meta = meta.clone();
@@ -458,21 +482,12 @@ impl CacheStore for DiskCache {
             let meta_path_owned = meta_path.clone();
             let tmp_dir = self.cache_dir.join("tmp");
             let hash = key.hash_hex().to_string();
-            let active_fills = self.active_fills.clone();
-            let key_owned = key.clone();
+            let meta_lock = self.meta_lock_for(key);
             tokio::spawn(async move {
                 static ACCESS_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-                // Acquire the per-key commit lock (if one exists) to
-                // serialize against concurrent commit_fill operations.
-                let fill_entry = {
-                    let fills = active_fills.read().await;
-                    fills.get(&key_owned).cloned()
-                };
-                let _commit_guard = match &fill_entry {
-                    Some(entry) => Some(entry.commit_lock.lock().await),
-                    None => None,
-                };
+                // Hold the per-key meta lock for the entire check+rename.
+                let _guard = meta_lock.lock().await;
 
                 // Re-read current metadata to verify no newer fill overwrote it.
                 if let Ok(current_bytes) = tokio::fs::read(&meta_path_owned).await {

@@ -165,25 +165,43 @@ pub fn serialize_list_objects_v1(output: &ListObjectsOutput) -> String {
 ///   ...
 /// </CompleteMultipartUpload>
 /// ```
-/// Fast byte-level check for per-part checksum XML elements inside a
-/// CompleteMultipartUpload body. S3 allows clients to include
-/// `<ChecksumCRC32>`, `<ChecksumCRC32C>`, `<ChecksumSHA1>`,
-/// `<ChecksumSHA256>`, or `<ChecksumCRC64NVME>` elements per-part for
-/// integrity validation. The typed path drops these, so callers use
-/// this to route through passthrough instead.
+/// Check whether a CompleteMultipartUpload XML body contains per-part
+/// checksum elements (`ChecksumCRC32`, `ChecksumCRC32C`, `ChecksumSHA1`,
+/// `ChecksumSHA256`, `ChecksumCRC64NVME`). Uses the quick-xml parser
+/// so it handles whitespace, namespace prefixes, and other legal XML
+/// variants that a raw byte scan would miss.
 pub fn body_has_checksum_elements(xml_body: &[u8]) -> bool {
-    // Substring search on the raw bytes is sufficient: these element
-    // names never appear in valid ETag or PartNumber values.
-    const MARKERS: &[&[u8]] = &[
-        b"<ChecksumCRC32>",
-        b"<ChecksumCRC32C>",
-        b"<ChecksumCRC64NVME>",
-        b"<ChecksumSHA1>",
-        b"<ChecksumSHA256>",
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+
+    const CHECKSUM_NAMES: &[&str] = &[
+        "ChecksumCRC32",
+        "ChecksumCRC32C",
+        "ChecksumCRC64NVME",
+        "ChecksumSHA1",
+        "ChecksumSHA256",
     ];
-    MARKERS
-        .iter()
-        .any(|m| xml_body.windows(m.len()).any(|w| w == *m))
+
+    let mut reader = Reader::from_reader(xml_body);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                let local = e.local_name();
+                let name = String::from_utf8_lossy(local.as_ref());
+                if CHECKSUM_NAMES.contains(&name.as_ref()) {
+                    return true;
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    false
 }
 
 pub fn parse_complete_multipart_body(xml_body: &[u8]) -> Result<Vec<CompletedPart>, String> {
