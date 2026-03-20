@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use axum::body::Body;
+use bytes::Bytes;
 use http::Response;
 
 use crate::backend::models::{CompleteMultipartInput, UploadPartInput};
@@ -181,24 +182,8 @@ pub async fn handle_complete_multipart<B: Backend, C: CacheStore>(
     parsed: &ParsedRequest,
     key: &str,
     upload_id: &str,
-    body: Body,
+    body_bytes: Bytes,
 ) -> Response<Body> {
-    // Read body XML
-    let body_bytes = match axum::body::to_bytes(body, state.config.max_request_body_bytes as usize).await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            tracing::error!(
-                request_id = %parsed.request_id,
-                error = %e,
-                operation = "CompleteMultipartUpload",
-                key = key,
-                "failed to read request body"
-            );
-            let s3err = S3Error::from_body_error(&e, &parsed.request_id);
-            return s3err.to_response();
-        }
-    };
-
     // Parse the CompleteMultipartUpload XML
     let parts = match parse_complete_multipart_body(&body_bytes) {
         Ok(parts) => parts,
@@ -502,7 +487,7 @@ mod tests {
         let xml_body = br#"<CompleteMultipartUpload>
             <Part><PartNumber>1</PartNumber><ETag>"e1"</ETag></Part>
         </CompleteMultipartUpload>"#;
-        let body = Body::from(xml_body.to_vec());
+        let body = Bytes::from(xml_body.to_vec());
 
         let resp =
             handle_complete_multipart(&state, &parsed, key, "upload-123", body).await;
@@ -537,7 +522,7 @@ mod tests {
         let xml_body = br#"<CompleteMultipartUpload>
             <Part><PartNumber>1</PartNumber><ETag>"e1"</ETag></Part>
         </CompleteMultipartUpload>"#;
-        let body = Body::from(xml_body.to_vec());
+        let body = Bytes::from(xml_body.to_vec());
 
         let resp =
             handle_complete_multipart(&state, &parsed, key, "upload-123", body).await;

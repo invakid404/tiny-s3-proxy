@@ -445,15 +445,33 @@ impl CacheStore for DiskCache {
         // This is throttled to avoid a disk write on every single cache hit.
         // Uses temp-file + atomic rename so a crash/ENOSPC during the write
         // cannot corrupt the live metadata file.
+        //
+        // Guard: only rename if the on-disk metadata's cache_written_at still
+        // matches what we read. If a fresh fill published newer metadata
+        // between our read and the rename, the stale update is skipped to
+        // avoid overwriting the newer entry with old headers/ETag.
         let now = chrono::Utc::now();
         if now.signed_duration_since(meta.last_accessed_at) > chrono::Duration::hours(1) {
             let mut updated_meta = meta.clone();
             updated_meta.last_accessed_at = now;
+            let expected_written_at = meta.cache_written_at;
             let meta_path_owned = meta_path.clone();
             let tmp_dir = self.cache_dir.join("tmp");
             let hash = key.hash_hex().to_string();
             tokio::spawn(async move {
                 static ACCESS_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                // Re-read current metadata to verify no newer fill overwrote it.
+                if let Ok(current_bytes) = tokio::fs::read(&meta_path_owned).await {
+                    if let Ok(current_meta) = serde_json::from_slice::<CacheMeta>(&current_bytes) {
+                        if current_meta.cache_written_at != expected_written_at {
+                            // A fresh fill published newer metadata; skip update.
+                            return;
+                        }
+                    }
+                } else {
+                    // Metadata was deleted (purge); skip update.
+                    return;
+                }
                 if let Ok(bytes) = serde_json::to_vec(&updated_meta) {
                     let counter = ACCESS_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let tmp_path = tmp_dir.join(format!(

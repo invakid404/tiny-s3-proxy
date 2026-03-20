@@ -165,6 +165,26 @@ pub fn serialize_list_objects_v1(output: &ListObjectsOutput) -> String {
 ///   ...
 /// </CompleteMultipartUpload>
 /// ```
+/// Fast byte-level check for per-part checksum XML elements inside a
+/// CompleteMultipartUpload body. S3 allows clients to include
+/// `<ChecksumCRC32>`, `<ChecksumCRC32C>`, `<ChecksumSHA1>`, or
+/// `<ChecksumSHA256>` elements per-part for integrity validation.
+/// The typed path drops these, so callers use this to route through
+/// passthrough instead.
+pub fn body_has_checksum_elements(xml_body: &[u8]) -> bool {
+    // Substring search on the raw bytes is sufficient: these element
+    // names never appear in valid ETag or PartNumber values.
+    const MARKERS: &[&[u8]] = &[
+        b"<ChecksumCRC32>",
+        b"<ChecksumCRC32C>",
+        b"<ChecksumSHA1>",
+        b"<ChecksumSHA256>",
+    ];
+    MARKERS
+        .iter()
+        .any(|m| xml_body.windows(m.len()).any(|w| w == *m))
+}
+
 pub fn parse_complete_multipart_body(xml_body: &[u8]) -> Result<Vec<CompletedPart>, String> {
     use quick_xml::Reader;
 
@@ -506,7 +526,9 @@ mod tests {
         let body = b"<NotCompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"e\"</ETag></Part></NotCompleteMultipartUpload>";
         let result = parse_complete_multipart_body(body);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Missing CompleteMultipartUpload root element"));
+        assert!(result
+            .unwrap_err()
+            .contains("Missing CompleteMultipartUpload root element"));
     }
 
     #[test]
@@ -530,7 +552,9 @@ mod tests {
         let body = b"<Wrapper><CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"e\"</ETag></Part></CompleteMultipartUpload></Wrapper>";
         let result = parse_complete_multipart_body(body);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Missing CompleteMultipartUpload root element"));
+        assert!(result
+            .unwrap_err()
+            .contains("Missing CompleteMultipartUpload root element"));
     }
 
     #[test]
@@ -591,5 +615,43 @@ mod tests {
         assert!(xml.contains("<ETag>\"final-etag\"</ETag>"));
         assert!(xml.contains("<Location>http://mybucket.s3.amazonaws.com/mykey</Location>"));
         assert!(xml.contains("</CompleteMultipartUploadResult>"));
+    }
+
+    // --- body_has_checksum_elements tests ---
+
+    #[test]
+    fn test_checksum_crc32_detected() {
+        let body = br#"<CompleteMultipartUpload>
+            <Part><PartNumber>1</PartNumber><ETag>"e1"</ETag><ChecksumCRC32>abc</ChecksumCRC32></Part>
+        </CompleteMultipartUpload>"#;
+        assert!(body_has_checksum_elements(body));
+    }
+
+    #[test]
+    fn test_checksum_sha256_detected() {
+        let body = br#"<CompleteMultipartUpload>
+            <Part><PartNumber>1</PartNumber><ETag>"e1"</ETag><ChecksumSHA256>abc</ChecksumSHA256></Part>
+        </CompleteMultipartUpload>"#;
+        assert!(body_has_checksum_elements(body));
+    }
+
+    #[test]
+    fn test_no_checksum_not_detected() {
+        let body = br#"<CompleteMultipartUpload>
+            <Part><PartNumber>1</PartNumber><ETag>"e1"</ETag></Part>
+        </CompleteMultipartUpload>"#;
+        assert!(!body_has_checksum_elements(body));
+    }
+
+    #[test]
+    fn test_checksum_crc32c_detected() {
+        let body = b"<Part><ChecksumCRC32C>x</ChecksumCRC32C></Part>";
+        assert!(body_has_checksum_elements(body));
+    }
+
+    #[test]
+    fn test_checksum_sha1_detected() {
+        let body = b"<Part><ChecksumSHA1>x</ChecksumSHA1></Part>";
+        assert!(body_has_checksum_elements(body));
     }
 }

@@ -219,6 +219,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_put_forwards_user_metadata_to_backend() {
+        use crate::s3::parse::parse_request;
+
         let key = "some/key.txt";
 
         let backend = MockBackend::new().with_put(Ok(crate::backend::models::PutObjectOutput {
@@ -229,20 +231,31 @@ mod tests {
 
         let state = build_app_state(backend, MockCache::new(), MockAuth::allow_all());
 
-        let mut parsed = make_parsed(key);
-        parsed.user_metadata.insert("x-amz-meta-author".to_string(), "alice".to_string());
-        parsed.user_metadata.insert("x-amz-meta-version".to_string(), "3".to_string());
+        // Build the request with actual x-amz-meta-* headers and run it
+        // through parse_request to exercise the full parser contract
+        // (the parser strips the "x-amz-meta-" prefix and stores bare keys).
+        let req = http::Request::builder()
+            .method("PUT")
+            .uri("/test-frontend/some/key.txt")
+            .header("x-amz-meta-author", "alice")
+            .header("x-amz-meta-version", "3")
+            .header("content-length", "5")
+            .body(())
+            .unwrap();
+        let parsed = parse_request(&req);
 
         let body = Body::from(b"hello".to_vec());
         let resp = handle_put(&state, &parsed, key, body).await;
 
         assert_eq!(resp.status(), 200);
 
-        // Verify the metadata was forwarded to the backend
+        // Verify the metadata was forwarded to the backend.
+        // The parser stores bare keys (without the "x-amz-meta-" prefix),
+        // and the handler forwards them as-is to the backend.
         let calls = state.backend.put_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         let put_input = &calls[0];
-        assert_eq!(put_input.metadata.get("x-amz-meta-author").unwrap(), "alice");
-        assert_eq!(put_input.metadata.get("x-amz-meta-version").unwrap(), "3");
+        assert_eq!(put_input.metadata.get("author").unwrap(), "alice");
+        assert_eq!(put_input.metadata.get("version").unwrap(), "3");
     }
 }

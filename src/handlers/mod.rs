@@ -258,7 +258,31 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
                     &state, "POST", &rewritten, query, &parts.headers, body, &parsed.request_id,
                 ).await
             } else {
-                multipart::handle_complete_multipart(&state, &parsed, key, upload_id, body).await
+                // Read the body eagerly so we can check for per-part checksum
+                // XML elements (ChecksumCRC32, ChecksumCRC32C, ChecksumSHA1,
+                // ChecksumSHA256). The typed path drops these — route through
+                // passthrough to preserve integrity validation.
+                match axum::body::to_bytes(
+                    body,
+                    state.config.max_request_body_bytes as usize,
+                ).await {
+                    Err(e) => {
+                        let s3err = S3Error::from_body_error(&e, &parsed.request_id);
+                        s3err.to_response()
+                    }
+                    Ok(body_bytes) if crate::s3::xml::body_has_checksum_elements(&body_bytes) => {
+                        let raw_path = parts.uri.path();
+                        let rewritten = rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
+                        let query = parts.uri.query();
+                        passthrough::handle_passthrough(
+                            &state, "POST", &rewritten, query, &parts.headers,
+                            Body::from(body_bytes), &parsed.request_id,
+                        ).await
+                    }
+                    Ok(body_bytes) => {
+                        multipart::handle_complete_multipart(&state, &parsed, key, upload_id, body_bytes).await
+                    }
+                }
             }
         }
         S3Operation::AbortMultipartUpload { key, upload_id, .. } => {
