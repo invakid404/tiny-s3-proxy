@@ -289,7 +289,11 @@ pub fn parse_request<B>(req: &Request<B>) -> ParsedRequest {
         }
     };
 
-    let content_length = header_str(req, "content-length").and_then(|v| v.parse::<i64>().ok());
+    // Reject negative Content-Length at parse time (treat as absent).
+    // The handler also rejects it with 400 as defense-in-depth.
+    let content_length = header_str(req, "content-length")
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|&v| v >= 0);
 
     // Scan for x-amz-meta-* user metadata and other x-amz-* headers to forward.
     let mut user_metadata = HashMap::new();
@@ -771,5 +775,20 @@ mod tests {
         let req = build_request("PUT", "/mybucket/mykey?partNumber=1");
         let parsed = parse_request(&req);
         assert!(matches!(parsed.operation, S3Operation::Unsupported { .. }));
+    }
+
+    #[test]
+    fn test_negative_content_length_treated_as_absent() {
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/mybucket/mykey")
+            .header("content-length", "-1")
+            .body(())
+            .unwrap();
+        let parsed = parse_request(&req);
+        assert_eq!(
+            parsed.content_length, None,
+            "negative Content-Length should be treated as absent"
+        );
     }
 }

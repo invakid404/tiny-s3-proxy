@@ -136,16 +136,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Run both servers concurrently with graceful shutdown.
     // Both listeners receive the same shutdown signal via a watch channel
     // and are awaited with try_join! so both fully drain before exit.
+    //
+    // Subscribe BEFORE spawning the signal task so there is no window
+    // where send(true) could fire before the receivers exist (a watch
+    // receiver created after send() treats the value as already-seen
+    // and changed().await would block forever).
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
-
-    let signal_tx = shutdown_tx.clone();
-    tokio::spawn(async move {
-        shutdown_signal().await;
-        let _ = signal_tx.send(true);
-    });
 
     let mut s3_shutdown_rx = shutdown_tx.subscribe();
     let mut admin_shutdown_rx = shutdown_tx.subscribe();
+
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    });
 
     let s3_shutdown = async move { let _ = s3_shutdown_rx.changed().await; };
     let admin_shutdown = async move { let _ = admin_shutdown_rx.changed().await; };

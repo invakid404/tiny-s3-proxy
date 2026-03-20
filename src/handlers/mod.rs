@@ -557,6 +557,8 @@ pub mod test_utils {
         pub abort_multipart_response: Mutex<Option<Result<(), ProxyError>>>,
         pub put_calls: Mutex<Vec<PutObjectInput>>,
         pub delete_calls: Mutex<Vec<(String, String)>>,
+        /// Total number of Backend trait method invocations.
+        pub total_calls: std::sync::atomic::AtomicU32,
     }
 
     impl MockBackend {
@@ -574,6 +576,7 @@ pub mod test_utils {
                 abort_multipart_response: Mutex::new(None),
                 put_calls: Mutex::new(Vec::new()),
                 delete_calls: Mutex::new(Vec::new()),
+                total_calls: std::sync::atomic::AtomicU32::new(0),
             }
         }
 
@@ -635,6 +638,7 @@ pub mod test_utils {
             _bucket: &str,
             _key: &str,
         ) -> Result<(GetObjectMeta, BoxByteStream), ProxyError> {
+            self.total_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let resp = self
                 .get_response
                 .lock()
@@ -668,6 +672,7 @@ pub mod test_utils {
             _bucket: &str,
             _key: &str,
         ) -> Result<HeadObjectOutput, ProxyError> {
+            self.total_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.head_response
                 .lock()
                 .unwrap()
@@ -681,6 +686,7 @@ pub mod test_utils {
         }
 
         async fn put_object(&self, req: PutObjectInput) -> Result<PutObjectOutput, ProxyError> {
+            self.total_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.put_calls.lock().unwrap().push(PutObjectInput {
                 bucket: req.bucket.clone(),
                 key: req.key.clone(),
@@ -704,6 +710,7 @@ pub mod test_utils {
         }
 
         async fn delete_object(&self, bucket: &str, key: &str) -> Result<DeleteObjectOutput, ProxyError> {
+            self.total_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.delete_calls
                 .lock()
                 .unwrap()
@@ -724,6 +731,7 @@ pub mod test_utils {
             &self,
             _req: ListObjectsInput,
         ) -> Result<ListObjectsOutput, ProxyError> {
+            self.total_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.list_response
                 .lock()
                 .unwrap()
@@ -744,6 +752,7 @@ pub mod test_utils {
             _metadata: &std::collections::HashMap<String, String>,
             _content_headers: &std::collections::HashMap<String, String>,
         ) -> Result<CreateMultipartOutput, ProxyError> {
+            self.total_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.create_multipart_response
                 .lock()
                 .unwrap()
@@ -760,6 +769,7 @@ pub mod test_utils {
             &self,
             _req: UploadPartInput,
         ) -> Result<UploadPartOutput, ProxyError> {
+            self.total_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.upload_part_response
                 .lock()
                 .unwrap()
@@ -776,6 +786,7 @@ pub mod test_utils {
             &self,
             _req: CompleteMultipartInput,
         ) -> Result<CompleteMultipartOutput, ProxyError> {
+            self.total_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.complete_multipart_response
                 .lock()
                 .unwrap()
@@ -794,6 +805,7 @@ pub mod test_utils {
             _key: &str,
             _upload_id: &str,
         ) -> Result<(), ProxyError> {
+            self.total_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.abort_multipart_response
                 .lock()
                 .unwrap()
@@ -1151,9 +1163,10 @@ mod tests {
             MockAuth::allow_all(),
         );
 
+        // CONNECT uses authority-form URI (host:port), not a path.
         let req = Request::builder()
             .method("CONNECT")
-            .uri("/test-frontend/some-key")
+            .uri("example.com:443")
             .body(Body::empty())
             .unwrap();
         let resp = handle_s3_request(State(state), req).await;
@@ -1162,9 +1175,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_patch_rejected_without_calling_backend() {
-        let backend = MockBackend::new();
         let state = build_app_state(
-            backend,
+            MockBackend::new(),
             MockCache::new(),
             MockAuth::allow_all(),
         );
@@ -1173,13 +1185,9 @@ mod tests {
         let resp = handle_s3_request(State(state.clone()), req).await;
         assert_eq!(resp.status(), 501);
 
-        // Verify the backend was never called: all mock response slots
-        // should still be untouched (Some/None depending on init).
-        // The get/head/put/delete slots are all initialized to None,
-        // so if any were consumed (taken), they'd be None.  We verify
-        // the backend wasn't touched by checking the response is 501
-        // (if passthrough ran, it would try to contact example.com
-        // and return a different status).
+        // Verify the backend was never invoked via the call counter.
+        let calls = state.backend.total_calls.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(calls, 0, "backend should not be called for non-S3 methods");
     }
 
     #[tokio::test]
