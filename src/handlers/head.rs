@@ -92,6 +92,7 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
         }
         Err(e) => {
             tracing::error!(
+                request_id = %parsed.request_id,
                 error = %e,
                 operation = "HeadObject",
                 key = key,

@@ -24,26 +24,14 @@ pub async fn handle_delete<B: Backend, C: CacheStore>(
         Ok(output) => {
             // Purge cache for this key (best-effort with one retry)
             let cache_key = CacheKey::new(&*state.backend_bucket, key);
-            if let Err(e) = state.cache.purge(&cache_key).await {
-                tracing::warn!(error = %e, key = key, "cache purge failed, retrying once");
-                if let Err(e2) = state.cache.purge(&cache_key).await {
-                    tracing::error!(
-                        error = %e2,
-                        operation = "DeleteObject",
-                        key = key,
-                        "cache purge failed on retry — poisoning key to block stale reads"
-                    );
-                    if let Err(e3) = state.cache.poison(&cache_key).await {
-                        tracing::error!(
-                            error = %e3,
-                            operation = "DeleteObject",
-                            key = key,
-                            "CRITICAL: cache purge AND poison marker both failed — stale data may be served"
-                        );
-                    }
-                }
-            }
-            state.singleflight.cancel(&cache_key).await;
+            super::invalidate_cache_key(
+                &state.cache,
+                &state.singleflight,
+                &cache_key,
+                "DeleteObject",
+                key,
+                &parsed.request_id,
+            ).await;
 
             tracing::info!(
                 request_id = %parsed.request_id,
@@ -67,6 +55,7 @@ pub async fn handle_delete<B: Backend, C: CacheStore>(
         }
         Err(e) => {
             tracing::error!(
+                request_id = %parsed.request_id,
                 error = %e,
                 operation = "DeleteObject",
                 key = key,

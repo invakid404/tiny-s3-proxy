@@ -11,10 +11,10 @@ use crate::backend::{Backend, BoxByteStream};
 use crate::cache::entry::CacheEntry;
 use crate::cache::key::CacheKey;
 use crate::cache::metadata::CacheMeta;
-use crate::cache::{CacheStore, FlightResult};
+use crate::cache::{CacheStore, FlightResult, FlightWaiter};
 use crate::handlers::AppState;
 use crate::s3::errors::S3Error;
-use crate::s3::headers::{common_headers, get_object_headers, with_cache_status};
+use crate::s3::headers::{common_headers, get_object_headers, metadata_headers, with_cache_status};
 use crate::s3::ops::ParsedRequest;
 
 /// Build an HTTP response from metadata + a streaming body.
@@ -67,26 +67,52 @@ async fn open_file_stream(
 /// Try to build a response from a cached entry. Returns `None` if the body
 /// file has disappeared (e.g. eviction/purge race), signaling the caller
 /// should fall back to the backend rather than returning a 500.
+///
+/// Builds headers directly from `CacheMeta` references, avoiding the
+/// HashMap clones that constructing an intermediate `GetObjectMeta` would
+/// require.
 async fn build_cache_response(
     entry: &CacheEntry,
     request_id: &str,
     cache_status: &str,
 ) -> Option<Response<Body>> {
-    let meta = GetObjectMeta {
-        content_type: entry.meta.content_type.clone(),
-        content_length: Some(entry.meta.content_length),
-        etag: entry.meta.etag.clone(),
-        last_modified: entry.meta.last_modified,
-        metadata: entry.meta.metadata.clone(),
-        extra_headers: entry.meta.extra_headers.clone(),
-    };
-
     let body_path = entry.body_path.clone();
     match open_file_stream(&body_path).await {
         Ok(stream) => {
-            let mut headers = get_object_headers(&meta);
-            let common = common_headers(request_id);
-            headers.extend(common);
+            let m = &entry.meta;
+            let mut headers = http::HeaderMap::new();
+
+            if let Some(ref ct) = m.content_type {
+                if let Ok(val) = http::header::HeaderValue::from_str(ct) {
+                    headers.insert("content-type", val);
+                }
+            }
+            headers.insert(
+                "content-length",
+                http::header::HeaderValue::from(m.content_length),
+            );
+            if let Some(ref etag) = m.etag {
+                if let Ok(val) = http::header::HeaderValue::from_str(etag) {
+                    headers.insert("etag", val);
+                }
+            }
+            if let Some(ref dt) = m.last_modified {
+                let formatted = dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+                if let Ok(val) = http::header::HeaderValue::from_str(&formatted) {
+                    headers.insert("last-modified", val);
+                }
+            }
+            headers.extend(metadata_headers(&m.metadata));
+            for (k, v) in &m.extra_headers {
+                if let (Ok(name), Ok(val)) = (
+                    http::header::HeaderName::from_bytes(k.as_bytes()),
+                    http::header::HeaderValue::from_str(v),
+                ) {
+                    headers.insert(name, val);
+                }
+            }
+
+            headers.extend(common_headers(request_id));
             with_cache_status(&mut headers, cache_status);
 
             let mut response = Response::builder().status(200);
@@ -213,13 +239,171 @@ async fn handle_passthrough<B: Backend, C: CacheStore>(
     }
 }
 
+/// Spawn a background task that tees the backend body stream to both
+/// the client (via an mpsc channel) and the disk cache.
+///
+/// Returns the client-facing response Body backed by the channel receiver.
+///
+/// # Why this isn't behind CacheStore
+///
+/// The tee operation bridges two concerns that cannot be cleanly separated:
+/// streaming the response to the client AND filling the cache simultaneously.
+/// Pushing this behind CacheStore would require the trait to understand
+/// HTTP response bodies and mpsc channels, leaking transport details into
+/// the cache abstraction.
+fn spawn_cache_tee<C: CacheStore + 'static>(
+    cache: Arc<C>,
+    body_stream: BoxByteStream,
+    cache_meta: CacheMeta,
+    fill_guard: Option<crate::cache::FillGuard>,
+    waiter: FlightWaiter,
+    temp_body_path: PathBuf,
+    request_id: String,
+    key: String,
+) -> Body {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
+    let temp_path_clone = temp_body_path.clone();
+    let req_id_for_tee = request_id;
+    let key_for_tee = key;
+
+    tokio::spawn(async move {
+        use tokio_stream::StreamExt;
+        use tokio::io::AsyncWriteExt;
+
+        let mut file = match tokio::fs::File::create(&temp_path_clone).await {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(
+                    request_id = %req_id_for_tee,
+                    key = %key_for_tee,
+                    error = %e,
+                    "cache fill: failed to create temp file"
+                );
+                if let Some(guard) = fill_guard {
+                    cache.abort_fill(guard).await;
+                }
+                // Drain stream to client without caching
+                let mut stream = body_stream;
+                while let Some(chunk) = stream.next().await {
+                    let _ = tx.send(chunk).await;
+                }
+                waiter.complete().await;
+                return;
+            }
+        };
+
+        let mut stream = body_stream;
+
+        let cache_ok = match tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            async {
+                let mut ok = true;
+                while let Some(chunk_result) = stream.next().await {
+                    match chunk_result {
+                        Ok(chunk) => {
+                            if ok
+                                && let Err(e) = file.write_all(&chunk).await
+                            {
+                                tracing::warn!(
+                                    request_id = %req_id_for_tee,
+                                    key = %key_for_tee,
+                                    error = %e,
+                                    "cache fill: write error"
+                                );
+                                ok = false;
+                            }
+                            // Send to client; if client disconnected, still
+                            // continue writing to disk so cache fills for followers.
+                            let _ = tx.send(Ok(chunk)).await;
+                        }
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(std::io::Error::other(e.to_string())))
+                                .await;
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                ok
+            },
+        )
+        .await
+        {
+            Ok(ok) => ok,
+            Err(_) => {
+                tracing::error!(
+                    request_id = %req_id_for_tee,
+                    key = %key_for_tee,
+                    "cache fill: tee task timed out after 300s"
+                );
+                false
+            }
+        };
+
+        // Drop sender so the client body ends
+        drop(tx);
+
+        if cache_ok {
+            if let Err(e) = file.sync_all().await {
+                tracing::warn!(
+                    request_id = %req_id_for_tee,
+                    key = %key_for_tee,
+                    error = %e,
+                    "cache fill: fsync error"
+                );
+                if let Some(guard) = fill_guard {
+                    cache.abort_fill(guard).await;
+                }
+                let _ = tokio::fs::remove_file(&temp_path_clone).await;
+                waiter.complete().await;
+                return;
+            }
+            drop(file);
+
+            if let Some(guard) = fill_guard {
+                // commit_fill always cleans up active_fills internally
+                // (on success, rejection, and error).
+                if let Err(e) = cache
+                    .commit_fill(guard, temp_path_clone.clone(), cache_meta)
+                    .await
+                {
+                    tracing::warn!(
+                        request_id = %req_id_for_tee,
+                        key = %key_for_tee,
+                        error = %e,
+                        "cache fill: commit error"
+                    );
+                    let _ = tokio::fs::remove_file(&temp_path_clone).await;
+                }
+            } else {
+                tracing::warn!(
+                    request_id = %req_id_for_tee,
+                    key = %key_for_tee,
+                    "cache fill: no fill guard, skipping cache commit"
+                );
+                let _ = tokio::fs::remove_file(&temp_path_clone).await;
+            }
+        } else {
+            if let Some(guard) = fill_guard {
+                cache.abort_fill(guard).await;
+            }
+            let _ = tokio::fs::remove_file(&temp_path_clone).await;
+        }
+
+        waiter.complete().await;
+    });
+
+    Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
+}
+
 /// Leader path: fetch from backend, tee stream to cache + client.
 async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
     state: &Arc<AppState<B, C>>,
     parsed: &ParsedRequest,
     key: &str,
     cache_key: &CacheKey,
-    waiter: crate::cache::FlightWaiter,
+    waiter: FlightWaiter,
 ) -> Response<Body> {
     // Register fill BEFORE the backend fetch so that any purge() during
     // the round-trip bumps the generation counter, causing commit_fill to
@@ -242,15 +426,9 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                 .unwrap_or(false);
 
             if is_size_cacheable {
-                // Tee: stream to client AND write to cache
-                let (tx, rx) =
-                    tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
-
                 let temp_body_path = PathBuf::from(&state.config.cache_dir)
                     .join("tmp")
                     .join(format!("{}-{}.body", std::process::id(), crate::request_id::generate()));
-
-                let cache = state.cache.clone();
 
                 let cache_meta = CacheMeta {
                     bucket: state.backend_bucket.to_string(),
@@ -266,98 +444,16 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                     metadata: meta.metadata.clone(),
                     extra_headers: meta.extra_headers.clone(),
                 };
-                let temp_path_clone = temp_body_path.clone();
 
-                // Spawn tee task
-                tokio::spawn(async move {
-                    use futures_util::StreamExt;
-                    use tokio::io::AsyncWriteExt;
-
-                    let mut file = match tokio::fs::File::create(&temp_path_clone).await {
-                        Ok(f) => f,
-                        Err(e) => {
-                            tracing::warn!("cache fill: failed to create temp file: {}", e);
-                            if let Some(guard) = fill_guard {
-                                cache.abort_fill(guard).await;
-                            }
-                            // Drain stream to client without caching
-                            let mut stream = body_stream;
-                            while let Some(chunk) = stream.next().await {
-                                let _ = tx.send(chunk).await;
-                            }
-                            waiter.complete().await;
-                            return;
-                        }
-                    };
-
-                    let mut stream = body_stream;
-                    let mut cache_ok = true;
-
-                    while let Some(chunk_result) = stream.next().await {
-                        match chunk_result {
-                            Ok(chunk) => {
-                                if cache_ok
-                                    && let Err(e) = file.write_all(&chunk).await
-                                {
-                                    tracing::warn!("cache fill: write error: {}", e);
-                                    cache_ok = false;
-                                }
-                                // Send to client; if client disconnected, still
-                                // continue writing to disk so cache fills for followers.
-                                let _ = tx.send(Ok(chunk)).await;
-                            }
-                            Err(e) => {
-                                let _ = tx
-                                    .send(Err(std::io::Error::other(e.to_string())))
-                                    .await;
-                                cache_ok = false;
-                                break;
-                            }
-                        }
-                    }
-
-                    // Drop sender so the client body ends
-                    drop(tx);
-
-                    if cache_ok {
-                        if let Err(e) = file.sync_all().await {
-                            tracing::warn!("cache fill: fsync error: {}", e);
-                            if let Some(guard) = fill_guard {
-                                cache.abort_fill(guard).await;
-                            }
-                            let _ = tokio::fs::remove_file(&temp_path_clone).await;
-                            waiter.complete().await;
-                            return;
-                        }
-                        drop(file);
-
-                        if let Some(guard) = fill_guard {
-                            // commit_fill always cleans up active_fills internally
-                            // (on success, rejection, and error).
-                            if let Err(e) = cache
-                                .commit_fill(guard, temp_path_clone.clone(), cache_meta)
-                                .await
-                            {
-                                tracing::warn!("cache fill: commit error: {}", e);
-                                let _ = tokio::fs::remove_file(&temp_path_clone).await;
-                            }
-                        } else {
-                            tracing::warn!("cache fill: no fill guard, skipping cache commit");
-                            let _ = tokio::fs::remove_file(&temp_path_clone).await;
-                        }
-                    } else {
-                        if let Some(guard) = fill_guard {
-                            cache.abort_fill(guard).await;
-                        }
-                        let _ = tokio::fs::remove_file(&temp_path_clone).await;
-                    }
-
-                    waiter.complete().await;
-                });
-
-                // Build response from channel receiver
-                let body = Body::from_stream(
-                    tokio_stream::wrappers::ReceiverStream::new(rx),
+                let body = spawn_cache_tee(
+                    state.cache.clone(),
+                    body_stream,
+                    cache_meta,
+                    fill_guard,
+                    waiter,
+                    temp_body_path,
+                    parsed.request_id.clone(),
+                    key.to_string(),
                 );
 
                 tracing::info!(
@@ -930,7 +1026,7 @@ mod tests {
             .entries
             .lock()
             .unwrap()
-            .insert(cache_key.hash_hex(), entry);
+            .insert(cache_key.hash_hex().to_string(), entry);
 
         // Signal followers
         waiter.complete().await;

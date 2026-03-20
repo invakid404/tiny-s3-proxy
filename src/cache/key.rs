@@ -1,36 +1,41 @@
-use std::fmt::Write;
-
 /// A cache key derived from bucket + object key.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CacheKey {
     pub bucket: String,
     pub object_key: String,
+    hash: String,
 }
 
 impl CacheKey {
     pub fn new(bucket: impl Into<String>, object_key: impl Into<String>) -> Self {
+        let bucket = bucket.into();
+        let object_key = object_key.into();
+        let hash = Self::compute_hash(&bucket, &object_key);
         Self {
-            bucket: bucket.into(),
-            object_key: object_key.into(),
+            bucket,
+            object_key,
+            hash,
         }
     }
 
-    /// Returns a hex-encoded hash for filesystem paths.
+    /// Compute the SHA-256 hash (truncated to 128 bits / 32 hex chars) for
+    /// a bucket + object key pair.
     ///
-    /// Uses SHA-256 (truncated to 128 bits / 32 hex chars) for collision
-    /// resistance and unconditional stability across restarts, library
-    /// upgrades, and platforms. The AWS SDK already depends on the `sha2`
-    /// crate transitively, so this adds no new dependency weight.
+    /// Uses SHA-256 for collision resistance and unconditional stability
+    /// across restarts, library upgrades, and platforms. The AWS SDK already
+    /// depends on the `sha2` crate transitively, so this adds no new
+    /// dependency weight.
     ///
     /// The input is `bucket + "\0" + object_key`, where the null byte
     /// prevents ambiguous concatenation (e.g. bucket "a" + key "bc" vs
     /// bucket "ab" + key "c").
-    pub fn hash_hex(&self) -> String {
+    fn compute_hash(bucket: &str, object_key: &str) -> String {
         use sha2::{Digest, Sha256};
+        use std::fmt::Write;
         let mut hasher = Sha256::new();
-        hasher.update(self.bucket.as_bytes());
+        hasher.update(bucket.as_bytes());
         hasher.update(b"\0");
-        hasher.update(self.object_key.as_bytes());
+        hasher.update(object_key.as_bytes());
         let result = hasher.finalize();
         // Truncate to 128 bits (16 bytes / 32 hex chars) for shorter filenames.
         // Birthday bound is ~2^64 entries for 50% collision probability, far
@@ -43,10 +48,15 @@ impl CacheKey {
         hex
     }
 
+    /// Returns the hex-encoded hash for filesystem paths, computed at
+    /// construction time and cached.
+    pub fn hash_hex(&self) -> &str {
+        &self.hash
+    }
+
     /// Returns the two-level directory prefix (first 2 + next 2 hex chars).
-    pub fn dir_prefix(&self) -> (String, String) {
-        let h = self.hash_hex();
-        (h[..2].to_string(), h[2..4].to_string())
+    pub fn dir_prefix(&self) -> (&str, &str) {
+        (&self.hash[..2], &self.hash[2..4])
     }
 }
 
@@ -77,8 +87,16 @@ mod tests {
         let key2 = CacheKey::new("bucket-a", "key2");
         let key3 = CacheKey::new("bucket-b", "key1");
 
-        assert_ne!(key1.hash_hex(), key2.hash_hex(), "different keys should differ");
-        assert_ne!(key1.hash_hex(), key3.hash_hex(), "different buckets should differ");
+        assert_ne!(
+            key1.hash_hex(),
+            key2.hash_hex(),
+            "different keys should differ"
+        );
+        assert_ne!(
+            key1.hash_hex(),
+            key3.hash_hex(),
+            "different buckets should differ"
+        );
         assert_ne!(key2.hash_hex(), key3.hash_hex());
     }
 

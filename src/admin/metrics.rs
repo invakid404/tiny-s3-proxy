@@ -32,15 +32,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_metrics_handler_returns_text_body() {
+    async fn test_metrics_handler_returns_valid_utf8_body() {
         let handle = metrics_exporter_prometheus::PrometheusBuilder::new()
             .build_recorder()
             .handle();
         let resp = metrics_handler(State(handle)).await.into_response();
         let body = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
-        // Body should be valid UTF-8 (prometheus text format)
-        let text = std::str::from_utf8(&body).unwrap();
-        // Might be empty if no metrics recorded, that's fine
-        assert!(!text.is_empty() || text.is_empty()); // proves we can read it
+        // Body must be valid UTF-8 (prometheus text exposition format).
+        let text = std::str::from_utf8(&body)
+            .expect("metrics body must be valid UTF-8");
+        // The body must not contain any non-ASCII control characters that
+        // would indicate binary/corrupt output.
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n' && c != '\r'),
+            "metrics body should not contain control characters"
+        );
     }
 }

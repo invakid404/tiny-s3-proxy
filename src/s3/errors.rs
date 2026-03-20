@@ -18,8 +18,12 @@ impl S3Error {
     /// Detailed error context is available in server-side logs.
     pub fn from_proxy_error(err: &ProxyError, request_id: &str, resource: Option<&str>) -> Self {
         let message = match err {
-            ProxyError::Backend { .. } => "A backend error occurred. Please retry the request.".to_string(),
-            ProxyError::Timeout { .. } => "The request to the backend timed out. Please retry.".to_string(),
+            ProxyError::Backend { .. } => {
+                "A backend error occurred. Please retry the request.".to_string()
+            }
+            ProxyError::Timeout { .. } => {
+                "The request to the backend timed out. Please retry.".to_string()
+            }
             ProxyError::UpstreamS3 { s3_code, .. } => {
                 // Use a stable message; the specific S3 code is in <Code>.
                 format!("The backend returned an error: {s3_code}")
@@ -137,7 +141,10 @@ impl S3Error {
         // Walk the error source chain looking for the typed LengthLimitError.
         let mut source: Option<&dyn std::error::Error> = Some(e);
         while let Some(err) = source {
-            if err.downcast_ref::<http_body_util::LengthLimitError>().is_some() {
+            if err
+                .downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some()
+            {
                 return Self::entity_too_large(
                     "request body exceeded the configured size limit",
                     request_id,
@@ -148,7 +155,7 @@ impl S3Error {
         S3Error {
             http_status: StatusCode::BAD_REQUEST,
             code: "IncompleteBody".to_string(),
-            message: format!("failed to read request body: {e}"),
+            message: "The request body could not be read.".to_string(),
             resource: None,
             request_id: request_id.to_string(),
         }

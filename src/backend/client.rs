@@ -1085,14 +1085,10 @@ mod tests {
         config.backend_allow_http = true;
 
         let result = S3Backend::from_config(&config).await;
-        // Should NOT be the InvalidRequest error about BACKEND_ALLOW_HTTP.
-        match &result {
-            Err(ProxyError::InvalidRequest { message })
-                if message.contains("BACKEND_ALLOW_HTTP") =>
-            {
-                panic!("should not reject http:// when backend_allow_http is true");
-            }
-            _ => {} // Ok or any other error is fine
-        }
+        assert!(
+            result.is_ok(),
+            "from_config should succeed with http:// when backend_allow_http is true, got: {:?}",
+            result.err()
+        );
     }
 }

@@ -60,6 +60,17 @@ fn collect_connection_nominated(headers: &http::HeaderMap) -> Vec<String> {
 
 /// Handle an unsupported S3 operation by proxying the raw HTTP request
 /// to the backend, re-signing it with the backend credentials.
+///
+/// # Architecture note
+///
+/// This handler intentionally bypasses the `Backend` trait. The Backend
+/// trait exposes typed methods (get_object, put_object, etc.) for operations
+/// the proxy understands. Passthrough exists for operations the proxy does
+/// NOT model — it forwards the raw HTTP request with all its headers and
+/// body intact. Re-signing with SigV4 requires access to the raw URL, headers,
+/// and body bytes, which typed trait methods cannot provide. Abstracting
+/// this behind a trait would either leak HTTP details into the trait or
+/// require a second "raw proxy" trait that duplicates the HTTP client logic.
 pub async fn handle_passthrough<B: Backend, C: CacheStore>(
     state: &Arc<AppState<B, C>>,
     method: &str,
@@ -124,10 +135,10 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
     // standard hop-by-hop headers, and any headers nominated by Connection.
     let connection_nominated = collect_connection_nominated(original_headers);
     for (name, value) in original_headers {
-        let name_lower = name.as_str().to_lowercase();
-        if SKIP_REQUEST_HEADERS.contains(&name_lower.as_str())
-            || HOP_BY_HOP_HEADERS.contains(&name_lower.as_str())
-            || connection_nominated.iter().any(|h| h == &name_lower)
+        let name_str = name.as_str();
+        if SKIP_REQUEST_HEADERS.contains(&name_str)
+            || HOP_BY_HOP_HEADERS.contains(&name_str)
+            || connection_nominated.iter().any(|h| h == name_str)
         {
             continue;
         }
@@ -138,10 +149,7 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
         Ok(req) => req,
         Err(e) => {
             tracing::error!(error = %e, "passthrough: failed to build signable request");
-            let s3err = S3Error::internal_error(
-                &format!("request build error: {}", e),
-                request_id,
-            );
+            let s3err = S3Error::internal_error("An internal error occurred.", request_id);
             return s3err.to_response();
         }
     };
@@ -180,10 +188,7 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
         Ok(params) => params,
         Err(e) => {
             tracing::error!(error = %e, "passthrough: failed to build signing params");
-            let s3err = S3Error::internal_error(
-                &format!("signing error: {}", e),
-                request_id,
-            );
+            let s3err = S3Error::internal_error("An internal error occurred.", request_id);
             return s3err.to_response();
         }
     };
@@ -200,10 +205,7 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
         Ok(s) => s,
         Err(e) => {
             tracing::error!(error = %e, "passthrough: failed to create signable request");
-            let s3err = S3Error::internal_error(
-                &format!("signing error: {}", e),
-                request_id,
-            );
+            let s3err = S3Error::internal_error("An internal error occurred.", request_id);
             return s3err.to_response();
         }
     };
@@ -212,10 +214,7 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
         Ok(output) => output.into_parts(),
         Err(e) => {
             tracing::error!(error = %e, "passthrough: failed to sign request");
-            let s3err = S3Error::internal_error(
-                &format!("signing error: {}", e),
-                request_id,
-            );
+            let s3err = S3Error::internal_error("An internal error occurred.", request_id);
             return s3err.to_response();
         }
     };
@@ -235,11 +234,19 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
         _ => (false, 1, 0),
     };
 
+    let reqwest_method = match reqwest::Method::from_bytes(method.as_bytes()) {
+        Ok(m) => m,
+        Err(_) => {
+            let s3err = S3Error::not_implemented(method, request_id);
+            return s3err.to_response();
+        }
+    };
+
     let mut last_err = None;
     let mut upstream_resp = None;
     for attempt in 1..=max_attempts {
         let mut req_builder = state.http_client.request(
-            reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET),
+            reqwest_method.clone(),
             &upstream_url,
         );
         for (name, value) in signable_request.headers() {

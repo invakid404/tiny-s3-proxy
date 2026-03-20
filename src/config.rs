@@ -9,6 +9,9 @@ pub enum ConfigError {
 
     #[error("failed to parse environment variable {name}: {reason}")]
     ParseError { name: String, reason: String },
+
+    #[error("configuration validation error: {reason}")]
+    ValidationError { reason: String },
 }
 
 /// Authentication mode for inbound S3 requests.
@@ -62,7 +65,7 @@ pub struct Config {
 impl Config {
     /// Load configuration from environment variables.
     pub fn from_env() -> Result<Self, ConfigError> {
-        Ok(Self {
+        let config = Self {
             // Frontend
             s3_listen_addr: get_env_or_default("S3_LISTEN_ADDR", "0.0.0.0:8080"),
             admin_listen_addr: get_env_or_default("ADMIN_LISTEN_ADDR", "0.0.0.0:9090"),
@@ -84,15 +87,15 @@ impl Config {
             cache_max_bytes: parse_u64_env("CACHE_MAX_BYTES", 10_737_418_240)?,
             cache_max_object_bytes: parse_u64_env("CACHE_MAX_OBJECT_BYTES", 536_870_912)?,
             cacheable_prefixes: {
-                let raw =
-                    get_env_or_default("CACHEABLE_PREFIXES", "script_bundle/,bun_bundle/,tar/");
+                let raw = get_env_or_default("CACHEABLE_PREFIXES", "");
                 raw.split(',')
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect()
             },
             cache_serve_stale_on_error: parse_bool_env("CACHE_SERVE_STALE_ON_ERROR", true)?,
-            cache_eviction_interval_secs: parse_u64_env("CACHE_EVICTION_INTERVAL_SECS", 300)?,
+            cache_eviction_interval_secs: parse_u64_env("CACHE_EVICTION_INTERVAL_SECS", 300)?
+                .max(10),
 
             // Retry
             get_max_attempts: parse_u32_env("GET_MAX_ATTEMPTS", 3)?,
@@ -104,7 +107,17 @@ impl Config {
             upstream_connect_timeout_ms: parse_u64_env("UPSTREAM_CONNECT_TIMEOUT_MS", 5000)?,
             upstream_request_timeout_ms: parse_u64_env("UPSTREAM_REQUEST_TIMEOUT_MS", 30000)?,
             max_request_body_bytes: parse_u64_env("MAX_REQUEST_BODY_BYTES", 268_435_456)?, // 256 MiB default
-        })
+        };
+
+        if config.auth_mode == AuthMode::AccessKeyAllowlist
+            && config.allowed_frontend_keys.is_empty()
+        {
+            return Err(ConfigError::ValidationError {
+                reason: "AUTH_MODE is access_key_allowlist but ALLOWED_FRONTEND_KEYS is empty or not set; all requests would be rejected".to_string(),
+            });
+        }
+
+        Ok(config)
     }
 }
 
@@ -187,17 +200,32 @@ mod tests {
 
     /// All environment variable names that Config::from_env() reads.
     const ALL_CONFIG_VARS: &[&str] = &[
-        "S3_LISTEN_ADDR", "ADMIN_LISTEN_ADDR", "FRONTEND_BUCKET",
-        "AUTH_MODE", "ALLOWED_FRONTEND_KEYS",
-        "BACKEND_ENDPOINT", "BACKEND_REGION", "BACKEND_BUCKET",
-        "BACKEND_ACCESS_KEY_ID", "BACKEND_SECRET_ACCESS_KEY",
-        "BACKEND_USE_PATH_STYLE", "BACKEND_ALLOW_HTTP",
-        "CACHE_DIR", "CACHE_MAX_BYTES", "CACHE_MAX_OBJECT_BYTES",
-        "CACHEABLE_PREFIXES", "CACHE_SERVE_STALE_ON_ERROR",
+        "S3_LISTEN_ADDR",
+        "ADMIN_LISTEN_ADDR",
+        "FRONTEND_BUCKET",
+        "AUTH_MODE",
+        "ALLOWED_FRONTEND_KEYS",
+        "BACKEND_ENDPOINT",
+        "BACKEND_REGION",
+        "BACKEND_BUCKET",
+        "BACKEND_ACCESS_KEY_ID",
+        "BACKEND_SECRET_ACCESS_KEY",
+        "BACKEND_USE_PATH_STYLE",
+        "BACKEND_ALLOW_HTTP",
+        "CACHE_DIR",
+        "CACHE_MAX_BYTES",
+        "CACHE_MAX_OBJECT_BYTES",
+        "CACHEABLE_PREFIXES",
+        "CACHE_SERVE_STALE_ON_ERROR",
         "CACHE_EVICTION_INTERVAL_SECS",
-        "GET_MAX_ATTEMPTS", "HEAD_MAX_ATTEMPTS", "LIST_MAX_ATTEMPTS",
-        "PUT_MAX_ATTEMPTS", "DELETE_MAX_ATTEMPTS", "RETRY_BASE_BACKOFF_MS",
-        "UPSTREAM_CONNECT_TIMEOUT_MS", "UPSTREAM_REQUEST_TIMEOUT_MS",
+        "GET_MAX_ATTEMPTS",
+        "HEAD_MAX_ATTEMPTS",
+        "LIST_MAX_ATTEMPTS",
+        "PUT_MAX_ATTEMPTS",
+        "DELETE_MAX_ATTEMPTS",
+        "RETRY_BASE_BACKOFF_MS",
+        "UPSTREAM_CONNECT_TIMEOUT_MS",
+        "UPSTREAM_REQUEST_TIMEOUT_MS",
         "MAX_REQUEST_BODY_BYTES",
     ];
 
@@ -266,10 +294,7 @@ mod tests {
             assert_eq!(config.cache_dir, "/cache");
             assert_eq!(config.cache_max_bytes, 10_737_418_240);
             assert_eq!(config.cache_max_object_bytes, 536_870_912);
-            assert_eq!(
-                config.cacheable_prefixes,
-                vec!["script_bundle/", "bun_bundle/", "tar/"]
-            );
+            assert!(config.cacheable_prefixes.is_empty());
             assert!(config.cache_serve_stale_on_error);
             assert_eq!(config.cache_eviction_interval_secs, 300);
 

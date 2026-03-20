@@ -32,6 +32,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         auth_mode = ?config.auth_mode,
         "starting tiny-s3-proxy"
     );
+
+    if config.auth_mode == config::AuthMode::TrustedInternal {
+        tracing::warn!(
+            "AUTH_MODE is trusted_internal: ALL requests are accepted without authentication. \
+             This is only safe behind a trusted network boundary (e.g. VPC)."
+        );
+    }
+
+    if config.cacheable_prefixes.is_empty() {
+        tracing::warn!(
+            "CACHEABLE_PREFIXES is empty — all GET requests will bypass the cache. \
+             Set CACHEABLE_PREFIXES to enable caching for specific key prefixes."
+        );
+    }
+
     let config = Arc::new(config);
 
     // 3. Create auth
@@ -98,14 +113,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
     });
 
-    // 8. Set up Prometheus metrics recorder
-    let prometheus_handle = setup_metrics();
-
-    // 9. Build S3 router
+    // 8. Build S3 router
     let s3_app = build_s3_router(state);
 
-    // 10. Build admin router
-    let admin_app = admin::build_admin_router(prometheus_handle);
+    // 9. Build admin router
+    let admin_state = admin::AdminState {
+        prometheus_handle: setup_metrics(),
+        cache_dir: PathBuf::from(&config.cache_dir),
+    };
+    let admin_app = admin::build_admin_router(admin_state);
 
     // 11. Start both listeners
     let s3_addr: std::net::SocketAddr = config.s3_listen_addr.parse()?;
@@ -117,15 +133,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let s3_listener = tokio::net::TcpListener::bind(s3_addr).await?;
     let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;
 
-    // Run both servers concurrently; exit with error if either fails.
+    // Run both servers concurrently with graceful shutdown.
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+
+    // Spawn task that waits for OS signal then broadcasts shutdown
+    let signal_tx = shutdown_tx.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = signal_tx.send(true);
+    });
+
+    let mut s3_shutdown_rx = shutdown_tx.subscribe();
+    let mut admin_shutdown_rx = shutdown_tx.subscribe();
+
+    let s3_shutdown = async move { let _ = s3_shutdown_rx.changed().await; };
+    let admin_shutdown = async move { let _ = admin_shutdown_rx.changed().await; };
+
     tokio::select! {
-        result = axum::serve(s3_listener, s3_app) => {
+        result = axum::serve(s3_listener, s3_app)
+            .with_graceful_shutdown(s3_shutdown) => {
             if let Err(e) = &result {
                 tracing::error!(error = %e, "S3 server error");
             }
             result?;
         }
-        result = axum::serve(admin_listener, admin_app) => {
+        result = axum::serve(admin_listener, admin_app)
+            .with_graceful_shutdown(admin_shutdown) => {
             if let Err(e) = &result {
                 tracing::error!(error = %e, "admin server error");
             }
@@ -133,7 +166,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    tracing::info!("shutdown complete");
+
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    tracing::info!("shutdown signal received, draining connections...");
 }
 
 /// Build the S3 router. All requests are routed through the S3 handler via fallback.

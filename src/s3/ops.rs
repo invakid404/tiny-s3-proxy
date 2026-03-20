@@ -68,7 +68,7 @@ pub struct ParsedRequest {
     pub operation: S3Operation,
     pub request_id: String,
     pub content_type: Option<String>,
-    pub content_length: Option<u64>,
+    pub content_length: Option<i64>,
     pub content_md5: Option<String>,
     pub authorization: Option<String>,
     pub amz_date: Option<String>,

@@ -68,6 +68,7 @@ pub async fn handle_list<B: Backend, C: CacheStore>(
         }
         Err(e) => {
             tracing::error!(
+                request_id = %parsed.request_id,
                 error = %e,
                 operation = "ListObjects",
                 "backend error"

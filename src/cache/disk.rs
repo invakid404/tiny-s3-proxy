@@ -7,7 +7,6 @@ use crate::cache::entry::CacheEntry;
 use crate::cache::key::CacheKey;
 use crate::cache::metadata::CacheMeta;
 use crate::cache::policy::CachePolicy;
-use crate::cache::singleflight::SingleFlight;
 use crate::cache::{CacheStats, CacheStatsSnapshot, CacheStore, FillGuard};
 use crate::error::ProxyError;
 
@@ -30,12 +29,7 @@ struct FillEntry {
 /// scheme for even distribution. Writes are atomic (write to tmp, fsync, rename).
 pub struct DiskCache {
     cache_dir: PathBuf,
-    #[allow(dead_code)]
-    max_bytes: u64,
-    #[allow(dead_code)]
-    policy: CachePolicy,
     stats: Arc<CacheStats>,
-    singleflight: Arc<SingleFlight>,
     /// Per-key fill tracking: refcount + generation counter + commit lock.
     /// purge() takes a read lock to bump the generation atomically without
     /// blocking behind any per-key commit_lock. begin_fill takes a write
@@ -49,8 +43,8 @@ impl DiskCache {
     /// stats from any existing cached files on disk.
     pub async fn new(
         cache_dir: PathBuf,
-        max_bytes: u64,
-        policy: CachePolicy,
+        _max_bytes: u64,
+        _policy: CachePolicy,
     ) -> Result<Self, ProxyError> {
         // Create directory structure
         tokio::fs::create_dir_all(cache_dir.join("objects"))
@@ -71,10 +65,7 @@ impl DiskCache {
 
         Ok(Self {
             cache_dir,
-            max_bytes,
-            policy,
             stats: Arc::new(stats),
-            singleflight: Arc::new(SingleFlight::new()),
             active_fills: tokio::sync::RwLock::new(HashMap::new()),
         })
     }
@@ -182,11 +173,6 @@ impl DiskCache {
         let hash = key.hash_hex();
         let dir = self.cache_dir.join("objects").join(&hash[..2]).join(&hash[2..4]);
         dir.join(format!("{hash}.poisoned"))
-    }
-
-    /// Get a reference to the singleflight instance.
-    pub fn singleflight(&self) -> &Arc<SingleFlight> {
-        &self.singleflight
     }
 
     /// Get a reference to the stats.
@@ -465,7 +451,7 @@ impl CacheStore for DiskCache {
             updated_meta.last_accessed_at = now;
             let meta_path_owned = meta_path.clone();
             let tmp_dir = self.cache_dir.join("tmp");
-            let hash = key.hash_hex();
+            let hash = key.hash_hex().to_string();
             tokio::spawn(async move {
                 static ACCESS_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 if let Ok(bytes) = serde_json::to_vec(&updated_meta) {

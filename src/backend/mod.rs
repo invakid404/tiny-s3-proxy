@@ -5,7 +5,7 @@ pub mod retry;
 use std::pin::Pin;
 
 use bytes::Bytes;
-use futures_util::Stream;
+use tokio_stream::Stream;
 
 use crate::error::ProxyError;
 use models::*;

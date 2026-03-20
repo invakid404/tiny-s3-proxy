@@ -90,8 +90,26 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
         return response;
     }
 
-    // Handle unsupported operations by proxying to the backend.
+    // Handle unsupported operations: proxy S3-valid methods to the backend,
+    // reject truly unsupported HTTP methods with 501.
     if let S3Operation::Unsupported { ref method, ref path } = parsed.operation {
+        // S3 only uses GET, HEAD, PUT, POST, DELETE. Any other HTTP method
+        // (PATCH, TRACE, CONNECT, OPTIONS, etc.) is not a valid S3 operation
+        // and should be rejected rather than blindly signed and forwarded.
+        const S3_METHODS: &[&str] = &["GET", "HEAD", "PUT", "POST", "DELETE"];
+        if !S3_METHODS.contains(&method.as_str()) {
+            let s3err = S3Error::from_proxy_error(
+                &crate::error::ProxyError::UnsupportedOperation {
+                    operation: format!("{} {}", method, path),
+                },
+                &parsed.request_id,
+                None,
+            );
+            let response = s3err.to_response();
+            record_metrics(op_name, &response, start);
+            return response;
+        }
+
         tracing::warn!(
             request_id = %parsed.request_id,
             method = %method,
@@ -251,15 +269,15 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
 /// Rewrite the bucket portion of a path-style S3 URL.
 /// E.g. `/frontend-bucket/key` → `/backend-bucket/key`.
 fn rewrite_bucket_in_path(path: &str, frontend_bucket: &str, backend_bucket: &str) -> String {
-    let prefix = format!("/{}/", frontend_bucket);
-    if path.starts_with(&prefix) {
-        format!("/{}/{}", backend_bucket, &path[prefix.len()..])
-    } else if path == format!("/{}", frontend_bucket) {
-        format!("/{}", backend_bucket)
-    } else {
-        // Can't rewrite — pass through as-is.
-        path.to_string()
+    let stripped = path.strip_prefix('/').unwrap_or(path);
+    if let Some(rest) = stripped.strip_prefix(frontend_bucket) {
+        if let Some(key_part) = rest.strip_prefix('/') {
+            return format!("/{}/{}", backend_bucket, key_part);
+        } else if rest.is_empty() {
+            return format!("/{}", backend_bucket);
+        }
     }
+    path.to_owned()
 }
 
 /// Map common HTTP status codes to static strings, avoiding allocation.
@@ -295,7 +313,14 @@ fn record_metrics(operation: &'static str, response: &Response<Body>, start: Ins
     if let Some(cache_status) = response.headers().get("x-cache")
         && let Ok(cs) = cache_status.to_str()
     {
-        counter!("s3proxy_cache_total", "status" => cs.to_string()).increment(1);
+        let label: &'static str = match cs {
+            "HIT" => "HIT",
+            "MISS" => "MISS",
+            "BYPASS" => "BYPASS",
+            "STALE" => "STALE",
+            _ => "OTHER",
+        };
+        counter!("s3proxy_cache_total", "status" => label).increment(1);
     }
 
     // Response body size.
@@ -304,6 +329,46 @@ fn record_metrics(operation: &'static str, response: &Response<Body>, start: Ins
     {
         histogram!("s3proxy_response_size_bytes", "operation" => operation).record(size);
     }
+}
+
+/// Purge a cache key with one retry, falling back to a poison marker on failure.
+/// Also cancels any in-flight singleflight for the key.
+pub(crate) async fn invalidate_cache_key<C: CacheStore>(
+    cache: &Arc<C>,
+    singleflight: &Arc<SingleFlight>,
+    cache_key: &crate::cache::key::CacheKey,
+    operation: &str,
+    object_key: &str,
+    request_id: &str,
+) {
+    if let Err(e) = cache.purge(cache_key).await {
+        tracing::warn!(
+            request_id = %request_id,
+            error = %e,
+            operation = operation,
+            key = object_key,
+            "cache purge failed, retrying once"
+        );
+        if let Err(e2) = cache.purge(cache_key).await {
+            tracing::error!(
+                request_id = %request_id,
+                error = %e2,
+                operation = operation,
+                key = object_key,
+                "cache purge failed on retry — poisoning key to block stale reads"
+            );
+            if let Err(e3) = cache.poison(cache_key).await {
+                tracing::error!(
+                    request_id = %request_id,
+                    error = %e3,
+                    operation = operation,
+                    key = object_key,
+                    "CRITICAL: cache purge AND poison marker both failed — stale data may be served"
+                );
+            }
+        }
+    }
+    singleflight.cancel(cache_key).await;
 }
 
 /// Check if the request contains headers that the typed GET/HEAD backend
@@ -458,9 +523,7 @@ pub mod test_utils {
 
     /// Convert a Vec<u8> into a BoxByteStream (single-chunk stream).
     fn vec_to_stream(data: Vec<u8>) -> BoxByteStream {
-        let stream = futures_util::stream::once(async move {
-            Ok::<Bytes, std::io::Error>(Bytes::from(data))
-        });
+        let stream = tokio_stream::once(Ok::<Bytes, std::io::Error>(Bytes::from(data)));
         Box::pin(stream)
     }
 
@@ -773,7 +836,7 @@ pub mod test_utils {
                 meta,
                 body_path,
             };
-            self.entries.lock().unwrap().insert(key.hash_hex(), entry);
+            self.entries.lock().unwrap().insert(key.hash_hex().to_string(), entry);
             self
         }
     }
@@ -781,7 +844,7 @@ pub mod test_utils {
     impl CacheStore for MockCache {
         async fn lookup(&self, key: &CacheKey) -> Result<Option<CacheEntry>, ProxyError> {
             let entries = self.entries.lock().unwrap();
-            let entry = entries.get(&key.hash_hex()).map(|e| CacheEntry {
+            let entry = entries.get(key.hash_hex()).map(|e| CacheEntry {
                 meta: e.meta.clone(),
                 body_path: e.body_path.clone(),
             });
@@ -816,7 +879,7 @@ pub mod test_utils {
             self.entries
                 .lock()
                 .unwrap()
-                .insert(guard.key.hash_hex(), entry);
+                .insert(guard.key.hash_hex().to_string(), entry);
             Ok(())
         }
 
@@ -828,7 +891,7 @@ pub mod test_utils {
                     operation: "purge".into(),
                 });
             }
-            let removed = self.entries.lock().unwrap().remove(&key.hash_hex()).is_some();
+            let removed = self.entries.lock().unwrap().remove(key.hash_hex()).is_some();
             Ok(removed)
         }
 
@@ -938,6 +1001,24 @@ pub mod test_utils {
         })
     }
 
+    /// Build a ParsedRequest with the given operation and default values for all other fields.
+    pub fn test_parsed_request(operation: crate::s3::ops::S3Operation) -> crate::s3::ops::ParsedRequest {
+        crate::s3::ops::ParsedRequest {
+            operation,
+            request_id: "test-req-id".to_string(),
+            content_type: None,
+            content_length: None,
+            content_md5: None,
+            authorization: None,
+            amz_date: None,
+            amz_content_sha256: None,
+            range: None,
+            user_metadata: HashMap::new(),
+            extra_amz_headers: HashMap::new(),
+            content_headers: HashMap::new(),
+        }
+    }
+
     /// Build a test CacheMeta for a given key/body.
     pub fn test_cache_meta(bucket: &str, key: &str, body: &[u8]) -> CacheMeta {
         CacheMeta {
@@ -973,21 +1054,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_unsupported_operation_attempts_passthrough() {
+    async fn test_non_s3_method_returns_501() {
         let state = build_app_state(
             MockBackend::new(),
             MockCache::new(),
             MockAuth::allow_all(),
         );
 
+        // PATCH is not a valid S3 method and should be rejected with 501.
         let req = build_request("PATCH", "/test-frontend/some-key");
         let resp = handle_s3_request(State(state), req).await;
+        assert_eq!(resp.status(), 501);
 
-        // Unsupported operations are now proxied to the backend.
-        // The response depends on the backend's answer. In tests with
-        // the example.com endpoint the status varies, so just verify
-        // we did NOT get 501 (the old behaviour).
-        assert_ne!(resp.status(), 501);
+        let body = axum::body::to_bytes(resp.into_body(), 4096)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8_lossy(&body);
+        assert!(body_str.contains("NotImplemented"));
     }
 
     #[tokio::test]

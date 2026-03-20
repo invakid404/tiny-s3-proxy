@@ -44,15 +44,21 @@ impl RequestGate for AccessKeyAllowlistAuth {
                 message: "malformed SigV4 Authorization header".to_string(),
             })?;
 
+        // Always iterate the entire list so timing does not reveal which
+        // position (if any) matched. The `found` flag accumulates matches
+        // without short-circuiting.
+        let mut found = false;
         for allowed_key in &self.allowed_keys {
-            if constant_time_eq(access_key_id, allowed_key) {
-                return Ok(());
-            }
+            found |= constant_time_eq(access_key_id, allowed_key);
         }
 
-        Err(ProxyError::Auth {
-            message: "access key ID not in allowlist".to_string(),
-        })
+        if found {
+            Ok(())
+        } else {
+            Err(ProxyError::Auth {
+                message: "access key ID not in allowlist".to_string(),
+            })
+        }
     }
 }
 
@@ -73,13 +79,20 @@ fn extract_access_key_id(authorization: &str) -> Option<&str> {
 }
 
 /// Constant-time string comparison to prevent timing attacks.
+///
+/// Always iterates `max(len(a), len(b))` bytes so that neither the
+/// lengths nor the contents leak through timing. A length mismatch
+/// is folded into the accumulator without short-circuiting.
 fn constant_time_eq(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut result = 0u8;
-    for (x, y) in a.bytes().zip(b.bytes()) {
-        result |= x ^ y;
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    // Fold length mismatch into the result up front — no early return.
+    let mut result: u8 = (a.len() != b.len()) as u8;
+    let max_len = a.len().max(b.len());
+    for i in 0..max_len {
+        let byte_a = if i < a.len() { a[i] } else { 0 };
+        let byte_b = if i < b.len() { b[i] } else { 0 };
+        result |= byte_a ^ byte_b;
     }
     result == 0
 }
@@ -270,7 +283,9 @@ mod tests {
     fn test_extract_access_key_id_rejects_junk_between_scheme_and_credential() {
         // Scheme is correct but Credential= is not the first field
         assert_eq!(
-            extract_access_key_id("AWS4-HMAC-SHA256 junk Credential=AKID/20240101/us-east-1/s3/aws4_request"),
+            extract_access_key_id(
+                "AWS4-HMAC-SHA256 junk Credential=AKID/20240101/us-east-1/s3/aws4_request"
+            ),
             None
         );
     }

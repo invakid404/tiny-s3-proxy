@@ -11,18 +11,41 @@ use crate::s3::ops::{ListParams, ParsedRequest, S3Operation};
 /// This includes versioning params, response-override params, and all
 /// resource-level subresources.
 const S3_SUBRESOURCE_PARAMS: &[&str] = &[
-    "acl", "cors", "delete", "encryption", "intelligent-tiering",
-    "inventory", "legal-hold", "lifecycle", "location", "logging",
-    "metrics", "notification", "object-lock", "policy", "replication",
-    "requestPayment", "restore", "retention", "select", "tagging",
-    "torrent", "versioning", "versions", "website", "accelerate",
+    "acl",
+    "cors",
+    "delete",
+    "encryption",
+    "intelligent-tiering",
+    "inventory",
+    "legal-hold",
+    "lifecycle",
+    "location",
+    "logging",
+    "metrics",
+    "notification",
+    "object-lock",
+    "policy",
+    "replication",
+    "requestPayment",
+    "restore",
+    "retention",
+    "select",
+    "tagging",
+    "torrent",
+    "versioning",
+    "versions",
+    "website",
+    "accelerate",
     "analytics",
     // Versioning
     "versionId",
     // GET response-override parameters (change response headers)
-    "response-content-type", "response-content-disposition",
-    "response-content-encoding", "response-content-language",
-    "response-expires", "response-cache-control",
+    "response-content-type",
+    "response-content-disposition",
+    "response-content-encoding",
+    "response-content-language",
+    "response-expires",
+    "response-cache-control",
 ];
 
 /// Parse query string into key-value pairs.
@@ -91,111 +114,116 @@ pub fn parse_request<B>(req: &Request<B>) -> ParsedRequest {
                 path: path.to_string(),
             }
         } else {
-        // Operations on objects.
-        //
-        // Multipart control parameters (uploads, uploadId, partNumber) change
-        // the operation semantics entirely. If ANY of them are present, we only
-        // accept the exact valid combinations; everything else is Unsupported
-        // to prevent stray params from turning into unintended object operations.
-        let has_multipart_params = query.contains_key("uploads")
-            || query.contains_key("uploadId")
-            || query.contains_key("partNumber");
+            // Operations on objects.
+            //
+            // Multipart control parameters (uploads, uploadId, partNumber) change
+            // the operation semantics entirely. If ANY of them are present, we only
+            // accept the exact valid combinations; everything else is Unsupported
+            // to prevent stray params from turning into unintended object operations.
+            let has_multipart_params = query.contains_key("uploads")
+                || query.contains_key("uploadId")
+                || query.contains_key("partNumber");
 
-        if has_multipart_params {
-            match method {
-                "PUT" if query.contains_key("partNumber") && query.contains_key("uploadId")
-                    && !query.contains_key("uploads") =>
-                {
-                    if req.headers().contains_key("x-amz-copy-source") {
-                        S3Operation::Unsupported {
-                            method: method.to_string(),
-                            path: path.to_string(),
+            if has_multipart_params {
+                match method {
+                    "PUT"
+                        if query.contains_key("partNumber")
+                            && query.contains_key("uploadId")
+                            && !query.contains_key("uploads") =>
+                    {
+                        if req.headers().contains_key("x-amz-copy-source") {
+                            S3Operation::Unsupported {
+                                method: method.to_string(),
+                                path: path.to_string(),
+                            }
+                        } else {
+                            let part_number = query
+                                .get("partNumber")
+                                .and_then(|v| v.parse::<i32>().ok())
+                                .unwrap_or(0);
+                            let upload_id = query.get("uploadId").cloned().unwrap_or_default();
+                            S3Operation::UploadPart {
+                                bucket: bucket.to_string(),
+                                key,
+                                part_number,
+                                upload_id,
+                            }
                         }
-                    } else {
-                        let part_number = query
-                            .get("partNumber")
-                            .and_then(|v| v.parse::<i32>().ok())
-                            .unwrap_or(0);
-                        let upload_id = query.get("uploadId").cloned().unwrap_or_default();
-                        S3Operation::UploadPart {
+                    }
+                    "POST"
+                        if query.contains_key("uploads")
+                            && !query.contains_key("uploadId")
+                            && !query.contains_key("partNumber") =>
+                    {
+                        S3Operation::CreateMultipartUpload {
                             bucket: bucket.to_string(),
                             key,
-                            part_number,
+                        }
+                    }
+                    "POST"
+                        if query.contains_key("uploadId")
+                            && !query.contains_key("uploads")
+                            && !query.contains_key("partNumber") =>
+                    {
+                        let upload_id = query.get("uploadId").cloned().unwrap_or_default();
+                        S3Operation::CompleteMultipartUpload {
+                            bucket: bucket.to_string(),
+                            key,
                             upload_id,
                         }
                     }
-                }
-                "POST" if query.contains_key("uploads")
-                    && !query.contains_key("uploadId")
-                    && !query.contains_key("partNumber") =>
-                {
-                    S3Operation::CreateMultipartUpload {
-                        bucket: bucket.to_string(),
-                        key,
+                    "DELETE"
+                        if query.contains_key("uploadId")
+                            && !query.contains_key("uploads")
+                            && !query.contains_key("partNumber") =>
+                    {
+                        let upload_id = query.get("uploadId").cloned().unwrap_or_default();
+                        S3Operation::AbortMultipartUpload {
+                            bucket: bucket.to_string(),
+                            key,
+                            upload_id,
+                        }
                     }
-                }
-                "POST" if query.contains_key("uploadId")
-                    && !query.contains_key("uploads")
-                    && !query.contains_key("partNumber") =>
-                {
-                    let upload_id = query.get("uploadId").cloned().unwrap_or_default();
-                    S3Operation::CompleteMultipartUpload {
-                        bucket: bucket.to_string(),
-                        key,
-                        upload_id,
-                    }
-                }
-                "DELETE" if query.contains_key("uploadId")
-                    && !query.contains_key("uploads")
-                    && !query.contains_key("partNumber") =>
-                {
-                    let upload_id = query.get("uploadId").cloned().unwrap_or_default();
-                    S3Operation::AbortMultipartUpload {
-                        bucket: bucket.to_string(),
-                        key,
-                        upload_id,
-                    }
-                }
-                // Any other method/param combination with multipart params is invalid.
-                _ => S3Operation::Unsupported {
-                    method: method.to_string(),
-                    path: path.to_string(),
-                },
-            }
-        } else {
-        // Plain object operations (no multipart params).
-        match method {
-            "GET" => S3Operation::GetObject {
-                bucket: bucket.to_string(),
-                key,
-            },
-            "HEAD" => S3Operation::HeadObject {
-                bucket: bucket.to_string(),
-                key,
-            },
-            "PUT" => {
-                if req.headers().contains_key("x-amz-copy-source") {
-                    S3Operation::Unsupported {
+                    // Any other method/param combination with multipart params is invalid.
+                    _ => S3Operation::Unsupported {
                         method: method.to_string(),
                         path: path.to_string(),
-                    }
-                } else {
-                    S3Operation::PutObject {
+                    },
+                }
+            } else {
+                // Plain object operations (no multipart params).
+                match method {
+                    "GET" => S3Operation::GetObject {
                         bucket: bucket.to_string(),
                         key,
+                    },
+                    "HEAD" => S3Operation::HeadObject {
+                        bucket: bucket.to_string(),
+                        key,
+                    },
+                    "PUT" => {
+                        if req.headers().contains_key("x-amz-copy-source") {
+                            S3Operation::Unsupported {
+                                method: method.to_string(),
+                                path: path.to_string(),
+                            }
+                        } else {
+                            S3Operation::PutObject {
+                                bucket: bucket.to_string(),
+                                key,
+                            }
+                        }
                     }
+                    "DELETE" => S3Operation::DeleteObject {
+                        bucket: bucket.to_string(),
+                        key,
+                    },
+                    _ => S3Operation::Unsupported {
+                        method: method.to_string(),
+                        path: path.to_string(),
+                    },
                 }
             }
-            "DELETE" => S3Operation::DeleteObject {
-                bucket: bucket.to_string(),
-                key,
-            },
-            _ => S3Operation::Unsupported {
-                method: method.to_string(),
-                path: path.to_string(),
-            },
-        }
-        }
         }
     } else {
         // Bucket-level operations (no key)
@@ -214,13 +242,17 @@ pub fn parse_request<B>(req: &Request<B>) -> ParsedRequest {
                     // Any other value (e.g. "3") goes through passthrough so the
                     // backend returns the appropriate error.
                     let list_type = query.get("list-type").map(|v| v.as_str());
-                    let max_keys_invalid = query.get("max-keys")
+                    let max_keys_invalid = query
+                        .get("max-keys")
                         .is_some_and(|v| v.parse::<i32>().is_err());
                     // S3 only accepts encoding-type=url; anything else is InvalidArgument.
-                    let encoding_type_invalid = query.get("encoding-type")
-                        .is_some_and(|v| v != "url");
+                    let encoding_type_invalid =
+                        query.get("encoding-type").is_some_and(|v| v != "url");
 
-                    if matches!(list_type, Some(v) if v != "2") || max_keys_invalid || encoding_type_invalid {
+                    if matches!(list_type, Some(v) if v != "2")
+                        || max_keys_invalid
+                        || encoding_type_invalid
+                    {
                         S3Operation::Unsupported {
                             method: method.to_string(),
                             path: path.to_string(),
@@ -257,7 +289,9 @@ pub fn parse_request<B>(req: &Request<B>) -> ParsedRequest {
         }
     };
 
-    let content_length = header_str(req, "content-length").and_then(|v| v.parse::<u64>().ok());
+    let content_length = header_str(req, "content-length")
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|&v| v >= 0);
 
     // Scan for x-amz-meta-* user metadata and other x-amz-* headers to forward.
     let mut user_metadata = HashMap::new();
@@ -292,7 +326,13 @@ pub fn parse_request<B>(req: &Request<B>) -> ParsedRequest {
 
     // Capture standard content headers that the typed write path needs to forward.
     let mut content_headers = HashMap::new();
-    for name in &["content-encoding", "content-disposition", "content-language", "cache-control", "expires"] {
+    for name in &[
+        "content-encoding",
+        "content-disposition",
+        "content-language",
+        "cache-control",
+        "expires",
+    ] {
         if let Some(val) = header_str(req, name) {
             content_headers.insert(name.to_string(), val);
         }
