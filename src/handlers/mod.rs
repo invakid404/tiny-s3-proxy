@@ -736,6 +736,8 @@ pub mod test_utils {
         pub entries: Mutex<HashMap<String, CacheEntry>>,
         pub purge_calls: Mutex<Vec<CacheKey>>,
         pub fill_calls: Mutex<Vec<CacheKey>>,
+        pub poison_calls: Mutex<Vec<CacheKey>>,
+        pub purge_should_fail: Mutex<bool>,
         pub temp_dir: tempfile::TempDir,
     }
 
@@ -746,8 +748,15 @@ pub mod test_utils {
                 entries: Mutex::new(HashMap::new()),
                 purge_calls: Mutex::new(Vec::new()),
                 fill_calls: Mutex::new(Vec::new()),
+                poison_calls: Mutex::new(Vec::new()),
+                purge_should_fail: Mutex::new(false),
                 temp_dir: tempfile::TempDir::new().expect("create mock cache temp dir"),
             }
+        }
+
+        pub fn with_purge_failing(self) -> Self {
+            *self.purge_should_fail.lock().unwrap() = true;
+            self
         }
 
         /// Add a cache entry, writing the body to a temp file.
@@ -813,11 +822,18 @@ pub mod test_utils {
 
         async fn purge(&self, key: &CacheKey) -> Result<bool, ProxyError> {
             self.purge_calls.lock().unwrap().push(key.clone());
+            if *self.purge_should_fail.lock().unwrap() {
+                return Err(ProxyError::Cache {
+                    source: "mock purge failure".into(),
+                    operation: "purge".into(),
+                });
+            }
             let removed = self.entries.lock().unwrap().remove(&key.hash_hex()).is_some();
             Ok(removed)
         }
 
-        async fn poison(&self, _key: &CacheKey) -> Result<(), crate::error::ProxyError> {
+        async fn poison(&self, key: &CacheKey) -> Result<(), crate::error::ProxyError> {
+            self.poison_calls.lock().unwrap().push(key.clone());
             Ok(())
         }
 
@@ -1024,5 +1040,146 @@ mod tests {
             .unwrap();
         let body_str = String::from_utf8_lossy(&body);
         assert!(body_str.contains("AccessDenied"));
+    }
+
+    // ---- rewrite_bucket_in_path tests ----
+
+    #[test]
+    fn test_rewrite_bucket_in_path_with_key() {
+        let result = rewrite_bucket_in_path("/frontend/key/path", "frontend", "backend");
+        assert_eq!(result, "/backend/key/path");
+    }
+
+    #[test]
+    fn test_rewrite_bucket_in_path_bucket_only() {
+        let result = rewrite_bucket_in_path("/frontend", "frontend", "backend");
+        assert_eq!(result, "/backend");
+    }
+
+    #[test]
+    fn test_rewrite_bucket_in_path_no_match() {
+        let result = rewrite_bucket_in_path("/other/key", "frontend", "backend");
+        assert_eq!(result, "/other/key");
+    }
+
+    // ---- has_unsupported_get_modifiers tests ----
+
+    #[test]
+    fn test_has_unsupported_get_modifiers_range() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("range", "bytes=0-100".parse().unwrap());
+        assert!(has_unsupported_get_modifiers(&headers));
+    }
+
+    #[test]
+    fn test_has_unsupported_get_modifiers_if_match() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("if-match", "\"etag\"".parse().unwrap());
+        assert!(has_unsupported_get_modifiers(&headers));
+    }
+
+    #[test]
+    fn test_has_unsupported_get_modifiers_if_none_match() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("if-none-match", "\"etag\"".parse().unwrap());
+        assert!(has_unsupported_get_modifiers(&headers));
+    }
+
+    #[test]
+    fn test_has_unsupported_get_modifiers_ssec() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-amz-server-side-encryption-customer-algorithm",
+            "AES256".parse().unwrap(),
+        );
+        assert!(has_unsupported_get_modifiers(&headers));
+    }
+
+    #[test]
+    fn test_has_unsupported_get_modifiers_checksum_mode() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-amz-checksum-mode", "ENABLED".parse().unwrap());
+        assert!(has_unsupported_get_modifiers(&headers));
+    }
+
+    #[test]
+    fn test_has_unsupported_get_modifiers_clean() {
+        let headers = http::HeaderMap::new();
+        assert!(!has_unsupported_get_modifiers(&headers));
+    }
+
+    // ---- has_unsupported_write_modifiers tests ----
+
+    #[test]
+    fn test_has_unsupported_write_modifiers_storage_class() {
+        let mut extra_amz = std::collections::HashMap::new();
+        extra_amz.insert(
+            "x-amz-storage-class".to_string(),
+            "GLACIER".to_string(),
+        );
+        let headers = http::HeaderMap::new();
+        assert!(has_unsupported_write_modifiers(&extra_amz, &headers));
+    }
+
+    #[test]
+    fn test_has_unsupported_write_modifiers_if_match() {
+        let extra_amz = std::collections::HashMap::new();
+        let mut headers = http::HeaderMap::new();
+        headers.insert("if-match", "\"etag\"".parse().unwrap());
+        assert!(has_unsupported_write_modifiers(&extra_amz, &headers));
+    }
+
+    #[test]
+    fn test_has_unsupported_write_modifiers_clean() {
+        let extra_amz = std::collections::HashMap::new();
+        let headers = http::HeaderMap::new();
+        assert!(!has_unsupported_write_modifiers(&extra_amz, &headers));
+    }
+
+    // ---- has_unsupported_multipart_modifiers tests ----
+
+    #[test]
+    fn test_has_unsupported_multipart_modifiers_checksum() {
+        let mut extra_amz = std::collections::HashMap::new();
+        extra_amz.insert(
+            "x-amz-checksum-algorithm".to_string(),
+            "SHA256".to_string(),
+        );
+        let headers = http::HeaderMap::new();
+        assert!(has_unsupported_multipart_modifiers(&extra_amz, &headers));
+    }
+
+    #[test]
+    fn test_has_unsupported_multipart_modifiers_clean() {
+        let extra_amz = std::collections::HashMap::new();
+        let headers = http::HeaderMap::new();
+        assert!(!has_unsupported_multipart_modifiers(&extra_amz, &headers));
+    }
+
+    // ---- has_unsupported_list_modifiers tests ----
+
+    #[test]
+    fn test_has_unsupported_list_modifiers_fetch_owner() {
+        let headers = http::HeaderMap::new();
+        assert!(has_unsupported_list_modifiers(
+            Some("list-type=2&fetch-owner=true"),
+            &headers
+        ));
+    }
+
+    #[test]
+    fn test_has_unsupported_list_modifiers_request_payer() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-amz-request-payer", "requester".parse().unwrap());
+        assert!(has_unsupported_list_modifiers(None, &headers));
+    }
+
+    #[test]
+    fn test_has_unsupported_list_modifiers_clean() {
+        let headers = http::HeaderMap::new();
+        assert!(!has_unsupported_list_modifiers(
+            Some("list-type=2&prefix=foo/"),
+            &headers
+        ));
     }
 }

@@ -201,6 +201,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_put_success_calls_poison_on_purge_failure() {
+        let key = "script_bundle/test.js";
+
+        let backend = MockBackend::new().with_put(Ok(crate::backend::models::PutObjectOutput {
+            etag: Some("\"new-etag\"".to_string()),
+            version_id: None,
+            extra_headers: std::collections::HashMap::new(),
+        }));
+
+        let cache = MockCache::new().with_purge_failing();
+        let state = build_app_state(backend, cache, MockAuth::allow_all());
+        let parsed = make_parsed(key);
+
+        let body = Body::from(b"hello".to_vec());
+        let resp = handle_put(&state, &parsed, key, body).await;
+
+        // Put should succeed even though purge failed
+        assert_eq!(resp.status(), 200);
+
+        // Poison should have been called
+        let poison_calls = state.cache.poison_calls.lock().unwrap();
+        assert_eq!(poison_calls.len(), 1);
+        let expected_key = CacheKey::new("test-backend", key);
+        assert_eq!(poison_calls[0], expected_key);
+    }
+
+    #[tokio::test]
     async fn test_put_forwards_user_metadata_to_backend() {
         let key = "some/key.txt";
 

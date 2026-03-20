@@ -348,3 +348,449 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
         S3Error::internal_error("failed to build response", request_id).to_response()
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::policy::CachePolicy;
+    use crate::cache::SingleFlight;
+    use crate::config::{AuthMode, Config};
+    use crate::handlers::test_utils::*;
+    use crate::handlers::AppState;
+
+    use axum::body::Body;
+    use axum::routing::any;
+    use http::HeaderMap;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    /// State shared with the mock upstream server.
+    struct MockUpstream {
+        /// (method, uri, headers) for each request received.
+        requests: tokio::sync::Mutex<Vec<(String, String, HeaderMap)>>,
+        /// Status code the mock will return. Can be mutated between calls.
+        response_status: AtomicU32,
+        /// How many times the mock has been called.
+        call_count: AtomicU32,
+        /// Fixed response headers to include.
+        response_headers: tokio::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl MockUpstream {
+        fn new(status: u16) -> Arc<Self> {
+            Arc::new(Self {
+                requests: tokio::sync::Mutex::new(Vec::new()),
+                response_status: AtomicU32::new(status as u32),
+                call_count: AtomicU32::new(0),
+                response_headers: tokio::sync::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    /// Spin up a mock upstream HTTP server. Returns (address, mock_state).
+    async fn start_mock_upstream(mock: Arc<MockUpstream>) -> String {
+        let app = axum::Router::new()
+            .route("/{*path}", any(mock_handler))
+            .route("/", any(mock_handler))
+            .with_state(mock.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{}", addr)
+    }
+
+    async fn mock_handler(
+        axum::extract::State(state): axum::extract::State<Arc<MockUpstream>>,
+        req: http::Request<Body>,
+    ) -> http::Response<Body> {
+        let method = req.method().to_string();
+        let uri = req.uri().to_string();
+        let headers = req.headers().clone();
+        state.requests.lock().await.push((method, uri, headers));
+        let count = state.call_count.fetch_add(1, Ordering::SeqCst);
+
+        let status = state.response_status.load(Ordering::SeqCst);
+        let resp_headers = state.response_headers.lock().await;
+
+        let mut builder = http::Response::builder().status(status as u16);
+        for (k, v) in resp_headers.iter() {
+            builder = builder.header(k.as_str(), v.as_str());
+        }
+        // Include the call count in a custom header for test inspection.
+        builder = builder.header("x-mock-call-count", (count + 1).to_string());
+        builder.body(Body::from("mock response")).unwrap()
+    }
+
+    fn test_config_for_passthrough(endpoint: &str) -> Config {
+        Config {
+            s3_listen_addr: "0.0.0.0:8080".to_string(),
+            admin_listen_addr: "0.0.0.0:9090".to_string(),
+            frontend_bucket: "test-frontend".to_string(),
+            auth_mode: AuthMode::TrustedInternal,
+            allowed_frontend_keys: vec![],
+            backend_endpoint: endpoint.to_string(),
+            backend_region: "us-east-1".to_string(),
+            backend_bucket: "test-backend".to_string(),
+            backend_access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            backend_secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+            backend_use_path_style: true,
+            backend_allow_http: true,
+            cache_dir: "/tmp/test-cache".to_string(),
+            cache_max_bytes: 1024 * 1024,
+            cache_max_object_bytes: 512 * 1024,
+            cacheable_prefixes: vec![],
+            cache_serve_stale_on_error: false,
+            cache_eviction_interval_secs: 300,
+            get_max_attempts: 1,
+            head_max_attempts: 1,
+            list_max_attempts: 1,
+            put_max_attempts: 1,
+            delete_max_attempts: 1,
+            retry_base_backoff_ms: 1, // tiny backoff for fast tests
+            upstream_connect_timeout_ms: 5000,
+            upstream_request_timeout_ms: 30000,
+            max_request_body_bytes: 268_435_456,
+        }
+    }
+
+    fn build_passthrough_state(
+        config: Config,
+    ) -> Arc<AppState<MockBackend, MockCache>> {
+        let cache = MockCache::new();
+        Arc::new(AppState {
+            backend: Arc::new(MockBackend::new()),
+            cache: Arc::new(cache),
+            singleflight: Arc::new(SingleFlight::new()),
+            auth: Arc::new(MockAuth::allow_all()),
+            policy: CachePolicy::new(
+                config.cacheable_prefixes.clone(),
+                config.cache_max_object_bytes,
+            ),
+            frontend_bucket: Arc::from(config.frontend_bucket.as_str()),
+            backend_bucket: Arc::from(config.backend_bucket.as_str()),
+            http_client: reqwest::Client::new(),
+            config: Arc::new(config),
+        })
+    }
+
+    // ---- URL construction (path-style) ----
+    #[tokio::test]
+    async fn test_url_construction_path_style() {
+        let mock = MockUpstream::new(200);
+        let addr = start_mock_upstream(mock.clone()).await;
+
+        let config = test_config_for_passthrough(&addr);
+        let state = build_passthrough_state(config);
+
+        let headers = HeaderMap::new();
+        let _resp = handle_passthrough(
+            &state,
+            "GET",
+            "/test-backend/key",
+            Some("list-type=2"),
+            &headers,
+            Body::empty(),
+            "req-1",
+        )
+        .await;
+
+        let reqs = mock.requests.lock().await;
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].1, "/test-backend/key?list-type=2");
+    }
+
+    // ---- URL construction (virtual-hosted-style) ----
+    #[tokio::test]
+    async fn test_url_construction_virtual_hosted_style() {
+        // Virtual-hosted style rewrites bucket to subdomain.
+        // DNS won't resolve bucket.127.0.0.1, so expect a connection error
+        // (ProxyError::Backend), not an internal error.
+        let mut config = test_config_for_passthrough("http://127.0.0.1:19999");
+        config.backend_use_path_style = false;
+        let state = build_passthrough_state(config);
+
+        let headers = HeaderMap::new();
+        let resp = handle_passthrough(
+            &state,
+            "GET",
+            "/mybucket/mykey",
+            None,
+            &headers,
+            Body::empty(),
+            "req-vh",
+        )
+        .await;
+
+        // Should be a backend error (502 Bad Gateway) — not 500 Internal.
+        assert_eq!(resp.status(), 502);
+    }
+
+    // ---- Header stripping: auth/hop-by-hop headers not forwarded to upstream ----
+    #[tokio::test]
+    async fn test_header_stripping_on_upstream_request() {
+        let mock = MockUpstream::new(200);
+        let addr = start_mock_upstream(mock.clone()).await;
+
+        let config = test_config_for_passthrough(&addr);
+        let state = build_passthrough_state(config);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "AWS4-HMAC-SHA256 old".parse().unwrap());
+        headers.insert("x-amz-date", "20250101T000000Z".parse().unwrap());
+        headers.insert("x-amz-content-sha256", "UNSIGNED-PAYLOAD".parse().unwrap());
+        headers.insert("host", "frontend.example.com".parse().unwrap());
+        headers.insert("connection", "keep-alive, x-custom-hop".parse().unwrap());
+        headers.insert("keep-alive", "timeout=5".parse().unwrap());
+        headers.insert("transfer-encoding", "chunked".parse().unwrap());
+        headers.insert("proxy-authorization", "Basic abc".parse().unwrap());
+        headers.insert("x-custom-hop", "should-be-stripped".parse().unwrap());
+        // Also add a normal header that SHOULD be forwarded.
+        headers.insert("x-custom-normal", "should-pass".parse().unwrap());
+
+        let _resp = handle_passthrough(
+            &state,
+            "GET",
+            "/test-backend/key",
+            None,
+            &headers,
+            Body::empty(),
+            "req-strip",
+        )
+        .await;
+
+        let reqs = mock.requests.lock().await;
+        assert_eq!(reqs.len(), 1);
+        let upstream_headers = &reqs[0].2;
+
+        // These must NOT appear in what the upstream receives.
+        assert!(
+            !upstream_headers.contains_key("x-custom-hop"),
+            "connection-nominated header x-custom-hop should be stripped"
+        );
+        assert!(
+            !upstream_headers.contains_key("keep-alive"),
+            "hop-by-hop header keep-alive should be stripped"
+        );
+        assert!(
+            !upstream_headers.contains_key("transfer-encoding"),
+            "hop-by-hop header transfer-encoding should be stripped"
+        );
+        assert!(
+            !upstream_headers.contains_key("proxy-authorization"),
+            "hop-by-hop header proxy-authorization should be stripped"
+        );
+        assert!(
+            !upstream_headers.contains_key("connection"),
+            "hop-by-hop header connection should be stripped"
+        );
+
+        // Normal header should pass through.
+        assert_eq!(
+            upstream_headers.get("x-custom-normal").unwrap(),
+            "should-pass"
+        );
+    }
+
+    // ---- SigV4 headers added to upstream request ----
+    #[tokio::test]
+    async fn test_sigv4_headers_added() {
+        let mock = MockUpstream::new(200);
+        let addr = start_mock_upstream(mock.clone()).await;
+
+        let config = test_config_for_passthrough(&addr);
+        let state = build_passthrough_state(config);
+
+        let headers = HeaderMap::new();
+        let _resp = handle_passthrough(
+            &state,
+            "GET",
+            "/test-backend/key",
+            None,
+            &headers,
+            Body::empty(),
+            "req-sig",
+        )
+        .await;
+
+        let reqs = mock.requests.lock().await;
+        assert_eq!(reqs.len(), 1);
+        let upstream_headers = &reqs[0].2;
+
+        let auth = upstream_headers
+            .get("authorization")
+            .expect("authorization header must be present")
+            .to_str()
+            .unwrap();
+        assert!(
+            auth.starts_with("AWS4-HMAC-SHA256"),
+            "authorization should start with AWS4-HMAC-SHA256, got: {auth}"
+        );
+
+        assert!(
+            upstream_headers.contains_key("x-amz-date"),
+            "x-amz-date header must be present"
+        );
+        assert!(
+            upstream_headers.contains_key("x-amz-content-sha256"),
+            "x-amz-content-sha256 header must be present"
+        );
+    }
+
+    // ---- Response hop-by-hop header stripping ----
+    #[tokio::test]
+    async fn test_response_hop_by_hop_stripping() {
+        let mock = MockUpstream::new(200);
+        {
+            let mut rh = mock.response_headers.lock().await;
+            // Note: we do NOT set transfer-encoding manually because hyper
+            // manages HTTP framing headers itself; manually setting it creates
+            // a malformed response. The passthrough handler still strips
+            // transfer-encoding from whatever reqwest reports in the response.
+            rh.push(("connection".to_string(), "keep-alive".to_string()));
+            rh.push(("keep-alive".to_string(), "timeout=5".to_string()));
+            rh.push(("content-type".to_string(), "application/xml".to_string()));
+            rh.push(("etag".to_string(), "\"abc123\"".to_string()));
+            rh.push((
+                "x-amz-version-id".to_string(),
+                "v1".to_string(),
+            ));
+        }
+        let addr = start_mock_upstream(mock.clone()).await;
+
+        let config = test_config_for_passthrough(&addr);
+        let state = build_passthrough_state(config);
+
+        let headers = HeaderMap::new();
+        let resp = handle_passthrough(
+            &state,
+            "GET",
+            "/test-backend/key",
+            None,
+            &headers,
+            Body::empty(),
+            "req-resp-hop",
+        )
+        .await;
+
+        // Hop-by-hop headers should NOT be in the response.
+        assert!(
+            !resp.headers().contains_key("transfer-encoding"),
+            "transfer-encoding should be stripped from response"
+        );
+        assert!(
+            !resp.headers().contains_key("keep-alive"),
+            "keep-alive should be stripped from response"
+        );
+        assert!(
+            !resp.headers().contains_key("connection"),
+            "connection should be stripped from response"
+        );
+
+        // Normal headers SHOULD be in the response.
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/xml"
+        );
+        assert_eq!(resp.headers().get("etag").unwrap(), "\"abc123\"");
+        assert_eq!(resp.headers().get("x-amz-version-id").unwrap(), "v1");
+    }
+
+    // ---- Retry on 503 for GET ----
+    #[tokio::test]
+    async fn test_retry_on_503_for_get() {
+        let call_count = Arc::new(AtomicU32::new(0));
+        let call_count_clone = call_count.clone();
+
+        // Custom handler that returns 503 twice then 200.
+        let app = axum::Router::new().route(
+            "/{*path}",
+            any(move |_req: http::Request<Body>| {
+                let cc = call_count_clone.clone();
+                async move {
+                    let count = cc.fetch_add(1, Ordering::SeqCst);
+                    let status = if count < 2 { 503u16 } else { 200u16 };
+                    http::Response::builder()
+                        .status(status)
+                        .body(Body::from("ok"))
+                        .unwrap()
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = test_config_for_passthrough(&format!("http://{}", addr));
+        config.get_max_attempts = 3;
+
+        let state = build_passthrough_state(config);
+        let headers = HeaderMap::new();
+
+        let resp = handle_passthrough(
+            &state,
+            "GET",
+            "/test-backend/key",
+            None,
+            &headers,
+            Body::empty(),
+            "req-retry",
+        )
+        .await;
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+    }
+
+    // ---- No retry for POST on 503 ----
+    #[tokio::test]
+    async fn test_no_retry_for_post_on_503() {
+        let call_count = Arc::new(AtomicU32::new(0));
+        let call_count_clone = call_count.clone();
+
+        let app = axum::Router::new().route(
+            "/{*path}",
+            any(move |_req: http::Request<Body>| {
+                let cc = call_count_clone.clone();
+                async move {
+                    cc.fetch_add(1, Ordering::SeqCst);
+                    http::Response::builder()
+                        .status(503u16)
+                        .body(Body::from("service unavailable"))
+                        .unwrap()
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = test_config_for_passthrough(&format!("http://{}", addr));
+        config.get_max_attempts = 3; // would retry for GET, but not POST
+
+        let state = build_passthrough_state(config);
+        let headers = HeaderMap::new();
+
+        let resp = handle_passthrough(
+            &state,
+            "POST",
+            "/test-backend/key",
+            None,
+            &headers,
+            Body::empty(),
+            "req-no-retry",
+        )
+        .await;
+
+        assert_eq!(resp.status(), 503);
+        assert_eq!(call_count.load(Ordering::SeqCst), 1, "POST should not retry");
+    }
+}

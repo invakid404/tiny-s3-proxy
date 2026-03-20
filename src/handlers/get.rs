@@ -653,4 +653,298 @@ mod tests {
             "HIT"
         );
     }
+
+    // ---- StaleMockCache: returns None on first lookup, Some on subsequent ----
+    //
+    // This is needed to exercise the TRUE stale-on-error code path, where:
+    //   1. Initial cache.lookup() returns None (miss) → enters singleflight
+    //   2. Backend returns a transient error
+    //   3. Stale fallback calls cache.lookup() again → returns the entry
+    //   4. Handler serves the cached entry with x-cache: STALE
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    struct StaleMockCache {
+        /// The entry to serve on the stale (second) lookup.
+        entry: Option<CacheEntry>,
+        lookup_count: AtomicU32,
+        temp_dir: tempfile::TempDir,
+    }
+
+    impl StaleMockCache {
+        #[allow(dead_code)]
+        fn new(entry: Option<CacheEntry>) -> Self {
+            Self {
+                entry,
+                lookup_count: AtomicU32::new(0),
+                temp_dir: tempfile::TempDir::new().expect("create stale mock temp dir"),
+            }
+        }
+    }
+
+    impl CacheStore for StaleMockCache {
+        async fn lookup(
+            &self,
+            _key: &CacheKey,
+        ) -> Result<Option<CacheEntry>, crate::error::ProxyError> {
+            let count = self.lookup_count.fetch_add(1, Ordering::SeqCst);
+            if count == 0 {
+                // First lookup: simulate cache miss
+                Ok(None)
+            } else {
+                // Subsequent lookups: return the stale entry (if any)
+                Ok(self.entry.as_ref().map(|e| CacheEntry {
+                    meta: e.meta.clone(),
+                    body_path: e.body_path.clone(),
+                }))
+            }
+        }
+
+        async fn begin_fill(
+            &self,
+            key: &CacheKey,
+        ) -> Result<crate::cache::FillGuard, crate::error::ProxyError> {
+            Ok(crate::cache::FillGuard {
+                key: key.clone(),
+                temp_dir: self.temp_dir.path().to_path_buf(),
+                generation: 0,
+            })
+        }
+
+        async fn abort_fill(&self, _guard: crate::cache::FillGuard) {}
+
+        async fn commit_fill(
+            &self,
+            _guard: crate::cache::FillGuard,
+            _temp_body_path: std::path::PathBuf,
+            _meta: crate::cache::metadata::CacheMeta,
+        ) -> Result<(), crate::error::ProxyError> {
+            Ok(())
+        }
+
+        async fn purge(
+            &self,
+            _key: &CacheKey,
+        ) -> Result<bool, crate::error::ProxyError> {
+            Ok(false)
+        }
+
+        async fn poison(
+            &self,
+            _key: &CacheKey,
+        ) -> Result<(), crate::error::ProxyError> {
+            Ok(())
+        }
+
+        async fn stats(&self) -> crate::cache::CacheStatsSnapshot {
+            crate::cache::CacheStatsSnapshot::default()
+        }
+    }
+
+    /// Build an AppState using StaleMockCache instead of MockCache.
+    fn build_stale_app_state(
+        backend: MockBackend,
+        cache: StaleMockCache,
+        auth: MockAuth,
+        stale_on_error: bool,
+    ) -> Arc<AppState<MockBackend, StaleMockCache>> {
+        let mut config = test_config();
+        config.cache_dir = cache.temp_dir.path().to_str().unwrap().to_string();
+        config.cache_serve_stale_on_error = stale_on_error;
+        let tmp_dir = cache.temp_dir.path().join("tmp");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+
+        Arc::new(AppState {
+            backend: Arc::new(backend),
+            cache: Arc::new(cache),
+            singleflight: Arc::new(crate::cache::SingleFlight::new()),
+            auth: Arc::new(auth),
+            policy: crate::cache::policy::CachePolicy::new(
+                config.cacheable_prefixes.clone(),
+                config.cache_max_object_bytes,
+            ),
+            frontend_bucket: Arc::from(config.frontend_bucket.as_str()),
+            backend_bucket: Arc::from(config.backend_bucket.as_str()),
+            http_client: reqwest::Client::new(),
+            config: Arc::new(config),
+        })
+    }
+
+    /// Create a CacheEntry with a real body file in the given temp dir.
+    fn make_stale_entry(
+        temp_dir: &std::path::Path,
+        bucket: &str,
+        key: &str,
+        body: &[u8],
+    ) -> CacheEntry {
+        let body_path = temp_dir.join("stale-test.body");
+        std::fs::write(&body_path, body).expect("write stale body file");
+        CacheEntry {
+            meta: test_cache_meta(bucket, key, body),
+            body_path,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_true_stale_on_error_serves_cached_entry() {
+        let key = "script_bundle/stale-test.js";
+        let stale_body = b"stale javascript content".to_vec();
+
+        // Build the StaleMockCache: first lookup → None, second → Some
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let entry = make_stale_entry(temp_dir.path(), "test-backend", key, &stale_body);
+        let cache = StaleMockCache {
+            entry: Some(entry),
+            lookup_count: AtomicU32::new(0),
+            temp_dir,
+        };
+
+        // Backend returns a transient error
+        let backend = MockBackend::new().with_get(Err(crate::error::ProxyError::Backend {
+            source: "connection refused".into(),
+            operation: "get_object".into(),
+        }));
+
+        let state = build_stale_app_state(backend, cache, MockAuth::allow_all(), true);
+        let parsed = make_parsed(key);
+
+        let resp = handle_get(&state, &parsed, key).await;
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers().get("x-cache").unwrap().to_str().unwrap(),
+            "STALE",
+        );
+        let resp_body = axum::body::to_bytes(resp.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(resp_body.as_ref(), stale_body.as_slice());
+
+        // Verify two lookups occurred (initial miss + stale fallback)
+        assert_eq!(state.cache.lookup_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_stale_disabled_returns_error() {
+        let key = "script_bundle/stale-disabled.js";
+        let stale_body = b"should not be served".to_vec();
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let entry = make_stale_entry(temp_dir.path(), "test-backend", key, &stale_body);
+        let cache = StaleMockCache {
+            entry: Some(entry),
+            lookup_count: AtomicU32::new(0),
+            temp_dir,
+        };
+
+        let backend = MockBackend::new().with_get(Err(crate::error::ProxyError::Backend {
+            source: "backend down".into(),
+            operation: "get_object".into(),
+        }));
+
+        // stale_on_error = false
+        let state = build_stale_app_state(backend, cache, MockAuth::allow_all(), false);
+        let parsed = make_parsed(key);
+
+        let resp = handle_get(&state, &parsed, key).await;
+
+        assert_eq!(resp.status(), 502);
+        // The stale fallback lookup should NOT have been attempted
+        assert_eq!(state.cache.lookup_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_stale_non_transient_error_not_served() {
+        let key = "script_bundle/gone.js";
+        let stale_body = b"should not be served for 404".to_vec();
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let entry = make_stale_entry(temp_dir.path(), "test-backend", key, &stale_body);
+        let cache = StaleMockCache {
+            entry: Some(entry),
+            lookup_count: AtomicU32::new(0),
+            temp_dir,
+        };
+
+        // 404 is NOT transient — stale should not be served
+        let backend = MockBackend::new().with_get(Err(crate::error::ProxyError::UpstreamS3 {
+            status_code: 404,
+            s3_code: "NoSuchKey".into(),
+            message: "The specified key does not exist.".into(),
+            operation: "get_object".into(),
+        }));
+
+        let state = build_stale_app_state(backend, cache, MockAuth::allow_all(), true);
+        let parsed = make_parsed(key);
+
+        let resp = handle_get(&state, &parsed, key).await;
+
+        assert_eq!(resp.status(), 404);
+        // Only the initial lookup, no stale fallback for non-transient errors
+        assert_eq!(state.cache.lookup_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_follower_gets_cache_after_leader_fills() {
+        let key = "script_bundle/follower-test.js";
+        let body = b"leader-filled content".to_vec();
+        let cache_key = CacheKey::new("test-backend", key);
+
+        // Backend returns a successful response (leader will fill cache)
+        let backend = MockBackend::new().with_get(Ok(MockGetResponse {
+            body: body.clone(),
+            content_type: Some("application/javascript".to_string()),
+            etag: Some("\"etag-follower\"".to_string()),
+        }));
+        let cache = MockCache::new();
+        let state = build_app_state(backend, cache, MockAuth::allow_all());
+
+        // Pre-acquire singleflight to become leader for this key
+        let flight_result = state.singleflight.try_acquire(&cache_key).await;
+        let waiter = match flight_result {
+            crate::cache::FlightResult::Leader { waiter } => waiter,
+            _ => panic!("expected to be leader"),
+        };
+
+        // Spawn a follower task — it will block waiting for the leader
+        let state_clone = Arc::clone(&state);
+        let parsed = make_parsed(key);
+        let key_owned = key.to_string();
+        let follower = tokio::spawn(async move {
+            handle_get(&state_clone, &parsed, &key_owned).await
+        });
+
+        // Give the follower time to enter the waiting state
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Simulate leader completing: write entry to cache, then signal
+        let meta = test_cache_meta("test-backend", key, &body);
+        let body_path = state.cache.temp_dir.path().join("follower-test.body");
+        tokio::fs::write(&body_path, &body).await.unwrap();
+        let entry = CacheEntry {
+            meta,
+            body_path,
+        };
+        state
+            .cache
+            .entries
+            .lock()
+            .unwrap()
+            .insert(cache_key.hash_hex(), entry);
+
+        // Signal followers
+        waiter.complete().await;
+
+        // Follower should return 200 with HIT from cache
+        let resp = follower.await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers().get("x-cache").unwrap().to_str().unwrap(),
+            "HIT",
+        );
+        let resp_body = axum::body::to_bytes(resp.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(resp_body.as_ref(), body.as_slice());
+    }
 }

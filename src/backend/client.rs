@@ -895,3 +895,204 @@ async fn list_objects_v1(
         next_marker: resp.next_marker().map(|s| s.to_string()),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AuthMode, Config};
+
+    // ── helpers ──────────────────────────────────────────────────────
+
+    /// Helper to build a Config for from_config tests.
+    fn test_config() -> Config {
+        Config {
+            s3_listen_addr: "0.0.0.0:8080".to_string(),
+            admin_listen_addr: "0.0.0.0:9090".to_string(),
+            frontend_bucket: "test-frontend".to_string(),
+            auth_mode: AuthMode::TrustedInternal,
+            allowed_frontend_keys: vec![],
+            backend_endpoint: "https://s3.example.com".to_string(),
+            backend_region: "auto".to_string(),
+            backend_bucket: "test-backend".to_string(),
+            backend_access_key_id: "AKID".to_string(),
+            backend_secret_access_key: "secret".to_string(),
+            backend_use_path_style: true,
+            backend_allow_http: false,
+            cache_dir: "/tmp/test-cache".to_string(),
+            cache_max_bytes: 1024 * 1024,
+            cache_max_object_bytes: 512 * 1024,
+            cacheable_prefixes: vec!["script_bundle/".to_string(), "tar/".to_string()],
+            cache_serve_stale_on_error: true,
+            cache_eviction_interval_secs: 300,
+            get_max_attempts: 1,
+            head_max_attempts: 1,
+            list_max_attempts: 1,
+            put_max_attempts: 1,
+            delete_max_attempts: 1,
+            retry_base_backoff_ms: 10,
+            upstream_connect_timeout_ms: 5000,
+            upstream_request_timeout_ms: 30000,
+            max_request_body_bytes: 268_435_456,
+        }
+    }
+
+    /// A wrapper whose Debug formats as `NoSuchKey(SomeInner { ... })`.
+    struct FakeVariant;
+    impl std::fmt::Debug for FakeVariant {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "NoSuchKey(SomeInner {{ message: \"not found\" }})")
+        }
+    }
+
+    /// Debug has no parenthesis at all.
+    struct NoParen;
+    impl std::fmt::Debug for NoParen {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "JustAPlainString")
+        }
+    }
+
+    /// Debug starts with a lowercase letter.
+    struct LowercaseStart;
+    impl std::fmt::Debug for LowercaseStart {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "notUpperCase(inner)")
+        }
+    }
+
+    /// Debug has a non-alphanumeric character before the `(`.
+    struct SpecialChars;
+    impl std::fmt::Debug for SpecialChars {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "Not-Valid(inner)")
+        }
+    }
+
+    // ── extract_s3_code tests ───────────────────────────────────────
+
+    #[test]
+    fn test_extract_s3_code_variant_name() {
+        let code = extract_s3_code(&FakeVariant, 500);
+        assert_eq!(code, "NoSuchKey");
+    }
+
+    #[test]
+    fn test_extract_s3_code_no_paren() {
+        let code = extract_s3_code(&NoParen, 404);
+        assert_eq!(code, "NoSuchKey"); // falls back to default_s3_code_for_status(404)
+    }
+
+    #[test]
+    fn test_extract_s3_code_lowercase_start() {
+        let code = extract_s3_code(&LowercaseStart, 400);
+        assert_eq!(code, "InvalidArgument"); // falls back
+    }
+
+    #[test]
+    fn test_extract_s3_code_with_special_chars() {
+        let code = extract_s3_code(&SpecialChars, 409);
+        assert_eq!(code, "OperationAborted"); // falls back
+    }
+
+    // ── default_s3_code_for_status tests ────────────────────────────
+
+    #[test]
+    fn test_default_s3_code_304() {
+        assert_eq!(default_s3_code_for_status(304), "NotModified");
+    }
+
+    #[test]
+    fn test_default_s3_code_400() {
+        assert_eq!(default_s3_code_for_status(400), "InvalidArgument");
+    }
+
+    #[test]
+    fn test_default_s3_code_404() {
+        assert_eq!(default_s3_code_for_status(404), "NoSuchKey");
+    }
+
+    #[test]
+    fn test_default_s3_code_405() {
+        assert_eq!(default_s3_code_for_status(405), "MethodNotAllowed");
+    }
+
+    #[test]
+    fn test_default_s3_code_409() {
+        assert_eq!(default_s3_code_for_status(409), "OperationAborted");
+    }
+
+    #[test]
+    fn test_default_s3_code_412() {
+        assert_eq!(default_s3_code_for_status(412), "PreconditionFailed");
+    }
+
+    #[test]
+    fn test_default_s3_code_416() {
+        assert_eq!(default_s3_code_for_status(416), "InvalidRange");
+    }
+
+    #[test]
+    fn test_default_s3_code_500() {
+        assert_eq!(default_s3_code_for_status(500), "InternalError");
+    }
+
+    #[test]
+    fn test_default_s3_code_unknown() {
+        assert_eq!(default_s3_code_for_status(418), "InternalError");
+    }
+
+    // ── to_chrono tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_to_chrono_valid() {
+        let dt = aws_smithy_types::DateTime::from_secs(1_700_000_000);
+        let chrono_dt = to_chrono(&dt).expect("should convert");
+        assert_eq!(chrono_dt.timestamp(), 1_700_000_000);
+    }
+
+    #[test]
+    fn test_to_chrono_epoch() {
+        let dt = aws_smithy_types::DateTime::from_secs(0);
+        let chrono_dt = to_chrono(&dt).expect("should convert");
+        assert_eq!(chrono_dt.format("%Y-%m-%d").to_string(), "1970-01-01");
+    }
+
+    // ── from_config validation tests ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_from_config_rejects_http_without_allow() {
+        let mut config = test_config();
+        config.backend_endpoint = "http://example.com".to_string();
+        config.backend_allow_http = false;
+
+        let result = S3Backend::from_config(&config).await;
+        match result {
+            Err(ProxyError::InvalidRequest { message }) => {
+                assert!(
+                    message.contains("BACKEND_ALLOW_HTTP"),
+                    "error should mention BACKEND_ALLOW_HTTP, got: {message}"
+                );
+            }
+            Err(other) => panic!("expected InvalidRequest, got: {other:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_from_config_allows_http_with_flag() {
+        let mut config = test_config();
+        config.backend_endpoint = "http://example.com".to_string();
+        config.backend_allow_http = true;
+
+        let result = S3Backend::from_config(&config).await;
+        // Should NOT be the InvalidRequest error about BACKEND_ALLOW_HTTP.
+        match &result {
+            Err(ProxyError::InvalidRequest { message })
+                if message.contains("BACKEND_ALLOW_HTTP") =>
+            {
+                panic!("should not reject http:// when backend_allow_http is true");
+            }
+            _ => {} // Ok or any other error is fine
+        }
+    }
+}

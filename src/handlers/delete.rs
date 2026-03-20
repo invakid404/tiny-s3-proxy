@@ -134,6 +134,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_delete_success_calls_poison_on_purge_failure() {
+        let key = "script_bundle/test.js";
+
+        let backend = MockBackend::new().with_delete(Ok(crate::backend::models::DeleteObjectOutput {
+            delete_marker: None,
+            version_id: None,
+        }));
+
+        let cache = MockCache::new().with_purge_failing();
+        let state = build_app_state(backend, cache, MockAuth::allow_all());
+        let parsed = make_parsed(key);
+
+        let resp = handle_delete(&state, &parsed, key).await;
+
+        // Delete should succeed even though purge failed
+        assert_eq!(resp.status(), 204);
+
+        // Poison should have been called
+        let poison_calls = state.cache.poison_calls.lock().unwrap();
+        assert_eq!(poison_calls.len(), 1);
+        let expected_key = CacheKey::new("test-backend", key);
+        assert_eq!(poison_calls[0], expected_key);
+    }
+
+    #[tokio::test]
     async fn test_delete_backend_error() {
         let key = "some/key.txt";
 

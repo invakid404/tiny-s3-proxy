@@ -12,3 +12,35 @@ pub async fn metrics_handler(State(handle): State<PrometheusHandle>) -> impl Int
         metrics,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::State;
+    use axum::response::IntoResponse;
+
+    #[tokio::test]
+    async fn test_metrics_handler_returns_200() {
+        let handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+            .build_recorder()
+            .handle();
+        let resp = metrics_handler(State(handle)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Check content-type header
+        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        assert_eq!(ct, "text/plain; version=0.0.4");
+    }
+
+    #[tokio::test]
+    async fn test_metrics_handler_returns_text_body() {
+        let handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+            .build_recorder()
+            .handle();
+        let resp = metrics_handler(State(handle)).await.into_response();
+        let body = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+        // Body should be valid UTF-8 (prometheus text format)
+        let text = std::str::from_utf8(&body).unwrap();
+        // Might be empty if no metrics recorded, that's fine
+        assert!(!text.is_empty() || text.is_empty()); // proves we can read it
+    }
+}

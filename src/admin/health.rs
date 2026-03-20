@@ -29,4 +29,18 @@ mod tests {
         let resp = ready_check().await.into_response();
         assert_eq!(resp.status(), StatusCode::OK);
     }
+
+    #[tokio::test]
+    async fn test_health_check_body_content() {
+        let resp = health_check().await.into_response();
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(body.as_ref(), b"ok");
+    }
+
+    #[tokio::test]
+    async fn test_ready_check_body_content() {
+        let resp = ready_check().await.into_response();
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(body.as_ref(), b"ready");
+    }
 }

@@ -525,6 +525,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_complete_multipart_calls_poison_on_purge_failure() {
+        let key = "script_bundle/assembled.js";
+        let backend =
+            MockBackend::new().with_complete_multipart(Ok(CompleteMultipartOutput {
+                etag: Some("\"final-etag\"".to_string()),
+                location: None,
+                version_id: None,
+                extra_headers: std::collections::HashMap::new(),
+            }));
+
+        let cache = MockCache::new().with_purge_failing();
+        let state = build_app_state(backend, cache, MockAuth::allow_all());
+        let parsed = make_parsed_complete(key);
+
+        let xml_body = br#"<CompleteMultipartUpload>
+            <Part><PartNumber>1</PartNumber><ETag>"e1"</ETag></Part>
+        </CompleteMultipartUpload>"#;
+        let body = Body::from(xml_body.to_vec());
+
+        let resp =
+            handle_complete_multipart(&state, &parsed, key, "upload-123", body).await;
+
+        // Complete should succeed even though purge failed
+        assert_eq!(resp.status(), 200);
+
+        // Poison should have been called
+        let poison_calls = state.cache.poison_calls.lock().unwrap();
+        assert_eq!(poison_calls.len(), 1);
+        let expected_key = crate::cache::key::CacheKey::new("test-backend", key);
+        assert_eq!(poison_calls[0], expected_key);
+    }
+
+    #[tokio::test]
     async fn test_abort_multipart_success() {
         let key = "uploads/file.bin";
         let backend = MockBackend::new().with_abort_multipart(Ok(()));

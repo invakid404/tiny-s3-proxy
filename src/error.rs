@@ -84,3 +84,199 @@ impl ProxyError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── helpers ──────────────────────────────────────────────────────
+
+    fn backend_err() -> ProxyError {
+        ProxyError::Backend {
+            source: "test".into(),
+            operation: "get_object".into(),
+        }
+    }
+
+    fn cache_err() -> ProxyError {
+        ProxyError::Cache {
+            source: "disk full".into(),
+            operation: "write".into(),
+        }
+    }
+
+    fn auth_err() -> ProxyError {
+        ProxyError::Auth {
+            message: "denied".into(),
+        }
+    }
+
+    fn invalid_request_err() -> ProxyError {
+        ProxyError::InvalidRequest {
+            message: "bad".into(),
+        }
+    }
+
+    fn unsupported_err() -> ProxyError {
+        ProxyError::UnsupportedOperation {
+            operation: "COPY".into(),
+        }
+    }
+
+    fn timeout_err() -> ProxyError {
+        ProxyError::Timeout {
+            operation: "get_object".into(),
+        }
+    }
+
+    fn upstream_err(status_code: u16, s3_code: &str) -> ProxyError {
+        ProxyError::UpstreamS3 {
+            status_code,
+            s3_code: s3_code.into(),
+            message: "upstream error".into(),
+            operation: "get_object".into(),
+        }
+    }
+
+    fn internal_err() -> ProxyError {
+        ProxyError::Internal {
+            source: "bug".into(),
+        }
+    }
+
+    // ── status_code tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_status_code_backend() {
+        assert_eq!(backend_err().status_code(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn test_status_code_cache() {
+        assert_eq!(cache_err().status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_status_code_auth() {
+        assert_eq!(auth_err().status_code(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_status_code_invalid_request() {
+        assert_eq!(invalid_request_err().status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_status_code_unsupported() {
+        assert_eq!(unsupported_err().status_code(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[test]
+    fn test_status_code_timeout() {
+        assert_eq!(timeout_err().status_code(), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    #[test]
+    fn test_status_code_upstream_s3_404() {
+        assert_eq!(
+            upstream_err(404, "NoSuchKey").status_code(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn test_status_code_upstream_s3_invalid() {
+        // 0 is not a valid HTTP status code; should fall back to 502 BAD_GATEWAY.
+        assert_eq!(
+            upstream_err(0, "Unknown").status_code(),
+            StatusCode::BAD_GATEWAY
+        );
+    }
+
+    #[test]
+    fn test_status_code_internal() {
+        assert_eq!(
+            internal_err().status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    // ── is_transient tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_is_transient_backend() {
+        assert!(backend_err().is_transient());
+    }
+
+    #[test]
+    fn test_is_transient_timeout() {
+        assert!(timeout_err().is_transient());
+    }
+
+    #[test]
+    fn test_is_transient_upstream_500() {
+        assert!(upstream_err(500, "InternalError").is_transient());
+    }
+
+    #[test]
+    fn test_is_transient_upstream_503() {
+        assert!(upstream_err(503, "SlowDown").is_transient());
+    }
+
+    #[test]
+    fn test_is_transient_upstream_404() {
+        assert!(!upstream_err(404, "NoSuchKey").is_transient());
+    }
+
+    #[test]
+    fn test_is_transient_upstream_403() {
+        assert!(!upstream_err(403, "AccessDenied").is_transient());
+    }
+
+    #[test]
+    fn test_is_transient_auth() {
+        assert!(!auth_err().is_transient());
+    }
+
+    #[test]
+    fn test_is_transient_invalid_request() {
+        assert!(!invalid_request_err().is_transient());
+    }
+
+    #[test]
+    fn test_is_transient_cache() {
+        assert!(!cache_err().is_transient());
+    }
+
+    // ── s3_error_code tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_s3_error_code_backend() {
+        assert_eq!(backend_err().s3_error_code(), "InternalError");
+    }
+
+    #[test]
+    fn test_s3_error_code_auth() {
+        assert_eq!(auth_err().s3_error_code(), "AccessDenied");
+    }
+
+    #[test]
+    fn test_s3_error_code_invalid_request() {
+        assert_eq!(invalid_request_err().s3_error_code(), "InvalidRequest");
+    }
+
+    #[test]
+    fn test_s3_error_code_unsupported() {
+        assert_eq!(unsupported_err().s3_error_code(), "NotImplemented");
+    }
+
+    #[test]
+    fn test_s3_error_code_timeout() {
+        assert_eq!(timeout_err().s3_error_code(), "RequestTimeout");
+    }
+
+    #[test]
+    fn test_s3_error_code_upstream() {
+        assert_eq!(upstream_err(404, "NoSuchKey").s3_error_code(), "NoSuchKey");
+    }
+}

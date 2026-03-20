@@ -77,6 +77,102 @@ async fn build_raw_s3_client(
     aws_sdk_s3::Client::from_conf(config)
 }
 
+/// Build a proxy stack in `access_key_allowlist` mode, returning
+/// the same tuple as `build_proxy_stack`.
+async fn build_proxy_stack_allowlist(
+    backend_endpoint: &str,
+    allowed_keys: Vec<String>,
+) -> (aws_sdk_s3::Client, reqwest::Client, String, tempfile::TempDir) {
+    let cache_dir = tempfile::TempDir::new().expect("create temp cache dir");
+
+    let config = Config {
+        s3_listen_addr: "127.0.0.1:0".to_string(),
+        admin_listen_addr: "127.0.0.1:0".to_string(),
+        frontend_bucket: TEST_BUCKET.to_string(),
+        auth_mode: AuthMode::AccessKeyAllowlist,
+        allowed_frontend_keys: allowed_keys,
+        backend_endpoint: backend_endpoint.to_string(),
+        backend_region: "us-east-1".to_string(),
+        backend_bucket: TEST_BUCKET.to_string(),
+        backend_access_key_id: TEST_ACCESS_KEY.to_string(),
+        backend_secret_access_key: TEST_SECRET_KEY.to_string(),
+        backend_use_path_style: true,
+        backend_allow_http: true,
+        cache_dir: cache_dir.path().to_str().unwrap().to_string(),
+        cache_max_bytes: 100 * 1024 * 1024,
+        cache_max_object_bytes: 10 * 1024 * 1024,
+        cacheable_prefixes: vec![
+            "script_bundle/".into(),
+            "bun_bundle/".into(),
+            "tar/".into(),
+        ],
+        cache_serve_stale_on_error: true,
+        cache_eviction_interval_secs: 3600,
+        get_max_attempts: 3,
+        head_max_attempts: 3,
+        list_max_attempts: 3,
+        put_max_attempts: 1,
+        delete_max_attempts: 2,
+        retry_base_backoff_ms: 50,
+        upstream_connect_timeout_ms: 5000,
+        upstream_request_timeout_ms: 30000,
+        max_request_body_bytes: 268_435_456,
+    };
+
+    let s3_backend = backend::client::S3Backend::from_config(&config)
+        .await
+        .expect("build S3 backend");
+
+    let cache_policy = cache::policy::CachePolicy::new(
+        config.cacheable_prefixes.clone(),
+        config.cache_max_object_bytes,
+    );
+    let disk_cache = cache::DiskCache::new(
+        PathBuf::from(&config.cache_dir),
+        config.cache_max_bytes,
+        cache_policy.clone(),
+    )
+    .await
+    .expect("build disk cache");
+
+    let singleflight = Arc::new(cache::SingleFlight::new());
+    let authenticator = Arc::from(auth::create_request_gate(&config));
+
+    let state = Arc::new(handlers::AppState {
+        backend: Arc::new(s3_backend),
+        cache: Arc::new(disk_cache),
+        singleflight,
+        auth: authenticator,
+        policy: cache_policy,
+        config: Arc::new(config),
+        frontend_bucket: Arc::from(TEST_BUCKET),
+        backend_bucket: Arc::from(TEST_BUCKET),
+        http_client: reqwest::Client::new(),
+    });
+
+    let app = axum::Router::new()
+        .fallback(handlers::handle_s3_request)
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let proxy_endpoint = format!("http://127.0.0.1:{}", addr.port());
+
+    let proxy_client =
+        build_raw_s3_client(&proxy_endpoint, TEST_ACCESS_KEY, TEST_SECRET_KEY).await;
+
+    let http_client = reqwest::Client::new();
+
+    (proxy_client, http_client, proxy_endpoint, cache_dir)
+}
+
 /// Build the full proxy stack and return:
 /// - An S3 client pointed at the proxy
 /// - A reqwest client for raw HTTP (to inspect headers)
@@ -652,6 +748,109 @@ async fn test_wrong_bucket_returns_error() {
     assert!(
         body.contains("NoSuchBucket"),
         "response should contain NoSuchBucket error, got: {}",
+        body
+    );
+}
+
+/// Test 9: Allowlist mode accepts requests with a known access key.
+#[tokio::test]
+#[ignore]
+async fn test_allowlist_mode_accepts_known_key() {
+    let (_container, backend_endpoint) = start_versitygw().await;
+
+    let backend_client =
+        build_raw_s3_client(&backend_endpoint, TEST_ACCESS_KEY, TEST_SECRET_KEY).await;
+    backend_client
+        .create_bucket()
+        .bucket(TEST_BUCKET)
+        .send()
+        .await
+        .expect("create bucket");
+
+    // Build proxy in allowlist mode, allowing TEST_ACCESS_KEY
+    let (proxy_client, _http_client, _proxy_endpoint, _cache_dir) =
+        build_proxy_stack_allowlist(&backend_endpoint, vec![TEST_ACCESS_KEY.to_string()]).await;
+
+    let key = "allowlist/accepted.txt";
+    let content = b"accepted-by-allowlist";
+
+    // PUT should succeed because the client's access key is in the allowlist
+    proxy_client
+        .put_object()
+        .bucket(TEST_BUCKET)
+        .key(key)
+        .body(aws_sdk_s3::primitives::ByteStream::from(content.to_vec()))
+        .send()
+        .await
+        .expect("put_object with allowed key should succeed");
+
+    // GET should also succeed
+    let get_resp = proxy_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key(key)
+        .send()
+        .await
+        .expect("get_object with allowed key should succeed");
+    let body = get_resp
+        .body
+        .collect()
+        .await
+        .expect("read body")
+        .into_bytes();
+    assert_eq!(body.as_ref(), content);
+}
+
+/// Test 10: Allowlist mode rejects requests with an unknown access key.
+#[tokio::test]
+#[ignore]
+async fn test_allowlist_mode_rejects_unknown_key() {
+    let (_container, backend_endpoint) = start_versitygw().await;
+
+    let backend_client =
+        build_raw_s3_client(&backend_endpoint, TEST_ACCESS_KEY, TEST_SECRET_KEY).await;
+    backend_client
+        .create_bucket()
+        .bucket(TEST_BUCKET)
+        .send()
+        .await
+        .expect("create bucket");
+
+    // Build proxy in allowlist mode with a DIFFERENT allowed key
+    let (_proxy_client, http_client, proxy_endpoint, _cache_dir) =
+        build_proxy_stack_allowlist(&backend_endpoint, vec!["SOME-OTHER-KEY".to_string()]).await;
+
+    // Build a client that signs with TEST_ACCESS_KEY (not in the allowlist)
+    let rejected_client =
+        build_raw_s3_client(&proxy_endpoint, TEST_ACCESS_KEY, TEST_SECRET_KEY).await;
+
+    // PUT should fail with 403 (access denied)
+    let put_result = rejected_client
+        .put_object()
+        .bucket(TEST_BUCKET)
+        .key("allowlist/rejected.txt")
+        .body(aws_sdk_s3::primitives::ByteStream::from(b"should-be-rejected".to_vec()))
+        .send()
+        .await;
+    assert!(
+        put_result.is_err(),
+        "PUT with unknown access key should be rejected"
+    );
+
+    // Also verify via raw HTTP that the response is 403 with AccessDenied
+    let url = format!("{}/{}/allowlist/rejected.txt", proxy_endpoint, TEST_BUCKET);
+    let resp = http_client
+        .get(&url)
+        .header("authorization", "AWS4-HMAC-SHA256 Credential=UNKNOWN-KEY/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=abc")
+        .send()
+        .await
+        .expect("raw GET request");
+
+    assert_eq!(resp.status().as_u16(), 403);
+    let body = resp.text().await.expect("read body");
+    assert!(
+        body.contains("AccessDenied"),
+        "response should contain AccessDenied, got: {}",
         body
     );
 }

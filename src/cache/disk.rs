@@ -1029,6 +1029,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_poison_blocks_lookup() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = DiskCache::new(tmp.path().to_path_buf(), 1_000_000, test_policy())
+            .await
+            .unwrap();
+
+        let key = test_key();
+        let body = b"cached data".to_vec();
+        let meta = test_meta(body.len());
+
+        // Fill the cache entry
+        let temp_path = write_temp_body(tmp.path(), &body).await;
+        let guard = cache.begin_fill(&key).await.unwrap();
+        cache.commit_fill(guard, temp_path, meta).await.unwrap();
+
+        // Verify lookup returns Some before poisoning
+        assert!(cache.lookup(&key).await.unwrap().is_some());
+
+        // Poison the key
+        cache.poison(&key).await.unwrap();
+
+        // Lookup should now return None (cache miss)
+        assert!(cache.lookup(&key).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_poison_cleared_on_successful_purge() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = DiskCache::new(tmp.path().to_path_buf(), 1_000_000, test_policy())
+            .await
+            .unwrap();
+
+        let key = test_key();
+        let body = b"cached data".to_vec();
+        let meta = test_meta(body.len());
+
+        // Fill → poison → purge
+        let temp_path = write_temp_body(tmp.path(), &body).await;
+        let guard = cache.begin_fill(&key).await.unwrap();
+        cache.commit_fill(guard, temp_path, meta).await.unwrap();
+        cache.poison(&key).await.unwrap();
+        cache.purge(&key).await.unwrap();
+
+        // Refill with new data
+        let new_body = b"fresh data".to_vec();
+        let new_meta = test_meta(new_body.len());
+        let temp_path = write_temp_body(tmp.path(), &new_body).await;
+        let guard = cache.begin_fill(&key).await.unwrap();
+        cache.commit_fill(guard, temp_path, new_meta).await.unwrap();
+
+        // Lookup should return the new entry (poison was cleared by purge)
+        let entry = cache.lookup(&key).await.unwrap().expect("should hit after purge cleared poison");
+        let read_body = tokio::fs::read(&entry.body_path).await.unwrap();
+        assert_eq!(read_body, b"fresh data");
+    }
+
+    #[tokio::test]
+    async fn test_poison_cleared_on_new_fill() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = DiskCache::new(tmp.path().to_path_buf(), 1_000_000, test_policy())
+            .await
+            .unwrap();
+
+        let key = test_key();
+        let body = b"old data".to_vec();
+        let meta = test_meta(body.len());
+
+        // Fill → poison
+        let temp_path = write_temp_body(tmp.path(), &body).await;
+        let guard = cache.begin_fill(&key).await.unwrap();
+        cache.commit_fill(guard, temp_path, meta).await.unwrap();
+        cache.poison(&key).await.unwrap();
+
+        // Verify poisoned
+        assert!(cache.lookup(&key).await.unwrap().is_none());
+
+        // begin_fill + commit_fill with new data should clear the poison marker
+        let new_body = b"new data after poison".to_vec();
+        let new_meta = test_meta(new_body.len());
+        let temp_path = write_temp_body(tmp.path(), &new_body).await;
+        let guard = cache.begin_fill(&key).await.unwrap();
+        cache.commit_fill(guard, temp_path, new_meta).await.unwrap();
+
+        // Lookup should return the new entry
+        let entry = cache.lookup(&key).await.unwrap().expect("should hit after fill cleared poison");
+        let read_body = tokio::fs::read(&entry.body_path).await.unwrap();
+        assert_eq!(read_body, b"new data after poison");
+    }
+
+    #[tokio::test]
+    async fn test_lookup_without_poison_marker_works() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = DiskCache::new(tmp.path().to_path_buf(), 1_000_000, test_policy())
+            .await
+            .unwrap();
+
+        let key = test_key();
+        let body = b"normal data".to_vec();
+        let meta = test_meta(body.len());
+
+        // Fill without any poisoning
+        let temp_path = write_temp_body(tmp.path(), &body).await;
+        let guard = cache.begin_fill(&key).await.unwrap();
+        cache.commit_fill(guard, temp_path, meta).await.unwrap();
+
+        // Lookup should return Some (no poison marker)
+        let entry = cache.lookup(&key).await.unwrap().expect("should hit with no poison marker");
+        let read_body = tokio::fs::read(&entry.body_path).await.unwrap();
+        assert_eq!(read_body, b"normal data");
+    }
+
+    #[tokio::test]
     async fn test_commit_fill_rejected_after_purge() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cache = DiskCache::new(tmp.path().to_path_buf(), 1_000_000, test_policy())
