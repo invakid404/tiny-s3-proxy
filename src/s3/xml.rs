@@ -679,4 +679,22 @@ mod tests {
         let body = b"<Part><ChecksumCRC64NVME>x</ChecksumCRC64NVME></Part>";
         assert!(body_has_checksum_elements(body));
     }
+
+    #[test]
+    fn test_checksum_namespace_prefixed() {
+        let body = b"<Part><s3:ChecksumSHA256>abc</s3:ChecksumSHA256></Part>";
+        assert!(body_has_checksum_elements(body));
+    }
+
+    #[test]
+    fn test_checksum_self_closing_element() {
+        let body = b"<Part><ChecksumCRC32/></Part>";
+        assert!(body_has_checksum_elements(body));
+    }
+
+    #[test]
+    fn test_checksum_whitespace_before_close() {
+        let body = b"<Part><ChecksumSHA1 >abc</ChecksumSHA1></Part>";
+        assert!(body_has_checksum_elements(body));
+    }
 }

@@ -45,12 +45,18 @@ pub async fn run_eviction_loop(
     max_bytes: u64,
     interval_secs: u64,
     stats: Arc<CacheStats>,
+    disk_cache: Option<Arc<super::DiskCache>>,
 ) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
     loop {
         interval.tick().await;
         if let Err(e) = run_eviction_pass(&cache_dir, max_bytes, &stats).await {
             tracing::warn!(error = %e, "eviction pass failed");
+        }
+        // Sweep stale per-key meta locks after each pass to prevent
+        // unbounded growth from keys that have been evicted.
+        if let Some(ref dc) = disk_cache {
+            dc.sweep_stale_meta_locks().await;
         }
     }
 }

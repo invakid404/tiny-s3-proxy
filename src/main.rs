@@ -69,6 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     // Grab the stats reference from DiskCache before wrapping in Arc
+    let disk_cache = Arc::new(disk_cache);
     let eviction_stats = disk_cache.stats_ref().clone();
     tracing::info!(cache_dir = %config.cache_dir, "disk cache initialized");
 
@@ -77,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 6. Build shared app state
     let state = Arc::new(handlers::AppState {
         backend: Arc::new(backend),
-        cache: Arc::new(disk_cache),
+        cache: disk_cache.clone(),
         singleflight: singleflight.clone(),
         auth,
         policy: cache_policy,
@@ -103,12 +104,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let eviction_cache_dir = PathBuf::from(&config.cache_dir);
     let eviction_max = config.cache_max_bytes;
     let eviction_interval = config.cache_eviction_interval_secs;
+    let eviction_disk_cache = disk_cache.clone();
     tokio::spawn(async move {
         cache::eviction::run_eviction_loop(
             eviction_cache_dir,
             eviction_max,
             eviction_interval,
             eviction_stats,
+            Some(eviction_disk_cache),
         )
         .await;
     });

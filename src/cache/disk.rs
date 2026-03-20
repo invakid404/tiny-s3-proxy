@@ -192,6 +192,26 @@ impl DiskCache {
             .clone()
     }
 
+    /// Remove `meta_locks` entries whose cache files no longer exist on disk.
+    /// Called periodically by the eviction loop to prevent unbounded growth.
+    pub async fn sweep_stale_meta_locks(&self) {
+        // Snapshot current keys under a brief std::sync::Mutex hold.
+        let keys: Vec<CacheKey> = self.meta_locks.lock().unwrap().keys().cloned().collect();
+        let mut stale = Vec::new();
+        for key in &keys {
+            let (_, meta_path) = self.paths_for_key(key);
+            if !tokio::fs::try_exists(&meta_path).await.unwrap_or(true) {
+                stale.push(key.clone());
+            }
+        }
+        if !stale.is_empty() {
+            let mut locks = self.meta_locks.lock().unwrap();
+            for key in &stale {
+                locks.remove(key);
+            }
+        }
+    }
+
     /// Get a reference to the stats.
     pub fn stats_ref(&self) -> &Arc<CacheStats> {
         &self.stats
@@ -639,6 +659,10 @@ impl CacheStore for DiskCache {
         // Always clear the poison marker: if files were removed the stale data
         // is gone, and if they were already absent there's nothing stale to block.
         let _ = tokio::fs::remove_file(&self.poison_path_for_key(key)).await;
+
+        // Clean up the per-key meta lock — the cache entry is gone so no
+        // access-time updater can be in flight for this key.
+        self.meta_locks.lock().unwrap().remove(key);
 
         Ok(removed)
     }
