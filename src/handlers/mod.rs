@@ -1438,10 +1438,16 @@ pub mod test_utils {
             }
             // If a pending replacement is staged, swap it in and return false
             // (simulates a concurrent refill between probe and purge).
-            if let Some((hash, replacement)) = self.purge_swaps_entry.lock().unwrap().take() {
-                let mut entries = self.entries.lock().unwrap();
-                entries.insert(hash, replacement);
-                return Ok(false);
+            {
+                let mut pending = self.purge_swaps_entry.lock().unwrap();
+                if let Some((hash, replacement)) = pending.take() {
+                    if hash == key.hash_hex() {
+                        let mut entries = self.entries.lock().unwrap();
+                        entries.insert(hash, replacement);
+                        return Ok(false);
+                    }
+                    *pending = Some((hash, replacement));
+                }
             }
             let removed = {
                 let mut entries = self.entries.lock().unwrap();
@@ -1810,6 +1816,48 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let body_str = String::from_utf8_lossy(&body);
         assert!(body_str.contains("AccessDenied"));
+    }
+
+    #[tokio::test]
+    async fn test_mock_cache_purge_if_unchanged_only_consumes_matching_staged_replacement() {
+        let key_a = crate::cache::key::CacheKey::new("test-backend", "script_bundle/a.js");
+        let key_b = crate::cache::key::CacheKey::new("test-backend", "script_bundle/b.js");
+
+        let cache = MockCache::new()
+            .with_entry(
+                &key_a,
+                b"body-a",
+                test_cache_meta("test-backend", "script_bundle/a.js", b"body-a"),
+            )
+            .with_entry(
+                &key_b,
+                b"body-b",
+                test_cache_meta("test-backend", "script_bundle/b.js", b"body-b"),
+            );
+
+        let entry_a = cache.peek(&key_a).await.unwrap().unwrap();
+        let entry_b = cache.peek(&key_b).await.unwrap().unwrap();
+        let fill_id_a = entry_a.meta.fill_id;
+        let fill_id_b = entry_b.meta.fill_id;
+
+        let mut replacement_b = test_cache_meta("test-backend", "script_bundle/b.js", b"new-b");
+        replacement_b.head_metadata_checked = true;
+        cache.stage_purge_replacement(&key_b, b"new-b", replacement_b);
+
+        assert!(cache.purge_if_unchanged(&key_a, fill_id_a).await.unwrap());
+        assert!(cache.peek(&key_a).await.unwrap().is_none());
+
+        let pending = cache.purge_swaps_entry.lock().unwrap();
+        assert_eq!(
+            pending.as_ref().map(|(hash, _)| hash.as_str()),
+            Some(key_b.hash_hex())
+        );
+        drop(pending);
+
+        assert!(!cache.purge_if_unchanged(&key_b, fill_id_b).await.unwrap());
+        let newer_b = cache.peek(&key_b).await.unwrap().unwrap();
+        assert_ne!(newer_b.meta.fill_id, fill_id_b);
+        assert!(cache.purge_swaps_entry.lock().unwrap().is_none());
     }
 
     // ---- rewrite_bucket_in_path tests ----
