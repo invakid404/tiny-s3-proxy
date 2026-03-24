@@ -2000,8 +2000,9 @@ mod tests {
         let resp = handle_get(&state, &parsed, key).await;
 
         assert_eq!(resp.status(), 502);
+        // peek: 1 leader re-probe (metadata-only)
         assert_eq!(state.cache.peek_count.load(Ordering::SeqCst), 1);
-        // peek_body: 1 initial miss, 1 leader re-probe (miss)
+        // peek_body: 1 initial miss
         assert_eq!(state.cache.peek_body_count.load(Ordering::SeqCst), 1);
         assert_eq!(state.cache.lookup_count.load(Ordering::SeqCst), 0);
     }
@@ -2037,8 +2038,9 @@ mod tests {
         let resp = handle_get(&state, &parsed, key).await;
 
         assert_eq!(resp.status(), 404);
+        // peek: 1 leader re-probe (metadata-only)
         assert_eq!(state.cache.peek_count.load(Ordering::SeqCst), 1);
-        // peek_body: 1 initial miss, 1 leader re-probe (miss)
+        // peek_body: 1 initial miss
         assert_eq!(state.cache.peek_body_count.load(Ordering::SeqCst), 1);
         assert_eq!(state.cache.lookup_count.load(Ordering::SeqCst), 0);
     }
