@@ -549,10 +549,23 @@ fn spawn_cache_tee<C: CacheStore + 'static>(
                 if let Some(guard) = fill_guard {
                     cache.abort_fill(guard).await;
                 }
-                // Drain stream to client without caching
+                // Drain stream to client without caching.
+                // Use the same send timeout as the tee path so a stalled
+                // client doesn't block followers indefinitely.
+                let drain_send_timeout = std::time::Duration::from_secs(30);
                 let mut stream = body_stream;
                 while let Some(chunk) = stream.next().await {
-                    let _ = tx.send(chunk).await;
+                    if tokio::time::timeout(drain_send_timeout, tx.send(chunk))
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            request_id = %req_id_for_tee,
+                            key = %key_for_tee,
+                            "cache fill drain: client send timed out, aborting drain"
+                        );
+                        break;
+                    }
                 }
                 waiter.complete().await;
                 return;
