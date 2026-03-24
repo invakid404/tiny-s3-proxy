@@ -237,7 +237,13 @@ async fn try_refresh_cached_get_metadata<B: Backend + 'static, C: CacheStore + '
                 .update_metadata_if_unchanged(cache_key, entry.meta.fill_id, updated_meta)
                 .await
             {
-                Ok(true) => {} // Successfully persisted.
+                Ok(true) => {
+                    // Metadata persisted but checksum_mode_checked is still
+                    // false (HEAD can't flip it), so the entry won't satisfy
+                    // a checksum GET — skip the re-probe and fall through to
+                    // the backend GET path.
+                    return None;
+                }
                 Ok(false) => {
                     tracing::info!(
                         request_id = %parsed.request_id,
@@ -556,16 +562,17 @@ fn spawn_cache_tee<C: CacheStore + 'static>(
                 let drain_send_timeout = std::time::Duration::from_secs(30);
                 let mut stream = body_stream;
                 while let Some(chunk) = stream.next().await {
-                    if tokio::time::timeout(drain_send_timeout, tx.send(chunk))
-                        .await
-                        .is_err()
-                    {
-                        tracing::warn!(
-                            request_id = %req_id_for_tee,
-                            key = %key_for_tee,
-                            "cache fill drain: client send timed out, aborting drain"
-                        );
-                        break;
+                    match tokio::time::timeout(drain_send_timeout, tx.send(chunk)).await {
+                        Ok(Ok(())) => {} // sent successfully
+                        Ok(Err(_)) => break, // receiver dropped
+                        Err(_) => {
+                            tracing::warn!(
+                                request_id = %req_id_for_tee,
+                                key = %key_for_tee,
+                                "cache fill drain: client send timed out, aborting drain"
+                            );
+                            break;
+                        }
                     }
                 }
                 return;
