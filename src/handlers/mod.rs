@@ -1068,6 +1068,9 @@ pub mod test_utils {
         pub fill_calls: Mutex<Vec<CacheKey>>,
         pub poison_calls: Mutex<Vec<CacheKey>>,
         pub purge_should_fail: Mutex<bool>,
+        /// When set, purge_if_unchanged swaps in this replacement entry
+        /// (simulating a concurrent refill) and returns false.
+        pub purge_swaps_entry: Mutex<Option<(String, CacheEntry)>>,
         pub temp_dir: tempfile::TempDir,
     }
 
@@ -1088,8 +1091,37 @@ pub mod test_utils {
                 fill_calls: Mutex::new(Vec::new()),
                 poison_calls: Mutex::new(Vec::new()),
                 purge_should_fail: Mutex::new(false),
+                purge_swaps_entry: Mutex::new(None),
                 temp_dir: tempfile::TempDir::new().expect("create mock cache temp dir"),
             }
+        }
+
+        /// Stage a replacement entry that will be swapped in when
+        /// `purge_if_unchanged` is called, simulating a concurrent refill.
+        /// The purge will return `Ok(false)` and subsequent reads will see
+        /// the replacement.
+        pub fn stage_purge_replacement(
+            &self,
+            key: &CacheKey,
+            body: &[u8],
+            mut meta: CacheMeta,
+        ) {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static MOCK_COUNTER: AtomicU64 = AtomicU64::new(100_000);
+            let id = MOCK_COUNTER.fetch_add(1, Ordering::Relaxed);
+            meta.fill_id = self
+                .next_fill_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            meta.metadata_version = 0;
+            let body_path = self.temp_dir.path().join(format!("{}.body", id));
+            std::fs::write(&body_path, body).expect("write mock body");
+            let entry = CacheEntry {
+                meta,
+                body_path,
+                body_file: None,
+            };
+            *self.purge_swaps_entry.lock().unwrap() =
+                Some((key.hash_hex().to_string(), entry));
         }
 
         pub fn with_purge_failing(self) -> Self {
@@ -1283,6 +1315,13 @@ pub mod test_utils {
                     source: "mock purge_if_unchanged failure".into(),
                     operation: "purge_if_unchanged".into(),
                 });
+            }
+            // If a pending replacement is staged, swap it in and return false
+            // (simulates a concurrent refill between probe and purge).
+            if let Some((hash, replacement)) = self.purge_swaps_entry.lock().unwrap().take() {
+                let mut entries = self.entries.lock().unwrap();
+                entries.insert(hash, replacement);
+                return Ok(false);
             }
             let removed = {
                 let mut entries = self.entries.lock().unwrap();

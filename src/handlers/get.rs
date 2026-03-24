@@ -1644,45 +1644,52 @@ mod tests {
         assert_eq!(plain_resp.status(), 404);
     }
 
-    /// Verify the purge helper's return-value contract that the 404 re-probe
-    /// logic depends on. A true end-to-end test of the concurrent-refill race
-    /// requires modifying the entry between peek and purge within
-    /// try_refresh_cached_get_metadata, which can't be done with MockCache's
-    /// synchronous backend. The code paths are verified structurally:
-    /// - purge_if_unchanged returns false for mismatched fill_id
-    /// - purge_then_poison_if_unchanged propagates that false
-    /// - try_refresh_cached_get_metadata returns None on false (tested above)
-    /// - handle_leader re-probes and serves HIT on None (code at line 784)
+    /// End-to-end: HEAD returns 404, purge_if_unchanged swaps in a newer
+    /// entry (simulating concurrent refill), handle_leader re-probes and
+    /// serves the newer entry as HIT with zero backend GETs.
     #[tokio::test]
-    async fn test_purge_returns_false_for_replaced_entry() {
-        let key = "script_bundle/purge-false.js";
+    async fn test_checksum_get_404_concurrent_refill_serves_newer_entry() {
+        let key = "script_bundle/get-404-refill-e2e.js";
+        let old_body = b"old body".to_vec();
+        let new_body = b"new body from refill".to_vec();
         let cache_key = CacheKey::new("test-backend", key);
-        let meta = test_cache_meta("test-backend", key, b"body");
-        let cache = MockCache::new().with_entry(&cache_key, b"body", meta);
+        let old_meta = test_cache_meta("test-backend", key, &old_body);
 
-        let original_fill_id = {
-            let entries = cache.entries.lock().unwrap();
-            entries.get(cache_key.hash_hex()).unwrap().meta.fill_id
-        };
+        // Backend HEAD returns 404.
+        let backend = MockBackend::new()
+            .with_head(Err(crate::error::ProxyError::UpstreamS3 {
+                status_code: 404,
+                s3_code: "NoSuchKey".into(),
+                message: "deleted upstream".into(),
+                operation: "head_object".into(),
+            }));
 
-        // Mismatched fill_id → purge returns false.
-        let result = cache
-            .purge_if_unchanged(&cache_key, original_fill_id.wrapping_add(1000))
-            .await
-            .unwrap();
-        assert!(!result);
-        assert!(cache.peek(&cache_key).await.unwrap().is_some());
+        let cache = MockCache::new().with_entry(&cache_key, &old_body, old_meta);
 
-        let cache_arc = std::sync::Arc::new(cache);
-        let invalidated = super::purge_then_poison_if_unchanged(
-            &cache_arc,
-            &cache_key,
-            original_fill_id.wrapping_add(1000),
-            "test", "GetObject", key,
-            "ok", "changed", "fail", "poison ok", "poison fail",
-        )
-        .await;
-        assert!(!invalidated);
+        // Stage a replacement: when purge_if_unchanged runs (after HEAD 404),
+        // it swaps in this newer entry and returns false. The re-probe finds it.
+        let mut new_meta = test_cache_meta("test-backend", key, &new_body);
+        new_meta.checksum_mode_checked = true; // satisfies checksum read_options
+        cache.stage_purge_replacement(&cache_key, &new_body, new_meta);
+
+        let state = build_app_state(backend, cache, MockAuth::allow_all());
+        let resp = handle_get(&state, &make_parsed_with_checksum(key), key).await;
+
+        // Newer entry served — NOT 404.
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("x-cache").unwrap(), "HIT");
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        assert_eq!(body.as_ref(), new_body.as_slice());
+        // Zero backend GETs — served entirely from cache re-probe.
+        assert!(state.backend.get_read_calls.lock().unwrap().is_empty());
+        // note_hit was called.
+        assert_eq!(
+            state
+                .cache
+                .note_hit_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 
     #[tokio::test]
