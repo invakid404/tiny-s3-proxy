@@ -773,7 +773,13 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                     // one backend HEAD to re-learn the current HEAD surface.
                     head_extra_headers: std::collections::HashMap::new(),
                     head_checksum_headers: std::collections::HashMap::new(),
-                    checksum_mode_checked: read_options.wants_checksum_headers(),
+                    // True if checksums were requested, OR if the backend
+                    // returned checksum headers anyway (some backends do this
+                    // even without x-amz-checksum-mode: ENABLED).
+                    checksum_mode_checked: read_options.wants_checksum_headers()
+                        || meta.extra_headers.keys().any(|k| {
+                            crate::s3::headers::is_checksum_response_header(k)
+                        }),
                     head_metadata_checked: false,
                     head_checksum_checked: false,
                 };
@@ -862,6 +868,9 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                 )
                 .await
                 {
+                    // Record miss (backend GET was attempted) + hit (body
+                    // served from stale cache) for accurate stats.
+                    let _ = state.cache.note_miss().await;
                     tracing::warn!(
                         request_id = %parsed.request_id,
                         operation = "GetObject",

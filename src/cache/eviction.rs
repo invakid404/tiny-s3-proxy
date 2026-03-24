@@ -216,18 +216,34 @@ async fn collect_candidates(
                                 .map(|m| m.len())
                                 .unwrap_or(0);
                             let entry_size = body_sz + meta_sz;
-                            if let Ok(mb) = tokio::fs::read(&file_path).await {
-                                if let Ok(m) = serde_json::from_slice::<CacheMeta>(&mb) {
-                                    scan_total_bytes += entry_size;
-                                    scan_entry_count += 1;
-                                    candidates.push(EvictionCandidate {
-                                        body_path: body_path.clone(),
-                                        meta_path: file_path.clone(),
-                                        hash: hash.to_string(),
-                                        fill_id: m.fill_id,
-                                        last_accessed_at: m.last_accessed_at,
-                                        size: entry_size,
-                                    });
+                            match tokio::fs::read(&file_path).await {
+                                Ok(mb) => match serde_json::from_slice::<CacheMeta>(&mb) {
+                                    Ok(m) => {
+                                        scan_total_bytes += entry_size;
+                                        scan_entry_count += 1;
+                                        candidates.push(EvictionCandidate {
+                                            body_path: body_path.clone(),
+                                            meta_path: file_path.clone(),
+                                            hash: hash.to_string(),
+                                            fill_id: m.fill_id,
+                                            last_accessed_at: m.last_accessed_at,
+                                            size: entry_size,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        tracing::trace!(
+                                            hash = hash,
+                                            error = %e,
+                                            "raced-in entry metadata unparseable, skipping"
+                                        );
+                                    }
+                                },
+                                Err(e) => {
+                                    tracing::trace!(
+                                        hash = hash,
+                                        error = %e,
+                                        "raced-in entry metadata unreadable, skipping"
+                                    );
                                 }
                             }
                             continue;
