@@ -1166,6 +1166,53 @@ mod tests {
         assert!(state.backend.get_read_calls.lock().unwrap().is_empty());
     }
 
+    /// A plain GET fill whose backend response includes checksum headers
+    /// should infer checksum_mode_checked = true. A subsequent checksum GET
+    /// must be a cache HIT without needing a backend round-trip.
+    #[tokio::test]
+    async fn test_plain_get_with_checksum_headers_satisfies_checksum_get() {
+        let key = "script_bundle/plain-get-checksums.js";
+        let body = b"body with checksums".to_vec();
+        let cache_key = CacheKey::new("test-backend", key);
+
+        let mut get_extra = HashMap::new();
+        get_extra.insert("x-amz-checksum-sha256".to_string(), "abc123".to_string());
+
+        let backend = MockBackend::new().with_get(Ok(MockGetResponse {
+            body: body.clone(),
+            content_type: Some("text/plain".to_string()),
+            etag: Some("\"etag-1\"".to_string()),
+            extra_headers: get_extra,
+        }));
+        let cache = MockCache::new();
+        let state = build_app_state(backend, cache, MockAuth::allow_all());
+
+        // Plain GET fill — backend returns checksum headers.
+        let resp = handle_get(&state, &make_parsed(key), key).await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("x-cache").unwrap(), "MISS");
+
+        // Verify the fill inferred checksum_mode_checked from extra_headers.
+        let cached = wait_for_cached_entry(&state, &cache_key, |e| e.meta.checksum_mode_checked)
+            .await;
+        assert!(cached.meta.checksum_mode_checked);
+        assert_eq!(
+            cached.meta.extra_headers.get("x-amz-checksum-sha256").unwrap(),
+            "abc123"
+        );
+
+        // Subsequent checksum GET should be a HIT — no backend call.
+        let checksum_resp = handle_get(&state, &make_parsed_with_checksum(key), key).await;
+        assert_eq!(checksum_resp.status(), 200);
+        assert_eq!(checksum_resp.headers().get("x-cache").unwrap(), "HIT");
+        assert_eq!(
+            checksum_resp.headers().get("x-amz-checksum-sha256").unwrap(),
+            "abc123"
+        );
+        // Only the original fill GET was called — no additional backend calls.
+        assert_eq!(state.backend.get_read_calls.lock().unwrap().len(), 1);
+    }
+
     /// HEAD refresh enriches HEAD-specific state but cannot make checksum
     /// GET a cache hit. The checksum GET falls back to a real backend GET
     /// which populates extra_headers with GET-derived checksums.
