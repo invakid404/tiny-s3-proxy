@@ -1521,13 +1521,11 @@ mod tests {
         // Stage a GET-only replacement (head_metadata_checked = false).
         let mut get_only_meta = test_cache_meta("test-backend", key, b"new body");
         get_only_meta.head_metadata_checked = false;
+        // Use a different ETag from the retry HEAD response so refreshed_cache_meta()
+        // returns EtagMismatch and we exercise the "return fresh HEAD response
+        // directly" branch instead of the Updated branch.
+        get_only_meta.etag = Some("\"replacement-etag\"".to_string());
         cache.stage_purge_replacement(&cache_key, b"new body", get_only_meta);
-
-        // Read the replacement's etag for the retry HEAD response.
-        let new_etag = {
-            let pending = cache.purge_swaps_entry.lock().unwrap();
-            pending.as_ref().unwrap().1.meta.etag.clone()
-        };
 
         let mut retry_extra = HashMap::new();
         retry_extra.insert(
@@ -1540,7 +1538,7 @@ mod tests {
         let backend = Sequential404Then200HeadBackend::new(HeadObjectOutput {
             content_type: Some("text/plain".to_string()),
             content_length: Some(8),
-            etag: new_etag,
+            etag: Some("\"retry-etag\"".to_string()),
             last_modified: None,
             metadata: HashMap::new(),
             extra_headers: retry_extra,
@@ -1553,6 +1551,9 @@ mod tests {
         // Retry succeeded — must return 200, not the stale 404.
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.headers().get("x-cache").unwrap(), "MISS");
+        // Fresh HEAD response is returned directly even though cache refresh
+        // did not strongly match (EtagMismatch path).
+        assert_eq!(resp.headers().get("etag").unwrap(), "\"retry-etag\"");
         assert_eq!(
             resp.headers().get("x-amz-archive-status").unwrap(),
             "ARCHIVE_ACCESS"
