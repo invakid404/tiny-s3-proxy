@@ -27,10 +27,7 @@ pub(crate) async fn purge_then_poison_if_unchanged<C: crate::cache::CacheStore>(
     poison_success_msg: &str,
     poison_fail_msg: &str,
 ) -> bool {
-    match cache
-        .purge_if_unchanged(cache_key, expected_fill_id)
-        .await
-    {
+    match cache.purge_if_unchanged(cache_key, expected_fill_id).await {
         Ok(true) => {
             tracing::warn!(
                 request_id = request_id,
@@ -60,10 +57,7 @@ pub(crate) async fn purge_then_poison_if_unchanged<C: crate::cache::CacheStore>(
                 "{}",
                 purge_fail_msg
             );
-            match cache
-                .poison_if_unchanged(cache_key, expected_fill_id)
-                .await
-            {
+            match cache.poison_if_unchanged(cache_key, expected_fill_id).await {
                 Ok(true) => {
                     tracing::warn!(
                         request_id = request_id,
@@ -1059,6 +1053,15 @@ pub mod test_utils {
         release: std::sync::Arc<tokio::sync::Notify>,
     }
 
+    struct PendingPeekHeadStateUpdate {
+        call: u32,
+        key_hash: String,
+        head_extra_headers: HashMap<String, String>,
+        head_checksum_headers: HashMap<String, String>,
+        head_metadata_checked: bool,
+        head_checksum_checked: bool,
+    }
+
     pub struct MockCache {
         pub entries: Mutex<HashMap<String, CacheEntry>>,
         next_fill_id: std::sync::atomic::AtomicU64,
@@ -1073,9 +1076,11 @@ pub mod test_utils {
         pub fill_calls: Mutex<Vec<CacheKey>>,
         pub poison_calls: Mutex<Vec<CacheKey>>,
         pub purge_should_fail: Mutex<bool>,
+        peek_error: Mutex<Option<ProxyError>>,
         /// When set, purge_if_unchanged swaps in this replacement entry
         /// (simulating a concurrent refill) and returns false.
         pub purge_swaps_entry: Mutex<Option<(String, CacheEntry)>>,
+        peek_head_state_update: Mutex<Option<PendingPeekHeadStateUpdate>>,
         commit_fill_pause: Mutex<Option<MockCommitFillPause>>,
         pub temp_dir: tempfile::TempDir,
     }
@@ -1097,10 +1102,36 @@ pub mod test_utils {
                 fill_calls: Mutex::new(Vec::new()),
                 poison_calls: Mutex::new(Vec::new()),
                 purge_should_fail: Mutex::new(false),
+                peek_error: Mutex::new(None),
                 purge_swaps_entry: Mutex::new(None),
+                peek_head_state_update: Mutex::new(None),
                 commit_fill_pause: Mutex::new(None),
                 temp_dir: tempfile::TempDir::new().expect("create mock cache temp dir"),
             }
+        }
+
+        pub fn with_next_peek_error(self, error: ProxyError) -> Self {
+            *self.peek_error.lock().unwrap() = Some(error);
+            self
+        }
+
+        pub fn publish_head_state_after_nth_peek(
+            &self,
+            key: &CacheKey,
+            call: u32,
+            head_extra_headers: HashMap<String, String>,
+            head_checksum_headers: HashMap<String, String>,
+            head_metadata_checked: bool,
+            head_checksum_checked: bool,
+        ) {
+            *self.peek_head_state_update.lock().unwrap() = Some(PendingPeekHeadStateUpdate {
+                call,
+                key_hash: key.hash_hex().to_string(),
+                head_extra_headers,
+                head_checksum_headers,
+                head_metadata_checked,
+                head_checksum_checked,
+            });
         }
 
         pub fn pause_next_commit_fill(
@@ -1122,12 +1153,7 @@ pub mod test_utils {
         /// `purge_if_unchanged` is called, simulating a concurrent refill.
         /// The purge will return `Ok(false)` and subsequent reads will see
         /// the replacement.
-        pub fn stage_purge_replacement(
-            &self,
-            key: &CacheKey,
-            body: &[u8],
-            mut meta: CacheMeta,
-        ) {
+        pub fn stage_purge_replacement(&self, key: &CacheKey, body: &[u8], mut meta: CacheMeta) {
             use std::sync::atomic::{AtomicU64, Ordering};
             static MOCK_COUNTER: AtomicU64 = AtomicU64::new(100_000);
             let id = MOCK_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -1142,8 +1168,7 @@ pub mod test_utils {
                 body_path,
                 body_file: None,
             };
-            *self.purge_swaps_entry.lock().unwrap() =
-                Some((key.hash_hex().to_string(), entry));
+            *self.purge_swaps_entry.lock().unwrap() = Some((key.hash_hex().to_string(), entry));
         }
 
         /// Replace the current entry with a freshly published generation.
@@ -1215,27 +1240,36 @@ pub mod test_utils {
             }
             let snapshot = {
                 let entries = self.entries.lock().unwrap();
-                entries.get(key.hash_hex()).map(|e| (e.meta.clone(), e.body_path.clone()))
+                entries
+                    .get(key.hash_hex())
+                    .map(|e| (e.meta.clone(), e.body_path.clone()))
             };
             match snapshot {
                 Some((meta, body_path)) => {
-                    let body_file = Some(
-                        tokio::fs::File::open(&body_path)
-                            .await
-                            .map_err(|e| ProxyError::Cache {
-                                source: Box::new(e),
-                                operation: "mock lookup open body".into(),
-                            })?,
-                    );
-                    Ok(Some(CacheEntry { meta, body_path, body_file }))
+                    let body_file = Some(tokio::fs::File::open(&body_path).await.map_err(|e| {
+                        ProxyError::Cache {
+                            source: Box::new(e),
+                            operation: "mock lookup open body".into(),
+                        }
+                    })?);
+                    Ok(Some(CacheEntry {
+                        meta,
+                        body_path,
+                        body_file,
+                    }))
                 }
                 None => Ok(None),
             }
         }
 
         async fn peek(&self, key: &CacheKey) -> Result<Option<CacheEntry>, ProxyError> {
-            self.peek_count
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let call = self
+                .peek_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if let Some(error) = self.peek_error.lock().unwrap().take() {
+                return Err(error);
+            }
             if self.poisoned.lock().unwrap().contains(key.hash_hex()) {
                 return Ok(None);
             }
@@ -1245,6 +1279,27 @@ pub mod test_utils {
                 body_path: e.body_path.clone(),
                 body_file: None,
             });
+            drop(entries);
+
+            let pending_update = {
+                let mut pending = self.peek_head_state_update.lock().unwrap();
+                match pending.take() {
+                    Some(update) if update.call == call => Some(update),
+                    Some(update) => {
+                        *pending = Some(update);
+                        None
+                    }
+                    None => None,
+                }
+            };
+            if let Some(update) = pending_update {
+                if let Some(current) = self.entries.lock().unwrap().get_mut(&update.key_hash) {
+                    current.meta.head_extra_headers = update.head_extra_headers;
+                    current.meta.head_checksum_headers = update.head_checksum_headers;
+                    current.meta.head_metadata_checked = update.head_metadata_checked;
+                    current.meta.head_checksum_checked = update.head_checksum_checked;
+                }
+            }
             Ok(entry)
         }
 
@@ -1256,19 +1311,23 @@ pub mod test_utils {
             }
             let snapshot = {
                 let entries = self.entries.lock().unwrap();
-                entries.get(key.hash_hex()).map(|e| (e.meta.clone(), e.body_path.clone()))
+                entries
+                    .get(key.hash_hex())
+                    .map(|e| (e.meta.clone(), e.body_path.clone()))
             };
             match snapshot {
                 Some((meta, body_path)) => {
-                    let body_file = Some(
-                        tokio::fs::File::open(&body_path)
-                            .await
-                            .map_err(|e| ProxyError::Cache {
-                                source: Box::new(e),
-                                operation: "mock peek_body open body".into(),
-                            })?,
-                    );
-                    Ok(Some(CacheEntry { meta, body_path, body_file }))
+                    let body_file = Some(tokio::fs::File::open(&body_path).await.map_err(|e| {
+                        ProxyError::Cache {
+                            source: Box::new(e),
+                            operation: "mock peek_body open body".into(),
+                        }
+                    })?);
+                    Ok(Some(CacheEntry {
+                        meta,
+                        body_path,
+                        body_file,
+                    }))
                 }
                 None => Ok(None),
             }

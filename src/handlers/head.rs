@@ -281,6 +281,7 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
                 // Cache miss, fall through to backend
             }
             Err(e) => {
+                note_refresh_miss(state, &parsed.request_id, key).await;
                 tracing::warn!(
                     request_id = %parsed.request_id,
                     error = %e,
@@ -423,6 +424,23 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
                             // to enrich the newer generation instead of
                             // returning the stale 404.
                             if let Ok(Some(newer)) = state.cache.peek(&cache_key).await {
+                                if cache_entry_satisfies_head_request(&newer.meta, read_options) {
+                                    if let Err(hit_err) =
+                                        state.cache.note_hit(&cache_key, &newer.meta).await
+                                    {
+                                        tracing::warn!(
+                                            request_id = %parsed.request_id,
+                                            error = %hit_err,
+                                            "failed to record cache hit after second 404 re-probe"
+                                        );
+                                    }
+                                    return build_cached_head_response(
+                                        &newer.meta,
+                                        &parsed.request_id,
+                                        "HIT",
+                                        read_options.wants_checksum_headers(),
+                                    );
+                                }
                                 match state
                                     .backend
                                     .head_object(&state.backend_bucket, key, read_options)
@@ -1192,6 +1210,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_head_cache_peek_error_records_miss() {
+        let key = "script_bundle/head-peek-error.js";
+
+        let backend = MockBackend::new().with_head(Ok(crate::backend::models::HeadObjectOutput {
+            content_type: Some("text/plain".to_string()),
+            content_length: Some(128),
+            etag: Some("\"head-peek-error-etag\"".to_string()),
+            last_modified: None,
+            metadata: HashMap::new(),
+            extra_headers: HashMap::new(),
+        }));
+
+        let cache = MockCache::new().with_next_peek_error(ProxyError::Cache {
+            source: "mock peek failure".into(),
+            operation: "peek".into(),
+        });
+        let state = build_app_state(backend, cache, MockAuth::allow_all());
+
+        let resp = handle_head(&state, &make_parsed(key), key).await;
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            state
+                .cache
+                .note_miss_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn test_head_from_cache() {
         let key = "script_bundle/cached.js";
         let cache_key = crate::cache::key::CacheKey::new("test-backend", key);
@@ -1869,6 +1918,65 @@ mod tests {
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.headers().get("x-cache").unwrap(), "MISS");
         assert!(state.cache.lookup(&cache_key).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_head_404_second_reprobe_serves_newly_satisfiable_entry() {
+        let key = "script_bundle/head-404-second-reprobe-hit.js";
+        let cache_key = crate::cache::key::CacheKey::new("test-backend", key);
+        let mut old_meta = test_cache_meta("test-backend", key, b"cached body");
+        old_meta.head_metadata_checked = false;
+
+        let cache = MockCache::new().with_entry(&cache_key, b"cached body", old_meta);
+
+        let mut get_only_meta = test_cache_meta("test-backend", key, b"new body");
+        get_only_meta.head_metadata_checked = false;
+        cache.stage_purge_replacement(&cache_key, b"new body", get_only_meta);
+
+        let mut refreshed_head_extra_headers = HashMap::new();
+        refreshed_head_extra_headers
+            .insert("x-amz-archive-status".to_string(), "RESTORED".to_string());
+        cache.publish_head_state_after_nth_peek(
+            &cache_key,
+            2,
+            refreshed_head_extra_headers,
+            HashMap::new(),
+            true,
+            false,
+        );
+
+        let backend = MockBackend::new().with_head(Err(ProxyError::UpstreamS3 {
+            status_code: 404,
+            s3_code: "NoSuchKey".into(),
+            message: "gone".into(),
+            operation: "head_object".into(),
+        }));
+
+        let state = build_app_state(backend, cache, MockAuth::allow_all());
+
+        let resp = handle_head(&state, &make_parsed(key), key).await;
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("x-cache").unwrap(), "HIT");
+        assert_eq!(
+            resp.headers().get("x-amz-archive-status").unwrap(),
+            "RESTORED"
+        );
+        assert_eq!(state.backend.head_read_calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            state
+                .cache
+                .note_hit_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            state
+                .cache
+                .note_miss_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
     }
 
     #[tokio::test]
