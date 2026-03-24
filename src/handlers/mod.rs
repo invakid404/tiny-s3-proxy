@@ -10,6 +10,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 /// Shared invalidation helper used by both GET and HEAD handlers.
+/// Returns `true` if the entry was successfully purged/poisoned (the 404
+/// is authoritative for the observed generation), or `false` if the entry
+/// was replaced by a newer generation (the 404 may be stale — callers
+/// should re-probe the cache instead of returning the 404).
 pub(crate) async fn purge_then_poison_if_unchanged<C: crate::cache::CacheStore>(
     cache: &Arc<C>,
     cache_key: &crate::cache::key::CacheKey,
@@ -22,25 +26,31 @@ pub(crate) async fn purge_then_poison_if_unchanged<C: crate::cache::CacheStore>(
     purge_fail_msg: &str,
     poison_success_msg: &str,
     poison_fail_msg: &str,
-) {
+) -> bool {
     match cache
         .purge_if_unchanged(cache_key, expected_fill_id)
         .await
     {
-        Ok(true) => tracing::warn!(
-            request_id = request_id,
-            operation = operation,
-            key = key,
-            "{}",
-            purge_success_msg
-        ),
-        Ok(false) => tracing::info!(
-            request_id = request_id,
-            operation = operation,
-            key = key,
-            "{}",
-            purge_changed_msg
-        ),
+        Ok(true) => {
+            tracing::warn!(
+                request_id = request_id,
+                operation = operation,
+                key = key,
+                "{}",
+                purge_success_msg
+            );
+            return true;
+        }
+        Ok(false) => {
+            tracing::info!(
+                request_id = request_id,
+                operation = operation,
+                key = key,
+                "{}",
+                purge_changed_msg
+            );
+            return false;
+        }
         Err(purge_err) => {
             tracing::warn!(
                 request_id = request_id,
@@ -54,22 +64,30 @@ pub(crate) async fn purge_then_poison_if_unchanged<C: crate::cache::CacheStore>(
                 .poison_if_unchanged(cache_key, expected_fill_id)
                 .await
             {
-                Ok(true) => tracing::warn!(
-                    request_id = request_id,
-                    operation = operation,
-                    key = key,
-                    "{}",
-                    poison_success_msg
-                ),
-                Ok(false) => {}
-                Err(poison_err) => tracing::warn!(
-                    request_id = request_id,
-                    operation = operation,
-                    key = key,
-                    error = %poison_err,
-                    "{}",
-                    poison_fail_msg
-                ),
+                Ok(true) => {
+                    tracing::warn!(
+                        request_id = request_id,
+                        operation = operation,
+                        key = key,
+                        "{}",
+                        poison_success_msg
+                    );
+                    return true;
+                }
+                Ok(false) => return false,
+                Err(poison_err) => {
+                    tracing::warn!(
+                        request_id = request_id,
+                        operation = operation,
+                        key = key,
+                        error = %poison_err,
+                        "{}",
+                        poison_fail_msg
+                    );
+                    // Both purge and poison failed — treat as invalidated
+                    // (conservative: don't return stale 404).
+                    return true;
+                }
             }
         }
     }

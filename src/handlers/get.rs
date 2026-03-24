@@ -191,7 +191,7 @@ async fn try_refresh_cached_get_metadata<B: Backend + 'static, C: CacheStore + '
                     ..
                 }
             ) {
-                purge_then_poison_if_unchanged(
+                let invalidated = purge_then_poison_if_unchanged(
                     &state.cache,
                     cache_key,
                     entry.meta.fill_id,
@@ -205,15 +205,23 @@ async fn try_refresh_cached_get_metadata<B: Backend + 'static, C: CacheStore + '
                     "failed to poison stale cache entry after purge failure during GET refresh",
                 )
                 .await;
-                // HEAD authoritatively confirmed the object is gone — return
-                // 404 directly instead of falling through to a redundant GET.
-                let _ = state.cache.note_miss().await;
-                let s3err = S3Error::from_proxy_error(
-                    &e,
-                    &parsed.request_id,
-                    Some(&format!("/{}/{}", state.frontend_bucket, key)),
-                );
-                return Some(s3err.to_response());
+
+                if invalidated {
+                    // The 404 is authoritative for the generation we observed.
+                    let _ = state.cache.note_miss().await;
+                    let s3err = S3Error::from_proxy_error(
+                        &e,
+                        &parsed.request_id,
+                        Some(&format!("/{}/{}", state.frontend_bucket, key)),
+                    );
+                    return Some(s3err.to_response());
+                }
+                // purge_if_unchanged returned false — a concurrent refill
+                // replaced the entry. The 404 is stale; fall through to let
+                // the caller re-probe and serve the newer entry or continue
+                // upstream. (Same pattern as the transient-error re-probe in
+                // handle_head stale fallback at src/handlers/head.rs.)
+                return None;
             }
             tracing::warn!(
                 request_id = %parsed.request_id,
@@ -1599,6 +1607,45 @@ mod tests {
 
         let plain_resp = handle_get(&state, &make_parsed(key), key).await;
         assert_eq!(plain_resp.status(), 404);
+    }
+
+    /// Regression: verify purge_then_poison_if_unchanged returns false when
+    /// fill_id doesn't match (entry was replaced by concurrent refill), and
+    /// the GET refresh path correctly falls through instead of returning 404.
+    #[tokio::test]
+    async fn test_purge_returns_false_for_replaced_entry() {
+        let key = "script_bundle/purge-false.js";
+        let cache_key = CacheKey::new("test-backend", key);
+        let meta = test_cache_meta("test-backend", key, b"body");
+        let cache = MockCache::new().with_entry(&cache_key, b"body", meta);
+        let state = build_app_state(MockBackend::new(), cache, MockAuth::allow_all());
+
+        // purge_if_unchanged with a wrong fill_id should return false.
+        let result = state
+            .cache
+            .purge_if_unchanged(&cache_key, 999999)
+            .await
+            .unwrap();
+        assert!(!result, "purge_if_unchanged should return false for mismatched fill_id");
+        // Entry should still exist.
+        assert!(state.cache.peek(&cache_key).await.unwrap().is_some());
+
+        // Verify the shared helper also returns false.
+        let invalidated = super::purge_then_poison_if_unchanged(
+            &state.cache,
+            &cache_key,
+            999999,
+            "test",
+            "test",
+            key,
+            "purge ok",
+            "changed",
+            "purge fail",
+            "poison ok",
+            "poison fail",
+        )
+        .await;
+        assert!(!invalidated, "helper should return false when entry was replaced");
     }
 
     #[tokio::test]

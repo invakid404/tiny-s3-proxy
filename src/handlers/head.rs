@@ -355,7 +355,7 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
                     crate::error::ProxyError::UpstreamS3 {
                         status_code: 404, ..
                     } => {
-                        purge_then_poison_if_unchanged(
+                        let invalidated = purge_then_poison_if_unchanged(
                             &state.cache,
                             &cache_key,
                             cached_meta.fill_id,
@@ -369,6 +369,36 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
                             "failed to poison stale cache entry after purge failure following HEAD not found",
                         )
                         .await;
+                        if !invalidated {
+                            // A concurrent refill replaced the entry — the 404
+                            // is stale. Re-probe: if the newer entry satisfies
+                            // the request, serve it. Same pattern as the
+                            // transient-error re-probe below.
+                            if let Ok(Some(current)) = state.cache.peek(&cache_key).await {
+                                if cache_entry_satisfies_head_request(
+                                    &current.meta,
+                                    read_options,
+                                ) {
+                                    if let Err(hit_err) =
+                                        state.cache.note_hit(&cache_key, &current.meta).await
+                                    {
+                                        tracing::warn!(
+                                            request_id = %parsed.request_id,
+                                            error = %hit_err,
+                                            "failed to record cache hit after 404 re-probe"
+                                        );
+                                    }
+                                    return build_cached_head_response(
+                                        &current.meta,
+                                        &parsed.request_id,
+                                        "HIT",
+                                        read_options.wants_checksum_headers(),
+                                    );
+                                }
+                            }
+                            // Newer entry doesn't satisfy or doesn't exist —
+                            // fall through to the error response below.
+                        }
                     }
                     _ if state.config.cache_serve_stale_on_error
                         && e.is_transient() =>
@@ -1249,6 +1279,53 @@ mod tests {
         assert_eq!(
             resp.headers().get("x-cache").unwrap(),
             "STALE"
+        );
+    }
+
+    /// Regression: when HEAD returns 404 but a concurrent refill replaced
+    /// the cache entry (purge_if_unchanged returns false), the handler must
+    /// re-probe and serve the newer entry instead of returning the stale 404.
+    #[tokio::test]
+    async fn test_head_404_with_concurrent_refill_serves_newer_entry() {
+        let key = "script_bundle/head-404-refill.js";
+        let cache_key = crate::cache::key::CacheKey::new("test-backend", key);
+        let mut meta = test_cache_meta("test-backend", key, b"cached body");
+        // Needs HEAD refresh (head_metadata_checked = false).
+        meta.head_metadata_checked = false;
+
+        let backend = MockBackend::new().with_head(Err(crate::error::ProxyError::UpstreamS3 {
+            status_code: 404,
+            s3_code: "NoSuchKey".into(),
+            message: "deleted upstream".into(),
+            operation: "head_object".into(),
+        }));
+        let cache = MockCache::new().with_entry(&cache_key, b"cached body", meta);
+
+        // Simulate concurrent refill: bump fill_id so purge_if_unchanged
+        // returns false, AND set head_metadata_checked = true so the re-probe
+        // finds a satisfiable entry.
+        {
+            let mut entries = cache.entries.lock().unwrap();
+            if let Some(entry) = entries.get_mut(cache_key.hash_hex()) {
+                entry.meta.fill_id = 999999;
+                entry.meta.head_metadata_checked = true;
+                entry.meta.head_extra_headers.insert(
+                    "x-amz-archive-status".to_string(),
+                    "RESTORED".to_string(),
+                );
+            }
+        }
+
+        let state = build_app_state(backend, cache, MockAuth::allow_all());
+
+        let resp = handle_head(&state, &make_parsed(key), key).await;
+
+        // Must serve the newer cached entry, NOT the stale 404.
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("x-cache").unwrap(), "HIT");
+        assert_eq!(
+            resp.headers().get("x-amz-archive-status").unwrap(),
+            "RESTORED"
         );
     }
 
