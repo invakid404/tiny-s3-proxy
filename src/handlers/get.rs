@@ -207,6 +207,7 @@ async fn try_refresh_cached_get_metadata<B: Backend + 'static, C: CacheStore + '
                 .await;
                 // HEAD authoritatively confirmed the object is gone — return
                 // 404 directly instead of falling through to a redundant GET.
+                let _ = state.cache.note_miss().await;
                 let s3err = S3Error::from_proxy_error(
                     &e,
                     &parsed.request_id,
@@ -1439,6 +1440,11 @@ mod tests {
         assert_eq!(state.cache.purge_calls.lock().unwrap().len(), 1);
         assert!(state.cache.poison_calls.lock().unwrap().is_empty());
         assert!(state.backend.get_read_calls.lock().unwrap().is_empty());
+        assert_eq!(
+            state.cache.note_miss_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "HEAD 404 invalidation path must record a cache miss"
+        );
 
         // A subsequent plain GET (cache now empty) should also 404 via backend.
         *state.backend.get_response.lock().unwrap() =
