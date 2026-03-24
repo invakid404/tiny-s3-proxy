@@ -188,4 +188,25 @@ mod tests {
             Some(&"headsum".to_string())
         );
     }
+
+    #[test]
+    fn preserve_same_etag_head_state_ignores_mismatched_etags() {
+        let mut incoming = test_meta(Some("\"etag-a\""));
+        let mut current = test_meta(Some("\"etag-b\""));
+        current.head_metadata_checked = true;
+        current.head_checksum_checked = true;
+        current
+            .head_extra_headers
+            .insert("x-amz-archive-status".into(), "ARCHIVE_ACCESS".into());
+        current
+            .head_checksum_headers
+            .insert("x-amz-checksum-sha256".into(), "headsum".into());
+
+        incoming.preserve_same_etag_head_state_from(&current);
+
+        assert!(!incoming.head_metadata_checked);
+        assert!(!incoming.head_checksum_checked);
+        assert!(incoming.head_extra_headers.is_empty());
+        assert!(incoming.head_checksum_headers.is_empty());
+    }
 }

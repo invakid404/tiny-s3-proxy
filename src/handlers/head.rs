@@ -489,6 +489,28 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
                                         }
                                     }
                                     Err(retry_err) => {
+                                        if matches!(
+                                            retry_err,
+                                            crate::error::ProxyError::UpstreamS3 {
+                                                status_code: 404,
+                                                ..
+                                            }
+                                        ) {
+                                            let _ = purge_then_poison_if_unchanged(
+                                                &state.cache,
+                                                &cache_key,
+                                                newer.meta.fill_id,
+                                                &parsed.request_id,
+                                                "HeadObject",
+                                                key,
+                                                "purged disproved cache entry after retry HEAD returned not found",
+                                                "retry HEAD returned not found, but replacement entry changed before invalidation",
+                                                "failed to purge disproved cache entry after retry HEAD returned not found",
+                                                "poisoned disproved cache entry after retry HEAD purge failure",
+                                                "failed to poison disproved cache entry after retry HEAD purge failure",
+                                            )
+                                            .await;
+                                        }
                                         note_refresh_miss(state, &parsed.request_id, key).await;
                                         // Retry HEAD also failed. Return the
                                         // retry error (not the original stale
@@ -826,6 +848,92 @@ mod tests {
                     operation: "head_object".into(),
                 })
             }
+        }
+
+        async fn put_object(&self, _req: PutObjectInput) -> Result<PutObjectOutput, ProxyError> {
+            unreachable!()
+        }
+        async fn delete_object(&self, _bucket: &str, _key: &str) -> Result<DeleteObjectOutput, ProxyError> {
+            unreachable!()
+        }
+        async fn list_objects(&self, _req: ListObjectsInput) -> Result<ListObjectsOutput, ProxyError> {
+            unreachable!()
+        }
+        async fn create_multipart_upload(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _content_type: Option<&str>,
+            _metadata: &std::collections::HashMap<String, String>,
+            _content_headers: &std::collections::HashMap<String, String>,
+        ) -> Result<CreateMultipartOutput, ProxyError> {
+            unreachable!()
+        }
+        async fn upload_part(&self, _req: UploadPartInput) -> Result<UploadPartOutput, ProxyError> {
+            unreachable!()
+        }
+        async fn complete_multipart_upload(
+            &self,
+            _req: crate::backend::models::CompleteMultipartInput,
+        ) -> Result<CompleteMultipartOutput, ProxyError> {
+            unreachable!()
+        }
+        async fn abort_multipart_upload(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _upload_id: &str,
+        ) -> Result<(), ProxyError> {
+            unreachable!()
+        }
+    }
+
+    struct Sequential404Then404HeadBackend {
+        head_calls: std::sync::Mutex<Vec<ReadOptions>>,
+        count: AtomicUsize,
+    }
+
+    impl Sequential404Then404HeadBackend {
+        fn new() -> Self {
+            Self {
+                head_calls: std::sync::Mutex::new(Vec::new()),
+                count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Backend for Sequential404Then404HeadBackend {
+        async fn get_object(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _options: ReadOptions,
+        ) -> Result<(crate::backend::models::GetObjectMeta, crate::backend::BoxByteStream), ProxyError> {
+            Err(ProxyError::Backend {
+                source: "unexpected get_object".into(),
+                operation: "get_object".into(),
+            })
+        }
+
+        async fn head_object(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            options: ReadOptions,
+        ) -> Result<HeadObjectOutput, ProxyError> {
+            self.head_calls.lock().unwrap().push(options);
+            let call = self.count.fetch_add(1, Ordering::SeqCst);
+            let message = if call == 0 {
+                "deleted"
+            } else {
+                "still deleted"
+            };
+            Err(ProxyError::UpstreamS3 {
+                status_code: 404,
+                s3_code: "NoSuchKey".into(),
+                message: message.into(),
+                operation: "head_object".into(),
+            })
         }
 
         async fn put_object(&self, _req: PutObjectInput) -> Result<PutObjectOutput, ProxyError> {
@@ -1736,6 +1844,30 @@ mod tests {
         assert_eq!(resp.status(), 502);
         assert_eq!(state.backend.head_calls.lock().unwrap().len(), 2);
         assert_eq!(state.cache.note_miss_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_head_404_retry_not_found_invalidates_replacement() {
+        let key = "script_bundle/head-404-retry-not-found.js";
+        let cache_key = crate::cache::key::CacheKey::new("test-backend", key);
+        let mut old_meta = test_cache_meta("test-backend", key, b"cached body");
+        old_meta.head_metadata_checked = false;
+
+        let cache = MockCache::new().with_entry(&cache_key, b"cached body", old_meta);
+
+        let mut get_only_meta = test_cache_meta("test-backend", key, b"new body");
+        get_only_meta.head_metadata_checked = false;
+        cache.stage_purge_replacement(&cache_key, b"new body", get_only_meta);
+
+        let backend = Sequential404Then404HeadBackend::new();
+        let state = build_state_with_backend(backend, cache);
+
+        let resp = handle_head(&state, &make_parsed(key), key).await;
+
+        assert_eq!(resp.status(), 404);
+        assert_eq!(state.backend.head_calls.lock().unwrap().len(), 2);
+        assert_eq!(state.cache.note_miss_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(state.cache.lookup(&cache_key).await.unwrap().is_none());
     }
 
     #[tokio::test]

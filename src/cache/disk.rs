@@ -14,20 +14,6 @@ use crate::error::ProxyError;
 /// on-disk `fill_id` at startup so IDs remain unique across restarts.
 static FILL_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-#[cfg(test)]
-static COMMIT_RENAME_FAIL_AFTER_BODY_FOR_TEST: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-#[cfg(test)]
-fn arm_commit_rename_fail_after_body_for_test() {
-    COMMIT_RENAME_FAIL_AFTER_BODY_FOR_TEST.store(true, Ordering::Relaxed);
-}
-
-#[cfg(test)]
-fn take_commit_rename_fail_after_body_for_test() -> bool {
-    COMMIT_RENAME_FAIL_AFTER_BODY_FOR_TEST.swap(false, Ordering::Relaxed)
-}
-
 /// Check if a path exists, distinguishing NotFound from real I/O errors.
 async fn check_exists(path: &std::path::Path, operation: &str) -> Result<bool, ProxyError> {
     match tokio::fs::try_exists(path).await {
@@ -60,7 +46,7 @@ struct FillEntry {
 pub struct DiskCache {
     cache_dir: PathBuf,
     stats: Arc<CacheStats>,
-/// Per-key fill tracking: refcount + generation counter + commit lock.
+    /// Per-key fill tracking: refcount + generation counter + commit lock.
     /// purge() takes a read lock to bump the generation atomically without
     /// blocking behind any per-key commit_lock. begin_fill takes a write
     /// lock to create/increment entries atomically, so purge cannot slip
@@ -72,6 +58,8 @@ pub struct DiskCache {
     /// Entries are created on demand and never removed (the overhead is
     /// one Arc<Mutex> per unique key that has ever been written or hit).
     meta_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    #[cfg(test)]
+    commit_rename_fail_after_body_for_test: std::sync::atomic::AtomicBool,
 }
 
 impl DiskCache {
@@ -106,7 +94,15 @@ impl DiskCache {
             stats: Arc::new(stats),
             active_fills: tokio::sync::RwLock::new(HashMap::new()),
             meta_locks: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            commit_rename_fail_after_body_for_test: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    #[cfg(test)]
+    fn arm_commit_rename_fail_after_body_for_test(&self) {
+        self.commit_rename_fail_after_body_for_test
+            .store(true, Ordering::Relaxed);
     }
 
     /// Scan the objects directory to compute initial stats at startup and
@@ -198,18 +194,55 @@ impl DiskCache {
                             .join(format!("{hash}.meta.json"));
                         match tokio::fs::try_exists(&meta_path).await {
                             Ok(true) => {
-                                if let Ok(m) = tokio::fs::metadata(&file_path).await {
-                                    stats.total_bytes.fetch_add(m.len(), Ordering::Relaxed);
-                                    stats.entry_count.fetch_add(1, Ordering::Relaxed);
+                                match tokio::fs::metadata(&file_path).await {
+                                    Ok(m) => {
+                                        stats.total_bytes.fetch_add(m.len(), Ordering::Relaxed);
+                                        stats.entry_count.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            path = %file_path.display(),
+                                            error = %e,
+                                            "failed to stat body during startup scan"
+                                        );
+                                    }
                                 }
-                                if let Ok(m) = tokio::fs::metadata(&meta_path).await {
-                                    stats.total_bytes.fetch_add(m.len(), Ordering::Relaxed);
+                                match tokio::fs::metadata(&meta_path).await {
+                                    Ok(m) => {
+                                        stats.total_bytes.fetch_add(m.len(), Ordering::Relaxed);
+                                    }
+                                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            path = %meta_path.display(),
+                                            error = %e,
+                                            "failed to stat metadata during startup scan"
+                                        );
+                                    }
                                 }
-                                if let Ok(meta_bytes) = tokio::fs::read(&meta_path).await {
-                                    if let Ok(meta) =
-                                        serde_json::from_slice::<CacheMeta>(&meta_bytes)
-                                    {
-                                        max_fill_id = max_fill_id.max(meta.fill_id);
+                                match tokio::fs::read(&meta_path).await {
+                                    Ok(meta_bytes) => {
+                                        match serde_json::from_slice::<CacheMeta>(&meta_bytes) {
+                                            Ok(meta) => {
+                                                max_fill_id = max_fill_id.max(meta.fill_id);
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    path = %meta_path.display(),
+                                                    error = %e,
+                                                    "failed to parse metadata during startup scan"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            path = %meta_path.display(),
+                                            error = %e,
+                                            "failed to read metadata during startup scan"
+                                        );
                                     }
                                 }
                             }
@@ -636,7 +669,10 @@ impl DiskCache {
             }
 
             #[cfg(test)]
-            if take_commit_rename_fail_after_body_for_test() {
+            if self
+                .commit_rename_fail_after_body_for_test
+                .swap(false, Ordering::Relaxed)
+            {
                 if old_body_exists {
                     Self::restore_publish_backup(&final_body, &backup_body, "body").await;
                 } else {
@@ -1522,7 +1558,7 @@ mod tests {
             .await
             .unwrap();
 
-        arm_commit_rename_fail_after_body_for_test();
+        cache.arm_commit_rename_fail_after_body_for_test();
 
         let new_body = b"new body".to_vec();
         let mut new_meta = test_meta(new_body.len());
