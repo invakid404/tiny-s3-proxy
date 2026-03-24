@@ -197,6 +197,22 @@ fn build_fresh_head_response(
     response.body(Body::empty()).unwrap()
 }
 
+async fn note_refresh_miss<B: Backend, C: CacheStore>(
+    state: &Arc<AppState<B, C>>,
+    request_id: &str,
+    key: &str,
+) {
+    if let Err(miss_err) = state.cache.note_miss().await {
+        tracing::warn!(
+            request_id = %request_id,
+            error = %miss_err,
+            operation = "HeadObject",
+            key = key,
+            "failed to record cache miss"
+        );
+    }
+}
+
 /// Handle a HeadObject request.
 ///
 /// If the key is cacheable and we have a cached entry, serve metadata from cache.
@@ -338,15 +354,7 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
             // Record the miss now — the stale-on-error path records a hit
             // instead, so we only count here when actually serving from backend.
             if cache_refresh_target.is_some() {
-                if let Err(e) = state.cache.note_miss().await {
-                    tracing::warn!(
-                        request_id = %parsed.request_id,
-                        error = %e,
-                        operation = "HeadObject",
-                        key = key,
-                        "failed to record cache miss"
-                    );
-                }
+                note_refresh_miss(state, &parsed.request_id, key).await;
             }
 
             tracing::info!(
@@ -425,6 +433,7 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
                                     .await
                                 {
                                     Ok(retry_output) => {
+                                        note_refresh_miss(state, &parsed.request_id, key).await;
                                         // Enrich the newer entry with HEAD metadata.
                                         let outcome = refreshed_cache_meta(
                                             &newer.meta,
@@ -465,6 +474,7 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
                                         }
                                     }
                                     Err(retry_err) => {
+                                        note_refresh_miss(state, &parsed.request_id, key).await;
                                         // Retry HEAD also failed. Return the
                                         // retry error (not the original stale
                                         // 404) since we know a newer generation
@@ -553,15 +563,7 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
             }
             // Record miss for refresh paths that didn't serve stale.
             if cache_refresh_target.is_some() {
-                if let Err(miss_err) = state.cache.note_miss().await {
-                    tracing::warn!(
-                        request_id = %parsed.request_id,
-                        error = %miss_err,
-                        operation = "HeadObject",
-                        key = key,
-                        "failed to record cache miss on backend error"
-                    );
-                }
+                note_refresh_miss(state, &parsed.request_id, key).await;
             }
             tracing::error!(
                 request_id = %parsed.request_id,
@@ -720,6 +722,94 @@ mod tests {
                 })
             } else {
                 Ok(self.success_output.lock().unwrap().take().unwrap())
+            }
+        }
+
+        async fn put_object(&self, _req: PutObjectInput) -> Result<PutObjectOutput, ProxyError> {
+            unreachable!()
+        }
+        async fn delete_object(&self, _bucket: &str, _key: &str) -> Result<DeleteObjectOutput, ProxyError> {
+            unreachable!()
+        }
+        async fn list_objects(&self, _req: ListObjectsInput) -> Result<ListObjectsOutput, ProxyError> {
+            unreachable!()
+        }
+        async fn create_multipart_upload(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _content_type: Option<&str>,
+            _metadata: &std::collections::HashMap<String, String>,
+            _content_headers: &std::collections::HashMap<String, String>,
+        ) -> Result<CreateMultipartOutput, ProxyError> {
+            unreachable!()
+        }
+        async fn upload_part(&self, _req: UploadPartInput) -> Result<UploadPartOutput, ProxyError> {
+            unreachable!()
+        }
+        async fn complete_multipart_upload(
+            &self,
+            _req: crate::backend::models::CompleteMultipartInput,
+        ) -> Result<CompleteMultipartOutput, ProxyError> {
+            unreachable!()
+        }
+        async fn abort_multipart_upload(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _upload_id: &str,
+        ) -> Result<(), ProxyError> {
+            unreachable!()
+        }
+    }
+
+    struct Sequential404ThenErrorHeadBackend {
+        head_calls: std::sync::Mutex<Vec<ReadOptions>>,
+        count: AtomicUsize,
+    }
+
+    impl Sequential404ThenErrorHeadBackend {
+        fn new() -> Self {
+            Self {
+                head_calls: std::sync::Mutex::new(Vec::new()),
+                count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Backend for Sequential404ThenErrorHeadBackend {
+        async fn get_object(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _options: ReadOptions,
+        ) -> Result<(crate::backend::models::GetObjectMeta, crate::backend::BoxByteStream), ProxyError> {
+            Err(ProxyError::Backend {
+                source: "unexpected get_object".into(),
+                operation: "get_object".into(),
+            })
+        }
+
+        async fn head_object(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            options: ReadOptions,
+        ) -> Result<HeadObjectOutput, ProxyError> {
+            self.head_calls.lock().unwrap().push(options);
+            let call = self.count.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                Err(ProxyError::UpstreamS3 {
+                    status_code: 404,
+                    s3_code: "NoSuchKey".into(),
+                    message: "deleted".into(),
+                    operation: "head_object".into(),
+                })
+            } else {
+                Err(ProxyError::Backend {
+                    source: "retry failed".into(),
+                    operation: "head_object".into(),
+                })
             }
         }
 
@@ -1423,6 +1513,14 @@ mod tests {
         let release = std::sync::Arc::new(tokio::sync::Notify::new());
         let backend = BlockingHeadErrorBackend::new(started_tx, std::sync::Arc::clone(&release));
         let state = build_state_with_backend(backend, cache);
+        let original_fill_id = state
+            .cache
+            .peek(&cache_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .meta
+            .fill_id;
 
         let state_for_req = std::sync::Arc::clone(&state);
         let parsed = make_parsed(key);
@@ -1432,16 +1530,15 @@ mod tests {
 
         // Wait for HEAD to start, then replace cache entry with a satisfiable one.
         started_rx.await.unwrap();
-        {
-            let mut entries = state.cache.entries.lock().unwrap();
-            if let Some(entry) = entries.get_mut(cache_key.hash_hex()) {
-                entry.meta.head_metadata_checked = true;
-                entry.meta.head_extra_headers.insert(
-                    "x-amz-archive-status".to_string(),
-                    "ARCHIVE_ACCESS".to_string(),
-                );
-            }
-        }
+        let mut newer_meta = meta;
+        newer_meta.head_metadata_checked = true;
+        newer_meta.head_extra_headers.insert(
+            "x-amz-archive-status".to_string(),
+            "ARCHIVE_ACCESS".to_string(),
+        );
+        state
+            .cache
+            .replace_entry_with_new_generation(&cache_key, b"replacement body", newer_meta);
         release.notify_one();
 
         let resp = handle.await.unwrap();
@@ -1451,6 +1548,12 @@ mod tests {
             resp.headers().get("x-cache").unwrap(),
             "STALE"
         );
+        assert_eq!(
+            resp.headers().get("x-amz-archive-status").unwrap(),
+            "ARCHIVE_ACCESS"
+        );
+        let newer_entry = state.cache.peek(&cache_key).await.unwrap().unwrap();
+        assert_ne!(newer_entry.meta.fill_id, original_fill_id);
     }
 
     /// End-to-end: HEAD returns 404, purge_if_unchanged swaps in a newer
@@ -1561,6 +1664,30 @@ mod tests {
 
         // Backend HEAD was called twice: initial 404 + retry.
         assert_eq!(state.backend.head_calls.lock().unwrap().len(), 2);
+        assert_eq!(state.cache.note_miss_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_head_404_retry_error_records_miss() {
+        let key = "script_bundle/head-404-retry-error.js";
+        let cache_key = crate::cache::key::CacheKey::new("test-backend", key);
+        let mut old_meta = test_cache_meta("test-backend", key, b"cached body");
+        old_meta.head_metadata_checked = false;
+
+        let cache = MockCache::new().with_entry(&cache_key, b"cached body", old_meta);
+
+        let mut get_only_meta = test_cache_meta("test-backend", key, b"new body");
+        get_only_meta.head_metadata_checked = false;
+        cache.stage_purge_replacement(&cache_key, b"new body", get_only_meta);
+
+        let backend = Sequential404ThenErrorHeadBackend::new();
+        let state = build_state_with_backend(backend, cache);
+
+        let resp = handle_head(&state, &make_parsed(key), key).await;
+
+        assert_eq!(resp.status(), 502);
+        assert_eq!(state.backend.head_calls.lock().unwrap().len(), 2);
+        assert_eq!(state.cache.note_miss_count.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
