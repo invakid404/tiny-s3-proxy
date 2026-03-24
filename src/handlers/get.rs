@@ -563,7 +563,9 @@ fn spawn_cache_tee<C: CacheStore + 'static>(
 
         let cache_ok = {
             let chunk_timeout = std::time::Duration::from_secs(300);
+            let send_timeout = std::time::Duration::from_secs(30);
             let mut ok = true;
+            let mut client_alive = true;
             loop {
                 match tokio::time::timeout(chunk_timeout, stream.next()).await {
                     Ok(Some(Ok(chunk))) => {
@@ -576,12 +578,30 @@ fn spawn_cache_tee<C: CacheStore + 'static>(
                             );
                             ok = false;
                         }
-                        // Send to client; if client disconnected, still
-                        // continue writing to disk so cache fills for followers.
-                        let _ = tx.send(Ok(chunk)).await;
+                        // Send to client with a timeout so a slow/stalled
+                        // client doesn't block the cache fill indefinitely.
+                        if client_alive {
+                            match tokio::time::timeout(send_timeout, tx.send(Ok(chunk))).await {
+                                Ok(_) => {}
+                                Err(_) => {
+                                    tracing::warn!(
+                                        request_id = %req_id_for_tee,
+                                        key = %key_for_tee,
+                                        "cache fill: client send timed out, continuing disk fill only"
+                                    );
+                                    client_alive = false;
+                                }
+                            }
+                        }
                     }
                     Ok(Some(Err(e))) => {
-                        let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
+                        if client_alive {
+                            let _ = tokio::time::timeout(
+                                send_timeout,
+                                tx.send(Err(std::io::Error::other(e.to_string()))),
+                            )
+                            .await;
+                        }
                         ok = false;
                         break;
                     }
@@ -592,9 +612,13 @@ fn spawn_cache_tee<C: CacheStore + 'static>(
                             key = %key_for_tee,
                             "cache fill: chunk read timed out after 300s"
                         );
-                        let _ = tx
-                            .send(Err(std::io::Error::other("chunk read timeout")))
+                        if client_alive {
+                            let _ = tokio::time::timeout(
+                                send_timeout,
+                                tx.send(Err(std::io::Error::other("chunk read timeout"))),
+                            )
                             .await;
+                        }
                         ok = false;
                         break;
                     }
