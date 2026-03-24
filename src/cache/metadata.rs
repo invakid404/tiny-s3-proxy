@@ -69,7 +69,10 @@ pub struct CacheMeta {
 
 impl CacheMeta {
     pub(crate) fn preserve_same_etag_head_state_from(&mut self, current: &CacheMeta) {
-        if self.etag != current.etag {
+        let (Some(self_etag), Some(current_etag)) = (&self.etag, &current.etag) else {
+            return;
+        };
+        if self_etag != current_etag {
             return;
         }
 
@@ -83,6 +86,32 @@ impl CacheMeta {
 #[cfg(test)]
 mod tests {
     use super::CacheMeta;
+    use chrono::Utc;
+    use std::collections::HashMap;
+
+    fn test_meta(etag: Option<&str>) -> CacheMeta {
+        CacheMeta {
+            bucket: "bucket".into(),
+            key: "script_bundle/app.js".into(),
+            etag: etag.map(ToString::to_string),
+            last_modified: None,
+            content_type: Some("application/javascript".into()),
+            content_length: 42,
+            cache_written_at: Utc::now(),
+            fill_id: 1,
+            metadata_version: 0,
+            last_accessed_at: Utc::now(),
+            hit_count: 0,
+            source_status: 200,
+            metadata: HashMap::new(),
+            extra_headers: HashMap::new(),
+            head_extra_headers: HashMap::new(),
+            head_checksum_headers: HashMap::new(),
+            checksum_mode_checked: false,
+            head_metadata_checked: false,
+            head_checksum_checked: false,
+        }
+    }
 
     #[test]
     fn deserialize_legacy_metadata_defaults_new_fields() {
@@ -110,5 +139,53 @@ mod tests {
         assert!(!meta.checksum_mode_checked);
         assert!(!meta.head_metadata_checked);
         assert!(!meta.head_checksum_checked);
+    }
+
+    #[test]
+    fn preserve_same_etag_head_state_requires_real_etags() {
+        let mut incoming = test_meta(None);
+        let mut current = test_meta(None);
+        current.head_metadata_checked = true;
+        current.head_checksum_checked = true;
+        current
+            .head_extra_headers
+            .insert("x-amz-archive-status".into(), "ARCHIVE_ACCESS".into());
+        current
+            .head_checksum_headers
+            .insert("x-amz-checksum-sha256".into(), "headsum".into());
+
+        incoming.preserve_same_etag_head_state_from(&current);
+
+        assert!(!incoming.head_metadata_checked);
+        assert!(!incoming.head_checksum_checked);
+        assert!(incoming.head_extra_headers.is_empty());
+        assert!(incoming.head_checksum_headers.is_empty());
+    }
+
+    #[test]
+    fn preserve_same_etag_head_state_copies_verified_match() {
+        let mut incoming = test_meta(Some("\"etag\""));
+        let mut current = test_meta(Some("\"etag\""));
+        current.head_metadata_checked = true;
+        current.head_checksum_checked = true;
+        current
+            .head_extra_headers
+            .insert("x-amz-archive-status".into(), "ARCHIVE_ACCESS".into());
+        current
+            .head_checksum_headers
+            .insert("x-amz-checksum-sha256".into(), "headsum".into());
+
+        incoming.preserve_same_etag_head_state_from(&current);
+
+        assert!(incoming.head_metadata_checked);
+        assert!(incoming.head_checksum_checked);
+        assert_eq!(
+            incoming.head_extra_headers.get("x-amz-archive-status"),
+            Some(&"ARCHIVE_ACCESS".to_string())
+        );
+        assert_eq!(
+            incoming.head_checksum_headers.get("x-amz-checksum-sha256"),
+            Some(&"headsum".to_string())
+        );
     }
 }
