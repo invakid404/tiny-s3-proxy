@@ -669,52 +669,51 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
 ) -> Response<Body> {
     let read_options = parsed.read_options();
 
-    if read_options.wants_checksum_headers() {
-        match state.cache.peek_body(cache_key).await {
-            Ok(Some(entry)) if cache_entry_satisfies_read_options(&entry, read_options) => {
-                // A concurrent refresh already set checksum_mode_checked.
-                // Serve directly from cache instead of re-downloading.
-                let meta_for_hit = entry.meta.clone();
-                if let Some(resp) = build_cache_response(
-                    entry,
-                    &parsed.request_id,
-                    "HIT",
-                    read_options.wants_checksum_headers(),
-                )
-                .await
-                {
-                    if let Err(e) = state.cache.note_hit(cache_key, &meta_for_hit).await {
-                        tracing::warn!(
-                            request_id = %parsed.request_id,
-                            error = %e,
-                            operation = "GetObject",
-                            key = key,
-                            "failed to record cache hit"
-                        );
-                    }
-                    waiter.complete().await;
-                    return resp;
+    // Re-probe cache after acquiring leadership. A concurrent leader may have
+    // published the entry between the initial probe and try_acquire().
+    match state.cache.peek_body(cache_key).await {
+        Ok(Some(entry)) if cache_entry_satisfies_read_options(&entry, read_options) => {
+            let meta_for_hit = entry.meta.clone();
+            if let Some(resp) = build_cache_response(
+                entry,
+                &parsed.request_id,
+                "HIT",
+                read_options.wants_checksum_headers(),
+            )
+            .await
+            {
+                if let Err(e) = state.cache.note_hit(cache_key, &meta_for_hit).await {
+                    tracing::warn!(
+                        request_id = %parsed.request_id,
+                        error = %e,
+                        operation = "GetObject",
+                        key = key,
+                        "failed to record cache hit"
+                    );
                 }
+                waiter.complete().await;
+                return resp;
             }
-            Ok(Some(entry)) => {
-                if let Some(resp) =
-                    try_refresh_cached_get_metadata(state, parsed, key, cache_key, &entry).await
-                {
-                    waiter.complete().await;
-                    return resp;
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    request_id = %parsed.request_id,
-                    error = %e,
-                    operation = "GetObject",
-                    key = key,
-                    "leader cache probe failed"
-                );
-            }
-            Ok(None) => {} // Cache miss — proceed to backend
         }
+        Ok(Some(entry)) if read_options.wants_checksum_headers() => {
+            // Entry doesn't satisfy checksum requirements — try HEAD refresh.
+            if let Some(resp) =
+                try_refresh_cached_get_metadata(state, parsed, key, cache_key, &entry).await
+            {
+                waiter.complete().await;
+                return resp;
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                request_id = %parsed.request_id,
+                error = %e,
+                operation = "GetObject",
+                key = key,
+                "leader cache probe failed"
+            );
+        }
+        _ => {} // Cache miss or non-checksum unsatisfied — proceed to backend
     }
 
     // Register fill BEFORE the backend fetch so that any purge() during
@@ -1652,7 +1651,9 @@ mod tests {
             _key: &CacheKey,
         ) -> Result<Option<CacheEntry>, crate::error::ProxyError> {
             let count = self.peek_body_count.fetch_add(1, Ordering::SeqCst);
-            if count == 0 {
+            // Return None for the first two calls (initial probe + leader
+            // re-probe) so the stale-on-error path is exercised.
+            if count < 2 {
                 Ok(None)
             } else {
                 match self.entry.as_ref() {
@@ -1826,8 +1827,8 @@ mod tests {
         assert_eq!(resp_body.as_ref(), stale_body.as_slice());
 
         assert_eq!(state.cache.peek_count.load(Ordering::SeqCst), 0);
-        // peek_body: 1 for initial miss, 1 for stale probe (reused for replay)
-        assert_eq!(state.cache.peek_body_count.load(Ordering::SeqCst), 2);
+        // peek_body: 1 initial miss, 1 leader re-probe (miss), 1 stale probe
+        assert_eq!(state.cache.peek_body_count.load(Ordering::SeqCst), 3);
         assert_eq!(state.cache.lookup_count.load(Ordering::SeqCst), 0);
     }
 
@@ -1861,7 +1862,8 @@ mod tests {
 
         assert_eq!(resp.status(), 502);
         assert_eq!(state.cache.peek_count.load(Ordering::SeqCst), 0);
-        assert_eq!(state.cache.peek_body_count.load(Ordering::SeqCst), 1);
+        // peek_body: 1 initial miss, 1 leader re-probe (miss)
+        assert_eq!(state.cache.peek_body_count.load(Ordering::SeqCst), 2);
         assert_eq!(state.cache.lookup_count.load(Ordering::SeqCst), 0);
     }
 
@@ -1897,7 +1899,8 @@ mod tests {
 
         assert_eq!(resp.status(), 404);
         assert_eq!(state.cache.peek_count.load(Ordering::SeqCst), 0);
-        assert_eq!(state.cache.peek_body_count.load(Ordering::SeqCst), 1);
+        // peek_body: 1 initial miss, 1 leader re-probe (miss)
+        assert_eq!(state.cache.peek_body_count.load(Ordering::SeqCst), 2);
         assert_eq!(state.cache.lookup_count.load(Ordering::SeqCst), 0);
     }
 

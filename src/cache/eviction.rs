@@ -209,17 +209,17 @@ async fn collect_candidates(
                             // Body appeared after taking the lock (concurrent
                             // commit_fill). Re-read metadata and add as a
                             // candidate so it's both counted and evictable.
+                            // Only update accounting after metadata parses.
                             let body_sz = body_meta.len();
                             let meta_sz = tokio::fs::metadata(&file_path)
                                 .await
                                 .map(|m| m.len())
                                 .unwrap_or(0);
                             let entry_size = body_sz + meta_sz;
-                            scan_total_bytes += entry_size;
-                            scan_entry_count += 1;
-                            // Re-read metadata for fill_id/last_accessed_at.
                             if let Ok(mb) = tokio::fs::read(&file_path).await {
                                 if let Ok(m) = serde_json::from_slice::<CacheMeta>(&mb) {
+                                    scan_total_bytes += entry_size;
+                                    scan_entry_count += 1;
                                     candidates.push(EvictionCandidate {
                                         body_path: body_path.clone(),
                                         meta_path: file_path.clone(),
