@@ -35,7 +35,7 @@ anything else                            → raw passthrough with SigV4 re-signi
 
 Requests are also routed through raw passthrough when they carry headers or query parameters the typed path cannot forward:
 
-- **GET/HEAD** with `Range`, `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, SSE-C headers, `x-amz-checksum-mode`, `x-amz-request-payer`, or `x-amz-expected-bucket-owner`
+- **GET/HEAD** with `Range`, `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, SSE-C headers, `x-amz-request-payer`, `x-amz-expected-bucket-owner`, or malformed/duplicate/unparseable `x-amz-checksum-mode`
 - **GET/HEAD** with `?versionId`, `?partNumber`, or response-override query parameters
 - **PUT** with `x-amz-copy-source` (CopyObject / UploadPartCopy)
 - **PUT/DELETE/multipart** with operation-modifying `x-amz-*` headers not handled by the typed path (storage class, SSE, governance bypass, MFA, etc.)
@@ -45,7 +45,7 @@ GET responses for cacheable prefixes (default: `script_bundle/`, `bun_bundle/`, 
 
 Writes (PUT, DELETE, multipart completion) purge the cache for the affected key immediately. If the on-disk purge fails, a durable poison marker is written so subsequent reads bypass the stale entry until it is cleaned up.
 
-The proxy preserves the full set of standard S3 response headers through both fresh and cached paths, including `Content-Encoding`, `Cache-Control`, `Content-Disposition`, `Content-Language`, version IDs, SSE state, checksums, and other metadata. Write paths forward `Content-Encoding`, `Content-Disposition`, `Content-Language`, `Cache-Control`, and `Expires` to the backend alongside user metadata.
+The proxy preserves the full set of standard S3 response headers through both fresh and cached paths, including `Content-Encoding`, `Cache-Control`, `Content-Disposition`, `Content-Language`, version IDs, SSE state, and other metadata; checksum headers are preserved only when the request carries `x-amz-checksum-mode: ENABLED`. HEAD-only headers are learned from a typed `HEAD` response before plain cached `HEAD` hits are served, so GET-warmed entries may do one backend `HEAD` to enrich the cache before those headers become cache hits. Checksum-mode GET and HEAD warm-up are tracked independently: a checksum-mode HEAD does not satisfy later checksum-mode GET hits (and vice versa), because the two methods can return different checksum surfaces on some S3-compatible backends. Write paths forward `Content-Encoding`, `Content-Disposition`, `Content-Language`, `Cache-Control`, and `Expires` to the backend alongside user metadata.
 
 ## Quick start
 

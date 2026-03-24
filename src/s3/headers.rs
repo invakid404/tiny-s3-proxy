@@ -1,9 +1,13 @@
 use std::collections::HashMap;
 
-use http::header::{HeaderName, HeaderValue};
 use http::HeaderMap;
+use http::header::{HeaderName, HeaderValue};
 
 use crate::backend::models::{GetObjectMeta, HeadObjectOutput};
+
+pub(crate) fn is_checksum_response_header(name: &str) -> bool {
+    name.starts_with("x-amz-checksum-")
+}
 
 /// Format a DateTime to RFC 7231 (HTTP-date) format.
 fn format_last_modified(dt: &chrono::DateTime<chrono::Utc>) -> String {
@@ -28,37 +32,46 @@ pub fn metadata_headers(metadata: &HashMap<String, String>) -> HeaderMap {
     headers
 }
 
-/// Build response headers for a successful GetObject response.
-pub fn get_object_headers(meta: &GetObjectMeta) -> HeaderMap {
+/// Shared helper: populate standard S3 response headers from common fields.
+fn build_object_headers_common(
+    content_type: Option<&str>,
+    content_length: Option<i64>,
+    etag: Option<&str>,
+    last_modified: Option<&chrono::DateTime<chrono::Utc>>,
+    metadata: &HashMap<String, String>,
+    extra_headers: &HashMap<String, String>,
+    include_checksum_headers: bool,
+) -> HeaderMap {
     let mut headers = HeaderMap::new();
 
-    if let Some(ref ct) = meta.content_type
+    if let Some(ct) = content_type
         && let Ok(val) = HeaderValue::from_str(ct)
     {
         headers.insert("content-type", val);
     }
 
-    if let Some(cl) = meta.content_length {
+    if let Some(cl) = content_length {
         headers.insert("content-length", HeaderValue::from(cl));
     }
 
-    if let Some(ref etag) = meta.etag
+    if let Some(etag) = etag
         && let Ok(val) = HeaderValue::from_str(etag)
     {
         headers.insert("etag", val);
     }
 
-    if let Some(ref dt) = meta.last_modified
+    if let Some(dt) = last_modified
         && let Ok(val) = HeaderValue::from_str(&format_last_modified(dt))
     {
         headers.insert("last-modified", val);
     }
 
-    // Include x-amz-meta-* user metadata
-    headers.extend(metadata_headers(&meta.metadata));
+    headers.extend(metadata_headers(metadata));
 
-    // Emit additional S3 response headers captured from the backend.
-    for (k, v) in &meta.extra_headers {
+    for (k, v) in extra_headers {
+        if !include_checksum_headers && is_checksum_response_header(k) {
+            continue;
+        }
         if let (Ok(name), Ok(val)) = (
             HeaderName::from_bytes(k.as_bytes()),
             HeaderValue::from_str(v),
@@ -70,46 +83,30 @@ pub fn get_object_headers(meta: &GetObjectMeta) -> HeaderMap {
     headers
 }
 
+/// Build response headers for a successful GetObject response.
+pub fn get_object_headers(meta: &GetObjectMeta, include_checksum_headers: bool) -> HeaderMap {
+    build_object_headers_common(
+        meta.content_type.as_deref(),
+        meta.content_length,
+        meta.etag.as_deref(),
+        meta.last_modified.as_ref(),
+        &meta.metadata,
+        &meta.extra_headers,
+        include_checksum_headers,
+    )
+}
+
 /// Build response headers for a successful HeadObject response.
-pub fn head_object_headers(output: &HeadObjectOutput) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-
-    if let Some(ref ct) = output.content_type
-        && let Ok(val) = HeaderValue::from_str(ct)
-    {
-        headers.insert("content-type", val);
-    }
-
-    if let Some(cl) = output.content_length {
-        headers.insert("content-length", HeaderValue::from(cl));
-    }
-
-    if let Some(ref etag) = output.etag
-        && let Ok(val) = HeaderValue::from_str(etag)
-    {
-        headers.insert("etag", val);
-    }
-
-    if let Some(ref dt) = output.last_modified
-        && let Ok(val) = HeaderValue::from_str(&format_last_modified(dt))
-    {
-        headers.insert("last-modified", val);
-    }
-
-    // Include x-amz-meta-* user metadata
-    headers.extend(metadata_headers(&output.metadata));
-
-    // Emit additional S3 response headers captured from the backend.
-    for (k, v) in &output.extra_headers {
-        if let (Ok(name), Ok(val)) = (
-            HeaderName::from_bytes(k.as_bytes()),
-            HeaderValue::from_str(v),
-        ) {
-            headers.insert(name, val);
-        }
-    }
-
-    headers
+pub fn head_object_headers(output: &HeadObjectOutput, include_checksum_headers: bool) -> HeaderMap {
+    build_object_headers_common(
+        output.content_type.as_deref(),
+        output.content_length,
+        output.etag.as_deref(),
+        output.last_modified.as_ref(),
+        &output.metadata,
+        &output.extra_headers,
+        include_checksum_headers,
+    )
 }
 
 /// Build common S3 response headers.
@@ -161,7 +158,7 @@ mod tests {
             metadata: HashMap::new(),
             extra_headers: HashMap::new(),
         };
-        let headers = get_object_headers(&meta);
+        let headers = get_object_headers(&meta, false);
         assert_eq!(headers.get("content-type").unwrap(), "application/json");
         assert_eq!(headers.get("content-length").unwrap(), "256");
         assert_eq!(headers.get("etag").unwrap(), "\"abc123\"");
@@ -181,7 +178,7 @@ mod tests {
             metadata: HashMap::new(),
             extra_headers: HashMap::new(),
         };
-        let headers = head_object_headers(&output);
+        let headers = head_object_headers(&output, false);
         assert_eq!(headers.get("etag").unwrap(), "\"def456\"");
         assert_eq!(headers.get("content-length").unwrap(), "512");
     }
@@ -241,7 +238,7 @@ mod tests {
             metadata: HashMap::new(),
             extra_headers: HashMap::new(),
         };
-        let headers = get_object_headers(&meta);
+        let headers = get_object_headers(&meta, false);
         assert!(headers.get("content-type").is_none());
         assert!(headers.get("content-length").is_none());
         assert!(headers.get("etag").is_none());
@@ -278,7 +275,7 @@ mod tests {
             metadata,
             extra_headers: HashMap::new(),
         };
-        let headers = get_object_headers(&meta);
+        let headers = get_object_headers(&meta, false);
         assert_eq!(headers.get("x-amz-meta-custom").unwrap(), "value");
         assert_eq!(headers.get("content-type").unwrap(), "text/plain");
     }
@@ -295,8 +292,55 @@ mod tests {
             metadata,
             extra_headers: HashMap::new(),
         };
-        let headers = head_object_headers(&output);
+        let headers = head_object_headers(&output, false);
         assert_eq!(headers.get("x-amz-meta-tag").unwrap(), "test");
         assert_eq!(headers.get("content-length").unwrap(), "200");
+    }
+
+    #[test]
+    fn test_get_object_headers_filters_checksum_headers() {
+        let mut extra_headers = HashMap::new();
+        extra_headers.insert("x-amz-checksum-sha256".to_string(), "abc".to_string());
+        extra_headers.insert("cache-control".to_string(), "max-age=60".to_string());
+
+        let meta = GetObjectMeta {
+            content_type: None,
+            content_length: None,
+            etag: None,
+            last_modified: None,
+            metadata: HashMap::new(),
+            extra_headers,
+        };
+
+        let headers = get_object_headers(&meta, false);
+        assert!(headers.get("x-amz-checksum-sha256").is_none());
+        assert_eq!(headers.get("cache-control").unwrap(), "max-age=60");
+
+        let headers = get_object_headers(&meta, true);
+        assert_eq!(headers.get("x-amz-checksum-sha256").unwrap(), "abc");
+    }
+
+    #[test]
+    fn test_head_object_headers_filters_checksum_headers() {
+        let mut extra_headers = HashMap::new();
+        extra_headers.insert("x-amz-checksum-crc32".to_string(), "xyz".to_string());
+        extra_headers.insert("cache-control".to_string(), "no-store".to_string());
+
+        let output = HeadObjectOutput {
+            content_type: None,
+            content_length: Some(1),
+            etag: None,
+            last_modified: None,
+            metadata: HashMap::new(),
+            extra_headers,
+        };
+
+        let headers = head_object_headers(&output, false);
+        assert!(headers.get("x-amz-checksum-crc32").is_none());
+        assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+
+        let headers = head_object_headers(&output, true);
+        assert_eq!(headers.get("x-amz-checksum-crc32").unwrap(), "xyz");
+        assert_eq!(headers.get("cache-control").unwrap(), "no-store");
     }
 }

@@ -2,6 +2,28 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChecksumMode {
+    Enabled,
+}
+
+impl ChecksumMode {
+    pub fn from_header_value(value: &str) -> Option<Self> {
+        (value == "ENABLED").then_some(Self::Enabled)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadOptions {
+    pub checksum_mode: Option<ChecksumMode>,
+}
+
+impl ReadOptions {
+    pub fn wants_checksum_headers(self) -> bool {
+        matches!(self.checksum_mode, Some(ChecksumMode::Enabled))
+    }
+}
+
 /// Metadata from a GET response (no body).
 #[derive(Debug, Clone)]
 pub struct GetObjectMeta {

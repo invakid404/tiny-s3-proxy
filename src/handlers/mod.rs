@@ -9,6 +9,72 @@ pub mod put;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Shared invalidation helper used by both GET and HEAD handlers.
+pub(crate) async fn purge_then_poison_if_unchanged<C: crate::cache::CacheStore>(
+    cache: &Arc<C>,
+    cache_key: &crate::cache::key::CacheKey,
+    expected_fill_id: u64,
+    request_id: &str,
+    operation: &str,
+    key: &str,
+    purge_success_msg: &str,
+    purge_changed_msg: &str,
+    purge_fail_msg: &str,
+    poison_success_msg: &str,
+    poison_fail_msg: &str,
+) {
+    match cache
+        .purge_if_unchanged(cache_key, expected_fill_id)
+        .await
+    {
+        Ok(true) => tracing::warn!(
+            request_id = request_id,
+            operation = operation,
+            key = key,
+            "{}",
+            purge_success_msg
+        ),
+        Ok(false) => tracing::info!(
+            request_id = request_id,
+            operation = operation,
+            key = key,
+            "{}",
+            purge_changed_msg
+        ),
+        Err(purge_err) => {
+            tracing::warn!(
+                request_id = request_id,
+                operation = operation,
+                key = key,
+                error = %purge_err,
+                "{}",
+                purge_fail_msg
+            );
+            match cache
+                .poison_if_unchanged(cache_key, expected_fill_id)
+                .await
+            {
+                Ok(true) => tracing::warn!(
+                    request_id = request_id,
+                    operation = operation,
+                    key = key,
+                    "{}",
+                    poison_success_msg
+                ),
+                Ok(false) => {}
+                Err(poison_err) => tracing::warn!(
+                    request_id = request_id,
+                    operation = operation,
+                    key = key,
+                    error = %poison_err,
+                    "{}",
+                    poison_fail_msg
+                ),
+            }
+        }
+    }
+}
+
 use axum::body::Body;
 use axum::extract::State;
 use http::{Request, Response};
@@ -90,8 +156,7 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
                     record_metrics(op_name, &response, start);
                     return response;
                 }
-                histogram!("s3proxy_request_size_bytes", "operation" => op_name)
-                    .record(n as f64);
+                histogram!("s3proxy_request_size_bytes", "operation" => op_name).record(n as f64);
             }
         }
     }
@@ -126,7 +191,11 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
 
     // Handle unsupported S3 operations by proxying to the backend.
     // (Non-S3 methods like PATCH/TRACE/CONNECT are already rejected above.)
-    if let S3Operation::Unsupported { ref method, ref path } = parsed.operation {
+    if let S3Operation::Unsupported {
+        ref method,
+        ref path,
+    } = parsed.operation
+    {
         tracing::warn!(
             request_id = %parsed.request_id,
             method = %method,
@@ -135,7 +204,8 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
         );
 
         // Rewrite path: replace frontend bucket with backend bucket.
-        let rewritten_path = rewrite_bucket_in_path(path, &state.frontend_bucket, &state.backend_bucket);
+        let rewritten_path =
+            rewrite_bucket_in_path(path, &state.frontend_bucket, &state.backend_bucket);
         let query = parts.uri.query();
         let response = passthrough::handle_passthrough(
             &state,
@@ -160,11 +230,19 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
                 // API cannot carry. Use the original raw URI path to preserve
                 // percent-encoding (the parsed `key` is already decoded).
                 let raw_path = parts.uri.path();
-                let rewritten = rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
+                let rewritten =
+                    rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
                 let query = parts.uri.query();
                 passthrough::handle_passthrough(
-                    &state, "GET", &rewritten, query, &parts.headers, body, &parsed.request_id,
-                ).await
+                    &state,
+                    "GET",
+                    &rewritten,
+                    query,
+                    &parts.headers,
+                    body,
+                    &parsed.request_id,
+                )
+                .await
             } else {
                 get::handle_get(&state, &parsed, key).await
             }
@@ -172,11 +250,19 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
         S3Operation::HeadObject { key, .. } => {
             if has_unsupported_get_modifiers(&parts.headers) {
                 let raw_path = parts.uri.path();
-                let rewritten = rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
+                let rewritten =
+                    rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
                 let query = parts.uri.query();
                 passthrough::handle_passthrough(
-                    &state, "HEAD", &rewritten, query, &parts.headers, body, &parsed.request_id,
-                ).await
+                    &state,
+                    "HEAD",
+                    &rewritten,
+                    query,
+                    &parts.headers,
+                    body,
+                    &parsed.request_id,
+                )
+                .await
             } else {
                 head::handle_head(&state, &parsed, key).await
             }
@@ -184,11 +270,19 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
         S3Operation::PutObject { key, .. } => {
             if has_unsupported_write_modifiers(&parsed.extra_amz_headers, &parts.headers) {
                 let raw_path = parts.uri.path();
-                let rewritten = rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
+                let rewritten =
+                    rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
                 let query = parts.uri.query();
                 passthrough::handle_passthrough(
-                    &state, "PUT", &rewritten, query, &parts.headers, body, &parsed.request_id,
-                ).await
+                    &state,
+                    "PUT",
+                    &rewritten,
+                    query,
+                    &parts.headers,
+                    body,
+                    &parsed.request_id,
+                )
+                .await
             } else {
                 put::handle_put(&state, &parsed, key, body).await
             }
@@ -196,24 +290,39 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
         S3Operation::DeleteObject { key, .. } => {
             if has_unsupported_write_modifiers(&parsed.extra_amz_headers, &parts.headers) {
                 let raw_path = parts.uri.path();
-                let rewritten = rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
+                let rewritten =
+                    rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
                 let query = parts.uri.query();
                 passthrough::handle_passthrough(
-                    &state, "DELETE", &rewritten, query, &parts.headers, body, &parsed.request_id,
-                ).await
+                    &state,
+                    "DELETE",
+                    &rewritten,
+                    query,
+                    &parts.headers,
+                    body,
+                    &parsed.request_id,
+                )
+                .await
             } else {
                 delete::handle_delete(&state, &parsed, key).await
             }
         }
-        S3Operation::ListObjectsV1 { params, .. }
-        | S3Operation::ListObjectsV2 { params, .. } => {
+        S3Operation::ListObjectsV1 { params, .. } | S3Operation::ListObjectsV2 { params, .. } => {
             if has_unsupported_list_modifiers(parts.uri.query(), &parts.headers) {
                 let raw_path = parts.uri.path();
-                let rewritten = rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
+                let rewritten =
+                    rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
                 let query = parts.uri.query();
                 passthrough::handle_passthrough(
-                    &state, "GET", &rewritten, query, &parts.headers, body, &parsed.request_id,
-                ).await
+                    &state,
+                    "GET",
+                    &rewritten,
+                    query,
+                    &parts.headers,
+                    body,
+                    &parsed.request_id,
+                )
+                .await
             } else {
                 let is_v2 = matches!(&parsed.operation, S3Operation::ListObjectsV2 { .. });
                 list::handle_list(&state, &parsed, params, is_v2).await
@@ -222,11 +331,19 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
         S3Operation::CreateMultipartUpload { key, .. } => {
             if has_unsupported_multipart_modifiers(&parsed.extra_amz_headers, &parts.headers) {
                 let raw_path = parts.uri.path();
-                let rewritten = rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
+                let rewritten =
+                    rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
                 let query = parts.uri.query();
                 passthrough::handle_passthrough(
-                    &state, "POST", &rewritten, query, &parts.headers, body, &parsed.request_id,
-                ).await
+                    &state,
+                    "POST",
+                    &rewritten,
+                    query,
+                    &parts.headers,
+                    body,
+                    &parsed.request_id,
+                )
+                .await
             } else {
                 multipart::handle_create_multipart(&state, &parsed, key).await
             }
@@ -239,11 +356,19 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
         } => {
             if has_unsupported_multipart_modifiers(&parsed.extra_amz_headers, &parts.headers) {
                 let raw_path = parts.uri.path();
-                let rewritten = rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
+                let rewritten =
+                    rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
                 let query = parts.uri.query();
                 passthrough::handle_passthrough(
-                    &state, "PUT", &rewritten, query, &parts.headers, body, &parsed.request_id,
-                ).await
+                    &state,
+                    "PUT",
+                    &rewritten,
+                    query,
+                    &parts.headers,
+                    body,
+                    &parsed.request_id,
+                )
+                .await
             } else {
                 multipart::handle_upload_part(&state, &parsed, key, *part_number, upload_id, body)
                     .await
@@ -252,35 +377,54 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
         S3Operation::CompleteMultipartUpload { key, upload_id, .. } => {
             if has_unsupported_multipart_modifiers(&parsed.extra_amz_headers, &parts.headers) {
                 let raw_path = parts.uri.path();
-                let rewritten = rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
+                let rewritten =
+                    rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
                 let query = parts.uri.query();
                 passthrough::handle_passthrough(
-                    &state, "POST", &rewritten, query, &parts.headers, body, &parsed.request_id,
-                ).await
+                    &state,
+                    "POST",
+                    &rewritten,
+                    query,
+                    &parts.headers,
+                    body,
+                    &parsed.request_id,
+                )
+                .await
             } else {
                 // Read the body eagerly so we can check for per-part checksum
                 // XML elements (ChecksumCRC32, ChecksumCRC32C, ChecksumSHA1,
                 // ChecksumSHA256). The typed path drops these — route through
                 // passthrough to preserve integrity validation.
-                match axum::body::to_bytes(
-                    body,
-                    state.config.max_request_body_bytes as usize,
-                ).await {
+                match axum::body::to_bytes(body, state.config.max_request_body_bytes as usize).await
+                {
                     Err(e) => {
                         let s3err = S3Error::from_body_error(&e, &parsed.request_id);
                         s3err.to_response()
                     }
                     Ok(body_bytes) if crate::s3::xml::body_has_checksum_elements(&body_bytes) => {
                         let raw_path = parts.uri.path();
-                        let rewritten = rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
+                        let rewritten = rewrite_bucket_in_path(
+                            raw_path,
+                            &state.frontend_bucket,
+                            &state.backend_bucket,
+                        );
                         let query = parts.uri.query();
                         passthrough::handle_passthrough(
-                            &state, "POST", &rewritten, query, &parts.headers,
-                            Body::from(body_bytes), &parsed.request_id,
-                        ).await
+                            &state,
+                            "POST",
+                            &rewritten,
+                            query,
+                            &parts.headers,
+                            Body::from(body_bytes),
+                            &parsed.request_id,
+                        )
+                        .await
                     }
                     Ok(body_bytes) => {
-                        multipart::handle_complete_multipart(&state, &parsed, key, upload_id, body_bytes).await
+                        multipart::handle_complete_multipart(
+                            &state, &parsed, key, upload_id, body_bytes,
+                        )
+                        .await
                     }
                 }
             }
@@ -288,11 +432,19 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
         S3Operation::AbortMultipartUpload { key, upload_id, .. } => {
             if has_unsupported_multipart_modifiers(&parsed.extra_amz_headers, &parts.headers) {
                 let raw_path = parts.uri.path();
-                let rewritten = rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
+                let rewritten =
+                    rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
                 let query = parts.uri.query();
                 passthrough::handle_passthrough(
-                    &state, "DELETE", &rewritten, query, &parts.headers, body, &parsed.request_id,
-                ).await
+                    &state,
+                    "DELETE",
+                    &rewritten,
+                    query,
+                    &parts.headers,
+                    body,
+                    &parsed.request_id,
+                )
+                .await
             } else {
                 multipart::handle_abort_multipart(&state, &parsed, key, upload_id).await
             }
@@ -324,9 +476,17 @@ fn rewrite_bucket_in_path(path: &str, frontend_bucket: &str, backend_bucket: &st
 /// Map common HTTP status codes to static strings, avoiding allocation.
 fn status_str(status: http::StatusCode) -> &'static str {
     match status.as_u16() {
-        200 => "200", 204 => "204", 206 => "206",
-        400 => "400", 403 => "403", 404 => "404",
-        500 => "500", 501 => "501", 502 => "502", 503 => "503", 504 => "504",
+        200 => "200",
+        204 => "204",
+        206 => "206",
+        400 => "400",
+        403 => "403",
+        404 => "404",
+        500 => "500",
+        501 => "501",
+        502 => "502",
+        503 => "503",
+        504 => "504",
         _ => "other",
     }
 }
@@ -415,6 +575,21 @@ pub(crate) async fn invalidate_cache_key<C: CacheStore>(
 /// Check if the request contains headers that the typed GET/HEAD backend
 /// API cannot forward. When present, the request must go through the raw
 /// HTTP passthrough to preserve semantics.
+fn checksum_mode_requires_passthrough(headers: &http::HeaderMap) -> bool {
+    let mut values = headers.get_all("x-amz-checksum-mode").iter();
+    let Some(value) = values.next() else {
+        return false;
+    };
+    if values.next().is_some() {
+        return true;
+    }
+    value
+        .to_str()
+        .ok()
+        .and_then(crate::backend::models::ChecksumMode::from_header_value)
+        .is_none()
+}
+
 fn has_unsupported_get_modifiers(headers: &http::HeaderMap) -> bool {
     headers.contains_key("range")
         || headers.contains_key("if-match")
@@ -423,8 +598,11 @@ fn has_unsupported_get_modifiers(headers: &http::HeaderMap) -> bool {
         || headers.contains_key("if-unmodified-since")
         || headers.contains_key("x-amz-request-payer")
         || headers.contains_key("x-amz-expected-bucket-owner")
-        || headers.contains_key("x-amz-checksum-mode")
-        || headers.keys().any(|k| k.as_str().starts_with("x-amz-server-side-encryption-customer-"))
+        || checksum_mode_requires_passthrough(headers)
+        || headers.keys().any(|k| {
+            k.as_str()
+                .starts_with("x-amz-server-side-encryption-customer-")
+        })
 }
 
 /// Check if the request contains write-side headers that the typed path
@@ -484,8 +662,7 @@ const MULTIPART_CHECKSUM_HEADERS: &[&str] = &[
 
 /// Check for standard HTTP conditionals that typed write paths don't forward.
 fn has_unsupported_http_conditionals(raw_headers: &http::HeaderMap) -> bool {
-    raw_headers.contains_key("if-match")
-        || raw_headers.contains_key("if-none-match")
+    raw_headers.contains_key("if-match") || raw_headers.contains_key("if-none-match")
 }
 
 /// Gate for PutObject and DeleteObject. Checksum headers are NOT gated here
@@ -497,7 +674,9 @@ fn has_unsupported_write_modifiers(
     if has_unsupported_http_conditionals(raw_headers) {
         return true;
     }
-    extra_amz.keys().any(|k| WRITE_MODIFYING_BASE.contains(&k.as_str()))
+    extra_amz
+        .keys()
+        .any(|k| WRITE_MODIFYING_BASE.contains(&k.as_str()))
 }
 
 /// Gate for multipart operations. Includes checksum headers because the typed
@@ -560,6 +739,7 @@ pub mod test_utils {
         pub body: Vec<u8>,
         pub content_type: Option<String>,
         pub etag: Option<String>,
+        pub extra_headers: HashMap<String, String>,
     }
 
     /// Convert a Vec<u8> into a BoxByteStream (single-chunk stream).
@@ -576,9 +756,10 @@ pub mod test_utils {
         pub list_response: Mutex<Option<Result<ListObjectsOutput, ProxyError>>>,
         pub create_multipart_response: Mutex<Option<Result<CreateMultipartOutput, ProxyError>>>,
         pub upload_part_response: Mutex<Option<Result<UploadPartOutput, ProxyError>>>,
-        pub complete_multipart_response:
-            Mutex<Option<Result<CompleteMultipartOutput, ProxyError>>>,
+        pub complete_multipart_response: Mutex<Option<Result<CompleteMultipartOutput, ProxyError>>>,
         pub abort_multipart_response: Mutex<Option<Result<(), ProxyError>>>,
+        pub get_read_calls: Mutex<Vec<ReadOptions>>,
+        pub head_read_calls: Mutex<Vec<ReadOptions>>,
         pub put_calls: Mutex<Vec<PutObjectInput>>,
         pub delete_calls: Mutex<Vec<(String, String)>>,
         /// Total number of Backend trait method invocations.
@@ -598,6 +779,8 @@ pub mod test_utils {
                 upload_part_response: Mutex::new(None),
                 complete_multipart_response: Mutex::new(None),
                 abort_multipart_response: Mutex::new(None),
+                get_read_calls: Mutex::new(Vec::new()),
+                head_read_calls: Mutex::new(Vec::new()),
                 put_calls: Mutex::new(Vec::new()),
                 delete_calls: Mutex::new(Vec::new()),
                 total_calls: std::sync::atomic::AtomicU32::new(0),
@@ -661,19 +844,17 @@ pub mod test_utils {
             &self,
             _bucket: &str,
             _key: &str,
+            options: ReadOptions,
         ) -> Result<(GetObjectMeta, BoxByteStream), ProxyError> {
-            self.total_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let resp = self
-                .get_response
-                .lock()
-                .unwrap()
-                .take()
-                .unwrap_or_else(|| {
-                    Err(ProxyError::Backend {
-                        source: "no mock response configured".into(),
-                        operation: "get_object".into(),
-                    })
-                });
+            self.total_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.get_read_calls.lock().unwrap().push(options);
+            let resp = self.get_response.lock().unwrap().take().unwrap_or_else(|| {
+                Err(ProxyError::Backend {
+                    source: "no mock response configured".into(),
+                    operation: "get_object".into(),
+                })
+            });
             match resp {
                 Ok(mock) => {
                     let meta = GetObjectMeta {
@@ -682,7 +863,7 @@ pub mod test_utils {
                         etag: mock.etag.clone(),
                         last_modified: Some(Utc::now()),
                         metadata: HashMap::new(),
-                        extra_headers: HashMap::new(),
+                        extra_headers: mock.extra_headers.clone(),
                     };
                     let stream = vec_to_stream(mock.body);
                     Ok((meta, stream))
@@ -695,8 +876,11 @@ pub mod test_utils {
             &self,
             _bucket: &str,
             _key: &str,
+            options: ReadOptions,
         ) -> Result<HeadObjectOutput, ProxyError> {
-            self.total_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.total_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.head_read_calls.lock().unwrap().push(options);
             self.head_response
                 .lock()
                 .unwrap()
@@ -710,7 +894,8 @@ pub mod test_utils {
         }
 
         async fn put_object(&self, req: PutObjectInput) -> Result<PutObjectOutput, ProxyError> {
-            self.total_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.total_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.put_calls.lock().unwrap().push(PutObjectInput {
                 bucket: req.bucket.clone(),
                 key: req.key.clone(),
@@ -721,20 +906,21 @@ pub mod test_utils {
                 extra_amz_headers: req.extra_amz_headers.clone(),
                 content_headers: req.content_headers.clone(),
             });
-            self.put_response
-                .lock()
-                .unwrap()
-                .take()
-                .unwrap_or_else(|| {
-                    Err(ProxyError::Backend {
-                        source: "no mock response configured".into(),
-                        operation: "put_object".into(),
-                    })
+            self.put_response.lock().unwrap().take().unwrap_or_else(|| {
+                Err(ProxyError::Backend {
+                    source: "no mock response configured".into(),
+                    operation: "put_object".into(),
                 })
+            })
         }
 
-        async fn delete_object(&self, bucket: &str, key: &str) -> Result<DeleteObjectOutput, ProxyError> {
-            self.total_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        async fn delete_object(
+            &self,
+            bucket: &str,
+            key: &str,
+        ) -> Result<DeleteObjectOutput, ProxyError> {
+            self.total_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.delete_calls
                 .lock()
                 .unwrap()
@@ -755,7 +941,8 @@ pub mod test_utils {
             &self,
             _req: ListObjectsInput,
         ) -> Result<ListObjectsOutput, ProxyError> {
-            self.total_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.total_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.list_response
                 .lock()
                 .unwrap()
@@ -776,7 +963,8 @@ pub mod test_utils {
             _metadata: &std::collections::HashMap<String, String>,
             _content_headers: &std::collections::HashMap<String, String>,
         ) -> Result<CreateMultipartOutput, ProxyError> {
-            self.total_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.total_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.create_multipart_response
                 .lock()
                 .unwrap()
@@ -789,11 +977,9 @@ pub mod test_utils {
                 })
         }
 
-        async fn upload_part(
-            &self,
-            _req: UploadPartInput,
-        ) -> Result<UploadPartOutput, ProxyError> {
-            self.total_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        async fn upload_part(&self, _req: UploadPartInput) -> Result<UploadPartOutput, ProxyError> {
+            self.total_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.upload_part_response
                 .lock()
                 .unwrap()
@@ -810,7 +996,8 @@ pub mod test_utils {
             &self,
             _req: CompleteMultipartInput,
         ) -> Result<CompleteMultipartOutput, ProxyError> {
-            self.total_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.total_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.complete_multipart_response
                 .lock()
                 .unwrap()
@@ -829,7 +1016,8 @@ pub mod test_utils {
             _key: &str,
             _upload_id: &str,
         ) -> Result<(), ProxyError> {
-            self.total_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.total_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.abort_multipart_response
                 .lock()
                 .unwrap()
@@ -850,6 +1038,14 @@ pub mod test_utils {
 
     pub struct MockCache {
         pub entries: Mutex<HashMap<String, CacheEntry>>,
+        next_fill_id: std::sync::atomic::AtomicU64,
+        fill_generation: std::sync::atomic::AtomicU64,
+        pub poisoned: Mutex<std::collections::HashSet<String>>,
+        pub lookup_count: std::sync::atomic::AtomicU32,
+        pub peek_count: std::sync::atomic::AtomicU32,
+        pub peek_body_count: std::sync::atomic::AtomicU32,
+        pub note_hit_count: std::sync::atomic::AtomicU32,
+        pub note_miss_count: std::sync::atomic::AtomicU32,
         pub purge_calls: Mutex<Vec<CacheKey>>,
         pub fill_calls: Mutex<Vec<CacheKey>>,
         pub poison_calls: Mutex<Vec<CacheKey>>,
@@ -862,6 +1058,14 @@ pub mod test_utils {
         pub fn new() -> Self {
             Self {
                 entries: Mutex::new(HashMap::new()),
+                next_fill_id: std::sync::atomic::AtomicU64::new(1),
+                fill_generation: std::sync::atomic::AtomicU64::new(0),
+                poisoned: Mutex::new(std::collections::HashSet::new()),
+                lookup_count: std::sync::atomic::AtomicU32::new(0),
+                peek_count: std::sync::atomic::AtomicU32::new(0),
+                peek_body_count: std::sync::atomic::AtomicU32::new(0),
+                note_hit_count: std::sync::atomic::AtomicU32::new(0),
+                note_miss_count: std::sync::atomic::AtomicU32::new(0),
                 purge_calls: Mutex::new(Vec::new()),
                 fill_calls: Mutex::new(Vec::new()),
                 poison_calls: Mutex::new(Vec::new()),
@@ -876,40 +1080,121 @@ pub mod test_utils {
         }
 
         /// Add a cache entry, writing the body to a temp file.
-        pub fn with_entry(self, key: &CacheKey, body: &[u8], meta: CacheMeta) -> Self {
+        /// Stamps a fresh `fill_id` and resets `metadata_version` to match
+        /// `DiskCache::commit_fill` semantics.
+        pub fn with_entry(self, key: &CacheKey, body: &[u8], mut meta: CacheMeta) -> Self {
             use std::sync::atomic::{AtomicU64, Ordering};
             static MOCK_COUNTER: AtomicU64 = AtomicU64::new(0);
             let id = MOCK_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let body_path = self
-                .temp_dir
-                .path()
-                .join(format!("{}.body", id));
+            meta.fill_id = self
+                .next_fill_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            meta.metadata_version = 0;
+            let body_path = self.temp_dir.path().join(format!("{}.body", id));
             std::fs::write(&body_path, body).expect("write mock body");
             let entry = CacheEntry {
                 meta,
                 body_path,
+                body_file: None,
             };
-            self.entries.lock().unwrap().insert(key.hash_hex().to_string(), entry);
+            self.entries
+                .lock()
+                .unwrap()
+                .insert(key.hash_hex().to_string(), entry);
+            self.poisoned.lock().unwrap().remove(key.hash_hex());
             self
         }
     }
 
     impl CacheStore for MockCache {
         async fn lookup(&self, key: &CacheKey) -> Result<Option<CacheEntry>, ProxyError> {
+            self.lookup_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.poisoned.lock().unwrap().contains(key.hash_hex()) {
+                return Ok(None);
+            }
+            let snapshot = {
+                let entries = self.entries.lock().unwrap();
+                entries.get(key.hash_hex()).map(|e| (e.meta.clone(), e.body_path.clone()))
+            };
+            match snapshot {
+                Some((meta, body_path)) => {
+                    let body_file = Some(
+                        tokio::fs::File::open(&body_path)
+                            .await
+                            .map_err(|e| ProxyError::Cache {
+                                source: Box::new(e),
+                                operation: "mock lookup open body".into(),
+                            })?,
+                    );
+                    Ok(Some(CacheEntry { meta, body_path, body_file }))
+                }
+                None => Ok(None),
+            }
+        }
+
+        async fn peek(&self, key: &CacheKey) -> Result<Option<CacheEntry>, ProxyError> {
+            self.peek_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.poisoned.lock().unwrap().contains(key.hash_hex()) {
+                return Ok(None);
+            }
             let entries = self.entries.lock().unwrap();
             let entry = entries.get(key.hash_hex()).map(|e| CacheEntry {
                 meta: e.meta.clone(),
                 body_path: e.body_path.clone(),
+                body_file: None,
             });
             Ok(entry)
         }
 
+        async fn peek_body(&self, key: &CacheKey) -> Result<Option<CacheEntry>, ProxyError> {
+            self.peek_body_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.poisoned.lock().unwrap().contains(key.hash_hex()) {
+                return Ok(None);
+            }
+            let snapshot = {
+                let entries = self.entries.lock().unwrap();
+                entries.get(key.hash_hex()).map(|e| (e.meta.clone(), e.body_path.clone()))
+            };
+            match snapshot {
+                Some((meta, body_path)) => {
+                    let body_file = Some(
+                        tokio::fs::File::open(&body_path)
+                            .await
+                            .map_err(|e| ProxyError::Cache {
+                                source: Box::new(e),
+                                operation: "mock peek_body open body".into(),
+                            })?,
+                    );
+                    Ok(Some(CacheEntry { meta, body_path, body_file }))
+                }
+                None => Ok(None),
+            }
+        }
+
+        async fn note_hit(&self, _key: &CacheKey, _meta: &CacheMeta) -> Result<(), ProxyError> {
+            self.note_hit_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn note_miss(&self) -> Result<(), ProxyError> {
+            self.note_miss_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
         async fn begin_fill(&self, key: &CacheKey) -> Result<FillGuard, ProxyError> {
             self.fill_calls.lock().unwrap().push(key.clone());
+            let current_gen = self
+                .fill_generation
+                .load(std::sync::atomic::Ordering::Relaxed);
             Ok(FillGuard {
                 key: key.clone(),
                 temp_dir: self.temp_dir.path().to_path_buf(),
-                generation: 0,
+                generation: current_gen,
             })
         }
 
@@ -921,36 +1206,148 @@ pub mod test_utils {
             &self,
             guard: FillGuard,
             temp_body_path: PathBuf,
-            meta: CacheMeta,
+            mut meta: CacheMeta,
         ) -> Result<(), ProxyError> {
-            // For the mock, the temp_body_path already has the data.
-            // Just store the entry with that path.
+            // Hold both locks atomically, then recheck generation inside the
+            // critical section so a concurrent purge/poison cannot race in.
+            let mut entries = self.entries.lock().unwrap();
+            let mut poisoned = self.poisoned.lock().unwrap();
+            let current_gen = self
+                .fill_generation
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if guard.generation != current_gen {
+                return Ok(());
+            }
+            meta.fill_id = self
+                .next_fill_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            meta.metadata_version = 0;
             let entry = CacheEntry {
                 meta,
                 body_path: temp_body_path,
+                body_file: None,
             };
-            self.entries
-                .lock()
-                .unwrap()
-                .insert(guard.key.hash_hex().to_string(), entry);
+            entries.insert(guard.key.hash_hex().to_string(), entry);
+            poisoned.remove(guard.key.hash_hex());
             Ok(())
         }
 
         async fn purge(&self, key: &CacheKey) -> Result<bool, ProxyError> {
-            self.purge_calls.lock().unwrap().push(key.clone());
             if *self.purge_should_fail.lock().unwrap() {
                 return Err(ProxyError::Cache {
                     source: "mock purge failure".into(),
                     operation: "purge".into(),
                 });
             }
-            let removed = self.entries.lock().unwrap().remove(key.hash_hex()).is_some();
+            // Lock order: entries → poisoned → purge_calls (consistent everywhere)
+            let removed = {
+                let mut entries = self.entries.lock().unwrap();
+                let mut poisoned = self.poisoned.lock().unwrap();
+                let removed = entries.remove(key.hash_hex()).is_some();
+                // Always advance generation — even if no entry exists, this
+                // ensures any in-flight begin_fill sees the invalidation fence.
+                self.fill_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                poisoned.remove(key.hash_hex());
+                removed
+            };
+            self.purge_calls.lock().unwrap().push(key.clone());
+            Ok(removed)
+        }
+
+        async fn purge_if_unchanged(
+            &self,
+            key: &CacheKey,
+            expected_fill_id: u64,
+        ) -> Result<bool, ProxyError> {
+            if *self.purge_should_fail.lock().unwrap() {
+                return Err(ProxyError::Cache {
+                    source: "mock purge_if_unchanged failure".into(),
+                    operation: "purge_if_unchanged".into(),
+                });
+            }
+            let removed = {
+                let mut entries = self.entries.lock().unwrap();
+                match entries.get(key.hash_hex()) {
+                    Some(entry) if entry.meta.fill_id == expected_fill_id => {
+                        let mut poisoned = self.poisoned.lock().unwrap();
+                        entries.remove(key.hash_hex());
+                        self.fill_generation
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        poisoned.remove(key.hash_hex());
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if removed {
+                self.purge_calls.lock().unwrap().push(key.clone());
+            }
             Ok(removed)
         }
 
         async fn poison(&self, key: &CacheKey) -> Result<(), crate::error::ProxyError> {
+            // Lock order: entries → poisoned (consistent with commit_fill).
+            let _entries = self.entries.lock().unwrap();
+            let mut poisoned = self.poisoned.lock().unwrap();
+            self.fill_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            poisoned.insert(key.hash_hex().to_string());
+            drop(poisoned);
+            drop(_entries);
             self.poison_calls.lock().unwrap().push(key.clone());
             Ok(())
+        }
+
+        async fn poison_if_unchanged(
+            &self,
+            key: &CacheKey,
+            expected_fill_id: u64,
+        ) -> Result<bool, ProxyError> {
+            let key_hash = key.hash_hex().to_string();
+            let poisoned = {
+                let entries = self.entries.lock().unwrap();
+                match entries.get(&key_hash) {
+                    Some(entry) if entry.meta.fill_id == expected_fill_id => {
+                        let mut poisoned = self.poisoned.lock().unwrap();
+                        self.fill_generation
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        poisoned.insert(key_hash);
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if poisoned {
+                self.poison_calls.lock().unwrap().push(key.clone());
+            }
+            Ok(poisoned)
+        }
+
+        async fn update_metadata_if_unchanged(
+            &self,
+            key: &CacheKey,
+            expected_fill_id: u64,
+            meta: CacheMeta,
+        ) -> Result<bool, ProxyError> {
+            let mut entries = self.entries.lock().unwrap();
+            let Some(entry) = entries.get_mut(key.hash_hex()) else {
+                return Ok(false);
+            };
+            if entry.meta.fill_id != expected_fill_id
+                || entry.meta.metadata_version != meta.metadata_version
+            {
+                return Ok(false);
+            }
+            let mut meta = meta;
+            meta.cache_written_at = entry.meta.cache_written_at;
+            meta.fill_id = entry.meta.fill_id;
+            meta.last_accessed_at = entry.meta.last_accessed_at;
+            meta.hit_count = entry.meta.hit_count;
+            meta.source_status = entry.meta.source_status;
+            meta.metadata_version = entry.meta.metadata_version.saturating_add(1);
+            entry.meta = meta;
+            Ok(true)
         }
 
         async fn stats(&self) -> CacheStatsSnapshot {
@@ -989,8 +1386,8 @@ pub mod test_utils {
     // ---- Helper to build AppState ----
 
     use super::AppState;
-    use crate::cache::policy::CachePolicy;
     use crate::cache::SingleFlight;
+    use crate::cache::policy::CachePolicy;
     use crate::config::{AuthMode, Config};
     use std::sync::Arc;
 
@@ -1055,7 +1452,9 @@ pub mod test_utils {
     }
 
     /// Build a ParsedRequest with the given operation and default values for all other fields.
-    pub fn test_parsed_request(operation: crate::s3::ops::S3Operation) -> crate::s3::ops::ParsedRequest {
+    pub fn test_parsed_request(
+        operation: crate::s3::ops::S3Operation,
+    ) -> crate::s3::ops::ParsedRequest {
         crate::s3::ops::ParsedRequest {
             operation,
             request_id: "test-req-id".to_string(),
@@ -1082,11 +1481,18 @@ pub mod test_utils {
             content_type: Some("application/octet-stream".to_string()),
             content_length: body.len() as i64,
             cache_written_at: Utc::now(),
+            fill_id: 1, // non-zero so conditional ops match
+            metadata_version: 0,
             last_accessed_at: Utc::now(),
             hit_count: 0,
             source_status: 200,
             metadata: HashMap::new(),
             extra_headers: HashMap::new(),
+            head_extra_headers: HashMap::new(),
+            head_checksum_headers: HashMap::new(),
+            checksum_mode_checked: false,
+            head_metadata_checked: false,
+            head_checksum_checked: false,
         }
     }
 }
@@ -1108,39 +1514,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_non_s3_method_returns_501() {
-        let state = build_app_state(
-            MockBackend::new(),
-            MockCache::new(),
-            MockAuth::allow_all(),
-        );
+        let state = build_app_state(MockBackend::new(), MockCache::new(), MockAuth::allow_all());
 
         // PATCH is not a valid S3 method and should be rejected with 501.
         let req = build_request("PATCH", "/test-frontend/some-key");
         let resp = handle_s3_request(State(state), req).await;
         assert_eq!(resp.status(), 501);
 
-        let body = axum::body::to_bytes(resp.into_body(), 4096)
-            .await
-            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let body_str = String::from_utf8_lossy(&body);
         assert!(body_str.contains("NotImplemented"));
     }
 
     #[tokio::test]
     async fn test_wrong_bucket_returns_404() {
-        let state = build_app_state(
-            MockBackend::new(),
-            MockCache::new(),
-            MockAuth::allow_all(),
-        );
+        let state = build_app_state(MockBackend::new(), MockCache::new(), MockAuth::allow_all());
 
         let req = build_request("GET", "/wrong-bucket/some-key");
         let resp = handle_s3_request(State(state), req).await;
 
         assert_eq!(resp.status(), 404);
-        let body = axum::body::to_bytes(resp.into_body(), 4096)
-            .await
-            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let body_str = String::from_utf8_lossy(&body);
         assert!(body_str.contains("NoSuchBucket"));
     }
@@ -1148,11 +1542,7 @@ mod tests {
     #[tokio::test]
     async fn test_non_s3_method_rejected_before_auth() {
         // Non-S3 methods should return 501 even when auth would deny.
-        let state = build_app_state(
-            MockBackend::new(),
-            MockCache::new(),
-            MockAuth::deny_all(),
-        );
+        let state = build_app_state(MockBackend::new(), MockCache::new(), MockAuth::deny_all());
 
         let req = build_request("PATCH", "/test-frontend/some-key");
         let resp = handle_s3_request(State(state), req).await;
@@ -1164,11 +1554,7 @@ mod tests {
     #[tokio::test]
     async fn test_trace_returns_501_before_bucket_check() {
         // TRACE * never has a bucket path — should get 501, not NoSuchBucket.
-        let state = build_app_state(
-            MockBackend::new(),
-            MockCache::new(),
-            MockAuth::allow_all(),
-        );
+        let state = build_app_state(MockBackend::new(), MockCache::new(), MockAuth::allow_all());
 
         let req = Request::builder()
             .method("TRACE")
@@ -1181,11 +1567,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_returns_501() {
-        let state = build_app_state(
-            MockBackend::new(),
-            MockCache::new(),
-            MockAuth::allow_all(),
-        );
+        let state = build_app_state(MockBackend::new(), MockCache::new(), MockAuth::allow_all());
 
         // CONNECT uses authority-form URI (host:port), not a path.
         let req = Request::builder()
@@ -1199,28 +1581,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_patch_rejected_without_calling_backend() {
-        let state = build_app_state(
-            MockBackend::new(),
-            MockCache::new(),
-            MockAuth::allow_all(),
-        );
+        let state = build_app_state(MockBackend::new(), MockCache::new(), MockAuth::allow_all());
 
         let req = build_request("PATCH", "/test-frontend/some-key");
         let resp = handle_s3_request(State(state.clone()), req).await;
         assert_eq!(resp.status(), 501);
 
         // Verify the backend was never invoked via the call counter.
-        let calls = state.backend.total_calls.load(std::sync::atomic::Ordering::Relaxed);
+        let calls = state
+            .backend
+            .total_calls
+            .load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(calls, 0, "backend should not be called for non-S3 methods");
     }
 
     #[tokio::test]
     async fn test_negative_content_length_returns_400() {
-        let state = build_app_state(
-            MockBackend::new(),
-            MockCache::new(),
-            MockAuth::allow_all(),
-        );
+        let state = build_app_state(MockBackend::new(), MockCache::new(), MockAuth::allow_all());
 
         let req = Request::builder()
             .method("PUT")
@@ -1231,9 +1608,7 @@ mod tests {
         let resp = handle_s3_request(State(state), req).await;
         assert_eq!(resp.status(), 400);
 
-        let body = axum::body::to_bytes(resp.into_body(), 4096)
-            .await
-            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let body_str = String::from_utf8_lossy(&body);
         assert!(
             body_str.contains("InvalidRequest"),
@@ -1244,19 +1619,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_auth_failure_returns_403() {
-        let state = build_app_state(
-            MockBackend::new(),
-            MockCache::new(),
-            MockAuth::deny_all(),
-        );
+        let state = build_app_state(MockBackend::new(), MockCache::new(), MockAuth::deny_all());
 
         let req = build_request("GET", "/test-frontend/some-key");
         let resp = handle_s3_request(State(state), req).await;
 
         assert_eq!(resp.status(), 403);
-        let body = axum::body::to_bytes(resp.into_body(), 4096)
-            .await
-            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let body_str = String::from_utf8_lossy(&body);
         assert!(body_str.contains("AccessDenied"));
     }
@@ -1318,6 +1687,21 @@ mod tests {
     fn test_has_unsupported_get_modifiers_checksum_mode() {
         let mut headers = http::HeaderMap::new();
         headers.insert("x-amz-checksum-mode", "ENABLED".parse().unwrap());
+        assert!(!has_unsupported_get_modifiers(&headers));
+    }
+
+    #[test]
+    fn test_has_unsupported_get_modifiers_invalid_checksum_mode() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-amz-checksum-mode", "DISABLED".parse().unwrap());
+        assert!(has_unsupported_get_modifiers(&headers));
+    }
+
+    #[test]
+    fn test_has_unsupported_get_modifiers_multiple_checksum_mode_headers() {
+        let mut headers = http::HeaderMap::new();
+        headers.append("x-amz-checksum-mode", "ENABLED".parse().unwrap());
+        headers.append("x-amz-checksum-mode", "ENABLED".parse().unwrap());
         assert!(has_unsupported_get_modifiers(&headers));
     }
 
@@ -1332,10 +1716,7 @@ mod tests {
     #[test]
     fn test_has_unsupported_write_modifiers_storage_class() {
         let mut extra_amz = std::collections::HashMap::new();
-        extra_amz.insert(
-            "x-amz-storage-class".to_string(),
-            "GLACIER".to_string(),
-        );
+        extra_amz.insert("x-amz-storage-class".to_string(), "GLACIER".to_string());
         let headers = http::HeaderMap::new();
         assert!(has_unsupported_write_modifiers(&extra_amz, &headers));
     }
@@ -1360,10 +1741,7 @@ mod tests {
     #[test]
     fn test_has_unsupported_multipart_modifiers_checksum() {
         let mut extra_amz = std::collections::HashMap::new();
-        extra_amz.insert(
-            "x-amz-checksum-algorithm".to_string(),
-            "SHA256".to_string(),
-        );
+        extra_amz.insert("x-amz-checksum-algorithm".to_string(), "SHA256".to_string());
         let headers = http::HeaderMap::new();
         assert!(has_unsupported_multipart_modifiers(&extra_amz, &headers));
     }

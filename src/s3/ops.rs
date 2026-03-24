@@ -83,6 +83,17 @@ pub struct ParsedRequest {
     pub content_headers: std::collections::HashMap<String, String>,
 }
 
+impl ParsedRequest {
+    pub fn read_options(&self) -> crate::backend::models::ReadOptions {
+        crate::backend::models::ReadOptions {
+            checksum_mode: self
+                .extra_amz_headers
+                .get("x-amz-checksum-mode")
+                .and_then(|value| crate::backend::models::ChecksumMode::from_header_value(value)),
+        }
+    }
+}
+
 impl S3Operation {
     /// Returns a short, human-readable name for this operation (for metrics labels).
     pub fn name(&self) -> &'static str {
@@ -250,5 +261,61 @@ mod tests {
             key: "k".to_string(),
         };
         assert!(!create.is_write());
+    }
+
+    #[test]
+    fn test_parsed_request_read_options_extract_checksum_mode() {
+        let mut extra_amz_headers = std::collections::HashMap::new();
+        extra_amz_headers.insert("x-amz-checksum-mode".to_string(), "ENABLED".to_string());
+
+        let parsed = ParsedRequest {
+            operation: S3Operation::GetObject {
+                bucket: "bucket".to_string(),
+                key: "key".to_string(),
+            },
+            request_id: "req".to_string(),
+            content_type: None,
+            content_length: None,
+            content_md5: None,
+            authorization: None,
+            amz_date: None,
+            amz_content_sha256: None,
+            range: None,
+            user_metadata: std::collections::HashMap::new(),
+            extra_amz_headers,
+            content_headers: std::collections::HashMap::new(),
+        };
+
+        assert!(parsed.read_options().wants_checksum_headers());
+    }
+
+    #[test]
+    fn test_parsed_request_read_options_rejects_invalid_or_missing_checksum_mode() {
+        let parsed_missing = ParsedRequest {
+            operation: S3Operation::GetObject {
+                bucket: "bucket".to_string(),
+                key: "key".to_string(),
+            },
+            request_id: "req".to_string(),
+            content_type: None,
+            content_length: None,
+            content_md5: None,
+            authorization: None,
+            amz_date: None,
+            amz_content_sha256: None,
+            range: None,
+            user_metadata: std::collections::HashMap::new(),
+            extra_amz_headers: std::collections::HashMap::new(),
+            content_headers: std::collections::HashMap::new(),
+        };
+        assert!(!parsed_missing.read_options().wants_checksum_headers());
+
+        let mut invalid_headers = std::collections::HashMap::new();
+        invalid_headers.insert("x-amz-checksum-mode".to_string(), "disabled".to_string());
+        let parsed_invalid = ParsedRequest {
+            extra_amz_headers: invalid_headers,
+            ..parsed_missing
+        };
+        assert!(!parsed_invalid.read_options().wants_checksum_headers());
     }
 }
