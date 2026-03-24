@@ -549,9 +549,10 @@ fn spawn_cache_tee<C: CacheStore + 'static>(
                 if let Some(guard) = fill_guard {
                     cache.abort_fill(guard).await;
                 }
-                // Drain stream to client without caching.
-                // Use the same send timeout as the tee path so a stalled
-                // client doesn't block followers indefinitely.
+                // Release followers immediately — they should not wait for
+                // the client drain since no cache fill will complete.
+                waiter.complete().await;
+                // Drain remaining stream to the leader's client only.
                 let drain_send_timeout = std::time::Duration::from_secs(30);
                 let mut stream = body_stream;
                 while let Some(chunk) = stream.next().await {
@@ -567,7 +568,6 @@ fn spawn_cache_tee<C: CacheStore + 'static>(
                         break;
                     }
                 }
-                waiter.complete().await;
                 return;
             }
         };
@@ -1923,6 +1923,10 @@ mod tests {
         // peek_body: 1 initial miss, 1 leader re-probe (miss), 1 stale probe
         assert_eq!(state.cache.peek_body_count.load(Ordering::SeqCst), 3);
         assert_eq!(state.cache.lookup_count.load(Ordering::SeqCst), 0);
+        // Stale replay records both a miss (backend GET attempted) and a hit
+        // (body served from stale cache).
+        assert_eq!(state.cache.note_miss_count.load(Ordering::SeqCst), 1);
+        assert_eq!(state.cache.note_hit_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
