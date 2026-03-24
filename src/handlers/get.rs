@@ -685,6 +685,9 @@ fn spawn_cache_tee<C: CacheStore + 'static>(
                 if let Some(guard) = fill_guard {
                     cache.abort_fill(guard).await;
                 }
+                // Note: unlinking an open file is valid on Linux/macOS (the
+                // only supported platforms). Windows support would require
+                // dropping the file handle before remove_file.
                 let _ = tokio::fs::remove_file(&temp_path_clone).await;
                 if let Some(w) = waiter.take() {
                     w.complete().await;
@@ -874,6 +877,14 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                     source_status: 200,
                     metadata: meta.metadata.clone(),
                     extra_headers: meta.extra_headers.clone(),
+                    // HEAD-only fields (head_extra_headers, head_checksum_headers,
+                    // head_metadata_checked, head_checksum_checked) are cleared
+                    // because this is a fresh GET fill. HEAD-only metadata
+                    // describes mutable storage/archive state (e.g.
+                    // x-amz-archive-status) that must be revalidated via a
+                    // backend HEAD after every version change. When the ETag
+                    // matches a prior entry, the same-ETag carry-forward logic
+                    // in try_refresh_cached_get_metadata preserves them instead.
                     head_extra_headers: std::collections::HashMap::new(),
                     head_checksum_headers: std::collections::HashMap::new(),
                     checksum_mode_checked: read_options.wants_checksum_headers()

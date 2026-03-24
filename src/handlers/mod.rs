@@ -1402,6 +1402,11 @@ pub mod test_utils {
             meta.last_accessed_at = entry.meta.last_accessed_at;
             meta.hit_count = entry.meta.hit_count;
             meta.source_status = entry.meta.source_status;
+            // Intentionally bumps metadata_version to match DiskCache behavior
+            // (src/cache/disk.rs update_metadata_if_unchanged). Preserving
+            // the old version would diverge from production and weaken
+            // refresh-collision test coverage — follow-up updates that should
+            // fail the CAS check would silently succeed in tests.
             meta.metadata_version = entry.meta.metadata_version.saturating_add(1);
             entry.meta = meta;
             Ok(true)
