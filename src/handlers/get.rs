@@ -298,6 +298,10 @@ async fn try_refresh_cached_get_metadata<B: Backend + 'static, C: CacheStore + '
             )
             .await;
             if resp.is_some() {
+                // Record both: miss (backend HEAD was needed) and hit (body
+                // served from cache) so stats reflect both the backend
+                // round-trip and the LRU touch.
+                let _ = state.cache.note_miss().await;
                 if let Err(e) = state.cache.note_hit(cache_key, &meta_for_hit).await {
                     tracing::warn!(
                         request_id = %parsed.request_id,
