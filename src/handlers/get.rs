@@ -273,7 +273,7 @@ async fn try_refresh_cached_get_metadata<B: Backend + 'static, C: CacheStore + '
             }
         }
         crate::handlers::head::CacheRefreshOutcome::EtagMismatch => {
-            purge_then_poison_if_unchanged(
+            let _ = purge_then_poison_if_unchanged(
                 &state.cache,
                 cache_key,
                 entry.meta.fill_id,
@@ -780,6 +780,41 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
             {
                 waiter.complete().await;
                 return resp;
+            }
+            // try_refresh returned None — either HEAD failed or the 404
+            // invalidation found the entry was replaced by a concurrent
+            // refill. Re-probe: if a newer entry now satisfies, serve it
+            // instead of paying a redundant backend GET.
+            if let Ok(Some(refreshed)) = state.cache.peek(cache_key).await {
+                if cache_entry_satisfies_read_options(&refreshed, read_options) {
+                    if let Ok(Some(pinned)) = state.cache.peek_body(cache_key).await {
+                        if cache_entry_satisfies_read_options(&pinned, read_options) {
+                            let meta_for_hit = pinned.meta.clone();
+                            if let Some(resp) = build_cache_response(
+                                pinned,
+                                &parsed.request_id,
+                                "HIT",
+                                read_options.wants_checksum_headers(),
+                            )
+                            .await
+                            {
+                                if let Err(e) =
+                                    state.cache.note_hit(cache_key, &meta_for_hit).await
+                                {
+                                    tracing::warn!(
+                                        request_id = %parsed.request_id,
+                                        error = %e,
+                                        operation = "GetObject",
+                                        key = key,
+                                        "failed to record cache hit after 404 re-probe"
+                                    );
+                                }
+                                waiter.complete().await;
+                                return resp;
+                            }
+                        }
+                    }
+                }
             }
         }
         Err(e) => {
@@ -1609,43 +1644,45 @@ mod tests {
         assert_eq!(plain_resp.status(), 404);
     }
 
-    /// Regression: verify purge_then_poison_if_unchanged returns false when
-    /// fill_id doesn't match (entry was replaced by concurrent refill), and
-    /// the GET refresh path correctly falls through instead of returning 404.
+    /// Verify the purge helper's return-value contract that the 404 re-probe
+    /// logic depends on. A true end-to-end test of the concurrent-refill race
+    /// requires modifying the entry between peek and purge within
+    /// try_refresh_cached_get_metadata, which can't be done with MockCache's
+    /// synchronous backend. The code paths are verified structurally:
+    /// - purge_if_unchanged returns false for mismatched fill_id
+    /// - purge_then_poison_if_unchanged propagates that false
+    /// - try_refresh_cached_get_metadata returns None on false (tested above)
+    /// - handle_leader re-probes and serves HIT on None (code at line 784)
     #[tokio::test]
     async fn test_purge_returns_false_for_replaced_entry() {
         let key = "script_bundle/purge-false.js";
         let cache_key = CacheKey::new("test-backend", key);
         let meta = test_cache_meta("test-backend", key, b"body");
         let cache = MockCache::new().with_entry(&cache_key, b"body", meta);
-        let state = build_app_state(MockBackend::new(), cache, MockAuth::allow_all());
 
-        // purge_if_unchanged with a wrong fill_id should return false.
-        let result = state
-            .cache
-            .purge_if_unchanged(&cache_key, 999999)
+        let original_fill_id = {
+            let entries = cache.entries.lock().unwrap();
+            entries.get(cache_key.hash_hex()).unwrap().meta.fill_id
+        };
+
+        // Mismatched fill_id → purge returns false.
+        let result = cache
+            .purge_if_unchanged(&cache_key, original_fill_id.wrapping_add(1000))
             .await
             .unwrap();
-        assert!(!result, "purge_if_unchanged should return false for mismatched fill_id");
-        // Entry should still exist.
-        assert!(state.cache.peek(&cache_key).await.unwrap().is_some());
+        assert!(!result);
+        assert!(cache.peek(&cache_key).await.unwrap().is_some());
 
-        // Verify the shared helper also returns false.
+        let cache_arc = std::sync::Arc::new(cache);
         let invalidated = super::purge_then_poison_if_unchanged(
-            &state.cache,
+            &cache_arc,
             &cache_key,
-            999999,
-            "test",
-            "test",
-            key,
-            "purge ok",
-            "changed",
-            "purge fail",
-            "poison ok",
-            "poison fail",
+            original_fill_id.wrapping_add(1000),
+            "test", "GetObject", key,
+            "ok", "changed", "fail", "poison ok", "poison fail",
         )
         .await;
-        assert!(!invalidated, "helper should return false when entry was replaced");
+        assert!(!invalidated);
     }
 
     #[tokio::test]
