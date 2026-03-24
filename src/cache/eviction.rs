@@ -11,6 +11,8 @@ use super::CacheStats;
 struct EvictionCandidate {
     body_path: PathBuf,
     meta_path: PathBuf,
+    hash: String,
+    fill_id: u64,
     last_accessed_at: chrono::DateTime<chrono::Utc>,
     size: u64,
 }
@@ -50,7 +52,9 @@ pub async fn run_eviction_loop(
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
     loop {
         interval.tick().await;
-        if let Err(e) = run_eviction_pass(&cache_dir, max_bytes, &stats).await {
+        if let Err(e) =
+            run_eviction_pass_inner(&cache_dir, max_bytes, &stats, disk_cache.as_deref()).await
+        {
             tracing::warn!(error = %e, "eviction pass failed");
         }
         // Sweep stale per-key meta locks after each pass to prevent
@@ -70,6 +74,7 @@ pub async fn run_eviction_loop(
 async fn collect_candidates(
     objects_dir: &std::path::Path,
     stats: &Arc<CacheStats>,
+    disk_cache: Option<&super::DiskCache>,
 ) -> Result<Vec<EvictionCandidate>, Box<dyn std::error::Error + Send + Sync>> {
     let mut candidates = Vec::new();
     let mut scan_total_bytes: u64 = 0;
@@ -105,8 +110,18 @@ async fn collect_candidates(
                     if file_name.ends_with(".body") {
                         let hash = file_name.trim_end_matches(".body");
                         let meta_path = d2_path.join(format!("{}.meta.json", hash));
+                        // Acquire the per-key lock to avoid racing with
+                        // commit_fill which writes body before meta.
+                        let meta_lock = disk_cache.map(|dc| dc.meta_lock_for_hash(hash));
+                        let _guard = match meta_lock.as_ref() {
+                            Some(lock) => Some(lock.lock().await),
+                            None => None,
+                        };
                         if !tokio::fs::try_exists(&meta_path).await.unwrap_or(true) {
-                            let size = tokio::fs::metadata(&file_path).await.map(|m| m.len()).unwrap_or(0);
+                            let size = tokio::fs::metadata(&file_path)
+                                .await
+                                .map(|m| m.len())
+                                .unwrap_or(0);
                             let _ = tokio::fs::remove_file(&file_path).await;
                             tracing::debug!(path = %file_path.display(), size, "removed orphan body file");
                         }
@@ -126,41 +141,85 @@ async fn collect_candidates(
                 // doesn't leak disk space indefinitely outside of eviction's
                 // accounting.
                 let hash_for_cleanup = file_name.trim_end_matches(".meta.json");
-                let meta_bytes = match tokio::fs::read(&file_path).await {
-                    Ok(b) => b,
-                    Err(e) => {
+                // Try reading metadata. On failure, acquire the per-key lock
+                // and re-read to avoid racing with a concurrent fill/repair.
+                let meta: CacheMeta = match tokio::fs::read(&file_path).await
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<CacheMeta>(&b).ok())
+                {
+                    Some(m) => m,
+                    None => {
                         let body = d2_path.join(format!("{}.body", hash_for_cleanup));
-                        let _ = tokio::fs::remove_file(&file_path).await;
-                        let _ = tokio::fs::remove_file(&body).await;
-                        tracing::warn!(path = %file_path.display(), error = %e, "removed corrupt cache entry: unreadable metadata");
-                        continue;
-                    }
-                };
-                let meta: CacheMeta = match serde_json::from_slice(&meta_bytes) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        let body = d2_path.join(format!("{}.body", hash_for_cleanup));
-                        let _ = tokio::fs::remove_file(&file_path).await;
-                        let _ = tokio::fs::remove_file(&body).await;
-                        tracing::warn!(path = %file_path.display(), error = %e, "removed corrupt cache entry: invalid metadata JSON");
-                        continue;
+                        let meta_lock =
+                            disk_cache.map(|dc| dc.meta_lock_for_hash(hash_for_cleanup));
+                        let _guard = match meta_lock.as_ref() {
+                            Some(lock) => Some(lock.lock().await),
+                            None => None,
+                        };
+                        // Re-read under lock — a concurrent fill may have
+                        // repaired the entry since the unlocked check.
+                        match tokio::fs::read(&file_path).await
+                            .ok()
+                            .and_then(|b| serde_json::from_slice::<CacheMeta>(&b).ok())
+                        {
+                            Some(m) => m,
+                            None => {
+                                let poison = d2_path.join(format!("{hash_for_cleanup}.poisoned"));
+                                let _ = tokio::fs::remove_file(&file_path).await;
+                                let _ = tokio::fs::remove_file(&body).await;
+                                let _ = tokio::fs::remove_file(&poison).await;
+                                tracing::warn!(path = %file_path.display(), "removed corrupt cache entry after locked recheck");
+                                continue;
+                            }
+                        }
                     }
                 };
 
                 let hash = file_name.trim_end_matches(".meta.json");
+                if hash.len() < 5 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    let body = d2_path.join(format!("{hash}.body"));
+                    let meta_lock = disk_cache.map(|dc| dc.meta_lock_for_hash(hash));
+                    let _guard = match meta_lock.as_ref() {
+                        Some(lock) => Some(lock.lock().await),
+                        None => None,
+                    };
+                    let poison = d2_path.join(format!("{hash}.poisoned"));
+                    let _ = tokio::fs::remove_file(&file_path).await;
+                    let _ = tokio::fs::remove_file(&body).await;
+                    let _ = tokio::fs::remove_file(&poison).await;
+                    tracing::warn!(
+                        path = %file_path.display(),
+                        "removed cache entry with malformed filename stem"
+                    );
+                    continue;
+                }
                 let body_path = d2_path.join(format!("{}.body", hash));
 
                 let body_size = match tokio::fs::metadata(&body_path).await {
                     Ok(m) => m.len(),
                     Err(_) => {
-                        // Body file missing; clean up orphaned metadata.
-                        // Not counted in scan totals, so no stat adjustment needed.
+                        // Body appears missing — acquire per-key lock and
+                        // re-check to avoid racing with commit_fill().
+                        let meta_lock = disk_cache.map(|dc| dc.meta_lock_for_hash(hash));
+                        let _guard = match meta_lock.as_ref() {
+                            Some(lock) => Some(lock.lock().await),
+                            None => None,
+                        };
+                        if tokio::fs::metadata(&body_path).await.is_ok() {
+                            // Body appeared after taking the lock — skip.
+                            continue;
+                        }
+                        let poison = d2_path.join(format!("{hash}.poisoned"));
                         let _ = tokio::fs::remove_file(&file_path).await;
+                        let _ = tokio::fs::remove_file(&poison).await;
                         continue;
                     }
                 };
 
-                let meta_size = meta_bytes.len() as u64;
+                let meta_size = tokio::fs::metadata(&file_path)
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(0);
                 let entry_size = body_size + meta_size;
 
                 // Count this complete entry toward the authoritative scan totals.
@@ -170,6 +229,8 @@ async fn collect_candidates(
                 candidates.push(EvictionCandidate {
                     body_path,
                     meta_path: file_path,
+                    hash: hash.to_string(),
+                    fill_id: meta.fill_id,
                     last_accessed_at: meta.last_accessed_at,
                     size: entry_size,
                 });
@@ -187,11 +248,25 @@ async fn collect_candidates(
 }
 
 /// Single eviction pass: scan cache (reconciling stats), sort by LRU, evict
-/// until under limit.
+/// until under limit. Requires a `DiskCache` reference for per-key lock
+/// coordination with concurrent fills and metadata writes.
 pub async fn run_eviction_pass(
     cache_dir: &std::path::Path,
     max_bytes: u64,
     stats: &Arc<CacheStats>,
+    disk_cache: &super::DiskCache,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let result = run_eviction_pass_inner(cache_dir, max_bytes, stats, Some(disk_cache)).await;
+    disk_cache.sweep_stale_meta_locks().await;
+    result
+}
+
+/// Inner implementation that accepts an optional DiskCache for testability.
+async fn run_eviction_pass_inner(
+    cache_dir: &std::path::Path,
+    max_bytes: u64,
+    stats: &Arc<CacheStats>,
+    disk_cache: Option<&super::DiskCache>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let objects_dir = cache_dir.join("objects");
     if !tokio::fs::try_exists(&objects_dir).await.unwrap_or(false) {
@@ -199,7 +274,7 @@ pub async fn run_eviction_pass(
     }
 
     // collect_candidates walks the filesystem and reconciles stats.
-    let mut candidates = collect_candidates(&objects_dir, stats).await?;
+    let mut candidates = collect_candidates(&objects_dir, stats, disk_cache).await?;
 
     // Sort by last_accessed_at ascending (oldest first = evicted first)
     candidates.sort_by_key(|c| c.last_accessed_at);
@@ -221,6 +296,28 @@ pub async fn run_eviction_pass(
             break;
         }
 
+        // Acquire the per-key metadata lock (if the DiskCache is available) so
+        // eviction cannot race with rewrite_last_accessed or metadata updates
+        // on the same entry.
+        let meta_lock = disk_cache.map(|dc| dc.meta_lock_for_hash(&candidate.hash));
+        let _meta_guard = match meta_lock.as_ref() {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+
+        // Re-read metadata under the lock to confirm this is still the same
+        // entry we scanned. A concurrent commit_fill() may have replaced it.
+        if let Ok(meta_bytes) = tokio::fs::read(&candidate.meta_path).await {
+            if let Ok(meta) = serde_json::from_slice::<CacheMeta>(&meta_bytes) {
+                if meta.fill_id != candidate.fill_id
+                    || meta.last_accessed_at != candidate.last_accessed_at
+                {
+                    // Entry was replaced or updated since the scan — skip it.
+                    continue;
+                }
+            }
+        }
+
         let body_removed = tokio::fs::remove_file(&candidate.body_path).await.is_ok();
         let meta_removed = tokio::fs::remove_file(&candidate.meta_path).await.is_ok();
         if body_removed || meta_removed {
@@ -235,14 +332,16 @@ pub async fn run_eviction_pass(
             // scan reconciles.
             current_size = current_size.saturating_sub(candidate.size);
             evicted += 1;
-            let _ = stats.entry_count.fetch_update(
-                Ordering::Relaxed, Ordering::Relaxed,
-                |c| Some(c.saturating_sub(1)),
-            );
-            let _ = stats.total_bytes.fetch_update(
-                Ordering::Relaxed, Ordering::Relaxed,
-                |c| Some(c.saturating_sub(candidate.size)),
-            );
+            let _ = stats
+                .entry_count
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                    Some(c.saturating_sub(1))
+                });
+            let _ = stats
+                .total_bytes
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                    Some(c.saturating_sub(candidate.size))
+                });
             tracing::debug!(
                 path = %candidate.body_path.display(),
                 size = candidate.size,
@@ -299,11 +398,18 @@ mod tests {
             content_type: Some("application/octet-stream".into()),
             content_length: body.len() as i64,
             cache_written_at: last_accessed_at,
+            fill_id: 0,
+            metadata_version: 0,
             last_accessed_at,
             hit_count: 0,
             source_status: 200,
             metadata: std::collections::HashMap::new(),
             extra_headers: std::collections::HashMap::new(),
+            head_extra_headers: std::collections::HashMap::new(),
+            head_checksum_headers: std::collections::HashMap::new(),
+            checksum_mode_checked: false,
+            head_metadata_checked: false,
+            head_checksum_checked: false,
         };
         let meta_json = serde_json::to_vec(&meta).unwrap();
         tokio::fs::write(&meta_path, &meta_json).await.unwrap();
@@ -325,7 +431,9 @@ mod tests {
         // Stats start at zero — the scan reconciles them to filesystem reality.
 
         // Set limit very high
-        run_eviction_pass(&cache_dir, 1_000_000, &stats).await.unwrap();
+        run_eviction_pass_inner(&cache_dir, 1_000_000, &stats, None)
+            .await
+            .unwrap();
 
         // Entry should still exist
         let hash = key.hash_hex();
@@ -340,7 +448,10 @@ mod tests {
         let snap = stats.snapshot();
         // Reconciliation should have set entry_count to 1 and total_bytes > 0.
         assert_eq!(snap.entry_count, 1);
-        assert!(snap.total_bytes > 0, "reconciliation should have computed total_bytes");
+        assert!(
+            snap.total_bytes > 0,
+            "reconciliation should have computed total_bytes"
+        );
         assert_eq!(snap.eviction_count, 0);
     }
 
@@ -382,7 +493,7 @@ mod tests {
         let stats = Arc::new(CacheStats::default());
 
         // Set limit so only ~1 entry fits (body + meta ~= 1200 bytes each, so ~1500 is one entry)
-        run_eviction_pass(&cache_dir, 1500, &stats).await.unwrap();
+        run_eviction_pass_inner(&cache_dir, 1500, &stats, None).await.unwrap();
 
         // The oldest entries should be evicted, newest should remain
         let hash_old = key_old.hash_hex();
@@ -411,6 +522,11 @@ mod tests {
         assert_eq!(snap.entry_count, 1);
     }
 
+    // Note: the lock-aware eviction paths (meta_lock_for_hash) are exercised
+    // indirectly through DiskCache integration tests. Adding a standalone test
+    // here requires trait-method dispatch that conflicts with Rust's type
+    // inference for impl-Future-returning traits.
+
     #[tokio::test]
     async fn test_eviction_on_empty_directory() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -419,7 +535,7 @@ mod tests {
         let stats = Arc::new(CacheStats::default());
 
         // Should not error
-        let result = run_eviction_pass(&cache_dir, 1000, &stats).await;
+        let result = run_eviction_pass_inner(&cache_dir, 1000, &stats, None).await;
         assert!(result.is_ok());
     }
 
@@ -433,7 +549,7 @@ mod tests {
 
         let stats = Arc::new(CacheStats::default());
 
-        let result = run_eviction_pass(&cache_dir, 1000, &stats).await;
+        let result = run_eviction_pass_inner(&cache_dir, 1000, &stats, None).await;
         assert!(result.is_ok());
 
         let snap = stats.snapshot();
@@ -459,13 +575,21 @@ mod tests {
         stats.total_bytes.store(999_999, Ordering::Relaxed);
 
         // Run eviction with a high limit (no eviction needed).
-        run_eviction_pass(&cache_dir, 1_000_000, &stats).await.unwrap();
+        run_eviction_pass_inner(&cache_dir, 1_000_000, &stats, None)
+            .await
+            .unwrap();
 
         // Stats should be reconciled to actual filesystem state.
         let snap = stats.snapshot();
         assert_eq!(snap.entry_count, 1, "reconciliation should fix entry_count");
-        assert!(snap.total_bytes < 1000, "reconciliation should fix total_bytes");
-        assert!(snap.total_bytes > 0, "total_bytes should reflect actual files");
+        assert!(
+            snap.total_bytes < 1000,
+            "reconciliation should fix total_bytes"
+        );
+        assert!(
+            snap.total_bytes > 0,
+            "total_bytes should reflect actual files"
+        );
     }
 
     #[tokio::test]
@@ -484,14 +608,18 @@ mod tests {
         let orphan_dir = objects_dir.join("ab").join("cd");
         tokio::fs::create_dir_all(&orphan_dir).await.unwrap();
         let orphan_body = orphan_dir.join("abcd0000dead0000.body");
-        tokio::fs::write(&orphan_body, b"orphan data").await.unwrap();
+        tokio::fs::write(&orphan_body, b"orphan data")
+            .await
+            .unwrap();
 
         // Simulate overstated stats (as if the orphan was still counted).
         let stats = Arc::new(CacheStats::default());
         stats.entry_count.store(2, Ordering::Relaxed);
         stats.total_bytes.store(999_999, Ordering::Relaxed);
 
-        run_eviction_pass(&cache_dir, 1_000_000, &stats).await.unwrap();
+        run_eviction_pass_inner(&cache_dir, 1_000_000, &stats, None)
+            .await
+            .unwrap();
 
         // Orphan should be removed.
         assert!(!orphan_body.exists(), "orphan body should be cleaned up");

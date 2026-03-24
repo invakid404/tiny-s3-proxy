@@ -14,8 +14,13 @@ use crate::cache::metadata::CacheMeta;
 use crate::cache::{CacheStore, FlightResult, FlightWaiter};
 use crate::handlers::AppState;
 use crate::s3::errors::S3Error;
-use crate::s3::headers::{common_headers, get_object_headers, metadata_headers, with_cache_status};
+use crate::s3::headers::{
+    common_headers, get_object_headers, is_checksum_response_header, metadata_headers,
+    with_cache_status,
+};
 use crate::s3::ops::ParsedRequest;
+
+use super::purge_then_poison_if_unchanged;
 
 /// Build an HTTP response from metadata + a streaming body.
 fn build_streaming_response(
@@ -23,8 +28,9 @@ fn build_streaming_response(
     body_stream: BoxByteStream,
     request_id: &str,
     cache_status: &str,
+    include_checksum_headers: bool,
 ) -> Response<Body> {
-    let mut headers = get_object_headers(meta);
+    let mut headers = get_object_headers(meta, include_checksum_headers);
     let common = common_headers(request_id);
     headers.extend(common);
     with_cache_status(&mut headers, cache_status);
@@ -42,8 +48,9 @@ fn build_meta_response(
     body: Body,
     request_id: &str,
     cache_status: &str,
+    include_checksum_headers: bool,
 ) -> Response<Body> {
-    let mut headers = get_object_headers(meta);
+    let mut headers = get_object_headers(meta, include_checksum_headers);
     let common = common_headers(request_id);
     headers.extend(common);
     with_cache_status(&mut headers, cache_status);
@@ -57,9 +64,13 @@ fn build_meta_response(
 
 /// Open a cached body file and return a boxed stream of chunks.
 async fn open_file_stream(
+    file: Option<tokio::fs::File>,
     path: &std::path::Path,
 ) -> Result<BoxByteStream, std::io::Error> {
-    let file = tokio::fs::File::open(path).await?;
+    let file = match file {
+        Some(file) => file,
+        None => tokio::fs::File::open(path).await?,
+    };
     Ok(Box::pin(ReaderStream::with_capacity(file, 65536))) // 64KB chunks
 }
 
@@ -72,12 +83,13 @@ async fn open_file_stream(
 /// HashMap clones that constructing an intermediate `GetObjectMeta` would
 /// require.
 async fn build_cache_response(
-    entry: &CacheEntry,
+    entry: CacheEntry,
     request_id: &str,
     cache_status: &str,
+    include_checksum_headers: bool,
 ) -> Option<Response<Body>> {
     let body_path = entry.body_path.clone();
-    match open_file_stream(&body_path).await {
+    match open_file_stream(entry.body_file, &body_path).await {
         Ok(stream) => {
             let m = &entry.meta;
             let mut headers = http::HeaderMap::new();
@@ -104,6 +116,9 @@ async fn build_cache_response(
             }
             headers.extend(metadata_headers(&m.metadata));
             for (k, v) in &m.extra_headers {
+                if !include_checksum_headers && is_checksum_response_header(k.as_str()) {
+                    continue;
+                }
                 if let (Ok(name), Ok(val)) = (
                     http::header::HeaderName::from_bytes(k.as_bytes()),
                     http::header::HeaderValue::from_str(v),
@@ -132,12 +147,207 @@ async fn build_cache_response(
     }
 }
 
+fn cache_entry_satisfies_read_options(
+    entry: &CacheEntry,
+    options: crate::backend::models::ReadOptions,
+) -> bool {
+    !options.wants_checksum_headers() || entry.meta.checksum_mode_checked
+}
+
+/// Attempt a HEAD-based metadata refresh for a checksum-mode GET on a
+/// plain-warmed cache entry. This is called when `checksum_mode_checked` is
+/// false, meaning the entry was filled by a plain GET that didn't request
+/// checksum headers.
+///
+/// Design tradeoff: the first checksum-mode GET after a plain fill always
+/// pays HEAD + GET because HEAD cannot set `checksum_mode_checked` (HEAD
+/// and GET can return different checksum surfaces on some backends). The
+/// HEAD probes for ETag validity and enriches HEAD-specific metadata, but
+/// the GET must still follow to populate the GET-shared checksum surface.
+/// This is a one-time warm-up cost per cache entry.
+async fn try_refresh_cached_get_metadata<B: Backend + 'static, C: CacheStore + 'static>(
+    state: &Arc<AppState<B, C>>,
+    parsed: &ParsedRequest,
+    key: &str,
+    cache_key: &CacheKey,
+    entry: &CacheEntry,
+) -> Option<Response<Body>> {
+    let read_options = parsed.read_options();
+    if !read_options.wants_checksum_headers() || entry.meta.checksum_mode_checked {
+        return None;
+    }
+
+    let head_output = match state
+        .backend
+        .head_object(&state.backend_bucket, key, read_options)
+        .await
+    {
+        Ok(output) => output,
+        Err(e) => {
+            if matches!(
+                &e,
+                crate::error::ProxyError::UpstreamS3 {
+                    status_code: 404,
+                    ..
+                }
+            ) {
+                purge_then_poison_if_unchanged(
+                    &state.cache,
+                    cache_key,
+                    entry.meta.fill_id,
+                    &parsed.request_id,
+                    "GetObject",
+                    key,
+                    "purged stale cache entry after HEAD returned not found during GET refresh",
+                    "HEAD returned not found during GET refresh, but cache entry changed before invalidation",
+                    "failed to purge stale cache entry after HEAD returned not found during GET refresh",
+                    "poisoned stale cache entry after purge failure during GET refresh",
+                    "failed to poison stale cache entry after purge failure during GET refresh",
+                )
+                .await;
+                // HEAD authoritatively confirmed the object is gone — return
+                // 404 directly instead of falling through to a redundant GET.
+                let s3err = S3Error::from_proxy_error(
+                    &e,
+                    &parsed.request_id,
+                    Some(&format!("/{}/{}", state.frontend_bucket, key)),
+                );
+                return Some(s3err.to_response());
+            }
+            tracing::warn!(
+                request_id = %parsed.request_id,
+                operation = "GetObject",
+                key = key,
+                error = %e,
+                "failed to refresh cached GET metadata via HEAD"
+            );
+            return None;
+        }
+    };
+
+    match crate::handlers::head::refreshed_cache_meta(
+        &entry.meta,
+        &head_output,
+        read_options.wants_checksum_headers(),
+    ) {
+        crate::handlers::head::CacheRefreshOutcome::Updated(updated_meta) => {
+            match state
+                .cache
+                .update_metadata_if_unchanged(cache_key, entry.meta.fill_id, updated_meta)
+                .await
+            {
+                Ok(true) => {} // Successfully persisted.
+                Ok(false) => {
+                    tracing::info!(
+                        request_id = %parsed.request_id,
+                        operation = "GetObject",
+                        key = key,
+                        "metadata refresh lost race, entry was replaced"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        request_id = %parsed.request_id,
+                        operation = "GetObject",
+                        key = key,
+                        error = %e,
+                        "failed to persist refreshed GET metadata from HEAD"
+                    );
+                    return None;
+                }
+            }
+        }
+        crate::handlers::head::CacheRefreshOutcome::EtagMismatch => {
+            purge_then_poison_if_unchanged(
+                &state.cache,
+                cache_key,
+                entry.meta.fill_id,
+                &parsed.request_id,
+                "GetObject",
+                key,
+                "purged stale cache entry after HEAD etag mismatch during GET refresh",
+                "HEAD etag mismatch observed during GET refresh, but cache entry changed before invalidation",
+                "failed to purge stale cache entry after HEAD etag mismatch during GET refresh",
+                "poisoned stale cache entry after purge failure during GET refresh",
+                "failed to poison stale cache entry after purge failure during GET refresh",
+            )
+            .await;
+            return None;
+        }
+        crate::handlers::head::CacheRefreshOutcome::NoStrongMatch => {
+            tracing::info!(
+                request_id = %parsed.request_id,
+                operation = "GetObject",
+                key = key,
+                "cached body did not strongly match HEAD refresh, falling back to GET"
+            );
+            return None;
+        }
+    }
+
+    match state.cache.peek_body(cache_key).await {
+        Ok(Some(refreshed_entry))
+            if cache_entry_satisfies_read_options(&refreshed_entry, read_options) =>
+        {
+            let meta_for_hit = refreshed_entry.meta.clone();
+            let resp = build_cache_response(
+                refreshed_entry,
+                &parsed.request_id,
+                "MISS",
+                read_options.wants_checksum_headers(),
+            )
+            .await;
+            if resp.is_some() {
+                if let Err(e) = state.cache.note_hit(cache_key, &meta_for_hit).await {
+                    tracing::warn!(
+                        request_id = %parsed.request_id,
+                        error = %e,
+                        operation = "GetObject",
+                        key = key,
+                        "failed to record cache hit after HEAD refresh"
+                    );
+                }
+                tracing::info!(
+                    request_id = %parsed.request_id,
+                    operation = "GetObject",
+                    key = key,
+                    cache_status = "MISS",
+                    "served cached body after HEAD metadata refresh"
+                );
+            }
+            resp
+        }
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!(
+                request_id = %parsed.request_id,
+                operation = "GetObject",
+                key = key,
+                error = %e,
+                "cache lookup failed after HEAD metadata refresh"
+            );
+            None
+        }
+    }
+}
+
 /// Handle a GetObject request with caching, singleflight, and stale-on-error.
 pub async fn handle_get<B: Backend + 'static, C: CacheStore + 'static>(
     state: &Arc<AppState<B, C>>,
     parsed: &ParsedRequest,
     key: &str,
 ) -> Response<Body> {
+    handle_get_with_refresh(state, parsed, key, true).await
+}
+
+async fn handle_get_with_refresh<B: Backend + 'static, C: CacheStore + 'static>(
+    state: &Arc<AppState<B, C>>,
+    parsed: &ParsedRequest,
+    key: &str,
+    allow_post_flight_refresh: bool,
+) -> Response<Body> {
+    let read_options = parsed.read_options();
+
     // Range requests are routed through raw passthrough at the dispatch layer
     // (handlers/mod.rs) to preserve the Range header. This is a defensive
     // fallback for any edge case where a ranged request reaches this handler.
@@ -164,24 +374,55 @@ pub async fn handle_get<B: Backend + 'static, C: CacheStore + 'static>(
         return handle_passthrough(state, parsed, key, "BYPASS").await;
     }
 
-    // Try cache lookup
+    // Probe cache without accounting first so checksum refresh checks do not
+    // inflate hit stats for entries that still need backend work. Use a
+    // body-pinning probe so a usable GET hit can stream the same entry.
     let cache_key = CacheKey::new(&*state.backend_bucket, key);
-    match state.cache.lookup(&cache_key).await {
+    match state.cache.peek_body(&cache_key).await {
         Ok(Some(entry)) => {
-            tracing::info!(
-                request_id = %parsed.request_id,
-                operation = "GetObject",
-                key = key,
-                cache_status = "HIT",
-                "serving from cache"
-            );
-            if let Some(resp) = build_cache_response(&entry, &parsed.request_id, "HIT").await {
-                return resp;
+            if !cache_entry_satisfies_read_options(&entry, read_options) {
+                tracing::info!(
+                    request_id = %parsed.request_id,
+                    operation = "GetObject",
+                    key = key,
+                    cache_status = "MISS",
+                    "cache entry missing requested checksum metadata, refreshing from backend"
+                );
+            } else {
+                let meta_for_hit = entry.meta.clone();
+                if let Some(resp) = build_cache_response(
+                    entry,
+                    &parsed.request_id,
+                    "HIT",
+                    read_options.wants_checksum_headers(),
+                )
+                .await
+                {
+                    if let Err(e) = state.cache.note_hit(&cache_key, &meta_for_hit).await {
+                        tracing::warn!(
+                            request_id = %parsed.request_id,
+                            error = %e,
+                            operation = "GetObject",
+                            key = key,
+                            "failed to record cache hit"
+                        );
+                    }
+                    tracing::info!(
+                        request_id = %parsed.request_id,
+                        operation = "GetObject",
+                        key = key,
+                        cache_status = "HIT",
+                        "serving from cache"
+                    );
+                    return resp;
+                }
+                // Body file disappeared — fall through to singleflight.
             }
-            // Body file disappeared — fall through to backend
         }
         Ok(None) => {
-            // Cache miss, proceed to singleflight
+            // Cache miss — proceed to singleflight. Miss accounting is
+            // deferred to the actual MISS response path to avoid inflation
+            // when followers later serve from cache as HIT.
         }
         Err(e) => {
             tracing::warn!(
@@ -202,7 +443,15 @@ pub async fn handle_get<B: Backend + 'static, C: CacheStore + 'static>(
             handle_leader(state, parsed, key, &cache_key, waiter).await
         }
         FlightResult::Follower { mut receiver } => {
-            handle_follower(state, parsed, key, &cache_key, &mut receiver).await
+            handle_follower(
+                state,
+                parsed,
+                key,
+                &cache_key,
+                &mut receiver,
+                allow_post_flight_refresh,
+            )
+            .await
         }
     }
 }
@@ -214,14 +463,24 @@ async fn handle_passthrough<B: Backend, C: CacheStore>(
     key: &str,
     cache_status: &str,
 ) -> Response<Body> {
+    let read_options = parsed.read_options();
     match state
         .backend
-        .get_object(&state.backend_bucket, key)
+        .get_object(&state.backend_bucket, key, read_options)
         .await
     {
         Ok((meta, body_stream)) => {
-            build_streaming_response(&meta, body_stream, &parsed.request_id, cache_status)
-        }
+            if cache_status == "MISS" {
+                let _ = state.cache.note_miss().await;
+            }
+            build_streaming_response(
+                &meta,
+                body_stream,
+            &parsed.request_id,
+            cache_status,
+            read_options.wants_checksum_headers(),
+        )
+        },
         Err(e) => {
             tracing::error!(
                 error = %e,
@@ -267,8 +526,8 @@ fn spawn_cache_tee<C: CacheStore + 'static>(
     let key_for_tee = key;
 
     tokio::spawn(async move {
-        use tokio_stream::StreamExt;
         use tokio::io::AsyncWriteExt;
+        use tokio_stream::StreamExt;
 
         let mut file = match tokio::fs::File::create(&temp_path_clone).await {
             Ok(f) => f,
@@ -294,51 +553,46 @@ fn spawn_cache_tee<C: CacheStore + 'static>(
 
         let mut stream = body_stream;
 
-        let cache_ok = match tokio::time::timeout(
-            std::time::Duration::from_secs(300),
-            async {
-                let mut ok = true;
-                while let Some(chunk_result) = stream.next().await {
-                    match chunk_result {
-                        Ok(chunk) => {
-                            if ok
-                                && let Err(e) = file.write_all(&chunk).await
-                            {
-                                tracing::warn!(
-                                    request_id = %req_id_for_tee,
-                                    key = %key_for_tee,
-                                    error = %e,
-                                    "cache fill: write error"
-                                );
-                                ok = false;
-                            }
-                            // Send to client; if client disconnected, still
-                            // continue writing to disk so cache fills for followers.
-                            let _ = tx.send(Ok(chunk)).await;
-                        }
-                        Err(e) => {
-                            let _ = tx
-                                .send(Err(std::io::Error::other(e.to_string())))
-                                .await;
+        let cache_ok = {
+            let chunk_timeout = std::time::Duration::from_secs(300);
+            let mut ok = true;
+            loop {
+                match tokio::time::timeout(chunk_timeout, stream.next()).await {
+                    Ok(Some(Ok(chunk))) => {
+                        if ok && let Err(e) = file.write_all(&chunk).await {
+                            tracing::warn!(
+                                request_id = %req_id_for_tee,
+                                key = %key_for_tee,
+                                error = %e,
+                                "cache fill: write error"
+                            );
                             ok = false;
-                            break;
                         }
+                        // Send to client; if client disconnected, still
+                        // continue writing to disk so cache fills for followers.
+                        let _ = tx.send(Ok(chunk)).await;
+                    }
+                    Ok(Some(Err(e))) => {
+                        let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
+                        ok = false;
+                        break;
+                    }
+                    Ok(None) => break, // stream finished
+                    Err(_) => {
+                        tracing::error!(
+                            request_id = %req_id_for_tee,
+                            key = %key_for_tee,
+                            "cache fill: chunk read timed out after 300s"
+                        );
+                        let _ = tx
+                            .send(Err(std::io::Error::other("chunk read timeout")))
+                            .await;
+                        ok = false;
+                        break;
                     }
                 }
-                ok
-            },
-        )
-        .await
-        {
-            Ok(ok) => ok,
-            Err(_) => {
-                tracing::error!(
-                    request_id = %req_id_for_tee,
-                    key = %key_for_tee,
-                    "cache fill: tee task timed out after 300s"
-                );
-                false
             }
+            ok
         };
 
         // Drop sender so the client body ends
@@ -405,6 +659,56 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
     cache_key: &CacheKey,
     waiter: FlightWaiter,
 ) -> Response<Body> {
+    let read_options = parsed.read_options();
+
+    if read_options.wants_checksum_headers() {
+        match state.cache.peek_body(cache_key).await {
+            Ok(Some(entry)) if cache_entry_satisfies_read_options(&entry, read_options) => {
+                // A concurrent refresh already set checksum_mode_checked.
+                // Serve directly from cache instead of re-downloading.
+                let meta_for_hit = entry.meta.clone();
+                if let Some(resp) = build_cache_response(
+                    entry,
+                    &parsed.request_id,
+                    "HIT",
+                    read_options.wants_checksum_headers(),
+                )
+                .await
+                {
+                    if let Err(e) = state.cache.note_hit(cache_key, &meta_for_hit).await {
+                        tracing::warn!(
+                            request_id = %parsed.request_id,
+                            error = %e,
+                            operation = "GetObject",
+                            key = key,
+                            "failed to record cache hit"
+                        );
+                    }
+                    waiter.complete().await;
+                    return resp;
+                }
+            }
+            Ok(Some(entry)) => {
+                if let Some(resp) =
+                    try_refresh_cached_get_metadata(state, parsed, key, cache_key, &entry).await
+                {
+                    waiter.complete().await;
+                    return resp;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    request_id = %parsed.request_id,
+                    error = %e,
+                    operation = "GetObject",
+                    key = key,
+                    "leader cache probe failed"
+                );
+            }
+            Ok(None) => {} // Cache miss — proceed to backend
+        }
+    }
+
     // Register fill BEFORE the backend fetch so that any purge() during
     // the round-trip bumps the generation counter, causing commit_fill to
     // reject the stale response. Without this, a purge during the GET
@@ -413,7 +717,7 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
 
     let result = state
         .backend
-        .get_object(&state.backend_bucket, key)
+        .get_object(&state.backend_bucket, key, read_options)
         .await;
 
     match result {
@@ -426,9 +730,14 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                 .unwrap_or(false);
 
             if is_size_cacheable {
-                let temp_body_path = PathBuf::from(&state.config.cache_dir)
-                    .join("tmp")
-                    .join(format!("{}-{}.body", std::process::id(), crate::request_id::generate()));
+                let temp_body_path =
+                    PathBuf::from(&state.config.cache_dir)
+                        .join("tmp")
+                        .join(format!(
+                            "{}-{}.body",
+                            std::process::id(),
+                            crate::request_id::generate()
+                        ));
 
                 let cache_meta = CacheMeta {
                     bucket: state.backend_bucket.to_string(),
@@ -438,11 +747,28 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                     content_type: meta.content_type.clone(),
                     content_length: meta.content_length.unwrap_or(0),
                     cache_written_at: chrono::Utc::now(),
+                    fill_id: 0, // stamped by commit_fill()
+                    metadata_version: 0,
                     last_accessed_at: chrono::Utc::now(),
                     hit_count: 0,
                     source_status: 200,
                     metadata: meta.metadata.clone(),
                     extra_headers: meta.extra_headers.clone(),
+                    // Design decision: HEAD-only metadata (x-amz-archive-status,
+                    // HEAD-specific checksums) is intentionally NOT carried
+                    // forward from a prior cache entry, even on ETag match.
+                    // ETag equality proves the object bytes are the same, but
+                    // HEAD-only headers describe mutable storage/archive state
+                    // (e.g. an object can transition between storage classes
+                    // without its ETag changing). Carrying them forward would
+                    // freeze stale archive-state information indefinitely.
+                    // The first plain or checksum HEAD after this fill will do
+                    // one backend HEAD to re-learn the current HEAD surface.
+                    head_extra_headers: std::collections::HashMap::new(),
+                    head_checksum_headers: std::collections::HashMap::new(),
+                    checksum_mode_checked: read_options.wants_checksum_headers(),
+                    head_metadata_checked: false,
+                    head_checksum_checked: false,
                 };
 
                 let body = spawn_cache_tee(
@@ -464,8 +790,15 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                     cached = true,
                     "serving from backend (tee to cache)"
                 );
+                let _ = state.cache.note_miss().await;
 
-                build_meta_response(&meta, body, &parsed.request_id, "MISS")
+                build_meta_response(
+                    &meta,
+                    body,
+                    &parsed.request_id,
+                    "MISS",
+                    read_options.wants_checksum_headers(),
+                )
             } else {
                 // Too large to cache — abort the pre-registered fill.
                 if let Some(guard) = fill_guard {
@@ -481,12 +814,14 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                     cached = false,
                     "served from backend (too large to cache)"
                 );
+                let _ = state.cache.note_miss().await;
 
                 build_streaming_response(
                     &meta,
                     body_stream,
                     &parsed.request_id,
                     "MISS",
+                    read_options.wants_checksum_headers(),
                 )
             }
         }
@@ -496,28 +831,53 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                 state.cache.abort_fill(guard).await;
             }
             // Try serving stale from cache if configured.
-            if state.config.cache_serve_stale_on_error
-                && e.is_transient()
-                && let Ok(Some(stale_entry)) = state.cache.lookup(cache_key).await
-            {
-                tracing::warn!(
-                    request_id = %parsed.request_id,
-                    operation = "GetObject",
-                    key = key,
-                    cache_status = "STALE",
-                    error = %e,
-                    "serving stale cache entry on backend error"
-                );
+            if state.config.cache_serve_stale_on_error && e.is_transient() {
+                match state.cache.peek_body(cache_key).await {
+                    Err(probe_err) => {
+                        tracing::warn!(
+                            request_id = %parsed.request_id,
+                            error = %probe_err,
+                            operation = "GetObject",
+                            key = key,
+                            "stale cache probe failed"
+                        );
+                    }
+                    Ok(None) => {} // No cached entry available.
+                    Ok(Some(stale_entry))
+                        if !cache_entry_satisfies_read_options(&stale_entry, read_options) => {}
+                    Ok(Some(stale_entry)) => {
+                let stale_meta = stale_entry.meta.clone();
                 if let Some(resp) = build_cache_response(
-                    &stale_entry,
+                    stale_entry,
                     &parsed.request_id,
                     "STALE",
+                    read_options.wants_checksum_headers(),
                 )
-                .await {
+                .await
+                {
+                    tracing::warn!(
+                        request_id = %parsed.request_id,
+                        operation = "GetObject",
+                        key = key,
+                        cache_status = "STALE",
+                        error = %e,
+                        "serving stale cache entry on backend error"
+                    );
+                    if let Err(hit_err) =
+                        state.cache.note_hit(cache_key, &stale_meta).await
+                    {
+                        tracing::warn!(
+                            request_id = %parsed.request_id,
+                            error = %hit_err,
+                            "failed to record stale cache hit"
+                        );
+                    }
                     waiter.complete().await;
                     return resp;
                 }
-                // Stale body disappeared — fall through to error
+                    // Stale body disappeared — fall through to error
+                    }
+                }
             }
 
             // No stale entry available (or stale body disappeared)
@@ -545,24 +905,62 @@ async fn handle_follower<B: Backend + 'static, C: CacheStore + 'static>(
     key: &str,
     cache_key: &CacheKey,
     receiver: &mut tokio::sync::broadcast::Receiver<()>,
+    allow_post_flight_refresh: bool,
 ) -> Response<Body> {
     // Wait for leader to complete (or drop)
     let _ = receiver.recv().await;
 
     // Re-read from cache
-    match state.cache.lookup(cache_key).await {
+    match state.cache.peek_body(cache_key).await {
         Ok(Some(entry)) => {
-            tracing::info!(
-                request_id = %parsed.request_id,
-                operation = "GetObject",
-                key = key,
-                cache_status = "HIT",
-                "follower served from cache after leader"
-            );
-            if let Some(resp) = build_cache_response(&entry, &parsed.request_id, "HIT").await {
+            let read_options = parsed.read_options();
+            if !cache_entry_satisfies_read_options(&entry, read_options) {
+                tracing::info!(
+                    request_id = %parsed.request_id,
+                    operation = "GetObject",
+                    key = key,
+                    allow_post_flight_refresh,
+                    "follower cache entry missing requested checksum metadata"
+                );
+                if allow_post_flight_refresh {
+                    return Box::pin(handle_get_with_refresh(state, parsed, key, false)).await;
+                }
+                tracing::info!(
+                    request_id = %parsed.request_id,
+                    operation = "GetObject",
+                    key = key,
+                    "follower already attempted post-flight refresh, falling back to direct backend read"
+                );
+                return handle_passthrough(state, parsed, key, "MISS").await;
+            }
+            let meta_for_hit = entry.meta.clone();
+            if let Some(resp) = build_cache_response(
+                entry,
+                &parsed.request_id,
+                "HIT",
+                read_options.wants_checksum_headers(),
+            )
+            .await
+            {
+                if let Err(e) = state.cache.note_hit(cache_key, &meta_for_hit).await {
+                    tracing::warn!(
+                        request_id = %parsed.request_id,
+                        error = %e,
+                        operation = "GetObject",
+                        key = key,
+                        "failed to record follower cache hit"
+                    );
+                }
+                tracing::info!(
+                    request_id = %parsed.request_id,
+                    operation = "GetObject",
+                    key = key,
+                    cache_status = "HIT",
+                    "follower served from cache after leader"
+                );
                 return resp;
             }
-            // Body file disappeared — fall through to direct backend fetch
+            // Body file disappeared — fall through
             tracing::info!(
                 request_id = %parsed.request_id,
                 operation = "GetObject",
@@ -571,14 +969,27 @@ async fn handle_follower<B: Backend + 'static, C: CacheStore + 'static>(
             );
             return handle_passthrough(state, parsed, key, "MISS").await;
         }
-        _ => {
-            // Leader may have failed or object was too large to cache.
-            // Fetch directly from backend (no singleflight to avoid recursion).
+        Ok(None) => {
+            // Known tradeoff: if the leader returned a HEAD 404 and purged
+            // the entry, followers see Ok(None) and fall back to a backend
+            // GET. Propagating the negative outcome through singleflight
+            // would require a result channel, which is not worth the
+            // complexity for this rare edge case (deleted key under load).
             tracing::info!(
                 request_id = %parsed.request_id,
                 operation = "GetObject",
                 key = key,
                 "follower cache miss, fetching from backend directly"
+            );
+            handle_passthrough(state, parsed, key, "MISS").await
+        }
+        Err(e) => {
+            tracing::warn!(
+                request_id = %parsed.request_id,
+                error = %e,
+                operation = "GetObject",
+                key = key,
+                "follower cache probe failed, fetching from backend directly"
             );
             handle_passthrough(state, parsed, key, "MISS").await
         }
@@ -588,10 +999,10 @@ async fn handle_follower<B: Backend + 'static, C: CacheStore + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use crate::cache::key::CacheKey;
     use crate::handlers::test_utils::*;
     use crate::s3::ops::{ParsedRequest, S3Operation};
+    use std::collections::HashMap;
 
     fn make_parsed(key: &str) -> ParsedRequest {
         ParsedRequest {
@@ -613,6 +1024,36 @@ mod tests {
         }
     }
 
+    fn make_parsed_with_checksum(key: &str) -> ParsedRequest {
+        let mut parsed = make_parsed(key);
+        parsed
+            .extra_amz_headers
+            .insert("x-amz-checksum-mode".to_string(), "ENABLED".to_string());
+        parsed
+    }
+
+    async fn wait_for_cached_entry<F>(
+        state: &Arc<AppState<MockBackend, MockCache>>,
+        cache_key: &CacheKey,
+        predicate: F,
+    ) -> CacheEntry
+    where
+        F: Fn(&CacheEntry) -> bool,
+    {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(entry) = state.cache.peek(cache_key).await.unwrap()
+                    && predicate(&entry)
+                {
+                    return entry;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("timed out waiting for cached entry")
+    }
+
     #[tokio::test]
     async fn test_cache_hit() {
         let key = "script_bundle/test.js";
@@ -632,10 +1073,380 @@ mod tests {
             resp.headers().get("x-cache").unwrap().to_str().unwrap(),
             "HIT"
         );
-        let resp_body = axum::body::to_bytes(resp.into_body(), 4096)
-            .await
-            .unwrap();
+        let resp_body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         assert_eq!(resp_body.as_ref(), body.as_slice());
+        assert_eq!(
+            state
+                .cache
+                .peek_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            state
+                .cache
+                .peek_body_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            state
+                .cache
+                .lookup_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            state
+                .cache
+                .note_hit_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_hit_filters_checksum_headers_when_not_requested() {
+        let key = "script_bundle/checksum-filter.js";
+        let body = b"cached checksum body".to_vec();
+        let cache_key = CacheKey::new("test-backend", key);
+        let mut meta = test_cache_meta("test-backend", key, &body);
+        meta.extra_headers
+            .insert("x-amz-checksum-sha256".to_string(), "abc123".to_string());
+        meta.checksum_mode_checked = true;
+
+        let cache = MockCache::new().with_entry(&cache_key, &body, meta);
+        let state = build_app_state(MockBackend::new(), cache, MockAuth::allow_all());
+
+        let resp = handle_get(&state, &make_parsed(key), key).await;
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("x-cache").unwrap(), "HIT");
+        assert!(resp.headers().get("x-amz-checksum-sha256").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_checksum_mode_cache_hit_preserves_checksum_headers() {
+        let key = "script_bundle/checksum-hit.js";
+        let body = b"cached checksum body".to_vec();
+        let cache_key = CacheKey::new("test-backend", key);
+        let mut meta = test_cache_meta("test-backend", key, &body);
+        meta.extra_headers
+            .insert("x-amz-checksum-sha256".to_string(), "abc123".to_string());
+        meta.checksum_mode_checked = true;
+
+        let cache = MockCache::new().with_entry(&cache_key, &body, meta);
+        let state = build_app_state(MockBackend::new(), cache, MockAuth::allow_all());
+
+        let resp = handle_get(&state, &make_parsed_with_checksum(key), key).await;
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("x-cache").unwrap(), "HIT");
+        assert_eq!(
+            resp.headers().get("x-amz-checksum-sha256").unwrap(),
+            "abc123"
+        );
+        assert!(state.backend.get_read_calls.lock().unwrap().is_empty());
+    }
+
+    /// HEAD refresh enriches HEAD-specific state but cannot make checksum
+    /// GET a cache hit. The checksum GET falls back to a real backend GET
+    /// which populates extra_headers with GET-derived checksums.
+    #[tokio::test]
+    async fn test_checksum_mode_falls_through_to_get_after_head_refresh() {
+        let key = "script_bundle/checksum-refresh.js";
+        let cached_body = b"cached body".to_vec();
+        let fresh_body = b"fresh body".to_vec();
+        let cache_key = CacheKey::new("test-backend", key);
+        let stale_meta = test_cache_meta("test-backend", key, &cached_body);
+
+        let mut head_extra = HashMap::new();
+        head_extra.insert("x-amz-checksum-sha256".to_string(), "headsum".to_string());
+        head_extra.insert(
+            "x-amz-archive-status".to_string(),
+            "ARCHIVE_ACCESS".to_string(),
+        );
+        let mut get_extra = HashMap::new();
+        get_extra.insert("x-amz-checksum-sha256".to_string(), "getsum".to_string());
+
+        let backend = MockBackend::new()
+            .with_head(Ok(crate::backend::models::HeadObjectOutput {
+                content_type: Some("application/javascript".to_string()),
+                content_length: Some(cached_body.len() as i64),
+                etag: stale_meta.etag.clone(),
+                last_modified: None,
+                metadata: HashMap::new(),
+                extra_headers: head_extra,
+            }))
+            .with_get(Ok(MockGetResponse {
+                body: fresh_body.clone(),
+                content_type: Some("application/javascript".to_string()),
+                etag: stale_meta.etag.clone(),
+                extra_headers: get_extra,
+            }));
+        let cache = MockCache::new().with_entry(&cache_key, &cached_body, stale_meta);
+        let state = build_app_state(backend, cache, MockAuth::allow_all());
+
+        let resp = handle_get(&state, &make_parsed_with_checksum(key), key).await;
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("x-cache").unwrap(), "MISS");
+        // Response has GET-derived checksum, not HEAD-derived.
+        assert_eq!(
+            resp.headers().get("x-amz-checksum-sha256").unwrap(),
+            "getsum"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        assert_eq!(body.as_ref(), fresh_body.as_slice());
+
+        // Both HEAD and GET were called.
+        assert_eq!(state.backend.head_read_calls.lock().unwrap().len(), 1);
+        assert_eq!(state.backend.get_read_calls.lock().unwrap().len(), 1);
+    }
+
+    /// HEAD refresh must NOT overwrite GET-derived checksum headers in
+    /// extra_headers. Trigger a plain HEAD refresh on an entry that has
+    /// GET-derived checksums, then verify a subsequent checksum GET still
+    /// returns the original GET-derived values.
+    #[tokio::test]
+    async fn test_head_refresh_does_not_overwrite_get_checksum_headers() {
+        let key = "script_bundle/head-no-overwrite-get-checksum.js";
+        let cached_body = b"cached body".to_vec();
+        let cache_key = CacheKey::new("test-backend", key);
+        let mut meta = test_cache_meta("test-backend", key, &cached_body);
+        meta.extra_headers
+            .insert("x-amz-checksum-sha256".to_string(), "getsum".to_string());
+        meta.checksum_mode_checked = true;
+        // head_metadata_checked = false triggers a HEAD refresh on plain HEAD.
+
+        let mut head_extra = HashMap::new();
+        head_extra.insert("x-amz-checksum-sha256".to_string(), "headsum".to_string());
+        head_extra.insert(
+            "x-amz-archive-status".to_string(),
+            "ARCHIVE_ACCESS".to_string(),
+        );
+        let backend = MockBackend::new().with_head(Ok(crate::backend::models::HeadObjectOutput {
+            content_type: Some("text/plain".to_string()),
+            content_length: Some(cached_body.len() as i64),
+            etag: meta.etag.clone(),
+            last_modified: None,
+            metadata: HashMap::new(),
+            extra_headers: head_extra,
+        }));
+        let cache = MockCache::new().with_entry(&cache_key, &cached_body, meta);
+        let state = build_app_state(backend, cache, MockAuth::allow_all());
+
+        // Plain HEAD triggers refresh (head_metadata_checked = false).
+        let head_resp = crate::handlers::head::handle_head(
+            &state,
+            &make_parsed(key),
+            key,
+        )
+        .await;
+        assert_eq!(head_resp.status(), 200);
+
+        // Now a checksum GET should serve from cache with original GET checksum.
+        let get_resp = handle_get(&state, &make_parsed_with_checksum(key), key).await;
+        assert_eq!(get_resp.status(), 200);
+        assert_eq!(get_resp.headers().get("x-cache").unwrap(), "HIT");
+        assert_eq!(
+            get_resp.headers().get("x-amz-checksum-sha256").unwrap(),
+            "getsum",
+            "HEAD refresh must not overwrite GET-derived checksum"
+        );
+
+        // Verify metadata: GET checksums preserved, HEAD checksums separate.
+        let cached = state.cache.peek(&cache_key).await.unwrap().unwrap();
+        assert_eq!(
+            cached.meta.extra_headers.get("x-amz-checksum-sha256").unwrap(),
+            "getsum"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_checksum_mode_falls_back_to_get_when_head_refresh_mismatches_body() {
+        let key = "script_bundle/checksum-refresh-fallback.js";
+        let stale_body = b"stale body".to_vec();
+        let fresh_body = b"fresh body".to_vec();
+        let cache_key = CacheKey::new("test-backend", key);
+        let stale_meta = test_cache_meta("test-backend", key, &stale_body);
+
+        let mut head_headers = HashMap::new();
+        head_headers.insert("x-amz-checksum-sha256".to_string(), "freshsum".to_string());
+        let mut get_headers = HashMap::new();
+        get_headers.insert("x-amz-checksum-sha256".to_string(), "freshsum".to_string());
+
+        let backend = MockBackend::new()
+            .with_head(Ok(crate::backend::models::HeadObjectOutput {
+                content_type: Some("application/javascript".to_string()),
+                content_length: Some(fresh_body.len() as i64),
+                etag: Some("\"etag-refresh\"".to_string()),
+                last_modified: None,
+                metadata: HashMap::new(),
+                extra_headers: head_headers,
+            }))
+            .with_get(Ok(MockGetResponse {
+                body: fresh_body.clone(),
+                content_type: Some("application/javascript".to_string()),
+                etag: Some("\"etag-refresh\"".to_string()),
+                extra_headers: get_headers,
+            }));
+        let cache = MockCache::new().with_entry(&cache_key, &stale_body, stale_meta);
+        let state = build_app_state(backend, cache, MockAuth::allow_all());
+
+        let resp = handle_get(&state, &make_parsed_with_checksum(key), key).await;
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("x-cache").unwrap(), "MISS");
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        assert_eq!(body.as_ref(), fresh_body.as_slice());
+
+        let head_calls = state.backend.head_read_calls.lock().unwrap();
+        assert_eq!(head_calls.len(), 1);
+        let get_calls = state.backend.get_read_calls.lock().unwrap();
+        assert_eq!(get_calls.len(), 1);
+        assert!(get_calls[0].wants_checksum_headers());
+    }
+
+    /// When a checksum HEAD returns no checksum headers, checksum_mode_checked
+    /// must NOT be flipped — the empty HEAD is not authoritative for the GET
+    /// checksum surface. The request falls back to a backend GET.
+    #[tokio::test]
+    async fn test_checksum_mode_falls_back_to_get_when_head_has_no_checksums() {
+        let key = "script_bundle/checksum-refresh-no-head-checksums.js";
+        let cached_body = b"cached body".to_vec();
+        let fresh_body = b"fresh body".to_vec();
+        let cache_key = CacheKey::new("test-backend", key);
+        let stale_meta = test_cache_meta("test-backend", key, &cached_body);
+
+        let mut head_headers = HashMap::new();
+        head_headers.insert(
+            "x-amz-archive-status".to_string(),
+            "ARCHIVE_ACCESS".to_string(),
+        );
+
+        let backend = MockBackend::new()
+            .with_head(Ok(crate::backend::models::HeadObjectOutput {
+                content_type: Some("application/javascript".to_string()),
+                content_length: Some(cached_body.len() as i64),
+                etag: stale_meta.etag.clone(),
+                last_modified: None,
+                metadata: HashMap::new(),
+                extra_headers: head_headers,
+            }))
+            .with_get(Ok(MockGetResponse {
+                body: fresh_body.clone(),
+                content_type: Some("application/javascript".to_string()),
+                etag: stale_meta.etag.clone(),
+                extra_headers: HashMap::new(),
+            }));
+        let cache = MockCache::new().with_entry(&cache_key, &cached_body, stale_meta);
+        let state = build_app_state(backend, cache, MockAuth::allow_all());
+
+        let resp = handle_get(&state, &make_parsed_with_checksum(key), key).await;
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("x-cache").unwrap(), "MISS");
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        assert_eq!(body.as_ref(), fresh_body.as_slice());
+
+        // Empty-checksum HEAD does NOT satisfy checksum GET — falls back to GET.
+        let head_calls = state.backend.head_read_calls.lock().unwrap();
+        assert_eq!(head_calls.len(), 1);
+        let get_calls = state.backend.get_read_calls.lock().unwrap();
+        assert_eq!(get_calls.len(), 1);
+        // The fallback GET must preserve checksum mode.
+        assert!(get_calls[0].wants_checksum_headers());
+    }
+
+    /// Regression: a GET refill (triggered by checksum GET fallback after HEAD
+    /// etag mismatch) must clear HEAD-specific state so stale HEAD-only
+    /// metadata is not carried forward.
+    #[tokio::test]
+    async fn test_get_refill_clears_head_state() {
+        let key = "script_bundle/get-refill-clears-head.js";
+        let cache_key = CacheKey::new("test-backend", key);
+        let mut meta = test_cache_meta("test-backend", key, b"old body");
+        meta.head_extra_headers.insert(
+            "x-amz-archive-status".to_string(),
+            "ARCHIVE_ACCESS".to_string(),
+        );
+        meta.head_metadata_checked = true;
+        meta.head_checksum_checked = true;
+        meta.head_checksum_headers
+            .insert("x-amz-checksum-sha256".to_string(), "oldsum".to_string());
+        // checksum_mode_checked = false forces a HEAD refresh on checksum GET.
+
+        let fresh_body = b"new body".to_vec();
+        let new_etag = "\"new-etag\"".to_string();
+        // HEAD returns a different ETag — triggers refill via GET fallback.
+        let backend = MockBackend::new()
+            .with_head(Ok(crate::backend::models::HeadObjectOutput {
+                content_type: Some("text/plain".to_string()),
+                content_length: Some(fresh_body.len() as i64),
+                etag: Some(new_etag.clone()),
+                last_modified: None,
+                metadata: HashMap::new(),
+                extra_headers: HashMap::new(),
+            }))
+            .with_get(Ok(MockGetResponse {
+                body: fresh_body.clone(),
+                content_type: Some("text/plain".to_string()),
+                etag: Some(new_etag.clone()),
+                extra_headers: HashMap::new(),
+            }));
+        let cache = MockCache::new().with_entry(&cache_key, b"old body", meta);
+        let state = build_app_state(backend, cache, MockAuth::allow_all());
+
+        let resp = handle_get(&state, &make_parsed_with_checksum(key), key).await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("x-cache").unwrap(), "MISS");
+
+        let cached = wait_for_cached_entry(&state, &cache_key, |e| e.meta.etag.as_deref() == Some(&new_etag)).await;
+        assert!(!cached.meta.head_metadata_checked);
+        assert!(!cached.meta.head_checksum_checked);
+        assert!(cached.meta.head_extra_headers.is_empty());
+        assert!(cached.meta.head_checksum_headers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_checksum_refresh_head_not_found_purges_cache_entry() {
+        let key = "script_bundle/checksum-refresh-not-found.js";
+        let stale_body = b"stale body".to_vec();
+        let cache_key = CacheKey::new("test-backend", key);
+        let stale_meta = test_cache_meta("test-backend", key, &stale_body);
+
+        let backend = MockBackend::new()
+            .with_head(Err(crate::error::ProxyError::UpstreamS3 {
+                status_code: 404,
+                s3_code: "NoSuchKey".into(),
+                message: "deleted upstream".into(),
+                operation: "head_object".into(),
+            }));
+        let cache = MockCache::new().with_entry(&cache_key, &stale_body, stale_meta);
+        let state = build_app_state(backend, cache, MockAuth::allow_all());
+
+        let resp = handle_get(&state, &make_parsed_with_checksum(key), key).await;
+
+        // HEAD 404 returns 404 directly — no redundant GET issued.
+        assert_eq!(resp.status(), 404);
+        assert!(state.cache.lookup(&cache_key).await.unwrap().is_none());
+        assert_eq!(state.cache.purge_calls.lock().unwrap().len(), 1);
+        assert!(state.cache.poison_calls.lock().unwrap().is_empty());
+        assert!(state.backend.get_read_calls.lock().unwrap().is_empty());
+
+        // A subsequent plain GET (cache now empty) should also 404 via backend.
+        *state.backend.get_response.lock().unwrap() =
+            Some(Err(crate::error::ProxyError::UpstreamS3 {
+                status_code: 404,
+                s3_code: "NoSuchKey".into(),
+                message: "deleted upstream".into(),
+                operation: "get_object".into(),
+            }));
+
+        let plain_resp = handle_get(&state, &make_parsed(key), key).await;
+        assert_eq!(plain_resp.status(), 404);
     }
 
     #[tokio::test]
@@ -647,6 +1458,7 @@ mod tests {
             body: body.clone(),
             content_type: Some("application/javascript".to_string()),
             etag: Some("\"etag-miss\"".to_string()),
+            extra_headers: HashMap::new(),
         }));
         let cache = MockCache::new();
 
@@ -660,19 +1472,20 @@ mod tests {
             resp.headers().get("x-cache").unwrap().to_str().unwrap(),
             "MISS"
         );
-        let resp_body = axum::body::to_bytes(resp.into_body(), 4096)
-            .await
-            .unwrap();
+        let resp_body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         assert_eq!(resp_body.as_ref(), body.as_slice());
 
-        // Verify cache was filled: wait a moment for the tee task to complete
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let cache_key = CacheKey::new("test-backend", key);
-        let cached = state.cache.lookup(&cache_key).await.unwrap();
-        assert!(cached.is_some());
-        let entry = cached.unwrap();
+        let entry = wait_for_cached_entry(&state, &cache_key, |_| true).await;
         let cached_body = tokio::fs::read(&entry.body_path).await.unwrap();
         assert_eq!(cached_body, body);
+        assert_eq!(
+            state
+                .cache
+                .note_miss_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 
     #[tokio::test]
@@ -684,6 +1497,7 @@ mod tests {
             body: body.clone(),
             content_type: Some("text/plain".to_string()),
             etag: None,
+            extra_headers: HashMap::new(),
         }));
 
         let state = build_app_state(backend, MockCache::new(), MockAuth::allow_all());
@@ -713,9 +1527,7 @@ mod tests {
         let resp = handle_get(&state, &parsed, key).await;
 
         assert_eq!(resp.status(), 502);
-        let body = axum::body::to_bytes(resp.into_body(), 4096)
-            .await
-            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let body_str = String::from_utf8_lossy(&body);
         assert!(body_str.contains("InternalError"));
     }
@@ -750,12 +1562,12 @@ mod tests {
         );
     }
 
-    // ---- StaleMockCache: returns None on first lookup, Some on subsequent ----
+    // ---- StaleMockCache: returns None on first body probe, Some on subsequent ----
     //
     // This is needed to exercise the TRUE stale-on-error code path, where:
-    //   1. Initial cache.lookup() returns None (miss) → enters singleflight
+    //   1. Initial cache.peek_body() returns None (miss) → enters singleflight
     //   2. Backend returns a transient error
-    //   3. Stale fallback calls cache.lookup() again → returns the entry
+    //   3. Stale fallback re-probes the cache via peek_body() and returns the entry
     //   4. Handler serves the cached entry with x-cache: STALE
 
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -763,7 +1575,11 @@ mod tests {
     struct StaleMockCache {
         /// The entry to serve on the stale (second) lookup.
         entry: Option<CacheEntry>,
+        peek_count: AtomicU32,
+        peek_body_count: AtomicU32,
         lookup_count: AtomicU32,
+        note_hit_count: AtomicU32,
+        note_miss_count: AtomicU32,
         temp_dir: tempfile::TempDir,
     }
 
@@ -772,7 +1588,11 @@ mod tests {
         fn new(entry: Option<CacheEntry>) -> Self {
             Self {
                 entry,
+                peek_count: AtomicU32::new(0),
+                peek_body_count: AtomicU32::new(0),
                 lookup_count: AtomicU32::new(0),
+                note_hit_count: AtomicU32::new(0),
+                note_miss_count: AtomicU32::new(0),
                 temp_dir: tempfile::TempDir::new().expect("create stale mock temp dir"),
             }
         }
@@ -783,17 +1603,70 @@ mod tests {
             &self,
             _key: &CacheKey,
         ) -> Result<Option<CacheEntry>, crate::error::ProxyError> {
-            let count = self.lookup_count.fetch_add(1, Ordering::SeqCst);
+            self.lookup_count.fetch_add(1, Ordering::SeqCst);
+            match self.entry.as_ref() {
+                Some(e) => {
+                    let body_file = tokio::fs::File::open(&e.body_path).await.ok();
+                    Ok(Some(CacheEntry {
+                        meta: e.meta.clone(),
+                        body_path: e.body_path.clone(),
+                        body_file,
+                    }))
+                }
+                None => Ok(None),
+            }
+        }
+
+        async fn peek(
+            &self,
+            _key: &CacheKey,
+        ) -> Result<Option<CacheEntry>, crate::error::ProxyError> {
+            let count = self.peek_count.fetch_add(1, Ordering::SeqCst);
             if count == 0 {
-                // First lookup: simulate cache miss
                 Ok(None)
             } else {
-                // Subsequent lookups: return the stale entry (if any)
                 Ok(self.entry.as_ref().map(|e| CacheEntry {
                     meta: e.meta.clone(),
                     body_path: e.body_path.clone(),
+                    body_file: None,
                 }))
             }
+        }
+
+        async fn peek_body(
+            &self,
+            _key: &CacheKey,
+        ) -> Result<Option<CacheEntry>, crate::error::ProxyError> {
+            let count = self.peek_body_count.fetch_add(1, Ordering::SeqCst);
+            if count == 0 {
+                Ok(None)
+            } else {
+                match self.entry.as_ref() {
+                    Some(e) => {
+                        let body_file = tokio::fs::File::open(&e.body_path).await.ok();
+                        Ok(Some(CacheEntry {
+                            meta: e.meta.clone(),
+                            body_path: e.body_path.clone(),
+                            body_file,
+                        }))
+                    }
+                    None => Ok(None),
+                }
+            }
+        }
+
+        async fn note_hit(
+            &self,
+            _key: &CacheKey,
+            _meta: &crate::cache::metadata::CacheMeta,
+        ) -> Result<(), crate::error::ProxyError> {
+            self.note_hit_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn note_miss(&self) -> Result<(), crate::error::ProxyError> {
+            self.note_miss_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
 
         async fn begin_fill(
@@ -818,18 +1691,37 @@ mod tests {
             Ok(())
         }
 
-        async fn purge(
+        async fn purge(&self, _key: &CacheKey) -> Result<bool, crate::error::ProxyError> {
+            Ok(false)
+        }
+
+        async fn poison(&self, _key: &CacheKey) -> Result<(), crate::error::ProxyError> {
+            Ok(())
+        }
+
+        async fn purge_if_unchanged(
             &self,
             _key: &CacheKey,
+            _expected_fill_id: u64,
         ) -> Result<bool, crate::error::ProxyError> {
             Ok(false)
         }
 
-        async fn poison(
+        async fn poison_if_unchanged(
             &self,
             _key: &CacheKey,
-        ) -> Result<(), crate::error::ProxyError> {
-            Ok(())
+            _expected_fill_id: u64,
+        ) -> Result<bool, crate::error::ProxyError> {
+            Ok(false)
+        }
+
+        async fn update_metadata_if_unchanged(
+            &self,
+            _key: &CacheKey,
+            _expected_fill_id: u64,
+            _meta: crate::cache::metadata::CacheMeta,
+        ) -> Result<bool, crate::error::ProxyError> {
+            Ok(false)
         }
 
         async fn stats(&self) -> crate::cache::CacheStatsSnapshot {
@@ -878,6 +1770,7 @@ mod tests {
         CacheEntry {
             meta: test_cache_meta(bucket, key, body),
             body_path,
+            body_file: None,
         }
     }
 
@@ -891,7 +1784,11 @@ mod tests {
         let entry = make_stale_entry(temp_dir.path(), "test-backend", key, &stale_body);
         let cache = StaleMockCache {
             entry: Some(entry),
+            peek_count: AtomicU32::new(0),
+            peek_body_count: AtomicU32::new(0),
             lookup_count: AtomicU32::new(0),
+            note_hit_count: AtomicU32::new(0),
+            note_miss_count: AtomicU32::new(0),
             temp_dir,
         };
 
@@ -911,13 +1808,13 @@ mod tests {
             resp.headers().get("x-cache").unwrap().to_str().unwrap(),
             "STALE",
         );
-        let resp_body = axum::body::to_bytes(resp.into_body(), 4096)
-            .await
-            .unwrap();
+        let resp_body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         assert_eq!(resp_body.as_ref(), stale_body.as_slice());
 
-        // Verify two lookups occurred (initial miss + stale fallback)
-        assert_eq!(state.cache.lookup_count.load(Ordering::SeqCst), 2);
+        assert_eq!(state.cache.peek_count.load(Ordering::SeqCst), 0);
+        // peek_body: 1 for initial miss, 1 for stale probe (reused for replay)
+        assert_eq!(state.cache.peek_body_count.load(Ordering::SeqCst), 2);
+        assert_eq!(state.cache.lookup_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -929,7 +1826,11 @@ mod tests {
         let entry = make_stale_entry(temp_dir.path(), "test-backend", key, &stale_body);
         let cache = StaleMockCache {
             entry: Some(entry),
+            peek_count: AtomicU32::new(0),
+            peek_body_count: AtomicU32::new(0),
             lookup_count: AtomicU32::new(0),
+            note_hit_count: AtomicU32::new(0),
+            note_miss_count: AtomicU32::new(0),
             temp_dir,
         };
 
@@ -945,8 +1846,9 @@ mod tests {
         let resp = handle_get(&state, &parsed, key).await;
 
         assert_eq!(resp.status(), 502);
-        // The stale fallback lookup should NOT have been attempted
-        assert_eq!(state.cache.lookup_count.load(Ordering::SeqCst), 1);
+        assert_eq!(state.cache.peek_count.load(Ordering::SeqCst), 0);
+        assert_eq!(state.cache.peek_body_count.load(Ordering::SeqCst), 1);
+        assert_eq!(state.cache.lookup_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -958,7 +1860,11 @@ mod tests {
         let entry = make_stale_entry(temp_dir.path(), "test-backend", key, &stale_body);
         let cache = StaleMockCache {
             entry: Some(entry),
+            peek_count: AtomicU32::new(0),
+            peek_body_count: AtomicU32::new(0),
             lookup_count: AtomicU32::new(0),
+            note_hit_count: AtomicU32::new(0),
+            note_miss_count: AtomicU32::new(0),
             temp_dir,
         };
 
@@ -976,8 +1882,9 @@ mod tests {
         let resp = handle_get(&state, &parsed, key).await;
 
         assert_eq!(resp.status(), 404);
-        // Only the initial lookup, no stale fallback for non-transient errors
-        assert_eq!(state.cache.lookup_count.load(Ordering::SeqCst), 1);
+        assert_eq!(state.cache.peek_count.load(Ordering::SeqCst), 0);
+        assert_eq!(state.cache.peek_body_count.load(Ordering::SeqCst), 1);
+        assert_eq!(state.cache.lookup_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -991,6 +1898,7 @@ mod tests {
             body: body.clone(),
             content_type: Some("application/javascript".to_string()),
             etag: Some("\"etag-follower\"".to_string()),
+            extra_headers: HashMap::new(),
         }));
         let cache = MockCache::new();
         let state = build_app_state(backend, cache, MockAuth::allow_all());
@@ -1002,16 +1910,25 @@ mod tests {
             _ => panic!("expected to be leader"),
         };
 
-        // Spawn a follower task — it will block waiting for the leader
+        let mut receiver = match state.singleflight.try_acquire(&cache_key).await {
+            crate::cache::FlightResult::Follower { receiver } => receiver,
+            _ => panic!("expected follower receiver"),
+        };
         let state_clone = Arc::clone(&state);
         let parsed = make_parsed(key);
         let key_owned = key.to_string();
+        let cache_key_clone = cache_key.clone();
         let follower = tokio::spawn(async move {
-            handle_get(&state_clone, &parsed, &key_owned).await
+            handle_follower(
+                &state_clone,
+                &parsed,
+                &key_owned,
+                &cache_key_clone,
+                &mut receiver,
+                true,
+            )
+            .await
         });
-
-        // Give the follower time to enter the waiting state
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
         // Simulate leader completing: write entry to cache, then signal
         let meta = test_cache_meta("test-backend", key, &body);
@@ -1020,6 +1937,7 @@ mod tests {
         let entry = CacheEntry {
             meta,
             body_path,
+            body_file: None,
         };
         state
             .cache
@@ -1038,9 +1956,182 @@ mod tests {
             resp.headers().get("x-cache").unwrap().to_str().unwrap(),
             "HIT",
         );
-        let resp_body = axum::body::to_bytes(resp.into_body(), 4096)
-            .await
-            .unwrap();
+        let resp_body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         assert_eq!(resp_body.as_ref(), body.as_slice());
+    }
+
+    #[tokio::test]
+    async fn test_checksum_followers_coalesce_after_plain_fill() {
+        let key = "script_bundle/checksum-followers.js";
+        let plain_body = b"plain cached content".to_vec();
+        let refreshed_body = b"checksum refreshed content".to_vec();
+        let cache_key = CacheKey::new("test-backend", key);
+
+        let mut extra_headers = HashMap::new();
+        extra_headers.insert(
+            "x-amz-checksum-sha256".to_string(),
+            "checksum-123".to_string(),
+        );
+        let backend = MockBackend::new().with_get(Ok(MockGetResponse {
+            body: refreshed_body.clone(),
+            content_type: Some("application/javascript".to_string()),
+            etag: Some("\"etag-checksum-refresh\"".to_string()),
+            extra_headers,
+        }));
+        let cache = MockCache::new();
+        let state = build_app_state(backend, cache, MockAuth::allow_all());
+
+        let flight_result = state.singleflight.try_acquire(&cache_key).await;
+        let waiter = match flight_result {
+            crate::cache::FlightResult::Leader { waiter } => waiter,
+            _ => panic!("expected to be leader"),
+        };
+
+        let mut receiver_one = match state.singleflight.try_acquire(&cache_key).await {
+            crate::cache::FlightResult::Follower { receiver } => receiver,
+            _ => panic!("expected first follower receiver"),
+        };
+        let mut receiver_two = match state.singleflight.try_acquire(&cache_key).await {
+            crate::cache::FlightResult::Follower { receiver } => receiver,
+            _ => panic!("expected second follower receiver"),
+        };
+        let state_clone = Arc::clone(&state);
+        let key_owned = key.to_string();
+        let cache_key_clone = cache_key.clone();
+        let follower_one = tokio::spawn(async move {
+            let parsed = make_parsed_with_checksum(&key_owned);
+            handle_follower(
+                &state_clone,
+                &parsed,
+                &key_owned,
+                &cache_key_clone,
+                &mut receiver_one,
+                true,
+            )
+            .await
+        });
+
+        let state_clone = Arc::clone(&state);
+        let key_owned = key.to_string();
+        let cache_key_clone = cache_key.clone();
+        let follower_two = tokio::spawn(async move {
+            let parsed = make_parsed_with_checksum(&key_owned);
+            handle_follower(
+                &state_clone,
+                &parsed,
+                &key_owned,
+                &cache_key_clone,
+                &mut receiver_two,
+                true,
+            )
+            .await
+        });
+
+        let mut meta = test_cache_meta("test-backend", key, &plain_body);
+        meta.checksum_mode_checked = false;
+        let body_path = state.cache.temp_dir.path().join("plain-fill.body");
+        tokio::fs::write(&body_path, &plain_body).await.unwrap();
+        let entry = CacheEntry {
+            meta,
+            body_path,
+            body_file: None,
+        };
+        state
+            .cache
+            .entries
+            .lock()
+            .unwrap()
+            .insert(cache_key.hash_hex().to_string(), entry);
+
+        waiter.complete().await;
+
+        let resp_one = follower_one.await.unwrap();
+        let resp_two = follower_two.await.unwrap();
+
+        let x_cache_values = [
+            resp_one.headers().get("x-cache"),
+            resp_two.headers().get("x-cache"),
+        ]
+        .into_iter()
+        .map(|value| value.unwrap().to_str().unwrap().to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            x_cache_values,
+            std::collections::BTreeSet::from(["HIT".to_string(), "MISS".to_string()])
+        );
+
+        for resp in [resp_one, resp_two] {
+            assert_eq!(resp.status(), 200);
+            assert_eq!(
+                resp.headers().get("x-amz-checksum-sha256").unwrap(),
+                "checksum-123"
+            );
+            let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+            assert_eq!(body.as_ref(), refreshed_body.as_slice());
+        }
+
+        let cached =
+            wait_for_cached_entry(&state, &cache_key, |entry| entry.meta.checksum_mode_checked)
+                .await;
+        assert!(cached.meta.checksum_mode_checked);
+        assert_eq!(
+            cached
+                .meta
+                .extra_headers
+                .get("x-amz-checksum-sha256")
+                .unwrap(),
+            "checksum-123"
+        );
+
+        let get_calls = state.backend.get_read_calls.lock().unwrap();
+        assert_eq!(get_calls.len(), 1);
+        assert!(get_calls[0].wants_checksum_headers());
+    }
+
+    #[tokio::test]
+    async fn test_follower_post_flight_refresh_falls_back_without_recursing() {
+        let key = "script_bundle/checksum-follower-bounded.js";
+        let stale_body = b"stale body".to_vec();
+        let fresh_body = b"fresh body".to_vec();
+        let cache_key = CacheKey::new("test-backend", key);
+        let stale_meta = test_cache_meta("test-backend", key, &stale_body);
+
+        let mut extra_headers = HashMap::new();
+        extra_headers.insert("x-amz-checksum-sha256".to_string(), "freshsum".to_string());
+        let backend = MockBackend::new().with_get(Ok(MockGetResponse {
+            body: fresh_body.clone(),
+            content_type: Some("application/javascript".to_string()),
+            etag: Some("\"etag-bounded\"".to_string()),
+            extra_headers,
+        }));
+        let cache = MockCache::new().with_entry(&cache_key, &stale_body, stale_meta);
+        let state = build_app_state(backend, cache, MockAuth::allow_all());
+
+        let (tx, mut receiver) = tokio::sync::broadcast::channel(1);
+        let _ = tx.send(());
+
+        let resp = handle_follower(
+            &state,
+            &make_parsed_with_checksum(key),
+            key,
+            &cache_key,
+            &mut receiver,
+            false,
+        )
+        .await;
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("x-cache").unwrap(), "MISS");
+        assert_eq!(
+            resp.headers().get("x-amz-checksum-sha256").unwrap(),
+            "freshsum"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        assert_eq!(body.as_ref(), fresh_body.as_slice());
+
+        let get_calls = state.backend.get_read_calls.lock().unwrap();
+        assert_eq!(get_calls.len(), 1);
+        assert!(get_calls[0].wants_checksum_headers());
     }
 }

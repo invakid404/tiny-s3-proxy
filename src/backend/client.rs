@@ -2,14 +2,14 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use aws_credential_types::Credentials;
+use aws_sdk_s3::Client;
 use aws_sdk_s3::config::Region;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::Client;
 use aws_smithy_types::timeout::TimeoutConfig;
 use tokio_util::io::ReaderStream;
 
 use crate::backend::models::*;
-use crate::backend::retry::{with_retry, RetryPolicy};
+use crate::backend::retry::{RetryPolicy, with_retry};
 use crate::backend::{Backend, BoxByteStream};
 use crate::config::Config;
 use crate::error::ProxyError;
@@ -30,9 +30,12 @@ impl S3Backend {
     /// Build an S3Backend from the application configuration.
     pub async fn from_config(config: &Config) -> Result<Self, ProxyError> {
         // Enforce BACKEND_ALLOW_HTTP: reject http:// endpoints unless explicitly allowed.
-        if !config.backend_allow_http
-            && config.backend_endpoint.starts_with("http://")
-        {
+        let scheme = config
+            .backend_endpoint
+            .split_once("://")
+            .map(|(s, _)| s)
+            .unwrap_or_default();
+        if !config.backend_allow_http && scheme.eq_ignore_ascii_case("http") {
             return Err(ProxyError::InvalidRequest {
                 message: format!(
                     "backend endpoint uses HTTP ({}) but BACKEND_ALLOW_HTTP is not enabled; \
@@ -45,8 +48,8 @@ impl S3Backend {
         let credentials = Credentials::new(
             &config.backend_access_key_id,
             &config.backend_secret_access_key,
-            None,  // session token
-            None,  // expiry
+            None, // session token
+            None, // expiry
             "tiny-s3-proxy-static",
         );
 
@@ -225,19 +228,34 @@ macro_rules! extract_extra_headers {
         }
         // Encryption
         if let Some(v) = $resp.server_side_encryption() {
-            extra.insert("x-amz-server-side-encryption".into(), v.as_str().to_string());
+            extra.insert(
+                "x-amz-server-side-encryption".into(),
+                v.as_str().to_string(),
+            );
         }
         if let Some(v) = $resp.ssekms_key_id() {
-            extra.insert("x-amz-server-side-encryption-aws-kms-key-id".into(), v.to_string());
+            extra.insert(
+                "x-amz-server-side-encryption-aws-kms-key-id".into(),
+                v.to_string(),
+            );
         }
         if let Some(v) = $resp.sse_customer_algorithm() {
-            extra.insert("x-amz-server-side-encryption-customer-algorithm".into(), v.to_string());
+            extra.insert(
+                "x-amz-server-side-encryption-customer-algorithm".into(),
+                v.to_string(),
+            );
         }
         if let Some(v) = $resp.sse_customer_key_md5() {
-            extra.insert("x-amz-server-side-encryption-customer-key-md5".into(), v.to_string());
+            extra.insert(
+                "x-amz-server-side-encryption-customer-key-md5".into(),
+                v.to_string(),
+            );
         }
         if $resp.bucket_key_enabled().unwrap_or(false) {
-            extra.insert("x-amz-server-side-encryption-bucket-key-enabled".into(), "true".into());
+            extra.insert(
+                "x-amz-server-side-encryption-bucket-key-enabled".into(),
+                "true".into(),
+            );
         }
         // Storage / object-lock
         if let Some(v) = $resp.storage_class() {
@@ -250,7 +268,10 @@ macro_rules! extract_extra_headers {
             extra.insert("x-amz-object-lock-retain-until-date".into(), format!("{v}"));
         }
         if let Some(v) = $resp.object_lock_legal_hold_status() {
-            extra.insert("x-amz-object-lock-legal-hold".into(), v.as_str().to_string());
+            extra.insert(
+                "x-amz-object-lock-legal-hold".into(),
+                v.as_str().to_string(),
+            );
         }
         // Multipart / redirect
         if let Some(v) = $resp.parts_count() {
@@ -297,13 +318,22 @@ macro_rules! extract_write_extra_headers {
         // passthrough via has_unsupported_write_modifiers, so the typed path
         // never produces sse_customer_algorithm / sse_customer_key_md5).
         if let Some(v) = $resp.server_side_encryption() {
-            extra.insert("x-amz-server-side-encryption".into(), v.as_str().to_string());
+            extra.insert(
+                "x-amz-server-side-encryption".into(),
+                v.as_str().to_string(),
+            );
         }
         if let Some(v) = $resp.ssekms_key_id() {
-            extra.insert("x-amz-server-side-encryption-aws-kms-key-id".into(), v.to_string());
+            extra.insert(
+                "x-amz-server-side-encryption-aws-kms-key-id".into(),
+                v.to_string(),
+            );
         }
         if $resp.bucket_key_enabled().unwrap_or(false) {
-            extra.insert("x-amz-server-side-encryption-bucket-key-enabled".into(), "true".into());
+            extra.insert(
+                "x-amz-server-side-encryption-bucket-key-enabled".into(),
+                "true".into(),
+            );
         }
         // Checksums
         if let Some(v) = $resp.checksum_crc32() {
@@ -352,7 +382,12 @@ macro_rules! extract_head_extra_headers {
 }
 
 impl Backend for S3Backend {
-    async fn get_object(&self, bucket: &str, key: &str) -> Result<(GetObjectMeta, BoxByteStream), ProxyError> {
+    async fn get_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        options: ReadOptions,
+    ) -> Result<(GetObjectMeta, BoxByteStream), ProxyError> {
         let bucket = bucket.to_string();
         let key = key.to_string();
 
@@ -363,11 +398,13 @@ impl Backend for S3Backend {
             let client = self.client.clone();
             let bucket = bucket.clone();
             let key = key.clone();
+            let options = options;
             async move {
-                client
-                    .get_object()
-                    .bucket(&bucket)
-                    .key(&key)
+                let mut request = client.get_object().bucket(&bucket).key(&key);
+                if options.wants_checksum_headers() {
+                    request = request.checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled);
+                }
+                request
                     .send()
                     .await
                     .map_err(|e| map_sdk_error(e, "get_object"))
@@ -396,7 +433,12 @@ impl Backend for S3Backend {
         Ok((meta, Box::pin(stream)))
     }
 
-    async fn head_object(&self, bucket: &str, key: &str) -> Result<HeadObjectOutput, ProxyError> {
+    async fn head_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        options: ReadOptions,
+    ) -> Result<HeadObjectOutput, ProxyError> {
         let bucket = bucket.to_string();
         let key = key.to_string();
 
@@ -404,11 +446,13 @@ impl Backend for S3Backend {
             let client = &self.client;
             let bucket = bucket.clone();
             let key = key.clone();
+            let options = options;
             async move {
-                let resp = client
-                    .head_object()
-                    .bucket(&bucket)
-                    .key(&key)
+                let mut request = client.head_object().bucket(&bucket).key(&key);
+                if options.wants_checksum_headers() {
+                    request = request.checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled);
+                }
+                let resp = request
                     .send()
                     .await
                     .map_err(|e| map_sdk_error(e, "head_object"))?;
@@ -521,7 +565,11 @@ impl Backend for S3Backend {
         .await
     }
 
-    async fn delete_object(&self, bucket: &str, key: &str) -> Result<DeleteObjectOutput, ProxyError> {
+    async fn delete_object(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<DeleteObjectOutput, ProxyError> {
         let bucket = bucket.to_string();
         let key = key.to_string();
 
@@ -547,10 +595,7 @@ impl Backend for S3Backend {
         .await
     }
 
-    async fn list_objects(
-        &self,
-        req: ListObjectsInput,
-    ) -> Result<ListObjectsOutput, ProxyError> {
+    async fn list_objects(&self, req: ListObjectsInput) -> Result<ListObjectsOutput, ProxyError> {
         with_retry(&self.list_policy, "list_objects", |_attempt| {
             let client = &self.client;
             let req = req.clone();
@@ -631,13 +676,22 @@ impl Backend for S3Backend {
         // responses (no individual checksums, no expiration), so extract directly.
         let mut extra_headers = HashMap::new();
         if let Some(v) = resp.server_side_encryption() {
-            extra_headers.insert("x-amz-server-side-encryption".into(), v.as_str().to_string());
+            extra_headers.insert(
+                "x-amz-server-side-encryption".into(),
+                v.as_str().to_string(),
+            );
         }
         if let Some(v) = resp.ssekms_key_id() {
-            extra_headers.insert("x-amz-server-side-encryption-aws-kms-key-id".into(), v.to_string());
+            extra_headers.insert(
+                "x-amz-server-side-encryption-aws-kms-key-id".into(),
+                v.to_string(),
+            );
         }
         if resp.bucket_key_enabled().unwrap_or(false) {
-            extra_headers.insert("x-amz-server-side-encryption-bucket-key-enabled".into(), "true".into());
+            extra_headers.insert(
+                "x-amz-server-side-encryption-bucket-key-enabled".into(),
+                "true".into(),
+            );
         }
         if let Some(v) = resp.checksum_algorithm() {
             extra_headers.insert("x-amz-checksum-algorithm".into(), v.as_str().to_string());
@@ -648,7 +702,10 @@ impl Backend for S3Backend {
         if let Some(v) = resp.request_charged() {
             extra_headers.insert("x-amz-request-charged".into(), v.as_str().to_string());
         }
-        Ok(CreateMultipartOutput { upload_id, extra_headers })
+        Ok(CreateMultipartOutput {
+            upload_id,
+            extra_headers,
+        })
     }
 
     async fn upload_part(&self, req: UploadPartInput) -> Result<UploadPartOutput, ProxyError> {
@@ -678,7 +735,10 @@ impl Backend for S3Backend {
             .to_string();
 
         let extra_headers = extract_write_extra_headers!(&resp);
-        Ok(UploadPartOutput { etag, extra_headers })
+        Ok(UploadPartOutput {
+            etag,
+            extra_headers,
+        })
     }
 
     async fn complete_multipart_upload(
@@ -794,9 +854,7 @@ async fn list_objects_v2(
             last_modified: obj.last_modified().and_then(to_chrono),
             etag: obj.e_tag().map(|s| s.to_string()),
             size: obj.size(),
-            storage_class: obj
-                .storage_class()
-                .map(|sc| sc.as_str().to_string()),
+            storage_class: obj.storage_class().map(|sc| sc.as_str().to_string()),
         })
         .collect();
 
@@ -814,9 +872,7 @@ async fn list_objects_v2(
         prefix: resp.prefix().map(|s| s.to_string()),
         delimiter: resp.delimiter().map(|s| s.to_string()),
         max_keys: resp.max_keys().unwrap_or(1000),
-        encoding_type: resp
-            .encoding_type()
-            .map(|et| et.as_str().to_string()),
+        encoding_type: resp.encoding_type().map(|et| et.as_str().to_string()),
         key_count: resp.key_count(),
         continuation_token: req.continuation_token.clone(),
         next_continuation_token: resp.next_continuation_token().map(|s| s.to_string()),
@@ -864,9 +920,7 @@ async fn list_objects_v1(
             last_modified: obj.last_modified().and_then(to_chrono),
             etag: obj.e_tag().map(|s| s.to_string()),
             size: obj.size(),
-            storage_class: obj
-                .storage_class()
-                .map(|sc| sc.as_str().to_string()),
+            storage_class: obj.storage_class().map(|sc| sc.as_str().to_string()),
         })
         .collect();
 
@@ -884,9 +938,7 @@ async fn list_objects_v1(
         prefix: resp.prefix().map(|s| s.to_string()),
         delimiter: resp.delimiter().map(|s| s.to_string()),
         max_keys: resp.max_keys().unwrap_or(1000),
-        encoding_type: resp
-            .encoding_type()
-            .map(|et| et.as_str().to_string()),
+        encoding_type: resp.encoding_type().map(|et| et.as_str().to_string()),
         key_count: None,
         continuation_token: None,
         next_continuation_token: None,
@@ -1090,5 +1142,23 @@ mod tests {
             "from_config should succeed with http:// when backend_allow_http is true, got: {:?}",
             result.err()
         );
+    }
+
+    #[test]
+    fn test_scheme_extraction_is_case_insensitive() {
+        for url in &["http://example.com", "HTTP://example.com", "Http://example.com"] {
+            let scheme = url.split_once("://").map(|(s, _)| s).unwrap_or_default();
+            assert!(
+                scheme.eq_ignore_ascii_case("http"),
+                "should detect http scheme in {url}"
+            );
+        }
+        for url in &["https://example.com", "HTTPS://example.com"] {
+            let scheme = url.split_once("://").map(|(s, _)| s).unwrap_or_default();
+            assert!(
+                !scheme.eq_ignore_ascii_case("http"),
+                "should not detect http scheme in {url}"
+            );
+        }
     }
 }
