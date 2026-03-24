@@ -308,8 +308,17 @@ async fn run_eviction_pass_inner(
     disk_cache: Option<&super::DiskCache>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let objects_dir = cache_dir.join("objects");
-    if !tokio::fs::try_exists(&objects_dir).await.unwrap_or(false) {
-        return Ok(());
+    match tokio::fs::try_exists(&objects_dir).await {
+        Ok(true) => {} // proceed
+        Ok(false) => return Ok(()),
+        Err(e) => {
+            tracing::warn!(
+                path = %objects_dir.display(),
+                error = %e,
+                "failed to check objects directory for eviction, skipping pass"
+            );
+            return Ok(());
+        }
     }
 
     // collect_candidates walks the filesystem and reconciles stats.
