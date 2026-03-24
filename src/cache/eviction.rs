@@ -205,8 +205,15 @@ async fn collect_candidates(
                             Some(lock) => Some(lock.lock().await),
                             None => None,
                         };
-                        if tokio::fs::metadata(&body_path).await.is_ok() {
-                            // Body appeared after taking the lock — skip.
+                        if let Ok(body_meta) = tokio::fs::metadata(&body_path).await {
+                            // Body appeared after taking the lock (concurrent
+                            // commit_fill). Count it in scan totals so the
+                            // authoritative reconciliation doesn't drop it.
+                            scan_total_bytes += body_meta.len();
+                            if let Ok(meta_meta) = tokio::fs::metadata(&file_path).await {
+                                scan_total_bytes += meta_meta.len();
+                            }
+                            scan_entry_count += 1;
                             continue;
                         }
                         let poison = d2_path.join(format!("{hash}.poisoned"));
@@ -526,6 +533,65 @@ mod tests {
     // indirectly through DiskCache integration tests. Adding a standalone test
     // here requires trait-method dispatch that conflicts with Rust's type
     // inference for impl-Future-returning traits.
+
+    /// When a body is missing on first probe but appears after taking the
+    /// per-key lock (concurrent commit_fill), the entry must be counted in
+    /// scan totals so the authoritative reconciliation doesn't drop it.
+    #[tokio::test]
+    async fn test_eviction_scan_counts_entry_that_appears_after_lock() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+        let key = CacheKey::new("bucket", "script_bundle/race.js");
+        let now = Utc::now();
+
+        // Write only the metadata — no body yet.
+        let hash = key.hash_hex();
+        let (d1, d2) = key.dir_prefix();
+        let dir = cache_dir.join("objects").join(&d1).join(&d2);
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let meta = CacheMeta {
+            bucket: "bucket".into(),
+            key: "script_bundle/race.js".into(),
+            etag: None,
+            last_modified: None,
+            content_type: None,
+            content_length: 5,
+            cache_written_at: now,
+            fill_id: 99,
+            metadata_version: 0,
+            last_accessed_at: now,
+            hit_count: 0,
+            source_status: 200,
+            metadata: std::collections::HashMap::new(),
+            extra_headers: std::collections::HashMap::new(),
+            head_extra_headers: std::collections::HashMap::new(),
+            head_checksum_headers: std::collections::HashMap::new(),
+            checksum_mode_checked: false,
+            head_metadata_checked: false,
+            head_checksum_checked: false,
+        };
+        let meta_path = dir.join(format!("{hash}.meta.json"));
+        let body_path = dir.join(format!("{hash}.body"));
+        tokio::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap())
+            .await
+            .unwrap();
+        // Body is missing — simulate the race window.
+
+        // Now write the body (as if commit_fill completed mid-scan).
+        tokio::fs::write(&body_path, b"hello").await.unwrap();
+
+        let stats = Arc::new(CacheStats::default());
+        run_eviction_pass_inner(&cache_dir, 1_000_000, &stats, None)
+            .await
+            .unwrap();
+
+        // The entry should be counted despite the initial body-missing probe.
+        assert_eq!(stats.entry_count.load(Ordering::Relaxed), 1);
+        assert!(stats.total_bytes.load(Ordering::Relaxed) > 0);
+        // Files should still exist (under limit).
+        assert!(tokio::fs::try_exists(&body_path).await.unwrap());
+        assert!(tokio::fs::try_exists(&meta_path).await.unwrap());
+    }
 
     #[tokio::test]
     async fn test_eviction_on_empty_directory() {
