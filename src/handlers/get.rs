@@ -574,6 +574,7 @@ fn spawn_cache_tee<C: CacheStore + 'static>(
 
         let mut stream = body_stream;
 
+        let mut waiter = Some(waiter);
         let cache_ok = {
             let chunk_timeout = std::time::Duration::from_secs(300);
             let send_timeout = std::time::Duration::from_secs(30);
@@ -590,6 +591,12 @@ fn spawn_cache_tee<C: CacheStore + 'static>(
                                 "cache fill: write error"
                             );
                             ok = false;
+                            // Release followers immediately — the cache fill
+                            // won't publish, so they should not wait for the
+                            // remaining stream to drain.
+                            if let Some(w) = waiter.take() {
+                                w.complete().await;
+                            }
                         }
                         // Send to client with a timeout so a slow/stalled
                         // client doesn't block the cache fill indefinitely.
@@ -655,7 +662,9 @@ fn spawn_cache_tee<C: CacheStore + 'static>(
                     cache.abort_fill(guard).await;
                 }
                 let _ = tokio::fs::remove_file(&temp_path_clone).await;
-                waiter.complete().await;
+                if let Some(w) = waiter.take() {
+                    w.complete().await;
+                }
                 return;
             }
             drop(file);
@@ -690,7 +699,9 @@ fn spawn_cache_tee<C: CacheStore + 'static>(
             let _ = tokio::fs::remove_file(&temp_path_clone).await;
         }
 
-        waiter.complete().await;
+        if let Some(w) = waiter.take() {
+            w.complete().await;
+        }
     });
 
     Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
