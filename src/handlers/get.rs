@@ -22,6 +22,44 @@ use crate::s3::ops::ParsedRequest;
 
 use super::purge_then_poison_if_unchanged;
 
+#[derive(Clone)]
+struct PreservedHeadState {
+    head_extra_headers: std::collections::HashMap<String, String>,
+    head_checksum_headers: std::collections::HashMap<String, String>,
+    head_metadata_checked: bool,
+    head_checksum_checked: bool,
+}
+
+fn preserved_head_state_for_etag(
+    meta: &CacheMeta,
+    expected_etag: Option<&str>,
+) -> Option<PreservedHeadState> {
+    if meta.etag.as_deref() != expected_etag {
+        return None;
+    }
+
+    Some(PreservedHeadState {
+        head_extra_headers: meta.head_extra_headers.clone(),
+        head_checksum_headers: meta.head_checksum_headers.clone(),
+        head_metadata_checked: meta.head_metadata_checked,
+        head_checksum_checked: meta.head_checksum_checked,
+    })
+}
+
+fn apply_preserved_head_state(
+    cache_meta: &mut CacheMeta,
+    preserved_head_state: Option<&PreservedHeadState>,
+) {
+    let Some(preserved_head_state) = preserved_head_state else {
+        return;
+    };
+
+    cache_meta.head_extra_headers = preserved_head_state.head_extra_headers.clone();
+    cache_meta.head_checksum_headers = preserved_head_state.head_checksum_headers.clone();
+    cache_meta.head_metadata_checked = preserved_head_state.head_metadata_checked;
+    cache_meta.head_checksum_checked = preserved_head_state.head_checksum_checked;
+}
+
 /// Build an HTTP response from metadata + a streaming body.
 fn build_streaming_response(
     meta: &GetObjectMeta,
@@ -551,6 +589,8 @@ fn spawn_cache_tee<C: CacheStore + 'static>(
         use tokio::io::AsyncWriteExt;
         use tokio_stream::StreamExt;
 
+        let mut cache_meta = cache_meta;
+
         let mut file = match tokio::fs::File::create(&temp_path_clone).await {
             Ok(f) => f,
             Err(e) => {
@@ -697,6 +737,25 @@ fn spawn_cache_tee<C: CacheStore + 'static>(
             drop(file);
 
             if let Some(guard) = fill_guard {
+                match cache.peek(&guard.key).await {
+                    Ok(Some(current)) => {
+                        let latest_head_state = preserved_head_state_for_etag(
+                            &current.meta,
+                            cache_meta.etag.as_deref(),
+                        );
+                        apply_preserved_head_state(&mut cache_meta, latest_head_state.as_ref());
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            request_id = %req_id_for_tee,
+                            key = %key_for_tee,
+                            error = %e,
+                            "cache fill: failed to re-read cached HEAD state before commit"
+                        );
+                    }
+                }
+
                 // commit_fill always cleans up active_fills internally
                 // (on success, rejection, and error).
                 if let Err(e) = cache
@@ -867,17 +926,17 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                 // it is cleared on version changes, but if the GET response ETag
                 // still matches the currently cached entry we can safely carry it
                 // forward instead of forcing the next HEAD to re-enrich again.
+                // This is only the initial snapshot; spawn_cache_tee() re-reads
+                // and re-merges the current same-ETag head_* state again right
+                // before commit_fill() publishes the new generation.
                 let preserved_head_state = match state.cache.peek(cache_key).await {
-                    Ok(Some(current)) if current.meta.etag == meta.etag => Some((
-                        current.meta.head_extra_headers.clone(),
-                        current.meta.head_checksum_headers.clone(),
-                        current.meta.head_metadata_checked,
-                        current.meta.head_checksum_checked,
-                    )),
+                    Ok(Some(current)) => {
+                        preserved_head_state_for_etag(&current.meta, meta.etag.as_deref())
+                    }
                     _ => None,
                 };
 
-                let cache_meta = CacheMeta {
+                let mut cache_meta = CacheMeta {
                     bucket: state.backend_bucket.to_string(),
                     key: key.to_string(),
                     etag: meta.etag.clone(),
@@ -895,27 +954,16 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                     // On version changes, clear HEAD-only fields — they describe
                     // mutable storage/archive state. On same-ETag fallback GETs,
                     // carry them forward from the current cached entry.
-                    head_extra_headers: preserved_head_state
-                        .as_ref()
-                        .map(|(h, _, _, _)| h.clone())
-                        .unwrap_or_default(),
-                    head_checksum_headers: preserved_head_state
-                        .as_ref()
-                        .map(|(_, h, _, _)| h.clone())
-                        .unwrap_or_default(),
+                    head_extra_headers: Default::default(),
+                    head_checksum_headers: Default::default(),
                     checksum_mode_checked: read_options.wants_checksum_headers()
                         || meta.extra_headers.keys().any(|k| {
                             crate::s3::headers::is_checksum_response_header(k)
                         }),
-                    head_metadata_checked: preserved_head_state
-                        .as_ref()
-                        .map(|(_, _, checked, _)| *checked)
-                        .unwrap_or(false),
-                    head_checksum_checked: preserved_head_state
-                        .as_ref()
-                        .map(|(_, _, _, checked)| *checked)
-                        .unwrap_or(false),
+                    head_metadata_checked: false,
+                    head_checksum_checked: false,
                 };
+                apply_preserved_head_state(&mut cache_meta, preserved_head_state.as_ref());
 
                 let body = spawn_cache_tee(
                     state.cache.clone(),
@@ -1670,12 +1718,32 @@ mod tests {
             }));
         let cache = MockCache::new().with_entry(&cache_key, b"old body", meta);
         let state = build_app_state(backend, cache, MockAuth::allow_all());
+        let original_fill_id = state
+            .cache
+            .peek(&cache_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .meta
+            .fill_id;
 
         let resp = handle_get(&state, &make_parsed_with_checksum(key), key).await;
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.headers().get("x-cache").unwrap(), "MISS");
 
-        let cached = wait_for_cached_entry(&state, &cache_key, |_| true).await;
+        let cached = wait_for_cached_entry(&state, &cache_key, |entry| {
+            entry.meta.fill_id != original_fill_id
+                && entry.meta.checksum_mode_checked
+                && entry.meta.head_metadata_checked
+                && entry.meta.head_checksum_checked
+                && entry
+                    .meta
+                    .head_checksum_headers
+                    .get("x-amz-checksum-sha256")
+                    .map(String::as_str)
+                    == Some("headsum")
+        })
+        .await;
         assert!(cached.meta.head_metadata_checked);
         assert!(cached.meta.head_checksum_checked);
         assert_eq!(

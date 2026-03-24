@@ -1124,6 +1124,34 @@ pub mod test_utils {
                 Some((key.hash_hex().to_string(), entry));
         }
 
+        /// Replace the current entry with a freshly published generation.
+        pub fn replace_entry_with_new_generation(
+            &self,
+            key: &CacheKey,
+            body: &[u8],
+            mut meta: CacheMeta,
+        ) {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static MOCK_COUNTER: AtomicU64 = AtomicU64::new(200_000);
+            let id = MOCK_COUNTER.fetch_add(1, Ordering::Relaxed);
+            meta.fill_id = self
+                .next_fill_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            meta.metadata_version = 0;
+            let body_path = self.temp_dir.path().join(format!("{}.body", id));
+            std::fs::write(&body_path, body).expect("write mock body");
+            let entry = CacheEntry {
+                meta,
+                body_path,
+                body_file: None,
+            };
+            self.entries
+                .lock()
+                .unwrap()
+                .insert(key.hash_hex().to_string(), entry);
+            self.poisoned.lock().unwrap().remove(key.hash_hex());
+        }
+
         pub fn with_purge_failing(self) -> Self {
             *self.purge_should_fail.lock().unwrap() = true;
             self
