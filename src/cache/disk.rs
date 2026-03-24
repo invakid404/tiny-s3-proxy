@@ -14,10 +14,18 @@ use crate::error::ProxyError;
 /// on-disk `fill_id` at startup so IDs remain unique across restarts.
 static FILL_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// Test-only: force the fill_id counter to a specific value.
 #[cfg(test)]
-pub(crate) fn set_fill_id_counter_for_test(val: u64) {
-    FILL_ID_COUNTER.store(val, std::sync::atomic::Ordering::Relaxed);
+static COMMIT_RENAME_FAIL_AFTER_BODY_FOR_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn arm_commit_rename_fail_after_body_for_test() {
+    COMMIT_RENAME_FAIL_AFTER_BODY_FOR_TEST.store(true, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn take_commit_rename_fail_after_body_for_test() -> bool {
+    COMMIT_RENAME_FAIL_AFTER_BODY_FOR_TEST.swap(false, Ordering::Relaxed)
 }
 
 /// Check if a path exists, distinguishing NotFound from real I/O errors.
@@ -317,6 +325,26 @@ impl DiskCache {
         &self.stats
     }
 
+    async fn restore_publish_backup(
+        final_path: &std::path::Path,
+        backup_path: &std::path::Path,
+        description: &str,
+    ) {
+        match tokio::fs::rename(backup_path, final_path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::error!(
+                    path = %final_path.display(),
+                    backup = %backup_path.display(),
+                    error = %e,
+                    "failed to restore cached {} after publish failure",
+                    description
+                );
+            }
+        }
+    }
+
     /// Decrement the active fill refcount for a key. When the count reaches
     /// zero, remove the entry so future purges don't needlessly bump generations.
     async fn finish_fill(&self, key: &CacheKey) {
@@ -557,25 +585,48 @@ impl DiskCache {
                 });
             }
 
-            // Best-effort incremental stat adjustment: subtract the old entry's
-            // size before replacing it.
-            let old_body_size = tokio::fs::metadata(&final_body)
-                .await
-                .map(|m| m.len())
-                .unwrap_or(0);
-            let old_meta_size = tokio::fs::metadata(&final_meta)
-                .await
-                .map(|m| m.len())
-                .unwrap_or(0);
-            // Remove old files before rename. Stats are adjusted after
-            // the replacement renames succeed so accounting stays consistent.
-            if old_body_size > 0 || old_meta_size > 0 {
-                let _ = tokio::fs::remove_file(&final_body).await;
-                let _ = tokio::fs::remove_file(&final_meta).await;
+            // Snapshot any previously published files so a transient publish
+            // failure cannot destroy a healthy entry.
+            let old_body = tokio::fs::metadata(&final_body).await.ok();
+            let old_meta = tokio::fs::metadata(&final_meta).await.ok();
+            let old_body_exists = old_body.is_some();
+            let old_meta_exists = old_meta.is_some();
+            let old_body_size = old_body.as_ref().map(|m| m.len()).unwrap_or(0);
+            let old_meta_size = old_meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let backup_body = guard.temp_dir.join(format!("{pid}-{id}.prev.body"));
+            let backup_meta = guard.temp_dir.join(format!("{pid}-{id}.prev.meta.json"));
+
+            if old_body_exists {
+                if let Err(e) = tokio::fs::rename(&final_body, &backup_body).await {
+                    let _ = tokio::fs::remove_file(&temp_body_path).await;
+                    let _ = tokio::fs::remove_file(&temp_meta).await;
+                    return Err(ProxyError::Cache {
+                        source: Box::new(e),
+                        operation: "backup existing body".into(),
+                    });
+                }
+            }
+            if old_meta_exists {
+                if let Err(e) = tokio::fs::rename(&final_meta, &backup_meta).await {
+                    if old_body_exists {
+                        Self::restore_publish_backup(&final_body, &backup_body, "body").await;
+                    }
+                    let _ = tokio::fs::remove_file(&temp_body_path).await;
+                    let _ = tokio::fs::remove_file(&temp_meta).await;
+                    return Err(ProxyError::Cache {
+                        source: Box::new(e),
+                        operation: "backup existing metadata".into(),
+                    });
+                }
             }
 
-            // Atomic rename — publish the new cache entry.
             if let Err(e) = tokio::fs::rename(&temp_body_path, &final_body).await {
+                if old_body_exists {
+                    Self::restore_publish_backup(&final_body, &backup_body, "body").await;
+                }
+                if old_meta_exists {
+                    Self::restore_publish_backup(&final_meta, &backup_meta, "metadata").await;
+                }
                 let _ = tokio::fs::remove_file(&temp_body_path).await;
                 let _ = tokio::fs::remove_file(&temp_meta).await;
                 return Err(ProxyError::Cache {
@@ -583,13 +634,45 @@ impl DiskCache {
                     operation: "rename body".into(),
                 });
             }
+
+            #[cfg(test)]
+            if take_commit_rename_fail_after_body_for_test() {
+                if old_body_exists {
+                    Self::restore_publish_backup(&final_body, &backup_body, "body").await;
+                } else {
+                    let _ = tokio::fs::remove_file(&final_body).await;
+                }
+                if old_meta_exists {
+                    Self::restore_publish_backup(&final_meta, &backup_meta, "metadata").await;
+                }
+                let _ = tokio::fs::remove_file(&temp_meta).await;
+                return Err(ProxyError::Cache {
+                    source: "injected rename metadata failure".into(),
+                    operation: "rename metadata".into(),
+                });
+            }
+
             if let Err(e) = tokio::fs::rename(&temp_meta, &final_meta).await {
-                let _ = tokio::fs::remove_file(&final_body).await;
+                if old_body_exists {
+                    Self::restore_publish_backup(&final_body, &backup_body, "body").await;
+                } else {
+                    let _ = tokio::fs::remove_file(&final_body).await;
+                }
+                if old_meta_exists {
+                    Self::restore_publish_backup(&final_meta, &backup_meta, "metadata").await;
+                }
                 let _ = tokio::fs::remove_file(&temp_meta).await;
                 return Err(ProxyError::Cache {
                     source: Box::new(e),
                     operation: "rename metadata".into(),
                 });
+            }
+
+            if old_body_exists {
+                let _ = tokio::fs::remove_file(&backup_body).await;
+            }
+            if old_meta_exists {
+                let _ = tokio::fs::remove_file(&backup_meta).await;
             }
 
             // Adjust stats after successful publish.
@@ -1142,27 +1225,28 @@ impl DiskCache {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Metadata gone — clean up any orphaned body file and stats.
-                let body_size = tokio::fs::metadata(&body_path)
-                    .await
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+                let body_meta = tokio::fs::metadata(&body_path).await.ok();
+                let body_size = body_meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                let body_existed = body_meta.is_some();
                 let body_removed = match tokio::fs::remove_file(&body_path).await {
                     Ok(()) => true,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
                     Err(_) => false,
                 };
                 drop(meta_guard);
-                if body_removed && body_size > 0 {
+                if body_removed && body_existed {
                     let _ = self.stats.entry_count.fetch_update(
                         Ordering::Relaxed,
                         Ordering::Relaxed,
                         |c| Some(c.saturating_sub(1)),
                     );
-                    let _ = self.stats.total_bytes.fetch_update(
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                        |c| Some(c.saturating_sub(body_size)),
-                    );
+                    if body_size > 0 {
+                        let _ = self.stats.total_bytes.fetch_update(
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                            |c| Some(c.saturating_sub(body_size)),
+                        );
+                    }
                 }
                 if track_access {
                     self.stats.miss_count.fetch_add(1, Ordering::Relaxed);
@@ -1421,6 +1505,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_commit_fill_failure_restores_previous_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = DiskCache::new(tmp.path().to_path_buf(), 1_000_000, test_policy())
+            .await
+            .unwrap();
+
+        let key = test_key();
+        let old_body = b"old body".to_vec();
+        let mut old_meta = test_meta(old_body.len());
+        old_meta.etag = Some("\"old-etag\"".into());
+        let old_temp_path = write_temp_body(tmp.path(), &old_body).await;
+        let old_guard = cache.begin_fill(&key).await.unwrap();
+        cache
+            .commit_fill(old_guard, old_temp_path, old_meta)
+            .await
+            .unwrap();
+
+        arm_commit_rename_fail_after_body_for_test();
+
+        let new_body = b"new body".to_vec();
+        let mut new_meta = test_meta(new_body.len());
+        new_meta.etag = Some("\"new-etag\"".into());
+        let new_temp_path = write_temp_body(tmp.path(), &new_body).await;
+        let new_guard = cache.begin_fill(&key).await.unwrap();
+        let err = cache.commit_fill(new_guard, new_temp_path, new_meta).await.unwrap_err();
+        assert!(err.to_string().contains("rename metadata"));
+
+        let entry = cache.lookup(&key).await.unwrap().unwrap();
+        assert_eq!(entry.meta.etag.as_deref(), Some("\"old-etag\""));
+        let restored_body = tokio::fs::read(&entry.body_path).await.unwrap();
+        assert_eq!(restored_body, old_body);
+        let stats = cache.stats().await;
+        assert_eq!(stats.entry_count, 1);
+    }
+
+    #[tokio::test]
     async fn test_purge_removes_entry() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cache = DiskCache::new(tmp.path().to_path_buf(), 1_000_000, test_policy())
@@ -1542,6 +1662,28 @@ mod tests {
         let s = cache.stats().await;
         assert_eq!(s.entry_count, 0);
         assert_eq!(s.total_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn test_lookup_metadata_miss_cleans_up_zero_byte_orphan_entry_count() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = DiskCache::new(tmp.path().to_path_buf(), 1_000_000, test_policy())
+            .await
+            .unwrap();
+
+        let key = test_key();
+        let body = Vec::new();
+        let meta = test_meta(body.len());
+        let temp_path = write_temp_body(tmp.path(), &body).await;
+        let guard = cache.begin_fill(&key).await.unwrap();
+        cache.commit_fill(guard, temp_path, meta).await.unwrap();
+        assert_eq!(cache.stats().await.entry_count, 1);
+
+        let (_, meta_path) = cache.paths_for_key(&key);
+        tokio::fs::remove_file(&meta_path).await.unwrap();
+
+        assert!(cache.lookup(&key).await.unwrap().is_none());
+        assert_eq!(cache.stats().await.entry_count, 0);
     }
 
     #[tokio::test]
@@ -1921,35 +2063,32 @@ mod tests {
         assert_eq!(after_stats.total_bytes, expected_total_bytes);
     }
 
-    /// Global lock for tests that mutate the process-wide FILL_ID_COUNTER.
-    static FILL_ID_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     /// Verify that DiskCache::new seeds the counter from on-disk fill_ids.
-    /// Uses FILL_ID_TEST_LOCK to safely force the counter below the on-disk
-    /// max, proving the reseed path is actually exercised.
     #[tokio::test]
     async fn test_fill_id_survives_restart() {
-        let _lock = FILL_ID_TEST_LOCK.lock().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let cache_dir = tmp.path().to_path_buf();
+        let key = test_key();
+        let body = b"restart data".to_vec();
+        let old_fill_id = 1_000_000_000_000_000_000u64;
 
-        // Fill an entry so there is an on-disk fill_id to discover.
+        // Seed the cache directory with a very large on-disk fill_id so the
+        // reseed path is exercised without mutating the process-wide counter
+        // from the test body.
         let cache1 = DiskCache::new(cache_dir.clone(), 1_000_000, test_policy())
             .await
             .unwrap();
-        let key = test_key();
-        let body = b"restart data".to_vec();
-        let meta = test_meta(body.len());
-        let temp_path = write_temp_body(tmp.path(), &body).await;
-        let guard = cache1.begin_fill(&key).await.unwrap();
-        cache1.commit_fill(guard, temp_path, meta).await.unwrap();
-        let old_fill_id = cache1.lookup(&key).await.unwrap().unwrap().meta.fill_id;
-        assert!(old_fill_id > 0);
+        let (body_path, meta_path) = cache1.paths_for_key(&key);
+        if let Some(parent) = body_path.parent() {
+            tokio::fs::create_dir_all(parent).await.unwrap();
+        }
+        let mut meta = test_meta(body.len());
+        meta.fill_id = old_fill_id;
+        tokio::fs::write(&body_path, &body).await.unwrap();
+        tokio::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap())
+            .await
+            .unwrap();
         drop(cache1);
-
-        // Force the counter below the on-disk max to prove DiskCache::new
-        // re-seeds it. This is safe because we hold FILL_ID_TEST_LOCK.
-        set_fill_id_counter_for_test(1);
 
         // DiskCache::new must re-seed from the on-disk max.
         let cache2 = DiskCache::new(cache_dir.clone(), 1_000_000, test_policy())

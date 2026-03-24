@@ -459,11 +459,26 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
                                             }
                                             CacheRefreshOutcome::EtagMismatch
                                             | CacheRefreshOutcome::NoStrongMatch => {
+                                                let _ = purge_then_poison_if_unchanged(
+                                                    &state.cache,
+                                                    &cache_key,
+                                                    newer.meta.fill_id,
+                                                    &parsed.request_id,
+                                                    "HeadObject",
+                                                    key,
+                                                    "purged disproved cache entry after retry HEAD validation failed",
+                                                    "retry HEAD validation failed, but replacement entry changed before invalidation",
+                                                    "failed to purge disproved cache entry after retry HEAD validation failed",
+                                                    "poisoned disproved cache entry after retry HEAD purge failure",
+                                                    "failed to poison disproved cache entry after retry HEAD purge failure",
+                                                )
+                                                .await;
                                                 // The retry HEAD proved the object exists.
                                                 // Even if the cache metadata doesn't strongly
-                                                // match, the fresh HEAD response itself is
-                                                // valid and must be returned instead of the
-                                                // stale original 404.
+                                                // match, the disproved cached replacement must
+                                                // not remain cacheable. Return the fresh HEAD
+                                                // response itself instead of the stale original
+                                                // 404.
                                                 return build_fresh_head_response(
                                                     &retry_output,
                                                     &parsed.request_id,
@@ -1665,6 +1680,39 @@ mod tests {
         // Backend HEAD was called twice: initial 404 + retry.
         assert_eq!(state.backend.head_calls.lock().unwrap().len(), 2);
         assert_eq!(state.cache.note_miss_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(state.cache.lookup(&cache_key).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_head_404_with_get_only_refill_retry_no_strong_match_invalidates_cache() {
+        let key = "script_bundle/head-404-get-refill-no-strong-match.js";
+        let cache_key = crate::cache::key::CacheKey::new("test-backend", key);
+        let mut old_meta = test_cache_meta("test-backend", key, b"cached body");
+        old_meta.head_metadata_checked = false;
+
+        let cache = MockCache::new().with_entry(&cache_key, b"cached body", old_meta);
+
+        let mut get_only_meta = test_cache_meta("test-backend", key, b"new body");
+        get_only_meta.head_metadata_checked = false;
+        get_only_meta.etag = Some("\"replacement-etag\"".to_string());
+        cache.stage_purge_replacement(&cache_key, b"new body", get_only_meta);
+
+        let backend = Sequential404Then200HeadBackend::new(HeadObjectOutput {
+            content_type: Some("text/plain".to_string()),
+            content_length: Some(8),
+            etag: None,
+            last_modified: None,
+            metadata: HashMap::new(),
+            extra_headers: HashMap::new(),
+        });
+
+        let state = build_state_with_backend(backend, cache);
+
+        let resp = handle_head(&state, &make_parsed(key), key).await;
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("x-cache").unwrap(), "MISS");
+        assert!(state.cache.lookup(&cache_key).await.unwrap().is_none());
     }
 
     #[tokio::test]
