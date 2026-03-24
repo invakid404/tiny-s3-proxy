@@ -432,51 +432,7 @@ impl DiskCache {
             .unwrap_or(0);
 
         let mut meta = meta;
-        meta.fill_id = FILL_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-        meta.metadata_version = 0;
-
-        // Write metadata to temp file. On any error below, clean up both
-        // temp files since the caller no longer owns temp_body_path.
         let temp_meta = guard.temp_dir.join(format!("{pid}-{id}.meta.json"));
-        let meta_bytes = match serde_json::to_vec(&meta) {
-            Ok(b) => b,
-            Err(e) => {
-                let _ = tokio::fs::remove_file(&temp_body_path).await;
-                return Err(ProxyError::Cache {
-                    source: Box::new(e),
-                    operation: "serialize metadata".into(),
-                });
-            }
-        };
-        if let Err(e) = tokio::fs::write(&temp_meta, &meta_bytes).await {
-            let _ = tokio::fs::remove_file(&temp_body_path).await;
-            let _ = tokio::fs::remove_file(&temp_meta).await;
-            return Err(ProxyError::Cache {
-                source: Box::new(e),
-                operation: "write temp metadata".into(),
-            });
-        }
-
-        // fsync metadata
-        let meta_file = match tokio::fs::File::open(&temp_meta).await {
-            Ok(f) => f,
-            Err(e) => {
-                let _ = tokio::fs::remove_file(&temp_body_path).await;
-                let _ = tokio::fs::remove_file(&temp_meta).await;
-                return Err(ProxyError::Cache {
-                    source: Box::new(e),
-                    operation: "open temp meta for fsync".into(),
-                });
-            }
-        };
-        if let Err(e) = meta_file.sync_all().await {
-            let _ = tokio::fs::remove_file(&temp_body_path).await;
-            let _ = tokio::fs::remove_file(&temp_meta).await;
-            return Err(ProxyError::Cache {
-                source: Box::new(e),
-                operation: "fsync temp metadata".into(),
-            });
-        }
 
         // Create parent directories for final location
         let (final_body, final_meta) = self.paths_for_key(&guard.key);
@@ -545,9 +501,60 @@ impl DiskCache {
                 if cur_gen != guard.generation {
                     tracing::info!(key = %guard.key.object_key, "cache fill rejected (late check)");
                     let _ = tokio::fs::remove_file(&temp_body_path).await;
-                    let _ = tokio::fs::remove_file(&temp_meta).await;
                     return Ok(());
                 }
+            }
+
+            if let Ok(current_bytes) = tokio::fs::read(&final_meta).await {
+                if let Ok(current_meta) = serde_json::from_slice::<CacheMeta>(&current_bytes) {
+                    meta.preserve_same_etag_head_state_from(&current_meta);
+                }
+            }
+
+            meta.fill_id = FILL_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+            meta.metadata_version = 0;
+
+            // Write metadata to temp file after reconciling against the latest
+            // published same-ETag entry under the publish lock.
+            let meta_bytes = match serde_json::to_vec(&meta) {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = tokio::fs::remove_file(&temp_body_path).await;
+                    return Err(ProxyError::Cache {
+                        source: Box::new(e),
+                        operation: "serialize metadata".into(),
+                    });
+                }
+            };
+            if let Err(e) = tokio::fs::write(&temp_meta, &meta_bytes).await {
+                let _ = tokio::fs::remove_file(&temp_body_path).await;
+                let _ = tokio::fs::remove_file(&temp_meta).await;
+                return Err(ProxyError::Cache {
+                    source: Box::new(e),
+                    operation: "write temp metadata".into(),
+                });
+            }
+
+            // fsync metadata after the commit-time reconciliation so the
+            // published file matches the merged snapshot exactly.
+            let meta_file = match tokio::fs::File::open(&temp_meta).await {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = tokio::fs::remove_file(&temp_body_path).await;
+                    let _ = tokio::fs::remove_file(&temp_meta).await;
+                    return Err(ProxyError::Cache {
+                        source: Box::new(e),
+                        operation: "open temp meta for fsync".into(),
+                    });
+                }
+            };
+            if let Err(e) = meta_file.sync_all().await {
+                let _ = tokio::fs::remove_file(&temp_body_path).await;
+                let _ = tokio::fs::remove_file(&temp_meta).await;
+                return Err(ProxyError::Cache {
+                    source: Box::new(e),
+                    operation: "fsync temp metadata".into(),
+                });
             }
 
             // Best-effort incremental stat adjustment: subtract the old entry's

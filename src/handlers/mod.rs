@@ -1054,6 +1054,11 @@ pub mod test_utils {
     // Stores cache entries on disk in a temp directory so that
     // CacheEntry.body_path is a real file that can be streamed.
 
+    struct MockCommitFillPause {
+        started: Option<tokio::sync::oneshot::Sender<()>>,
+        release: std::sync::Arc<tokio::sync::Notify>,
+    }
+
     pub struct MockCache {
         pub entries: Mutex<HashMap<String, CacheEntry>>,
         next_fill_id: std::sync::atomic::AtomicU64,
@@ -1071,6 +1076,7 @@ pub mod test_utils {
         /// When set, purge_if_unchanged swaps in this replacement entry
         /// (simulating a concurrent refill) and returns false.
         pub purge_swaps_entry: Mutex<Option<(String, CacheEntry)>>,
+        commit_fill_pause: Mutex<Option<MockCommitFillPause>>,
         pub temp_dir: tempfile::TempDir,
     }
 
@@ -1092,8 +1098,24 @@ pub mod test_utils {
                 poison_calls: Mutex::new(Vec::new()),
                 purge_should_fail: Mutex::new(false),
                 purge_swaps_entry: Mutex::new(None),
+                commit_fill_pause: Mutex::new(None),
                 temp_dir: tempfile::TempDir::new().expect("create mock cache temp dir"),
             }
+        }
+
+        pub fn pause_next_commit_fill(
+            &self,
+        ) -> (
+            tokio::sync::oneshot::Receiver<()>,
+            std::sync::Arc<tokio::sync::Notify>,
+        ) {
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let release = std::sync::Arc::new(tokio::sync::Notify::new());
+            *self.commit_fill_pause.lock().unwrap() = Some(MockCommitFillPause {
+                started: Some(started_tx),
+                release: std::sync::Arc::clone(&release),
+            });
+            (started_rx, release)
         }
 
         /// Stage a replacement entry that will be swapped in when
@@ -1286,6 +1308,14 @@ pub mod test_utils {
             temp_body_path: PathBuf,
             mut meta: CacheMeta,
         ) -> Result<(), ProxyError> {
+            let pause = { self.commit_fill_pause.lock().unwrap().take() };
+            if let Some(mut pause) = pause {
+                if let Some(started) = pause.started.take() {
+                    let _ = started.send(());
+                }
+                pause.release.notified().await;
+            }
+
             // Hold both locks atomically, then recheck generation inside the
             // critical section so a concurrent purge/poison cannot race in.
             let mut entries = self.entries.lock().unwrap();
@@ -1295,6 +1325,9 @@ pub mod test_utils {
                 .load(std::sync::atomic::Ordering::Relaxed);
             if guard.generation != current_gen {
                 return Ok(());
+            }
+            if let Some(current) = entries.get(guard.key.hash_hex()) {
+                meta.preserve_same_etag_head_state_from(&current.meta);
             }
             meta.fill_id = self
                 .next_fill_id
