@@ -182,13 +182,15 @@ fn build_cached_head_response(
 fn build_fresh_head_response(
     output: &crate::backend::models::HeadObjectOutput,
     request_id: &str,
-    cache_status: &str,
+    cache_status: Option<&str>,
     include_checksum_headers: bool,
 ) -> Response<Body> {
     let mut headers = head_object_headers(output, include_checksum_headers);
     let common = common_headers(request_id);
     headers.extend(common);
-    with_cache_status(&mut headers, cache_status);
+    if let Some(cache_status) = cache_status {
+        with_cache_status(&mut headers, cache_status);
+    }
 
     let mut response = Response::builder().status(200);
     for (k, v) in headers.iter() {
@@ -364,15 +366,12 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
                 "served from backend"
             );
 
-            let mut headers = head_object_headers(&output, read_options.wants_checksum_headers());
-            let common = common_headers(&parsed.request_id);
-            headers.extend(common);
-
-            let mut response = Response::builder().status(200);
-            for (k, v) in headers.iter() {
-                response = response.header(k, v);
-            }
-            response.body(Body::empty()).unwrap()
+            build_fresh_head_response(
+                &output,
+                &parsed.request_id,
+                None,
+                read_options.wants_checksum_headers(),
+            )
         }
         Err(e) => {
             if let Some(cached_meta) = cache_refresh_target.as_ref() {
@@ -401,10 +400,7 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
                             // the request, serve it. Same pattern as the
                             // transient-error re-probe below.
                             if let Ok(Some(current)) = state.cache.peek(&cache_key).await {
-                                if cache_entry_satisfies_head_request(
-                                    &current.meta,
-                                    read_options,
-                                ) {
+                                if cache_entry_satisfies_head_request(&current.meta, read_options) {
                                     if let Err(hit_err) =
                                         state.cache.note_hit(&cache_key, &current.meta).await
                                     {
@@ -482,7 +478,7 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
                                                 return build_fresh_head_response(
                                                     &retry_output,
                                                     &parsed.request_id,
-                                                    "MISS",
+                                                    Some("MISS"),
                                                     read_options.wants_checksum_headers(),
                                                 );
                                             }
@@ -519,10 +515,7 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
                                         let s3err = S3Error::from_proxy_error(
                                             &retry_err,
                                             &parsed.request_id,
-                                            Some(&format!(
-                                                "/{}/{}",
-                                                state.frontend_bucket, key
-                                            )),
+                                            Some(&format!("/{}/{}", state.frontend_bucket, key)),
                                         );
                                         return s3err.to_response();
                                     }
@@ -530,9 +523,7 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
                             }
                         }
                     }
-                    _ if state.config.cache_serve_stale_on_error
-                        && e.is_transient() =>
-                    {
+                    _ if state.config.cache_serve_stale_on_error && e.is_transient() => {
                         match state.cache.peek(&cache_key).await {
                             // Accept any current entry that satisfies the
                             // request — not just the original fill_id. A
@@ -735,7 +726,13 @@ mod tests {
             _bucket: &str,
             _key: &str,
             _options: ReadOptions,
-        ) -> Result<(crate::backend::models::GetObjectMeta, crate::backend::BoxByteStream), ProxyError> {
+        ) -> Result<
+            (
+                crate::backend::models::GetObjectMeta,
+                crate::backend::BoxByteStream,
+            ),
+            ProxyError,
+        > {
             Err(ProxyError::Backend {
                 source: "unexpected get_object".into(),
                 operation: "get_object".into(),
@@ -765,10 +762,17 @@ mod tests {
         async fn put_object(&self, _req: PutObjectInput) -> Result<PutObjectOutput, ProxyError> {
             unreachable!()
         }
-        async fn delete_object(&self, _bucket: &str, _key: &str) -> Result<DeleteObjectOutput, ProxyError> {
+        async fn delete_object(
+            &self,
+            _bucket: &str,
+            _key: &str,
+        ) -> Result<DeleteObjectOutput, ProxyError> {
             unreachable!()
         }
-        async fn list_objects(&self, _req: ListObjectsInput) -> Result<ListObjectsOutput, ProxyError> {
+        async fn list_objects(
+            &self,
+            _req: ListObjectsInput,
+        ) -> Result<ListObjectsOutput, ProxyError> {
             unreachable!()
         }
         async fn create_multipart_upload(
@@ -820,7 +824,13 @@ mod tests {
             _bucket: &str,
             _key: &str,
             _options: ReadOptions,
-        ) -> Result<(crate::backend::models::GetObjectMeta, crate::backend::BoxByteStream), ProxyError> {
+        ) -> Result<
+            (
+                crate::backend::models::GetObjectMeta,
+                crate::backend::BoxByteStream,
+            ),
+            ProxyError,
+        > {
             Err(ProxyError::Backend {
                 source: "unexpected get_object".into(),
                 operation: "get_object".into(),
@@ -853,10 +863,17 @@ mod tests {
         async fn put_object(&self, _req: PutObjectInput) -> Result<PutObjectOutput, ProxyError> {
             unreachable!()
         }
-        async fn delete_object(&self, _bucket: &str, _key: &str) -> Result<DeleteObjectOutput, ProxyError> {
+        async fn delete_object(
+            &self,
+            _bucket: &str,
+            _key: &str,
+        ) -> Result<DeleteObjectOutput, ProxyError> {
             unreachable!()
         }
-        async fn list_objects(&self, _req: ListObjectsInput) -> Result<ListObjectsOutput, ProxyError> {
+        async fn list_objects(
+            &self,
+            _req: ListObjectsInput,
+        ) -> Result<ListObjectsOutput, ProxyError> {
             unreachable!()
         }
         async fn create_multipart_upload(
@@ -908,7 +925,13 @@ mod tests {
             _bucket: &str,
             _key: &str,
             _options: ReadOptions,
-        ) -> Result<(crate::backend::models::GetObjectMeta, crate::backend::BoxByteStream), ProxyError> {
+        ) -> Result<
+            (
+                crate::backend::models::GetObjectMeta,
+                crate::backend::BoxByteStream,
+            ),
+            ProxyError,
+        > {
             Err(ProxyError::Backend {
                 source: "unexpected get_object".into(),
                 operation: "get_object".into(),
@@ -939,10 +962,17 @@ mod tests {
         async fn put_object(&self, _req: PutObjectInput) -> Result<PutObjectOutput, ProxyError> {
             unreachable!()
         }
-        async fn delete_object(&self, _bucket: &str, _key: &str) -> Result<DeleteObjectOutput, ProxyError> {
+        async fn delete_object(
+            &self,
+            _bucket: &str,
+            _key: &str,
+        ) -> Result<DeleteObjectOutput, ProxyError> {
             unreachable!()
         }
-        async fn list_objects(&self, _req: ListObjectsInput) -> Result<ListObjectsOutput, ProxyError> {
+        async fn list_objects(
+            &self,
+            _req: ListObjectsInput,
+        ) -> Result<ListObjectsOutput, ProxyError> {
             unreachable!()
         }
         async fn create_multipart_upload(
@@ -996,7 +1026,13 @@ mod tests {
             _bucket: &str,
             _key: &str,
             _options: ReadOptions,
-        ) -> Result<(crate::backend::models::GetObjectMeta, crate::backend::BoxByteStream), ProxyError> {
+        ) -> Result<
+            (
+                crate::backend::models::GetObjectMeta,
+                crate::backend::BoxByteStream,
+            ),
+            ProxyError,
+        > {
             Err(ProxyError::Backend {
                 source: "unexpected get_object".into(),
                 operation: "get_object".into(),
@@ -1146,7 +1182,13 @@ mod tests {
         let resp = handle_head(&state, &make_parsed(key), key).await;
 
         assert_eq!(resp.status(), 200);
-        assert_eq!(state.cache.note_miss_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            state
+                .cache
+                .note_miss_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1379,7 +1421,11 @@ mod tests {
         let updated = state.cache.peek(&cache_key).await.unwrap().unwrap();
         // GET-shared checksums survive.
         assert_eq!(
-            updated.meta.extra_headers.get("x-amz-checksum-sha256").unwrap(),
+            updated
+                .meta
+                .extra_headers
+                .get("x-amz-checksum-sha256")
+                .unwrap(),
             "getsum"
         );
         // HEAD-specific checksum surface is empty (HEAD returned none).
@@ -1387,7 +1433,8 @@ mod tests {
 
         // A checksum GET should still return the GET-side checksum.
         let get_resp =
-            crate::handlers::get::handle_get(&state, &make_get_parsed_with_checksum(key), key).await;
+            crate::handlers::get::handle_get(&state, &make_get_parsed_with_checksum(key), key)
+                .await;
         assert_eq!(get_resp.status(), 200);
         assert_eq!(
             get_resp.headers().get("x-amz-checksum-sha256").unwrap(),
@@ -1521,7 +1568,8 @@ mod tests {
         assert!(second.headers().get("x-amz-checksum-sha256").is_none());
 
         let checksum_get =
-            crate::handlers::get::handle_get(&state, &make_get_parsed_with_checksum(key), key).await;
+            crate::handlers::get::handle_get(&state, &make_get_parsed_with_checksum(key), key)
+                .await;
         assert_eq!(checksum_get.status(), 200);
         assert_eq!(checksum_get.headers().get("x-cache").unwrap(), "HIT");
         assert_eq!(
@@ -1647,9 +1695,7 @@ mod tests {
 
         let state_for_req = std::sync::Arc::clone(&state);
         let parsed = make_parsed(key);
-        let handle = tokio::spawn(async move {
-            handle_head(&state_for_req, &parsed, key).await
-        });
+        let handle = tokio::spawn(async move { handle_head(&state_for_req, &parsed, key).await });
 
         // Wait for HEAD to start, then replace cache entry with a satisfiable one.
         started_rx.await.unwrap();
@@ -1667,10 +1713,7 @@ mod tests {
         let resp = handle.await.unwrap();
         // Should serve the newer satisfiable entry, not the backend error.
         assert_eq!(resp.status(), 200);
-        assert_eq!(
-            resp.headers().get("x-cache").unwrap(),
-            "STALE"
-        );
+        assert_eq!(resp.headers().get("x-cache").unwrap(), "STALE");
         assert_eq!(
             resp.headers().get("x-amz-archive-status").unwrap(),
             "ARCHIVE_ACCESS"
@@ -1703,10 +1746,9 @@ mod tests {
         // it swaps in a newer satisfiable entry and returns false.
         let mut new_meta = test_cache_meta("test-backend", key, b"cached body");
         new_meta.head_metadata_checked = true;
-        new_meta.head_extra_headers.insert(
-            "x-amz-archive-status".to_string(),
-            "RESTORED".to_string(),
-        );
+        new_meta
+            .head_extra_headers
+            .insert("x-amz-archive-status".to_string(), "RESTORED".to_string());
         cache.stage_purge_replacement(&cache_key, b"cached body", new_meta);
 
         let state = build_app_state(backend, cache, MockAuth::allow_all());
@@ -1787,7 +1829,13 @@ mod tests {
 
         // Backend HEAD was called twice: initial 404 + retry.
         assert_eq!(state.backend.head_calls.lock().unwrap().len(), 2);
-        assert_eq!(state.cache.note_miss_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            state
+                .cache
+                .note_miss_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
         assert!(state.cache.lookup(&cache_key).await.unwrap().is_none());
     }
 
@@ -1843,7 +1891,13 @@ mod tests {
 
         assert_eq!(resp.status(), 502);
         assert_eq!(state.backend.head_calls.lock().unwrap().len(), 2);
-        assert_eq!(state.cache.note_miss_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            state
+                .cache
+                .note_miss_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1866,7 +1920,13 @@ mod tests {
 
         assert_eq!(resp.status(), 404);
         assert_eq!(state.backend.head_calls.lock().unwrap().len(), 2);
-        assert_eq!(state.cache.note_miss_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            state
+                .cache
+                .note_miss_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
         assert!(state.cache.lookup(&cache_key).await.unwrap().is_none());
     }
 
@@ -1884,7 +1944,8 @@ mod tests {
 
         let state_for_request = Arc::clone(&state);
         let parsed = make_parsed(key);
-        let handle = tokio::spawn(async move { handle_head(&state_for_request, &parsed, key).await });
+        let handle =
+            tokio::spawn(async move { handle_head(&state_for_request, &parsed, key).await });
 
         started_rx.await.unwrap();
         assert!(state.cache.purge(&cache_key).await.unwrap());
@@ -2158,7 +2219,8 @@ mod tests {
         // Checksum GET falls through to backend GET (HEAD can't flip
         // checksum_mode_checked) and gets GET-derived checksums.
         let get =
-            crate::handlers::get::handle_get(&state, &make_get_parsed_with_checksum(key), key).await;
+            crate::handlers::get::handle_get(&state, &make_get_parsed_with_checksum(key), key)
+                .await;
         assert_eq!(get.status(), 200);
         assert_eq!(get.headers().get("x-cache").unwrap(), "MISS");
         // GET response has GET-derived checksum, not HEAD-derived.
@@ -2217,7 +2279,8 @@ mod tests {
             }));
 
         let get_resp =
-            crate::handlers::get::handle_get(&state, &make_get_parsed_with_checksum(key), key).await;
+            crate::handlers::get::handle_get(&state, &make_get_parsed_with_checksum(key), key)
+                .await;
         assert_eq!(get_resp.status(), 200);
         assert_eq!(get_resp.headers().get("x-cache").unwrap(), "MISS");
         let get_body = axum::body::to_bytes(get_resp.into_body(), 4096)

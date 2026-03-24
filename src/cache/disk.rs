@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use crate::cache::entry::CacheEntry;
 use crate::cache::key::CacheKey;
@@ -9,10 +9,6 @@ use crate::cache::metadata::CacheMeta;
 use crate::cache::policy::CachePolicy;
 use crate::cache::{CacheStats, CacheStatsSnapshot, CacheStore, FillGuard};
 use crate::error::ProxyError;
-
-/// Monotonic counter for `CacheMeta.fill_id`. Seeded from the highest
-/// on-disk `fill_id` at startup so IDs remain unique across restarts.
-static FILL_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Check if a path exists, distinguishing NotFound from real I/O errors.
 async fn check_exists(path: &std::path::Path, operation: &str) -> Result<bool, ProxyError> {
@@ -58,8 +54,16 @@ pub struct DiskCache {
     /// Entries are created on demand and never removed (the overhead is
     /// one Arc<Mutex> per unique key that has ever been written or hit).
     meta_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// In-memory poison fence consulted alongside the durable `.poisoned`
+    /// marker. `poison()` inserts here before writing the marker so a marker
+    /// write failure still fails closed for the lifetime of this process.
+    poisoned_hashes: std::sync::Mutex<HashSet<String>>,
+    next_fill_id: std::sync::atomic::AtomicU64,
+    fill_id_persist_lock: tokio::sync::Mutex<()>,
     #[cfg(test)]
     commit_rename_fail_after_body_for_test: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    poison_marker_write_fail_for_test: std::sync::atomic::AtomicBool,
 }
 
 impl DiskCache {
@@ -84,18 +88,23 @@ impl DiskCache {
                 operation: "create tmp dir".into(),
             })?;
 
-        // Load stats from existing cached files and discover the highest
-        // fill_id already persisted so the counter starts above it.
-        let (stats, max_fill_id) = Self::scan_existing_stats(&cache_dir).await?;
-        FILL_ID_COUNTER.fetch_max(max_fill_id.saturating_add(1), Ordering::Relaxed);
+        // Load startup stats and derive the next fill_id to allocate.
+        let (stats, max_fill_id, saw_cache_files) = Self::scan_existing_stats(&cache_dir).await?;
+        let next_fill_id =
+            Self::load_next_fill_id(&cache_dir, max_fill_id, saw_cache_files).await?;
 
         Ok(Self {
             cache_dir,
             stats: Arc::new(stats),
             active_fills: tokio::sync::RwLock::new(HashMap::new()),
             meta_locks: std::sync::Mutex::new(HashMap::new()),
+            poisoned_hashes: std::sync::Mutex::new(HashSet::new()),
+            next_fill_id: std::sync::atomic::AtomicU64::new(next_fill_id),
+            fill_id_persist_lock: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             commit_rename_fail_after_body_for_test: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            poison_marker_write_fail_for_test: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -105,24 +114,166 @@ impl DiskCache {
             .store(true, Ordering::Relaxed);
     }
 
-    /// Scan the objects directory to compute initial stats at startup and
-    /// discover the highest `fill_id` already on disk. The periodic eviction
-    /// scan reconciles stats against filesystem reality on every pass.
+    #[cfg(test)]
+    fn arm_poison_marker_write_fail_for_test(&self) {
+        self.poison_marker_write_fail_for_test
+            .store(true, Ordering::Relaxed);
+    }
+
+    fn fill_id_counter_path_for(cache_dir: &std::path::Path) -> PathBuf {
+        cache_dir.join(".fill_id_counter")
+    }
+
+    fn fill_id_counter_path(&self) -> PathBuf {
+        Self::fill_id_counter_path_for(&self.cache_dir)
+    }
+
+    async fn read_persisted_fill_id_counter(
+        counter_path: &std::path::Path,
+    ) -> Result<Option<u64>, ProxyError> {
+        let bytes = match tokio::fs::read(counter_path).await {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(ProxyError::Cache {
+                    source: Box::new(e),
+                    operation: "read fill_id counter".into(),
+                });
+            }
+        };
+
+        let text = String::from_utf8(bytes).map_err(|e| ProxyError::Cache {
+            source: Box::new(e),
+            operation: "parse fill_id counter".into(),
+        })?;
+        let counter = text.trim().parse::<u64>().map_err(|e| ProxyError::Cache {
+            source: Box::new(e),
+            operation: "parse fill_id counter".into(),
+        })?;
+        if counter == 0 {
+            return Err(ProxyError::Cache {
+                source: "fill_id counter must be >= 1".into(),
+                operation: "parse fill_id counter".into(),
+            });
+        }
+        Ok(Some(counter))
+    }
+
+    async fn load_next_fill_id(
+        cache_dir: &std::path::Path,
+        scan_max_fill_id: u64,
+        saw_cache_files: bool,
+    ) -> Result<u64, ProxyError> {
+        let scan_next_fill_id = scan_max_fill_id.saturating_add(1).max(1);
+        let counter_path = Self::fill_id_counter_path_for(cache_dir);
+        match Self::read_persisted_fill_id_counter(&counter_path).await? {
+            Some(counter_file_value) => Ok(counter_file_value.max(scan_next_fill_id)),
+            None if saw_cache_files => {
+                tracing::warn!(
+                    path = %counter_path.display(),
+                    scan_max_fill_id,
+                    "fill_id counter file missing on non-empty cache; falling back to startup scan"
+                );
+                Ok(scan_next_fill_id)
+            }
+            None => Ok(1),
+        }
+    }
+
+    async fn persist_fill_id_counter(&self, next_fill_id: u64) -> Result<(), ProxyError> {
+        static COUNTER_FILE_TMP_ID: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+
+        let tmp_dir = self.cache_dir.join("tmp");
+        let id = COUNTER_FILE_TMP_ID.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let tmp_path = tmp_dir.join(format!("{pid}-{id}.fill_id_counter.tmp"));
+        let counter_path = self.fill_id_counter_path();
+        let bytes = next_fill_id.to_string().into_bytes();
+
+        if let Err(e) = tokio::fs::write(&tmp_path, &bytes).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(ProxyError::Cache {
+                source: Box::new(e),
+                operation: "write fill_id counter temp file".into(),
+            });
+        }
+
+        let file = match tokio::fs::File::open(&tmp_path).await {
+            Ok(file) => file,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                return Err(ProxyError::Cache {
+                    source: Box::new(e),
+                    operation: "open fill_id counter temp file".into(),
+                });
+            }
+        };
+        if let Err(e) = file.sync_all().await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(ProxyError::Cache {
+                source: Box::new(e),
+                operation: "fsync fill_id counter temp file".into(),
+            });
+        }
+
+        if let Err(e) = tokio::fs::rename(&tmp_path, &counter_path).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(ProxyError::Cache {
+                source: Box::new(e),
+                operation: "rename fill_id counter".into(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Persist `.fill_id_counter` separately from the cache entry metadata so
+    /// startup never relies solely on a best-effort full scan to avoid fill_id
+    /// reuse. Each fill reserves an ID in memory, fsyncs the updated
+    /// next-allocatable counter file, and only then publishes the entry. Crashes
+    /// or later publish failures may leak gaps, which is acceptable, but ID
+    /// reuse is not because `fill_id` is the CAS fence for cache invalidation.
+    ///
+    /// This assumes a single cache-owning process/instance per `cache_dir`.
+    /// Supporting multiple concurrent owners would require file locking around
+    /// both the in-memory counter and `.fill_id_counter` updates.
+    async fn reserve_fill_id(&self) -> Result<u64, ProxyError> {
+        let _guard = self.fill_id_persist_lock.lock().await;
+        let fill_id = self
+            .next_fill_id
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| ProxyError::Cache {
+                source: "fill_id counter overflow".into(),
+                operation: "reserve fill_id".into(),
+            })?;
+        let next_fill_id = fill_id.saturating_add(1);
+        self.persist_fill_id_counter(next_fill_id).await?;
+        Ok(fill_id)
+    }
+
+    /// Scan the objects directory to compute initial stats at startup. The
+    /// dedicated `.fill_id_counter` file is the primary source of the next
+    /// allocatable `fill_id`; the metadata scan only contributes a fallback
+    /// `max_fill_id` safety net for older caches and consistency checks.
     async fn scan_existing_stats(
         cache_dir: &std::path::Path,
-    ) -> Result<(CacheStats, u64), ProxyError> {
+    ) -> Result<(CacheStats, u64, bool), ProxyError> {
         let objects_dir = cache_dir.join("objects");
         let stats = CacheStats::default();
         let mut max_fill_id: u64 = 0;
+        let mut saw_cache_files = false;
 
         let mut d1_entries = match tokio::fs::read_dir(&objects_dir).await {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok((stats, max_fill_id));
+                return Ok((stats, max_fill_id, saw_cache_files));
             }
             Err(e) => {
                 tracing::warn!(error = %e, "failed to read objects directory during scan");
-                return Ok((stats, max_fill_id));
+                return Ok((stats, max_fill_id, saw_cache_files));
             }
         };
 
@@ -185,6 +336,7 @@ impl DiskCache {
                         Some(n) => n.to_string(),
                         None => continue,
                     };
+                    saw_cache_files = true;
 
                     if file_name.ends_with(".body") {
                         let hash = file_name.trim_end_matches(".body");
@@ -258,7 +410,7 @@ impl DiskCache {
             }
         }
 
-        Ok((stats, max_fill_id))
+        Ok((stats, max_fill_id, saw_cache_files))
     }
 
     /// Build paths for the body and metadata files for a given key.
@@ -358,6 +510,54 @@ impl DiskCache {
         &self.stats
     }
 
+    fn is_poisoned_in_memory(&self, key: &CacheKey) -> bool {
+        self.poisoned_hashes
+            .lock()
+            .unwrap()
+            .contains(key.hash_hex())
+    }
+
+    fn mark_poisoned_in_memory(&self, key: &CacheKey) {
+        self.poisoned_hashes
+            .lock()
+            .unwrap()
+            .insert(key.hash_hex().to_string());
+    }
+
+    fn clear_poisoned_in_memory(&self, key: &CacheKey) {
+        self.poisoned_hashes.lock().unwrap().remove(key.hash_hex());
+    }
+
+    async fn write_poison_marker(&self, key: &CacheKey) -> Result<(), ProxyError> {
+        let path = self.poison_path_for_key(key);
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| ProxyError::Cache {
+                    source: Box::new(e),
+                    operation: "create poison marker dir".into(),
+                })?;
+        }
+
+        #[cfg(test)]
+        if self
+            .poison_marker_write_fail_for_test
+            .swap(false, Ordering::Relaxed)
+        {
+            return Err(ProxyError::Cache {
+                source: "injected poison marker failure".into(),
+                operation: "write poison marker".into(),
+            });
+        }
+
+        tokio::fs::write(&path, b"")
+            .await
+            .map_err(|e| ProxyError::Cache {
+                source: Box::new(e),
+                operation: "write poison marker".into(),
+            })
+    }
+
     async fn restore_publish_backup(
         final_path: &std::path::Path,
         backup_path: &std::path::Path,
@@ -399,23 +599,23 @@ impl DiskCache {
         expected_fill_id: u64,
         now: chrono::DateTime<chrono::Utc>,
     ) {
-        static ACCESS_COUNTER: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
+        static ACCESS_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
         let _guard = meta_lock.lock().await;
 
-        let (mut current_meta, current_len) = if let Ok(current_bytes) = tokio::fs::read(&meta_path).await {
-            if let Ok(current_meta) = serde_json::from_slice::<CacheMeta>(&current_bytes) {
-                if current_meta.fill_id != expected_fill_id {
+        let (mut current_meta, current_len) =
+            if let Ok(current_bytes) = tokio::fs::read(&meta_path).await {
+                if let Ok(current_meta) = serde_json::from_slice::<CacheMeta>(&current_bytes) {
+                    if current_meta.fill_id != expected_fill_id {
+                        return;
+                    }
+                    (current_meta, current_bytes.len() as u64)
+                } else {
                     return;
                 }
-                (current_meta, current_bytes.len() as u64)
             } else {
                 return;
-            }
-        } else {
-            return;
-        };
+            };
         if current_meta.last_accessed_at >= now {
             return;
         }
@@ -433,7 +633,9 @@ impl DiskCache {
                     let new_len = bytes.len() as u64;
                     match new_len.cmp(&current_len) {
                         std::cmp::Ordering::Greater => {
-                            stats.total_bytes.fetch_add(new_len - current_len, Ordering::Relaxed);
+                            stats
+                                .total_bytes
+                                .fetch_add(new_len - current_len, Ordering::Relaxed);
                         }
                         std::cmp::Ordering::Less => {
                             let delta = current_len - new_len;
@@ -572,7 +774,14 @@ impl DiskCache {
                 }
             }
 
-            meta.fill_id = FILL_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+            meta.fill_id = match self.reserve_fill_id().await {
+                Ok(fill_id) => fill_id,
+                Err(e) => {
+                    let _ = tokio::fs::remove_file(&temp_body_path).await;
+                    let _ = tokio::fs::remove_file(&temp_meta).await;
+                    return Err(e);
+                }
+            };
             meta.metadata_version = 0;
 
             // Write metadata to temp file after reconciling against the latest
@@ -737,6 +946,7 @@ impl DiskCache {
             // Clear any stale poison marker while the publish locks are still
             // held so a newer poison() call cannot race and have its marker
             // erased by this fill.
+            self.clear_poisoned_in_memory(&guard.key);
             let _ = tokio::fs::remove_file(&self.poison_path_for_key(&guard.key)).await;
         }
 
@@ -839,6 +1049,7 @@ impl CacheStore for DiskCache {
         let meta_exists = check_exists(&meta_path, "check meta for purge").await?;
 
         if !body_exists && !meta_exists {
+            self.clear_poisoned_in_memory(key);
             let _ = tokio::fs::remove_file(&self.poison_path_for_key(key)).await;
             return Ok(false);
         }
@@ -886,6 +1097,7 @@ impl CacheStore for DiskCache {
             );
         }
 
+        self.clear_poisoned_in_memory(key);
         let _ = tokio::fs::remove_file(&self.poison_path_for_key(key)).await;
 
         Ok(removed)
@@ -938,6 +1150,7 @@ impl CacheStore for DiskCache {
         let meta_exists = check_exists(&meta_path, "check meta for conditional purge").await?;
 
         if !body_exists && !meta_exists {
+            self.clear_poisoned_in_memory(key);
             let _ = tokio::fs::remove_file(&self.poison_path_for_key(key)).await;
             return Ok(false);
         }
@@ -985,6 +1198,7 @@ impl CacheStore for DiskCache {
             );
         }
 
+        self.clear_poisoned_in_memory(key);
         let _ = tokio::fs::remove_file(&self.poison_path_for_key(key)).await;
 
         Ok(removed)
@@ -1012,21 +1226,8 @@ impl CacheStore for DiskCache {
         let meta_lock = self.meta_lock_for(key);
         let _guard = meta_lock.lock().await;
 
-        let path = self.poison_path_for_key(key);
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| ProxyError::Cache {
-                    source: Box::new(e),
-                    operation: "create poison marker dir".into(),
-                })?;
-        }
-        tokio::fs::write(&path, b"")
-            .await
-            .map_err(|e| ProxyError::Cache {
-                source: Box::new(e),
-                operation: "write poison marker".into(),
-            })
+        self.mark_poisoned_in_memory(key);
+        self.write_poison_marker(key).await
     }
 
     async fn poison_if_unchanged(
@@ -1072,21 +1273,8 @@ impl CacheStore for DiskCache {
             entry.generation.fetch_add(1, Ordering::Release);
         }
 
-        let poison_path = self.poison_path_for_key(key);
-        if let Some(parent) = poison_path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| ProxyError::Cache {
-                    source: Box::new(e),
-                    operation: "create poison marker dir".into(),
-                })?;
-        }
-        tokio::fs::write(&poison_path, b"")
-            .await
-            .map_err(|e| ProxyError::Cache {
-                source: Box::new(e),
-                operation: "write poison marker".into(),
-            })?;
+        self.mark_poisoned_in_memory(key);
+        self.write_poison_marker(key).await?;
 
         Ok(true)
     }
@@ -1237,7 +1425,13 @@ impl DiskCache {
         pin_body: bool,
     ) -> Result<Option<CacheEntry>, ProxyError> {
         let poison_path = self.poison_path_for_key(key);
-        if check_exists(&poison_path, "check poison marker").await? {
+        // Check both the durable poison marker and the in-memory poison fence.
+        // The in-memory fence is inserted before we attempt the marker write so
+        // a marker-write failure still fails closed for the lifetime of this
+        // process instead of serving stale data until restart.
+        if self.is_poisoned_in_memory(key)
+            || check_exists(&poison_path, "check poison marker").await?
+        {
             if track_access {
                 self.stats.miss_count.fetch_add(1, Ordering::Relaxed);
             }
@@ -1249,7 +1443,9 @@ impl DiskCache {
         let meta_guard = meta_lock.lock().await;
 
         // Re-check the poison marker after acquiring meta_lock.
-        if check_exists(&poison_path, "recheck poison marker").await? {
+        if self.is_poisoned_in_memory(key)
+            || check_exists(&poison_path, "recheck poison marker").await?
+        {
             drop(meta_guard);
             if track_access {
                 self.stats.miss_count.fetch_add(1, Ordering::Relaxed);
@@ -1488,6 +1684,19 @@ mod tests {
         temp_path
     }
 
+    async fn read_fill_id_counter(cache_dir: &std::path::Path) -> u64 {
+        let bytes = tokio::fs::read(DiskCache::fill_id_counter_path_for(cache_dir))
+            .await
+            .unwrap();
+        String::from_utf8(bytes).unwrap().trim().parse().unwrap()
+    }
+
+    async fn write_fill_id_counter(cache_dir: &std::path::Path, value: &str) {
+        tokio::fs::write(DiskCache::fill_id_counter_path_for(cache_dir), value)
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn test_lookup_empty_cache_returns_none() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1565,7 +1774,10 @@ mod tests {
         new_meta.etag = Some("\"new-etag\"".into());
         let new_temp_path = write_temp_body(tmp.path(), &new_body).await;
         let new_guard = cache.begin_fill(&key).await.unwrap();
-        let err = cache.commit_fill(new_guard, new_temp_path, new_meta).await.unwrap_err();
+        let err = cache
+            .commit_fill(new_guard, new_temp_path, new_meta)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("rename metadata"));
 
         let entry = cache.lookup(&key).await.unwrap().unwrap();
@@ -1888,10 +2100,12 @@ mod tests {
         );
         let expected_fill_id = updated_meta.fill_id;
 
-        assert!(cache
-            .update_metadata_if_unchanged(&key, expected_fill_id, updated_meta)
-            .await
-            .unwrap());
+        assert!(
+            cache
+                .update_metadata_if_unchanged(&key, expected_fill_id, updated_meta)
+                .await
+                .unwrap()
+        );
 
         let after_size = tokio::fs::metadata(&meta_path).await.unwrap().len();
         let after_stats = cache.stats().await;
@@ -1945,10 +2159,12 @@ mod tests {
             .insert("fresh".to_string(), "meta".to_string());
         stale_incoming.head_metadata_checked = true;
 
-        assert!(!cache
-            .update_metadata_if_unchanged(&key, current_meta.fill_id, stale_incoming,)
-            .await
-            .unwrap());
+        assert!(
+            !cache
+                .update_metadata_if_unchanged(&key, current_meta.fill_id, stale_incoming,)
+                .await
+                .unwrap()
+        );
 
         let updated: CacheMeta =
             serde_json::from_slice(&tokio::fs::read(&meta_path).await.unwrap()).unwrap();
@@ -2091,51 +2307,36 @@ mod tests {
         let after_stats = cache.stats().await;
         let expected_total_bytes = match after_size.cmp(&before_size) {
             std::cmp::Ordering::Greater => before_stats.total_bytes + (after_size - before_size),
-            std::cmp::Ordering::Less => {
-                before_stats.total_bytes.saturating_sub(before_size - after_size)
-            }
+            std::cmp::Ordering::Less => before_stats
+                .total_bytes
+                .saturating_sub(before_size - after_size),
             std::cmp::Ordering::Equal => before_stats.total_bytes,
         };
         assert_eq!(after_stats.total_bytes, expected_total_bytes);
     }
 
-    /// Verify that DiskCache::new seeds the counter from on-disk fill_ids.
+    /// Verify that DiskCache::new reloads the persisted next fill_id and keeps
+    /// allocating strictly newer generations across restarts.
     #[tokio::test]
     async fn test_fill_id_survives_restart() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cache_dir = tmp.path().to_path_buf();
         let key = test_key();
-        let body = b"restart data".to_vec();
-        let old_fill_id = 1_000_000_000_000_000_000u64;
-
-        // Seed the cache directory with a very large on-disk fill_id so the
-        // reseed path is exercised without mutating the process-wide counter
-        // from the test body.
         let cache1 = DiskCache::new(cache_dir.clone(), 1_000_000, test_policy())
             .await
             .unwrap();
-        let (body_path, meta_path) = cache1.paths_for_key(&key);
-        if let Some(parent) = body_path.parent() {
-            tokio::fs::create_dir_all(parent).await.unwrap();
-        }
-        let mut meta = test_meta(body.len());
-        meta.fill_id = old_fill_id;
-        tokio::fs::write(&body_path, &body).await.unwrap();
-        tokio::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap())
-            .await
-            .unwrap();
+        let body = b"restart data".to_vec();
+        let meta = test_meta(body.len());
+        let temp_path = write_temp_body(tmp.path(), &body).await;
+        let guard = cache1.begin_fill(&key).await.unwrap();
+        cache1.commit_fill(guard, temp_path, meta).await.unwrap();
+        let old_fill_id = cache1.lookup(&key).await.unwrap().unwrap().meta.fill_id;
+        assert_eq!(read_fill_id_counter(tmp.path()).await, old_fill_id + 1);
         drop(cache1);
 
-        // DiskCache::new must re-seed from the on-disk max.
         let cache2 = DiskCache::new(cache_dir.clone(), 1_000_000, test_policy())
             .await
             .unwrap();
-
-        // Verify counter was re-seeded above the on-disk max.
-        assert!(
-            FILL_ID_COUNTER.load(Ordering::Relaxed) > old_fill_id,
-            "FILL_ID_COUNTER was not re-seeded from disk"
-        );
         let body2 = b"new restart data".to_vec();
         let meta2 = test_meta(body2.len());
         let temp_path2 = write_temp_body(tmp.path(), &body2).await;
@@ -2147,11 +2348,96 @@ mod tests {
             new_fill_id > old_fill_id,
             "fill_id did not survive restart: old={old_fill_id}, new={new_fill_id}"
         );
+        assert_eq!(read_fill_id_counter(tmp.path()).await, new_fill_id + 1);
 
-        assert!(!cache2
-            .purge_if_unchanged(&key, old_fill_id)
+        assert!(!cache2.purge_if_unchanged(&key, old_fill_id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_fill_id_missing_counter_on_non_empty_cache_falls_back_to_scan() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+        let key = test_key();
+
+        let cache1 = DiskCache::new(cache_dir.clone(), 1_000_000, test_policy())
             .await
-            .unwrap());
+            .unwrap();
+        let body = b"scan fallback old".to_vec();
+        let meta = test_meta(body.len());
+        let temp_path = write_temp_body(tmp.path(), &body).await;
+        let guard = cache1.begin_fill(&key).await.unwrap();
+        cache1.commit_fill(guard, temp_path, meta).await.unwrap();
+        let old_fill_id = cache1.lookup(&key).await.unwrap().unwrap().meta.fill_id;
+
+        tokio::fs::remove_file(DiskCache::fill_id_counter_path_for(tmp.path()))
+            .await
+            .unwrap();
+        drop(cache1);
+
+        let cache2 = DiskCache::new(cache_dir, 1_000_000, test_policy())
+            .await
+            .unwrap();
+        let body2 = b"scan fallback new".to_vec();
+        let meta2 = test_meta(body2.len());
+        let temp_path2 = write_temp_body(tmp.path(), &body2).await;
+        let guard2 = cache2.begin_fill(&key).await.unwrap();
+        cache2.commit_fill(guard2, temp_path2, meta2).await.unwrap();
+
+        let new_fill_id = cache2.lookup(&key).await.unwrap().unwrap().meta.fill_id;
+        assert!(new_fill_id > old_fill_id);
+        assert_eq!(read_fill_id_counter(tmp.path()).await, new_fill_id + 1);
+    }
+
+    #[tokio::test]
+    async fn test_fill_id_corrupt_counter_is_startup_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_fill_id_counter(tmp.path(), "not-a-u64").await;
+
+        let err = DiskCache::new(tmp.path().to_path_buf(), 1_000_000, test_policy())
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("parse fill_id counter"));
+    }
+
+    #[tokio::test]
+    async fn test_fill_id_counter_wins_over_lower_scan_result() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+        let key = test_key();
+        let cache1 = DiskCache::new(cache_dir.clone(), 1_000_000, test_policy())
+            .await
+            .unwrap();
+        let (body_path, meta_path) = cache1.paths_for_key(&key);
+        if let Some(parent) = body_path.parent() {
+            tokio::fs::create_dir_all(parent).await.unwrap();
+        }
+
+        let legacy_body = b"legacy data".to_vec();
+        let mut legacy_meta = test_meta(legacy_body.len());
+        legacy_meta.fill_id = 7;
+        tokio::fs::write(&body_path, &legacy_body).await.unwrap();
+        tokio::fs::write(&meta_path, serde_json::to_vec(&legacy_meta).unwrap())
+            .await
+            .unwrap();
+        write_fill_id_counter(tmp.path(), "100").await;
+        drop(cache1);
+
+        let cache2 = DiskCache::new(cache_dir, 1_000_000, test_policy())
+            .await
+            .unwrap();
+        let new_body = b"new data".to_vec();
+        let new_meta = test_meta(new_body.len());
+        let temp_path = write_temp_body(tmp.path(), &new_body).await;
+        let guard = cache2.begin_fill(&key).await.unwrap();
+        cache2
+            .commit_fill(guard, temp_path, new_meta)
+            .await
+            .unwrap();
+
+        let fill_id = cache2.lookup(&key).await.unwrap().unwrap().meta.fill_id;
+        assert_eq!(fill_id, 100);
+        assert_eq!(read_fill_id_counter(tmp.path()).await, 101);
     }
 
     #[tokio::test]
@@ -2171,10 +2457,12 @@ mod tests {
         let entry = cache.lookup(&key).await.unwrap().unwrap();
         let expected_fill_id = entry.meta.fill_id;
 
-        assert!(cache
-            .purge_if_unchanged(&key, expected_fill_id)
-            .await
-            .unwrap());
+        assert!(
+            cache
+                .purge_if_unchanged(&key, expected_fill_id)
+                .await
+                .unwrap()
+        );
         assert!(cache.lookup(&key).await.unwrap().is_none());
 
         let s = cache.stats().await;
@@ -2205,10 +2493,7 @@ mod tests {
         let new_meta = test_meta(new_body.len());
 
         let wrong_fill_id = u64::MAX;
-        assert!(!cache
-            .purge_if_unchanged(&key, wrong_fill_id)
-            .await
-            .unwrap());
+        assert!(!cache.purge_if_unchanged(&key, wrong_fill_id).await.unwrap());
 
         cache
             .commit_fill(fill_guard, new_temp_path, new_meta)
@@ -2240,10 +2525,12 @@ mod tests {
 
         let stale_guard = cache.begin_fill(&key).await.unwrap();
 
-        assert!(cache
-            .poison_if_unchanged(&key, expected_fill_id)
-            .await
-            .unwrap());
+        assert!(
+            cache
+                .poison_if_unchanged(&key, expected_fill_id)
+                .await
+                .unwrap()
+        );
         let poison_path = cache.poison_path_for_key(&key);
         assert!(tokio::fs::try_exists(&poison_path).await.unwrap());
 
@@ -2322,6 +2609,35 @@ mod tests {
         cache.poison(&key).await.unwrap();
 
         // Lookup should now return None (cache miss)
+        assert!(cache.lookup(&key).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_poison_marker_write_failure_still_blocks_lookup() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = DiskCache::new(tmp.path().to_path_buf(), 1_000_000, test_policy())
+            .await
+            .unwrap();
+
+        let key = test_key();
+        let body = b"cached data".to_vec();
+        let meta = test_meta(body.len());
+        let temp_path = write_temp_body(tmp.path(), &body).await;
+        let guard = cache.begin_fill(&key).await.unwrap();
+        cache.commit_fill(guard, temp_path, meta).await.unwrap();
+
+        let (body_path, meta_path) = cache.paths_for_key(&key);
+        cache.arm_poison_marker_write_fail_for_test();
+
+        let err = cache.poison(&key).await.unwrap_err();
+        assert!(err.to_string().contains("write poison marker"));
+        assert!(tokio::fs::try_exists(&body_path).await.unwrap());
+        assert!(tokio::fs::try_exists(&meta_path).await.unwrap());
+        assert!(
+            !tokio::fs::try_exists(&cache.poison_path_for_key(&key))
+                .await
+                .unwrap()
+        );
         assert!(cache.lookup(&key).await.unwrap().is_none());
     }
 
@@ -2525,7 +2841,10 @@ mod tests {
         old_meta.etag = Some("\"old-etag\"".into());
         let old_temp = write_temp_body(tmp.path(), &old_body).await;
         let old_guard = cache.begin_fill(&key).await.unwrap();
-        cache.commit_fill(old_guard, old_temp, old_meta).await.unwrap();
+        cache
+            .commit_fill(old_guard, old_temp, old_meta)
+            .await
+            .unwrap();
 
         let looked_up = cache.lookup(&key).await.unwrap().unwrap();
         assert_eq!(looked_up.meta.etag.as_deref(), Some("\"old-etag\""));
@@ -2535,7 +2854,10 @@ mod tests {
         new_meta.etag = Some("\"new-etag\"".into());
         let new_temp = write_temp_body(tmp.path(), &new_body).await;
         let new_guard = cache.begin_fill(&key).await.unwrap();
-        cache.commit_fill(new_guard, new_temp, new_meta).await.unwrap();
+        cache
+            .commit_fill(new_guard, new_temp, new_meta)
+            .await
+            .unwrap();
 
         let mut pinned_file = looked_up.body_file.unwrap();
         let mut pinned_bytes = Vec::new();
