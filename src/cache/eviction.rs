@@ -310,7 +310,12 @@ async fn run_eviction_pass_inner(
     let objects_dir = cache_dir.join("objects");
     match tokio::fs::try_exists(&objects_dir).await {
         Ok(true) => {} // proceed
-        Ok(false) => return Ok(()),
+        Ok(false) => {
+            // No objects directory — reconcile stats to zero.
+            stats.entry_count.store(0, Ordering::Relaxed);
+            stats.total_bytes.store(0, Ordering::Relaxed);
+            return Ok(());
+        }
         Err(e) => {
             tracing::warn!(
                 path = %objects_dir.display(),
@@ -360,7 +365,10 @@ async fn run_eviction_pass_inner(
                 if meta.fill_id != candidate.fill_id
                     || meta.last_accessed_at != candidate.last_accessed_at
                 {
-                    // Entry was replaced or updated since the scan — skip it.
+                    // Entry was replaced or updated since the scan — skip it
+                    // and subtract its scanned size from current_size so
+                    // eviction decisions use an accurate total.
+                    current_size = current_size.saturating_sub(candidate.size);
                     continue;
                 }
             }
