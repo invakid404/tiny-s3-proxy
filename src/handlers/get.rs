@@ -609,7 +609,11 @@ fn spawn_cache_tee<C: CacheStore + 'static>(
                         // client doesn't block the cache fill indefinitely.
                         if client_alive {
                             match tokio::time::timeout(send_timeout, tx.send(Ok(chunk))).await {
-                                Ok(_) => {}
+                                Ok(Ok(())) => {} // sent successfully
+                                Ok(Err(_)) => {
+                                    // Receiver dropped — client disconnected.
+                                    client_alive = false;
+                                }
                                 Err(_) => {
                                     tracing::warn!(
                                         request_id = %req_id_for_tee,

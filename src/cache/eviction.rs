@@ -365,10 +365,22 @@ async fn run_eviction_pass_inner(
                 if meta.fill_id != candidate.fill_id
                     || meta.last_accessed_at != candidate.last_accessed_at
                 {
-                    // Entry was replaced or updated since the scan — skip it
-                    // and subtract its scanned size from current_size so
-                    // eviction decisions use an accurate total.
-                    current_size = current_size.saturating_sub(candidate.size);
+                    // Entry changed since scan — skip eviction but adjust
+                    // current_size to reflect the actual on-disk size (the
+                    // entry still exists, possibly at a different size).
+                    let actual_body = tokio::fs::metadata(&candidate.body_path)
+                        .await
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    let actual_meta = tokio::fs::metadata(&candidate.meta_path)
+                        .await
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    let actual_size = actual_body + actual_meta;
+                    // Replace the scanned size with the measured size.
+                    current_size = current_size
+                        .saturating_sub(candidate.size)
+                        .saturating_add(actual_size);
                     continue;
                 }
             }
