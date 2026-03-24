@@ -374,12 +374,15 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
                         && e.is_transient() =>
                     {
                         match state.cache.peek(&cache_key).await {
+                            // Accept any current entry that satisfies the
+                            // request — not just the original fill_id. A
+                            // concurrent refresh may have replaced the entry
+                            // with a newer one that already has HEAD metadata.
                             Ok(Some(current_entry))
-                                if current_entry.meta.fill_id == cached_meta.fill_id
-                                    && cache_entry_satisfies_head_request(
-                                        &current_entry.meta,
-                                        read_options,
-                                    ) =>
+                                if cache_entry_satisfies_head_request(
+                                    &current_entry.meta,
+                                    read_options,
+                                ) =>
                             {
                                 tracing::warn!(
                                     request_id = %parsed.request_id,
@@ -1200,6 +1203,53 @@ mod tests {
         // Must surface the backend error, not serve incomplete stale metadata.
         assert_eq!(resp.status(), 502);
         assert!(resp.headers().get("x-cache").is_none());
+    }
+
+    /// If the cache entry is replaced with a newer satisfiable entry while
+    /// the backend HEAD is failing, stale fallback should serve the newer
+    /// entry instead of returning the backend error.
+    #[tokio::test]
+    async fn test_plain_head_stale_fallback_serves_newer_satisfiable_entry() {
+        let key = "script_bundle/head-plain-stale-newer.js";
+        let cache_key = crate::cache::key::CacheKey::new("test-backend", key);
+        let mut meta = test_cache_meta("test-backend", key, b"cached body");
+        // Make initial entry NOT satisfy HEAD (needs refresh).
+        meta.head_metadata_checked = false;
+
+        let cache = MockCache::new().with_entry(&cache_key, b"cached body", meta.clone());
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let backend = BlockingHeadErrorBackend::new(started_tx, std::sync::Arc::clone(&release));
+        let state = build_state_with_backend(backend, cache);
+
+        let state_for_req = std::sync::Arc::clone(&state);
+        let parsed = make_parsed(key);
+        let handle = tokio::spawn(async move {
+            handle_head(&state_for_req, &parsed, key).await
+        });
+
+        // Wait for HEAD to start, then replace cache entry with a satisfiable one.
+        started_rx.await.unwrap();
+        {
+            let mut entries = state.cache.entries.lock().unwrap();
+            if let Some(entry) = entries.get_mut(cache_key.hash_hex()) {
+                entry.meta.head_metadata_checked = true;
+                entry.meta.head_extra_headers.insert(
+                    "x-amz-archive-status".to_string(),
+                    "ARCHIVE_ACCESS".to_string(),
+                );
+            }
+        }
+        release.notify_one();
+
+        let resp = handle.await.unwrap();
+        // Should serve the newer satisfiable entry, not the backend error.
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers().get("x-cache").unwrap(),
+            "STALE"
+        );
     }
 
     #[tokio::test]
