@@ -179,6 +179,24 @@ fn build_cached_head_response(
     response.body(Body::empty()).unwrap()
 }
 
+fn build_fresh_head_response(
+    output: &crate::backend::models::HeadObjectOutput,
+    request_id: &str,
+    cache_status: &str,
+    include_checksum_headers: bool,
+) -> Response<Body> {
+    let mut headers = head_object_headers(output, include_checksum_headers);
+    let common = common_headers(request_id);
+    headers.extend(common);
+    with_cache_status(&mut headers, cache_status);
+
+    let mut response = Response::builder().status(200);
+    for (k, v) in headers.iter() {
+        response = response.header(k, v);
+    }
+    response.body(Body::empty()).unwrap()
+}
+
 /// Handle a HeadObject request.
 ///
 /// If the key is cacheable and we have a cached entry, serve metadata from cache.
@@ -430,9 +448,19 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
                                                     read_options.wants_checksum_headers(),
                                                 );
                                             }
-                                            _ => {
-                                                // ETag mismatch on retry — the newer
-                                                // entry is also stale. Fall through.
+                                            CacheRefreshOutcome::EtagMismatch
+                                            | CacheRefreshOutcome::NoStrongMatch => {
+                                                // The retry HEAD proved the object exists.
+                                                // Even if the cache metadata doesn't strongly
+                                                // match, the fresh HEAD response itself is
+                                                // valid and must be returned instead of the
+                                                // stale original 404.
+                                                return build_fresh_head_response(
+                                                    &retry_output,
+                                                    &parsed.request_id,
+                                                    "MISS",
+                                                    read_options.wants_checksum_headers(),
+                                                );
                                             }
                                         }
                                     }
@@ -564,6 +592,7 @@ mod tests {
     use crate::handlers::test_utils::*;
     use crate::s3::ops::{ParsedRequest, S3Operation};
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::{Notify, oneshot};
 
     fn make_parsed(key: &str) -> ParsedRequest {
@@ -643,6 +672,93 @@ mod tests {
             http_client: reqwest::Client::new(),
             config: Arc::new(config),
         })
+    }
+
+    struct Sequential404Then200HeadBackend {
+        head_calls: std::sync::Mutex<Vec<ReadOptions>>,
+        count: AtomicUsize,
+        success_output: std::sync::Mutex<Option<HeadObjectOutput>>,
+    }
+
+    impl Sequential404Then200HeadBackend {
+        fn new(success_output: HeadObjectOutput) -> Self {
+            Self {
+                head_calls: std::sync::Mutex::new(Vec::new()),
+                count: AtomicUsize::new(0),
+                success_output: std::sync::Mutex::new(Some(success_output)),
+            }
+        }
+    }
+
+    impl Backend for Sequential404Then200HeadBackend {
+        async fn get_object(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _options: ReadOptions,
+        ) -> Result<(crate::backend::models::GetObjectMeta, crate::backend::BoxByteStream), ProxyError> {
+            Err(ProxyError::Backend {
+                source: "unexpected get_object".into(),
+                operation: "get_object".into(),
+            })
+        }
+
+        async fn head_object(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            options: ReadOptions,
+        ) -> Result<HeadObjectOutput, ProxyError> {
+            self.head_calls.lock().unwrap().push(options);
+            let call = self.count.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                Err(ProxyError::UpstreamS3 {
+                    status_code: 404,
+                    s3_code: "NoSuchKey".into(),
+                    message: "deleted".into(),
+                    operation: "head_object".into(),
+                })
+            } else {
+                Ok(self.success_output.lock().unwrap().take().unwrap())
+            }
+        }
+
+        async fn put_object(&self, _req: PutObjectInput) -> Result<PutObjectOutput, ProxyError> {
+            unreachable!()
+        }
+        async fn delete_object(&self, _bucket: &str, _key: &str) -> Result<DeleteObjectOutput, ProxyError> {
+            unreachable!()
+        }
+        async fn list_objects(&self, _req: ListObjectsInput) -> Result<ListObjectsOutput, ProxyError> {
+            unreachable!()
+        }
+        async fn create_multipart_upload(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _content_type: Option<&str>,
+            _metadata: &std::collections::HashMap<String, String>,
+            _content_headers: &std::collections::HashMap<String, String>,
+        ) -> Result<CreateMultipartOutput, ProxyError> {
+            unreachable!()
+        }
+        async fn upload_part(&self, _req: UploadPartInput) -> Result<UploadPartOutput, ProxyError> {
+            unreachable!()
+        }
+        async fn complete_multipart_upload(
+            &self,
+            _req: crate::backend::models::CompleteMultipartInput,
+        ) -> Result<CompleteMultipartOutput, ProxyError> {
+            unreachable!()
+        }
+        async fn abort_multipart_upload(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _upload_id: &str,
+        ) -> Result<(), ProxyError> {
+            unreachable!()
+        }
     }
 
     struct BlockingHeadErrorBackend {
@@ -953,7 +1069,7 @@ mod tests {
             extra_headers,
         }));
         let cache = MockCache::new().with_entry(&cache_key, b"cached body", meta);
-        let state = build_app_state(backend, cache, MockAuth::allow_all());
+        let state = build_state_with_backend(backend, cache);
 
         let first = handle_head(&state, &make_parsed_with_checksum(key), key).await;
         assert_eq!(first.status(), 200);
@@ -999,7 +1115,7 @@ mod tests {
             extra_headers: HashMap::new(),
         }));
         let cache = MockCache::new().with_entry(&cache_key, b"cached body", meta);
-        let state = build_app_state(backend, cache, MockAuth::allow_all());
+        let state = build_state_with_backend(backend, cache);
 
         let resp = handle_head(&state, &make_parsed_with_checksum(key), key).await;
         assert_eq!(resp.status(), 200);
@@ -1042,7 +1158,7 @@ mod tests {
             extra_headers: HashMap::new(),
         }));
         let cache = MockCache::new().with_entry(&cache_key, b"cached body", meta);
-        let state = build_app_state(backend, cache, MockAuth::allow_all());
+        let state = build_state_with_backend(backend, cache);
 
         let head_resp = handle_head(&state, &make_parsed_with_checksum(key), key).await;
         assert_eq!(head_resp.status(), 200);
@@ -1087,7 +1203,7 @@ mod tests {
             extra_headers,
         }));
         let cache = MockCache::new().with_entry(&cache_key, b"cached body", stale_meta);
-        let state = build_app_state(backend, cache, MockAuth::allow_all());
+        let state = build_state_with_backend(backend, cache);
 
         let resp = handle_head(&state, &make_parsed_with_checksum(key), key).await;
 
@@ -1419,46 +1535,31 @@ mod tests {
             "ARCHIVE_ACCESS".to_string(),
         );
 
-        // MockBackend: first HEAD call takes the 404, head_response becomes
-        // None. We use head_read_calls to detect the first call completed,
-        // then set the retry response. Since the handler is synchronous within
-        // one task, we set up a sequence: 404 first, then swap in the retry
-        // response via a second with_head equivalent after the first is taken.
-        //
-        // Approach: push two responses using head_responses Vec. Since
-        // MockBackend only has one slot, we'll use a workaround: set the
-        // response to 404, then after handle_head's first head_object call
-        // consumes it, the code retries head_object which finds None. The
-        // retry falls into the default mock path returning Backend error.
-        //
-        // For a true end-to-end test: verify the retry HEAD was attempted (2
-        // head_read_calls) and the handler did NOT return the stale 404.
-        let backend = MockBackend::new().with_head(Err(crate::error::ProxyError::UpstreamS3 {
-            status_code: 404,
-            s3_code: "NoSuchKey".into(),
-            message: "deleted".into(),
-            operation: "head_object".into(),
-        }));
+        // Real end-to-end sequence: first HEAD returns 404, retry HEAD
+        // against the newer generation returns 200 with enrichable metadata.
+        let backend = Sequential404Then200HeadBackend::new(HeadObjectOutput {
+            content_type: Some("text/plain".to_string()),
+            content_length: Some(8),
+            etag: new_etag,
+            last_modified: None,
+            metadata: HashMap::new(),
+            extra_headers: retry_extra,
+        });
 
-        let state = build_app_state(backend, cache, MockAuth::allow_all());
-
-        // Pre-set the retry response. MockBackend.head_object takes from
-        // head_response on each call. We need the FIRST call to get 404 and
-        // the SECOND to get the enrichment response. Since with_head already
-        // set the 404, we can't set both. Instead: verify structurally.
+        let state = build_state_with_backend(backend, cache);
 
         let resp = handle_head(&state, &make_parsed(key), key).await;
 
-        // The handler should have retried HEAD (2 calls total).
-        let head_calls = state.backend.head_read_calls.lock().unwrap();
-        assert_eq!(head_calls.len(), 2, "should retry HEAD against newer generation");
-        drop(head_calls);
+        // Retry succeeded — must return 200, not the stale 404.
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("x-cache").unwrap(), "MISS");
+        assert_eq!(
+            resp.headers().get("x-amz-archive-status").unwrap(),
+            "ARCHIVE_ACCESS"
+        );
 
-        // The retry HEAD returned no response (MockBackend default = Backend
-        // error), so it falls through to the error path. But critically, it
-        // did NOT return the original stale 404 — it retried first.
-        // The response is a 502 (backend error from the retry), not 404.
-        assert_ne!(resp.status(), 404, "must not return stale 404 when newer generation exists");
+        // Backend HEAD was called twice: initial 404 + retry.
+        assert_eq!(state.backend.head_calls.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
