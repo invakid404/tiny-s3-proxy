@@ -197,6 +197,15 @@ async fn collect_candidates(
 
                 let body_size = match tokio::fs::metadata(&body_path).await {
                     Ok(m) => m.len(),
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        // Transient I/O error — skip this entry without cleanup.
+                        tracing::trace!(
+                            hash = hash,
+                            error = %e,
+                            "body metadata probe failed with non-NotFound error, skipping"
+                        );
+                        continue;
+                    }
                     Err(_) => {
                         // Body appears missing — acquire per-key lock and
                         // re-check to avoid racing with commit_fill().
@@ -416,7 +425,9 @@ async fn run_eviction_pass_inner(
                 "evicted cache entry"
             );
         } else {
-            // Partial removal — stats will reconcile on the next scan.
+            // Partial or already-gone — subtract scanned size so the loop
+            // doesn't over-evict. Stats reconcile on the next scan.
+            current_size = current_size.saturating_sub(candidate.size);
             tracing::warn!(
                 path = %candidate.body_path.display(),
                 body_removed,

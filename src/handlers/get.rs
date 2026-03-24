@@ -728,30 +728,36 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
 ) -> Response<Body> {
     let read_options = parsed.read_options();
 
-    // Re-probe cache after acquiring leadership. A concurrent leader may have
-    // published the entry between the initial probe and try_acquire().
-    match state.cache.peek_body(cache_key).await {
+    // Re-probe cache after acquiring leadership. Use metadata-only peek first
+    // to avoid pinning a body file handle unnecessarily. Only open the body
+    // (peek_body) when we're about to serve a HIT.
+    match state.cache.peek(cache_key).await {
         Ok(Some(entry)) if cache_entry_satisfies_read_options(&entry, read_options) => {
-            let meta_for_hit = entry.meta.clone();
-            if let Some(resp) = build_cache_response(
-                entry,
-                &parsed.request_id,
-                "HIT",
-                read_options.wants_checksum_headers(),
-            )
-            .await
-            {
-                if let Err(e) = state.cache.note_hit(cache_key, &meta_for_hit).await {
-                    tracing::warn!(
-                        request_id = %parsed.request_id,
-                        error = %e,
-                        operation = "GetObject",
-                        key = key,
-                        "failed to record cache hit"
-                    );
+            // Entry satisfies — pin the body and serve.
+            if let Ok(Some(pinned)) = state.cache.peek_body(cache_key).await {
+                if cache_entry_satisfies_read_options(&pinned, read_options) {
+                    let meta_for_hit = pinned.meta.clone();
+                    if let Some(resp) = build_cache_response(
+                        pinned,
+                        &parsed.request_id,
+                        "HIT",
+                        read_options.wants_checksum_headers(),
+                    )
+                    .await
+                    {
+                        if let Err(e) = state.cache.note_hit(cache_key, &meta_for_hit).await {
+                            tracing::warn!(
+                                request_id = %parsed.request_id,
+                                error = %e,
+                                operation = "GetObject",
+                                key = key,
+                                "failed to record cache hit"
+                            );
+                        }
+                        waiter.complete().await;
+                        return resp;
+                    }
                 }
-                waiter.complete().await;
-                return resp;
             }
         }
         Ok(Some(entry)) if read_options.wants_checksum_headers() => {
@@ -1766,9 +1772,9 @@ mod tests {
             _key: &CacheKey,
         ) -> Result<Option<CacheEntry>, crate::error::ProxyError> {
             let count = self.peek_body_count.fetch_add(1, Ordering::SeqCst);
-            // Return None for the first two calls (initial probe + leader
-            // re-probe) so the stale-on-error path is exercised.
-            if count < 2 {
+            // Return None for the first call (initial probe). The leader
+            // re-probe now uses peek (metadata-only), not peek_body.
+            if count < 1 {
                 Ok(None)
             } else {
                 match self.entry.as_ref() {
@@ -1941,9 +1947,10 @@ mod tests {
         let resp_body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         assert_eq!(resp_body.as_ref(), stale_body.as_slice());
 
-        assert_eq!(state.cache.peek_count.load(Ordering::SeqCst), 0);
-        // peek_body: 1 initial miss, 1 leader re-probe (miss), 1 stale probe
-        assert_eq!(state.cache.peek_body_count.load(Ordering::SeqCst), 3);
+        // peek: 1 leader re-probe (metadata-only)
+        assert_eq!(state.cache.peek_count.load(Ordering::SeqCst), 1);
+        // peek_body: 1 initial miss, 1 stale probe
+        assert_eq!(state.cache.peek_body_count.load(Ordering::SeqCst), 2);
         assert_eq!(state.cache.lookup_count.load(Ordering::SeqCst), 0);
         // Stale replay records both a miss (backend GET attempted) and a hit
         // (body served from stale cache).
@@ -1980,9 +1987,9 @@ mod tests {
         let resp = handle_get(&state, &parsed, key).await;
 
         assert_eq!(resp.status(), 502);
-        assert_eq!(state.cache.peek_count.load(Ordering::SeqCst), 0);
+        assert_eq!(state.cache.peek_count.load(Ordering::SeqCst), 1);
         // peek_body: 1 initial miss, 1 leader re-probe (miss)
-        assert_eq!(state.cache.peek_body_count.load(Ordering::SeqCst), 2);
+        assert_eq!(state.cache.peek_body_count.load(Ordering::SeqCst), 1);
         assert_eq!(state.cache.lookup_count.load(Ordering::SeqCst), 0);
     }
 
@@ -2017,9 +2024,9 @@ mod tests {
         let resp = handle_get(&state, &parsed, key).await;
 
         assert_eq!(resp.status(), 404);
-        assert_eq!(state.cache.peek_count.load(Ordering::SeqCst), 0);
+        assert_eq!(state.cache.peek_count.load(Ordering::SeqCst), 1);
         // peek_body: 1 initial miss, 1 leader re-probe (miss)
-        assert_eq!(state.cache.peek_body_count.load(Ordering::SeqCst), 2);
+        assert_eq!(state.cache.peek_body_count.load(Ordering::SeqCst), 1);
         assert_eq!(state.cache.lookup_count.load(Ordering::SeqCst), 0);
     }
 
