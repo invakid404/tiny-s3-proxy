@@ -624,6 +624,11 @@ fn spawn_cache_tee<C: CacheStore + 'static>(
                                 }
                             }
                         }
+                        // No reason to keep draining the backend if both the
+                        // cache fill failed and the client is gone.
+                        if !ok && !client_alive {
+                            break;
+                        }
                     }
                     Ok(Some(Err(e))) => {
                         if client_alive {
