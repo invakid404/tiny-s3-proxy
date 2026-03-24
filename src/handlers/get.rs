@@ -801,7 +801,7 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                 .map(|len| state.policy.is_size_cacheable(len as u64))
                 .unwrap_or(false);
 
-            if is_size_cacheable {
+            if is_size_cacheable && fill_guard.is_some() {
                 let temp_body_path =
                     PathBuf::from(&state.config.cache_dir)
                         .join("tmp")
@@ -826,21 +826,8 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                     source_status: 200,
                     metadata: meta.metadata.clone(),
                     extra_headers: meta.extra_headers.clone(),
-                    // Design decision: HEAD-only metadata (x-amz-archive-status,
-                    // HEAD-specific checksums) is intentionally NOT carried
-                    // forward from a prior cache entry, even on ETag match.
-                    // ETag equality proves the object bytes are the same, but
-                    // HEAD-only headers describe mutable storage/archive state
-                    // (e.g. an object can transition between storage classes
-                    // without its ETag changing). Carrying them forward would
-                    // freeze stale archive-state information indefinitely.
-                    // The first plain or checksum HEAD after this fill will do
-                    // one backend HEAD to re-learn the current HEAD surface.
                     head_extra_headers: std::collections::HashMap::new(),
                     head_checksum_headers: std::collections::HashMap::new(),
-                    // True if checksums were requested, OR if the backend
-                    // returned checksum headers anyway (some backends do this
-                    // even without x-amz-checksum-mode: ENABLED).
                     checksum_mode_checked: read_options.wants_checksum_headers()
                         || meta.extra_headers.keys().any(|k| {
                             crate::s3::headers::is_checksum_response_header(k)
@@ -873,6 +860,32 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                 build_meta_response(
                     &meta,
                     body,
+                    &parsed.request_id,
+                    "MISS",
+                    read_options.wants_checksum_headers(),
+                )
+            } else if is_size_cacheable {
+                // Size is cacheable but fill_guard is None (begin_fill failed).
+                // Stream directly without tee — don't block followers on a
+                // fill that can never commit.
+                if let Some(guard) = fill_guard {
+                    state.cache.abort_fill(guard).await;
+                }
+                waiter.complete().await;
+
+                tracing::info!(
+                    request_id = %parsed.request_id,
+                    operation = "GetObject",
+                    key = key,
+                    cache_status = "MISS",
+                    cached = false,
+                    "serving from backend (fill registration failed)"
+                );
+                let _ = state.cache.note_miss().await;
+
+                build_streaming_response(
+                    &meta,
+                    body_stream,
                     &parsed.request_id,
                     "MISS",
                     read_options.wants_checksum_headers(),
