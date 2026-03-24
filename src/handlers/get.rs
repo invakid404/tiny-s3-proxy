@@ -862,6 +862,21 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                             crate::request_id::generate()
                         ));
 
+                // Preserve HEAD-enriched fields across same-ETag fallback GET
+                // fills. HEAD-only metadata describes mutable storage state, so
+                // it is cleared on version changes, but if the GET response ETag
+                // still matches the currently cached entry we can safely carry it
+                // forward instead of forcing the next HEAD to re-enrich again.
+                let preserved_head_state = match state.cache.peek(cache_key).await {
+                    Ok(Some(current)) if current.meta.etag == meta.etag => Some((
+                        current.meta.head_extra_headers.clone(),
+                        current.meta.head_checksum_headers.clone(),
+                        current.meta.head_metadata_checked,
+                        current.meta.head_checksum_checked,
+                    )),
+                    _ => None,
+                };
+
                 let cache_meta = CacheMeta {
                     bucket: state.backend_bucket.to_string(),
                     key: key.to_string(),
@@ -877,22 +892,29 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                     source_status: 200,
                     metadata: meta.metadata.clone(),
                     extra_headers: meta.extra_headers.clone(),
-                    // HEAD-only fields (head_extra_headers, head_checksum_headers,
-                    // head_metadata_checked, head_checksum_checked) are cleared
-                    // because this is a fresh GET fill. HEAD-only metadata
-                    // describes mutable storage/archive state (e.g.
-                    // x-amz-archive-status) that must be revalidated via a
-                    // backend HEAD after every version change. When the ETag
-                    // matches a prior entry, the same-ETag carry-forward logic
-                    // in try_refresh_cached_get_metadata preserves them instead.
-                    head_extra_headers: std::collections::HashMap::new(),
-                    head_checksum_headers: std::collections::HashMap::new(),
+                    // On version changes, clear HEAD-only fields — they describe
+                    // mutable storage/archive state. On same-ETag fallback GETs,
+                    // carry them forward from the current cached entry.
+                    head_extra_headers: preserved_head_state
+                        .as_ref()
+                        .map(|(h, _, _, _)| h.clone())
+                        .unwrap_or_default(),
+                    head_checksum_headers: preserved_head_state
+                        .as_ref()
+                        .map(|(_, h, _, _)| h.clone())
+                        .unwrap_or_default(),
                     checksum_mode_checked: read_options.wants_checksum_headers()
                         || meta.extra_headers.keys().any(|k| {
                             crate::s3::headers::is_checksum_response_header(k)
                         }),
-                    head_metadata_checked: false,
-                    head_checksum_checked: false,
+                    head_metadata_checked: preserved_head_state
+                        .as_ref()
+                        .map(|(_, _, checked, _)| *checked)
+                        .unwrap_or(false),
+                    head_checksum_checked: preserved_head_state
+                        .as_ref()
+                        .map(|(_, _, _, checked)| *checked)
+                        .unwrap_or(false),
                 };
 
                 let body = spawn_cache_tee(
@@ -927,9 +949,6 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                 // Size is cacheable but fill_guard is None (begin_fill failed).
                 // Stream directly without tee — don't block followers on a
                 // fill that can never commit.
-                if let Some(guard) = fill_guard {
-                    state.cache.abort_fill(guard).await;
-                }
                 waiter.complete().await;
 
                 tracing::info!(
@@ -1612,6 +1631,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_same_etag_get_refill_preserves_head_state() {
+        let key = "script_bundle/get-refill-preserves-head.js";
+        let cache_key = CacheKey::new("test-backend", key);
+        let mut meta = test_cache_meta("test-backend", key, b"old body");
+        meta.head_extra_headers.insert(
+            "x-amz-archive-status".to_string(),
+            "ARCHIVE_ACCESS".to_string(),
+        );
+        meta.head_metadata_checked = true;
+        meta.head_checksum_checked = true;
+        meta.head_checksum_headers
+            .insert("x-amz-checksum-sha256".to_string(), "oldsum".to_string());
+
+        let fresh_body = b"new body same etag".to_vec();
+        let same_etag = meta.etag.clone();
+        // Force checksum GET refresh path: entry lacks checksum_mode_checked.
+        let mut head_extra = HashMap::new();
+        head_extra.insert(
+            "x-amz-archive-status".to_string(),
+            "ARCHIVE_ACCESS".to_string(),
+        );
+        head_extra.insert("x-amz-checksum-sha256".to_string(), "headsum".to_string());
+        let backend = MockBackend::new()
+            .with_head(Ok(crate::backend::models::HeadObjectOutput {
+                content_type: Some("text/plain".to_string()),
+                content_length: Some(fresh_body.len() as i64),
+                etag: same_etag.clone(),
+                last_modified: None,
+                metadata: HashMap::new(),
+                extra_headers: head_extra,
+            }))
+            .with_get(Ok(MockGetResponse {
+                body: fresh_body.clone(),
+                content_type: Some("text/plain".to_string()),
+                etag: same_etag,
+                extra_headers: HashMap::new(),
+            }));
+        let cache = MockCache::new().with_entry(&cache_key, b"old body", meta);
+        let state = build_app_state(backend, cache, MockAuth::allow_all());
+
+        let resp = handle_get(&state, &make_parsed_with_checksum(key), key).await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("x-cache").unwrap(), "MISS");
+
+        let cached = wait_for_cached_entry(&state, &cache_key, |_| true).await;
+        assert!(cached.meta.head_metadata_checked);
+        assert!(cached.meta.head_checksum_checked);
+        assert_eq!(
+            cached
+                .meta
+                .head_extra_headers
+                .get("x-amz-archive-status")
+                .unwrap(),
+            "ARCHIVE_ACCESS"
+        );
+        assert_eq!(
+            cached
+                .meta
+                .head_checksum_headers
+                .get("x-amz-checksum-sha256")
+                .unwrap(),
+            "headsum"
+        );
+    }
+
+    #[tokio::test]
     async fn test_checksum_refresh_head_not_found_purges_cache_entry() {
         let key = "script_bundle/checksum-refresh-not-found.js";
         let stale_body = b"stale body".to_vec();
@@ -1820,9 +1905,10 @@ mod tests {
     //
     // This is needed to exercise the TRUE stale-on-error code path, where:
     //   1. Initial cache.peek_body() returns None (miss) → enters singleflight
-    //   2. Backend returns a transient error
-    //   3. Stale fallback re-probes the cache via peek_body() and returns the entry
-    //   4. Handler serves the cached entry with x-cache: STALE
+    //   2. Leader re-probes via cache.peek() and still misses
+    //   3. Backend returns a transient error
+    //   4. Stale fallback re-probes the cache via peek_body() and returns the entry
+    //   5. Handler serves the cached entry with x-cache: STALE
 
     use std::sync::atomic::{AtomicU32, Ordering};
 
