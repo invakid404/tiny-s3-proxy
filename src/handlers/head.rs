@@ -396,8 +396,15 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
                                     );
                                 }
                             }
-                            // Newer entry doesn't satisfy or doesn't exist —
-                            // fall through to the error response below.
+                            // Newer entry exists but doesn't satisfy HEAD yet
+                            // (e.g. only GET-warmed). Don't return the stale
+                            // 404 — the object exists in a newer generation.
+                            // Set cache_refresh_target so the error path
+                            // below can attempt stale-on-error with the newer
+                            // entry if the backend is also down.
+                            if let Ok(Some(newer)) = state.cache.peek(&cache_key).await {
+                                cache_refresh_target = Some(newer.meta.clone());
+                            }
                         }
                     }
                     _ if state.config.cache_serve_stale_on_error
