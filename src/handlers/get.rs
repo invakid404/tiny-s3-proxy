@@ -487,6 +487,9 @@ async fn handle_passthrough<B: Backend, C: CacheStore>(
         )
         },
         Err(e) => {
+            if cache_status == "MISS" {
+                let _ = state.cache.note_miss().await;
+            }
             tracing::error!(
                 error = %e,
                 operation = "GetObject",
@@ -887,6 +890,7 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
 
             // No stale entry available (or stale body disappeared)
             waiter.complete().await;
+            let _ = state.cache.note_miss().await;
             tracing::error!(
                 error = %e,
                 operation = "GetObject",

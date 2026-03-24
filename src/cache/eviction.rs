@@ -207,13 +207,29 @@ async fn collect_candidates(
                         };
                         if let Ok(body_meta) = tokio::fs::metadata(&body_path).await {
                             // Body appeared after taking the lock (concurrent
-                            // commit_fill). Count it in scan totals so the
-                            // authoritative reconciliation doesn't drop it.
-                            scan_total_bytes += body_meta.len();
-                            if let Ok(meta_meta) = tokio::fs::metadata(&file_path).await {
-                                scan_total_bytes += meta_meta.len();
-                            }
+                            // commit_fill). Re-read metadata and add as a
+                            // candidate so it's both counted and evictable.
+                            let body_sz = body_meta.len();
+                            let meta_sz = tokio::fs::metadata(&file_path)
+                                .await
+                                .map(|m| m.len())
+                                .unwrap_or(0);
+                            let entry_size = body_sz + meta_sz;
+                            scan_total_bytes += entry_size;
                             scan_entry_count += 1;
+                            // Re-read metadata for fill_id/last_accessed_at.
+                            if let Ok(mb) = tokio::fs::read(&file_path).await {
+                                if let Ok(m) = serde_json::from_slice::<CacheMeta>(&mb) {
+                                    candidates.push(EvictionCandidate {
+                                        body_path: body_path.clone(),
+                                        meta_path: file_path.clone(),
+                                        hash: hash.to_string(),
+                                        fill_id: m.fill_id,
+                                        last_accessed_at: m.last_accessed_at,
+                                        size: entry_size,
+                                    });
+                                }
+                            }
                             continue;
                         }
                         let poison = d2_path.join(format!("{hash}.poisoned"));
@@ -534,11 +550,13 @@ mod tests {
     // here requires trait-method dispatch that conflicts with Rust's type
     // inference for impl-Future-returning traits.
 
-    /// When a body is missing on first probe but appears after taking the
-    /// per-key lock (concurrent commit_fill), the entry must be counted in
-    /// scan totals so the authoritative reconciliation doesn't drop it.
+    /// Verify that an entry whose body was initially missing but appeared
+    /// before the scan is counted in totals and survives under-limit eviction.
+    /// Note: this exercises the steady-state path (body exists when scanned);
+    /// the lock-aware race branch requires a real DiskCache which cannot be
+    /// easily constructed in unit tests due to trait dispatch constraints.
     #[tokio::test]
-    async fn test_eviction_scan_counts_entry_that_appears_after_lock() {
+    async fn test_eviction_scan_counts_entry_with_late_body() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cache_dir = tmp.path().to_path_buf();
         let key = CacheKey::new("bucket", "script_bundle/race.js");
