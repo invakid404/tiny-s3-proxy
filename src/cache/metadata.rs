@@ -67,6 +67,19 @@ pub struct CacheMeta {
     pub head_checksum_checked: bool,
 }
 
+impl CacheMeta {
+    pub(crate) fn preserve_same_etag_head_state_from(&mut self, current: &CacheMeta) {
+        if self.etag != current.etag {
+            return;
+        }
+
+        self.head_extra_headers = current.head_extra_headers.clone();
+        self.head_checksum_headers = current.head_checksum_headers.clone();
+        self.head_metadata_checked = current.head_metadata_checked;
+        self.head_checksum_checked = current.head_checksum_checked;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::CacheMeta;
