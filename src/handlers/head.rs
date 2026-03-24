@@ -1282,21 +1282,16 @@ mod tests {
         );
     }
 
-    /// Regression: HEAD returns 404 but the cache entry was concurrently
-    /// replaced. purge_if_unchanged returns false. The handler re-probes
-    /// and serves the newer entry instead of the stale 404.
-    ///
-    /// Note: this pre-mutates the entry before the request starts. The peek
-    /// sees head_metadata_checked=false (needs refresh), so the handler goes
-    /// to the backend HEAD. HEAD returns 404. purge_if_unchanged is called
-    /// with the peek's fill_id, which no longer matches → returns false.
-    /// The re-probe finds the updated entry with head_metadata_checked=true.
+    /// End-to-end: HEAD returns 404, purge_if_unchanged swaps in a newer
+    /// satisfiable entry (simulating concurrent refill), handler re-probes
+    /// and serves it as HIT. Backend HEAD IS called (the entry needed
+    /// refresh), and note_hit IS recorded.
     #[tokio::test]
     async fn test_head_404_with_concurrent_refill_serves_newer_entry() {
         let key = "script_bundle/head-404-refill.js";
         let cache_key = crate::cache::key::CacheKey::new("test-backend", key);
-        let mut meta = test_cache_meta("test-backend", key, b"cached body");
-        meta.head_metadata_checked = false; // forces HEAD refresh
+        let mut old_meta = test_cache_meta("test-backend", key, b"cached body");
+        old_meta.head_metadata_checked = false; // forces HEAD refresh
 
         let backend = MockBackend::new().with_head(Err(crate::error::ProxyError::UpstreamS3 {
             status_code: 404,
@@ -1305,56 +1300,39 @@ mod tests {
             operation: "head_object".into(),
         }));
 
-        // Create the entry, then immediately simulate a concurrent refill by
-        // bumping fill_id. The peek will capture the NEW fill_id, but we need
-        // the OLD one for the purge to fail. So we store the old fill_id and
-        // manually set a wrapper that returns the old fill_id to the probe
-        // but the new one is on disk.
-        //
-        // Actually: the simplest valid test is to verify the re-probe path
-        // after purge_if_unchanged returns false. We set fill_id to a value
-        // that won't match what the handler captured from peek, by replacing
-        // the entry WHILE the handler is in the backend HEAD call.
-        // Since MockBackend HEAD is synchronous, we pre-stage both states:
-        // 1. Entry starts with head_metadata_checked=false, fill_id=X (peek)
-        // 2. Before purge runs, entry has fill_id=Y, head_metadata_checked=true
-        //
-        // We achieve this by making the MockBackend HEAD callback mutate the
-        // cache. But MockBackend doesn't support callbacks. Instead, we verify
-        // the code path at the unit level: purge_if_unchanged returns false
-        // for mismatched fill_id, and the HEAD handler's 404 branch re-probes.
-        let cache = MockCache::new().with_entry(&cache_key, b"cached body", meta);
+        let cache = MockCache::new().with_entry(&cache_key, b"cached body", old_meta);
 
-        // Record original fill_id, then bump it to simulate concurrent refill.
-        let _original_fill_id = {
-            let entries = cache.entries.lock().unwrap();
-            entries.get(cache_key.hash_hex()).unwrap().meta.fill_id
-        };
-        {
-            let mut entries = cache.entries.lock().unwrap();
-            let entry = entries.get_mut(cache_key.hash_hex()).unwrap();
-            entry.meta.fill_id = 999999;
-            entry.meta.head_metadata_checked = true;
-            entry.meta.head_extra_headers.insert(
-                "x-amz-archive-status".to_string(),
-                "RESTORED".to_string(),
-            );
-        }
+        // Stage replacement: when purge_if_unchanged runs after HEAD 404,
+        // it swaps in a newer satisfiable entry and returns false.
+        let mut new_meta = test_cache_meta("test-backend", key, b"cached body");
+        new_meta.head_metadata_checked = true;
+        new_meta.head_extra_headers.insert(
+            "x-amz-archive-status".to_string(),
+            "RESTORED".to_string(),
+        );
+        cache.stage_purge_replacement(&cache_key, b"cached body", new_meta);
 
         let state = build_app_state(backend, cache, MockAuth::allow_all());
 
         let resp = handle_head(&state, &make_parsed(key), key).await;
 
-        // The peek sees fill_id=999999, head_metadata_checked=true → HIT
-        // (entry already satisfies, no HEAD needed).
+        // Newer entry served — NOT 404.
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.headers().get("x-cache").unwrap(), "HIT");
         assert_eq!(
             resp.headers().get("x-amz-archive-status").unwrap(),
             "RESTORED"
         );
-        // Verify no backend HEAD was called — the entry was satisfiable.
-        assert!(state.backend.head_read_calls.lock().unwrap().is_empty());
+        // Backend HEAD WAS called (the old entry needed refresh).
+        assert_eq!(state.backend.head_read_calls.lock().unwrap().len(), 1);
+        // note_hit was recorded for the re-probed entry.
+        assert_eq!(
+            state
+                .cache
+                .note_hit_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 
     #[tokio::test]
