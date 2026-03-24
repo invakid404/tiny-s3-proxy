@@ -225,15 +225,31 @@ impl DiskCache {
             });
         }
 
+        let parent_dir = counter_path.parent().ok_or_else(|| ProxyError::Cache {
+            source: "fill_id counter path missing parent directory".into(),
+            operation: "locate fill_id counter parent dir".into(),
+        })?;
+        let dir = tokio::fs::File::open(parent_dir)
+            .await
+            .map_err(|e| ProxyError::Cache {
+                source: Box::new(e),
+                operation: "open fill_id counter parent dir".into(),
+            })?;
+        dir.sync_all().await.map_err(|e| ProxyError::Cache {
+            source: Box::new(e),
+            operation: "fsync fill_id counter parent dir".into(),
+        })?;
+
         Ok(())
     }
 
     /// Persist `.fill_id_counter` separately from the cache entry metadata so
     /// startup never relies solely on a best-effort full scan to avoid fill_id
     /// reuse. Each fill reserves an ID in memory, fsyncs the updated
-    /// next-allocatable counter file, and only then publishes the entry. Crashes
-    /// or later publish failures may leak gaps, which is acceptable, but ID
-    /// reuse is not because `fill_id` is the CAS fence for cache invalidation.
+    /// next-allocatable counter temp file, renames it into place, fsyncs the
+    /// parent directory, and only then publishes the entry. Crashes or later
+    /// publish failures may leak gaps, which is acceptable, but ID reuse is not
+    /// because `fill_id` is the CAS fence for cache invalidation.
     ///
     /// This assumes a single cache-owning process/instance per `cache_dir`.
     /// Supporting multiple concurrent owners would require file locking around
