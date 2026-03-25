@@ -14,6 +14,7 @@ use std::time::Instant;
 /// is authoritative for the observed generation), or `false` if the entry
 /// was replaced by a newer generation (the 404 may be stale — callers
 /// should re-probe the cache instead of returning the 404).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn purge_then_poison_if_unchanged<C: crate::cache::CacheStore>(
     cache: &Arc<C>,
     cache_key: &crate::cache::key::CacheKey,
@@ -36,7 +37,7 @@ pub(crate) async fn purge_then_poison_if_unchanged<C: crate::cache::CacheStore>(
                 "{}",
                 purge_success_msg
             );
-            return true;
+            true
         }
         Ok(false) => {
             tracing::info!(
@@ -46,7 +47,7 @@ pub(crate) async fn purge_then_poison_if_unchanged<C: crate::cache::CacheStore>(
                 "{}",
                 purge_changed_msg
             );
-            return false;
+            false
         }
         Err(purge_err) => {
             tracing::warn!(
@@ -66,9 +67,9 @@ pub(crate) async fn purge_then_poison_if_unchanged<C: crate::cache::CacheStore>(
                         "{}",
                         poison_success_msg
                     );
-                    return true;
+                    true
                 }
-                Ok(false) => return false,
+                Ok(false) => false,
                 Err(poison_err) => {
                     tracing::warn!(
                         request_id = request_id,
@@ -80,7 +81,7 @@ pub(crate) async fn purge_then_poison_if_unchanged<C: crate::cache::CacheStore>(
                     );
                     // Both purge and poison failed — treat as invalidated
                     // (conservative: don't return stale 404).
-                    return true;
+                    true
                 }
             }
         }
@@ -153,24 +154,23 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
     // Record request body size for writes (from content-length header).
     // Reject negative Content-Length with 400 Bad Request and only record
     // valid non-negative values in metrics.
-    if let Some(cl) = parts.headers.get("content-length") {
-        if let Ok(s) = cl.to_str() {
-            if let Ok(n) = s.parse::<i64>() {
-                if n < 0 {
-                    let s3err = S3Error::from_proxy_error(
-                        &crate::error::ProxyError::InvalidRequest {
-                            message: "Content-Length must not be negative".to_string(),
-                        },
-                        &parsed.request_id,
-                        None,
-                    );
-                    let response = s3err.to_response();
-                    record_metrics(op_name, &response, start);
-                    return response;
-                }
-                histogram!("s3proxy_request_size_bytes", "operation" => op_name).record(n as f64);
-            }
+    if let Some(cl) = parts.headers.get("content-length")
+        && let Ok(s) = cl.to_str()
+        && let Ok(n) = s.parse::<i64>()
+    {
+        if n < 0 {
+            let s3err = S3Error::from_proxy_error(
+                &crate::error::ProxyError::InvalidRequest {
+                    message: "Content-Length must not be negative".to_string(),
+                },
+                &parsed.request_id,
+                None,
+            );
+            let response = s3err.to_response();
+            record_metrics(op_name, &response, start);
+            return response;
         }
+        histogram!("s3proxy_request_size_bytes", "operation" => op_name).record(n as f64);
     }
 
     // Auth check (applies to ALL operations including passthrough)
@@ -1292,13 +1292,13 @@ pub mod test_utils {
                     None => None,
                 }
             };
-            if let Some(update) = pending_update {
-                if let Some(current) = self.entries.lock().unwrap().get_mut(&update.key_hash) {
-                    current.meta.head_extra_headers = update.head_extra_headers;
-                    current.meta.head_checksum_headers = update.head_checksum_headers;
-                    current.meta.head_metadata_checked = update.head_metadata_checked;
-                    current.meta.head_checksum_checked = update.head_checksum_checked;
-                }
+            if let Some(update) = pending_update
+                && let Some(current) = self.entries.lock().unwrap().get_mut(&update.key_hash)
+            {
+                current.meta.head_extra_headers = update.head_extra_headers;
+                current.meta.head_checksum_headers = update.head_checksum_headers;
+                current.meta.head_metadata_checked = update.head_metadata_checked;
+                current.meta.head_checksum_checked = update.head_checksum_checked;
             }
             Ok(entry)
         }
@@ -1847,12 +1847,13 @@ mod tests {
         assert!(cache.purge_if_unchanged(&key_a, fill_id_a).await.unwrap());
         assert!(cache.peek(&key_a).await.unwrap().is_none());
 
-        let pending = cache.purge_swaps_entry.lock().unwrap();
-        assert_eq!(
-            pending.as_ref().map(|(hash, _)| hash.as_str()),
-            Some(key_b.hash_hex())
-        );
-        drop(pending);
+        {
+            let pending = cache.purge_swaps_entry.lock().unwrap();
+            assert_eq!(
+                pending.as_ref().map(|(hash, _)| hash.as_str()),
+                Some(key_b.hash_hex())
+            );
+        }
 
         assert!(!cache.purge_if_unchanged(&key_b, fill_id_b).await.unwrap());
         let newer_b = cache.peek(&key_b).await.unwrap().unwrap();
