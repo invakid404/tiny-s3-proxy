@@ -3,6 +3,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use http::Response;
 
+use crate::backend::models::DeleteObjectInput;
 use crate::backend::Backend;
 use crate::cache::key::CacheKey;
 use crate::cache::CacheStore;
@@ -18,7 +19,7 @@ pub async fn handle_delete<B: Backend, C: CacheStore>(
     key: &str,
 ) -> Response<Body> {
     // Retry handled by the backend client
-    let result = state.backend.delete_object(&state.backend_bucket, key).await;
+    let result = state.backend.delete_object(DeleteObjectInput { bucket: &state.backend_bucket, key }).await;
 
     match result {
         Ok(output) => {

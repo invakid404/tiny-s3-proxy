@@ -1,6 +1,54 @@
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
+use typed_builder::TypedBuilder;
+
+/// Input for get_object operations.
+#[derive(Debug, TypedBuilder)]
+#[non_exhaustive]
+pub struct GetObjectInput<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub options: ReadOptions,
+}
+
+/// Input for head_object operations.
+#[derive(Debug, TypedBuilder)]
+#[non_exhaustive]
+pub struct HeadObjectInput<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub options: ReadOptions,
+}
+
+/// Input for delete_object operations.
+#[derive(Debug, TypedBuilder)]
+#[non_exhaustive]
+pub struct DeleteObjectInput<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+}
+
+/// Input for create_multipart_upload operations.
+#[derive(Debug, TypedBuilder)]
+#[non_exhaustive]
+pub struct CreateMultipartUploadInput<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    #[builder(default)]
+    pub content_type: Option<&'a str>,
+    pub metadata: &'a HashMap<String, String>,
+    pub content_headers: &'a HashMap<String, String>,
+}
+
+/// Input for abort_multipart_upload operations.
+#[derive(Debug, TypedBuilder)]
+#[non_exhaustive]
+pub struct AbortMultipartUploadInput<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub upload_id: &'a str,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChecksumMode {
@@ -54,16 +102,22 @@ pub struct HeadObjectOutput {
     pub extra_headers: HashMap<String, String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, TypedBuilder)]
+#[non_exhaustive]
 pub struct PutObjectInput {
     pub bucket: String,
     pub key: String,
     pub body: Bytes,
+    #[builder(default)]
     pub content_type: Option<String>,
+    #[builder(default)]
     pub content_md5: Option<String>,
+    #[builder(default)]
     pub metadata: HashMap<String, String>,
+    #[builder(default)]
     pub extra_amz_headers: HashMap<String, String>,
     /// Standard content headers to forward (content-encoding, content-disposition, etc.).
+    #[builder(default)]
     pub content_headers: HashMap<String, String>,
 }
 
@@ -82,15 +136,23 @@ pub struct DeleteObjectOutput {
     pub version_id: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, TypedBuilder)]
+#[non_exhaustive]
 pub struct ListObjectsInput {
     pub bucket: String,
+    #[builder(default)]
     pub prefix: Option<String>,
+    #[builder(default)]
     pub delimiter: Option<String>,
+    #[builder(default)]
     pub max_keys: Option<i32>,
+    #[builder(default)]
     pub continuation_token: Option<String>,
+    #[builder(default)]
     pub marker: Option<String>,
+    #[builder(default)]
     pub start_after: Option<String>,
+    #[builder(default)]
     pub encoding_type: Option<String>,
     pub is_v2: bool,
 }
@@ -132,13 +194,15 @@ pub struct CreateMultipartOutput {
     pub extra_headers: HashMap<String, String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, TypedBuilder)]
+#[non_exhaustive]
 pub struct UploadPartInput {
     pub bucket: String,
     pub key: String,
     pub upload_id: String,
     pub part_number: i32,
     pub body: Bytes,
+    #[builder(default)]
     pub content_md5: Option<String>,
 }
 
@@ -156,7 +220,8 @@ pub struct CompletedPart {
     pub part_number: i32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, TypedBuilder)]
+#[non_exhaustive]
 pub struct CompleteMultipartInput {
     pub bucket: String,
     pub key: String,

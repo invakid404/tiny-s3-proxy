@@ -384,10 +384,9 @@ macro_rules! extract_head_extra_headers {
 impl Backend for S3Backend {
     async fn get_object(
         &self,
-        bucket: &str,
-        key: &str,
-        options: ReadOptions,
+        req: GetObjectInput<'_>,
     ) -> Result<(GetObjectMeta, BoxByteStream), ProxyError> {
+        let GetObjectInput { bucket, key, options } = req;
         let bucket = bucket.to_string();
         let key = key.to_string();
 
@@ -434,10 +433,9 @@ impl Backend for S3Backend {
 
     async fn head_object(
         &self,
-        bucket: &str,
-        key: &str,
-        options: ReadOptions,
+        req: HeadObjectInput<'_>,
     ) -> Result<HeadObjectOutput, ProxyError> {
+        let HeadObjectInput { bucket, key, options } = req;
         let bucket = bucket.to_string();
         let key = key.to_string();
 
@@ -565,9 +563,9 @@ impl Backend for S3Backend {
 
     async fn delete_object(
         &self,
-        bucket: &str,
-        key: &str,
+        req: DeleteObjectInput<'_>,
     ) -> Result<DeleteObjectOutput, ProxyError> {
+        let DeleteObjectInput { bucket, key } = req;
         let bucket = bucket.to_string();
         let key = key.to_string();
 
@@ -610,12 +608,9 @@ impl Backend for S3Backend {
 
     async fn create_multipart_upload(
         &self,
-        bucket: &str,
-        key: &str,
-        content_type: Option<&str>,
-        metadata: &HashMap<String, String>,
-        content_headers: &HashMap<String, String>,
+        req: CreateMultipartUploadInput<'_>,
     ) -> Result<CreateMultipartOutput, ProxyError> {
+        let CreateMultipartUploadInput { bucket, key, content_type, metadata, content_headers } = req;
         let mut builder = self
             .client
             .create_multipart_upload()
@@ -781,10 +776,9 @@ impl Backend for S3Backend {
 
     async fn abort_multipart_upload(
         &self,
-        bucket: &str,
-        key: &str,
-        upload_id: &str,
+        req: AbortMultipartUploadInput<'_>,
     ) -> Result<(), ProxyError> {
+        let AbortMultipartUploadInput { bucket, key, upload_id } = req;
         let bucket = bucket.to_string();
         let key = key.to_string();
         let upload_id = upload_id.to_string();

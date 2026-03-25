@@ -6,7 +6,7 @@ use bytes::Bytes;
 use http::Response;
 use tokio_util::io::ReaderStream;
 
-use crate::backend::models::GetObjectMeta;
+use crate::backend::models::{GetObjectInput, GetObjectMeta, HeadObjectInput};
 use crate::backend::{Backend, BoxByteStream};
 use crate::cache::entry::CacheEntry;
 use crate::cache::key::CacheKey;
@@ -179,7 +179,7 @@ async fn try_refresh_cached_get_metadata<B: Backend + 'static, C: CacheStore + '
 
     let head_output = match state
         .backend
-        .head_object(&state.backend_bucket, key, read_options)
+        .head_object(HeadObjectInput { bucket: &state.backend_bucket, key, options: read_options })
         .await
     {
         Ok(output) => output,
@@ -491,7 +491,7 @@ async fn handle_passthrough<B: Backend, C: CacheStore>(
     let read_options = parsed.read_options();
     match state
         .backend
-        .get_object(&state.backend_bucket, key, read_options)
+        .get_object(GetObjectInput { bucket: &state.backend_bucket, key, options: read_options })
         .await
     {
         Ok((meta, body_stream)) => {
@@ -845,7 +845,7 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
 
     let result = state
         .backend
-        .get_object(&state.backend_bucket, key, read_options)
+        .get_object(GetObjectInput { bucket: &state.backend_bucket, key, options: read_options })
         .await;
 
     match result {

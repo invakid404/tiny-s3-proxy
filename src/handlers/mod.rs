@@ -858,13 +858,11 @@ pub mod test_utils {
     impl Backend for MockBackend {
         async fn get_object(
             &self,
-            _bucket: &str,
-            _key: &str,
-            options: ReadOptions,
+            req: GetObjectInput<'_>,
         ) -> Result<(GetObjectMeta, BoxByteStream), ProxyError> {
             self.total_calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.get_read_calls.lock().unwrap().push(options);
+            self.get_read_calls.lock().unwrap().push(req.options);
             let resp = self.get_response.lock().unwrap().take().unwrap_or_else(|| {
                 Err(ProxyError::Backend {
                     source: "no mock response configured".into(),
@@ -890,13 +888,11 @@ pub mod test_utils {
 
         async fn head_object(
             &self,
-            _bucket: &str,
-            _key: &str,
-            options: ReadOptions,
+            req: HeadObjectInput<'_>,
         ) -> Result<HeadObjectOutput, ProxyError> {
             self.total_calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.head_read_calls.lock().unwrap().push(options);
+            self.head_read_calls.lock().unwrap().push(req.options);
             self.head_response
                 .lock()
                 .unwrap()
@@ -932,15 +928,14 @@ pub mod test_utils {
 
         async fn delete_object(
             &self,
-            bucket: &str,
-            key: &str,
+            req: DeleteObjectInput<'_>,
         ) -> Result<DeleteObjectOutput, ProxyError> {
             self.total_calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.delete_calls
                 .lock()
                 .unwrap()
-                .push((bucket.to_string(), key.to_string()));
+                .push((req.bucket.to_string(), req.key.to_string()));
             self.delete_response
                 .lock()
                 .unwrap()
@@ -973,11 +968,7 @@ pub mod test_utils {
 
         async fn create_multipart_upload(
             &self,
-            _bucket: &str,
-            _key: &str,
-            _content_type: Option<&str>,
-            _metadata: &std::collections::HashMap<String, String>,
-            _content_headers: &std::collections::HashMap<String, String>,
+            _req: CreateMultipartUploadInput<'_>,
         ) -> Result<CreateMultipartOutput, ProxyError> {
             self.total_calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1028,9 +1019,7 @@ pub mod test_utils {
 
         async fn abort_multipart_upload(
             &self,
-            _bucket: &str,
-            _key: &str,
-            _upload_id: &str,
+            _req: AbortMultipartUploadInput<'_>,
         ) -> Result<(), ProxyError> {
             self.total_calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

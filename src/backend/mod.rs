@@ -16,51 +16,49 @@ pub type BoxByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>
 /// Trait defining the typed S3 backend interface.
 /// All operations return typed results, not raw HTTP.
 pub trait Backend: Send + Sync {
+    /// Retrieve an object's body and metadata.
     fn get_object(
         &self,
-        bucket: &str,
-        key: &str,
-        options: ReadOptions,
+        req: GetObjectInput<'_>,
     ) -> impl std::future::Future<Output = Result<(GetObjectMeta, BoxByteStream), ProxyError>> + Send;
+    /// Retrieve an object's metadata without its body.
     fn head_object(
         &self,
-        bucket: &str,
-        key: &str,
-        options: ReadOptions,
+        req: HeadObjectInput<'_>,
     ) -> impl std::future::Future<Output = Result<HeadObjectOutput, ProxyError>> + Send;
+    /// Upload an object.
     fn put_object(
         &self,
         req: PutObjectInput,
     ) -> impl std::future::Future<Output = Result<PutObjectOutput, ProxyError>> + Send;
+    /// Delete an object.
     fn delete_object(
         &self,
-        bucket: &str,
-        key: &str,
+        req: DeleteObjectInput<'_>,
     ) -> impl std::future::Future<Output = Result<DeleteObjectOutput, ProxyError>> + Send;
+    /// List objects in a bucket.
     fn list_objects(
         &self,
         req: ListObjectsInput,
     ) -> impl std::future::Future<Output = Result<ListObjectsOutput, ProxyError>> + Send;
+    /// Initiate a multipart upload and return an upload ID.
     fn create_multipart_upload(
         &self,
-        bucket: &str,
-        key: &str,
-        content_type: Option<&str>,
-        metadata: &std::collections::HashMap<String, String>,
-        content_headers: &std::collections::HashMap<String, String>,
+        req: CreateMultipartUploadInput<'_>,
     ) -> impl std::future::Future<Output = Result<CreateMultipartOutput, ProxyError>> + Send;
+    /// Upload a single part of a multipart upload.
     fn upload_part(
         &self,
         req: UploadPartInput,
     ) -> impl std::future::Future<Output = Result<UploadPartOutput, ProxyError>> + Send;
+    /// Finalize a multipart upload by assembling its parts.
     fn complete_multipart_upload(
         &self,
         req: CompleteMultipartInput,
     ) -> impl std::future::Future<Output = Result<CompleteMultipartOutput, ProxyError>> + Send;
+    /// Cancel a multipart upload and discard uploaded parts.
     fn abort_multipart_upload(
         &self,
-        bucket: &str,
-        key: &str,
-        upload_id: &str,
+        req: AbortMultipartUploadInput<'_>,
     ) -> impl std::future::Future<Output = Result<(), ProxyError>> + Send;
 }
