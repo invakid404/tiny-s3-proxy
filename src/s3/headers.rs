@@ -141,6 +141,23 @@ pub fn put_object_headers(etag: Option<&str>, request_id: &str) -> HeaderMap {
     headers
 }
 
+/// Append extra headers from a HashMap to a response builder, silently
+/// skipping entries with invalid header names or values.
+pub fn append_extra_headers(
+    mut builder: http::response::Builder,
+    headers: &HashMap<String, String>,
+) -> http::response::Builder {
+    for (k, v) in headers {
+        if let (Ok(name), Ok(val)) = (
+            HeaderName::from_bytes(k.as_bytes()),
+            HeaderValue::from_str(v),
+        ) {
+            builder = builder.header(name, val);
+        }
+    }
+    builder
+}
+
 /// Add a cache diagnostic header.
 pub fn with_cache_status(headers: &mut HeaderMap, status: &str) {
     if let Ok(val) = HeaderValue::from_str(status) {

@@ -9,7 +9,7 @@ use crate::cache::CacheStore;
 use crate::cache::key::CacheKey;
 use crate::handlers::AppState;
 use crate::s3::errors::S3Error;
-use crate::s3::headers::put_object_headers;
+use crate::s3::headers::{append_extra_headers, put_object_headers};
 use crate::s3::ops::ParsedRequest;
 
 /// Handle a PutObject request. On success, purges the cache for this key.
@@ -87,14 +87,7 @@ pub async fn handle_put<B: Backend, C: CacheStore>(
             if let Some(ref vid) = output.version_id {
                 response = response.header("x-amz-version-id", vid);
             }
-            for (k, v) in &output.extra_headers {
-                if let (Ok(name), Ok(val)) = (
-                    http::header::HeaderName::from_bytes(k.as_bytes()),
-                    http::header::HeaderValue::from_str(v),
-                ) {
-                    response = response.header(name, val);
-                }
-            }
+            response = append_extra_headers(response, &output.extra_headers);
             response.body(Body::empty()).unwrap()
         }
         Err(e) => {

@@ -12,7 +12,7 @@ use crate::cache::CacheStore;
 use crate::cache::key::CacheKey;
 use crate::handlers::AppState;
 use crate::s3::errors::S3Error;
-use crate::s3::headers::common_headers;
+use crate::s3::headers::{append_extra_headers, common_headers};
 use crate::s3::ops::ParsedRequest;
 use crate::s3::xml::{
     parse_complete_multipart_body, serialize_complete_multipart, serialize_initiate_multipart,
@@ -52,14 +52,7 @@ pub async fn handle_create_multipart<B: Backend, C: CacheStore>(
             for (k, v) in headers.iter() {
                 response = response.header(k, v);
             }
-            for (k, v) in &output.extra_headers {
-                if let (Ok(name), Ok(val)) = (
-                    http::header::HeaderName::from_bytes(k.as_bytes()),
-                    http::header::HeaderValue::from_str(v),
-                ) {
-                    response = response.header(name, val);
-                }
-            }
+            response = append_extra_headers(response, &output.extra_headers);
             response
                 .header("content-type", "application/xml")
                 .body(Body::from(xml))
@@ -152,14 +145,7 @@ pub async fn handle_upload_part<B: Backend, C: CacheStore>(
             for (k, v) in headers.iter() {
                 response = response.header(k, v);
             }
-            for (k, v) in &output.extra_headers {
-                if let (Ok(name), Ok(val)) = (
-                    http::header::HeaderName::from_bytes(k.as_bytes()),
-                    http::header::HeaderValue::from_str(v),
-                ) {
-                    response = response.header(name, val);
-                }
-            }
+            response = append_extra_headers(response, &output.extra_headers);
             response.body(Body::empty()).unwrap()
         }
         Err(e) => {
@@ -257,14 +243,7 @@ pub async fn handle_complete_multipart<B: Backend, C: CacheStore>(
             if let Some(ref vid) = output.version_id {
                 response = response.header("x-amz-version-id", vid);
             }
-            for (k, v) in &output.extra_headers {
-                if let (Ok(name), Ok(val)) = (
-                    http::header::HeaderName::from_bytes(k.as_bytes()),
-                    http::header::HeaderValue::from_str(v),
-                ) {
-                    response = response.header(name, val);
-                }
-            }
+            response = append_extra_headers(response, &output.extra_headers);
             response
                 .header("content-type", "application/xml")
                 .body(Body::from(xml))
