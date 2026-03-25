@@ -54,7 +54,7 @@ fn extract_checksum_headers(
 }
 
 pub(crate) enum CacheRefreshOutcome {
-    Updated(CacheMeta),
+    Updated(Box<CacheMeta>),
     EtagMismatch,
     NoStrongMatch,
 }
@@ -84,7 +84,7 @@ pub(crate) fn refreshed_cache_meta(
         }
     }
 
-    CacheRefreshOutcome::Updated(CacheMeta {
+    CacheRefreshOutcome::Updated(Box::new(CacheMeta {
         bucket: cached.bucket.clone(),
         key: cached.key.clone(),
         etag: Some(output_etag.clone()),
@@ -120,7 +120,7 @@ pub(crate) fn refreshed_cache_meta(
         // a known limitation of the current caching model.
         head_metadata_checked: true,
         head_checksum_checked: cached.head_checksum_checked || requested_checksum_headers,
-    })
+    }))
 }
 
 fn cache_entry_satisfies_head_request(
@@ -304,7 +304,7 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
             if let Some(ref cached_meta) = cache_refresh_target {
                 let cache_key = CacheKey::new(&*state.backend_bucket, key);
                 match refreshed_cache_meta(
-                    &cached_meta,
+                    cached_meta,
                     &output,
                     read_options.wants_checksum_headers(),
                 ) {
@@ -314,7 +314,7 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
                             .update_metadata_if_unchanged(
                                 &cache_key,
                                 cached_meta.fill_id,
-                                updated_meta,
+                                *updated_meta,
                             )
                             .await
                         {
@@ -400,24 +400,24 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
                             // is stale. Re-probe: if the newer entry satisfies
                             // the request, serve it. Same pattern as the
                             // transient-error re-probe below.
-                            if let Ok(Some(current)) = state.cache.peek(&cache_key).await {
-                                if cache_entry_satisfies_head_request(&current.meta, read_options) {
-                                    if let Err(hit_err) =
-                                        state.cache.note_hit(&cache_key, &current.meta).await
-                                    {
-                                        tracing::warn!(
-                                            request_id = %parsed.request_id,
-                                            error = %hit_err,
-                                            "failed to record cache hit after 404 re-probe"
-                                        );
-                                    }
-                                    return build_cached_head_response(
-                                        &current.meta,
-                                        &parsed.request_id,
-                                        "HIT",
-                                        read_options.wants_checksum_headers(),
+                            if let Ok(Some(current)) = state.cache.peek(&cache_key).await
+                                && cache_entry_satisfies_head_request(&current.meta, read_options)
+                            {
+                                if let Err(hit_err) =
+                                    state.cache.note_hit(&cache_key, &current.meta).await
+                                {
+                                    tracing::warn!(
+                                        request_id = %parsed.request_id,
+                                        error = %hit_err,
+                                        "failed to record cache hit after 404 re-probe"
                                     );
                                 }
+                                return build_cached_head_response(
+                                    &current.meta,
+                                    &parsed.request_id,
+                                    "HIT",
+                                    read_options.wants_checksum_headers(),
+                                );
                             }
                             // Newer entry exists but doesn't satisfy HEAD yet
                             // (e.g. only GET-warmed). Retry backend HEAD once
@@ -456,6 +456,7 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
                                         );
                                         match outcome {
                                             CacheRefreshOutcome::Updated(updated_meta) => {
+                                                let updated_meta = *updated_meta;
                                                 let _ = state
                                                     .cache
                                                     .update_metadata_if_unchanged(

@@ -94,19 +94,19 @@ async fn build_cache_response(
             let m = &entry.meta;
             let mut headers = http::HeaderMap::new();
 
-            if let Some(ref ct) = m.content_type {
-                if let Ok(val) = http::header::HeaderValue::from_str(ct) {
-                    headers.insert("content-type", val);
-                }
+            if let Some(ref ct) = m.content_type
+                && let Ok(val) = http::header::HeaderValue::from_str(ct)
+            {
+                headers.insert("content-type", val);
             }
             headers.insert(
                 "content-length",
                 http::header::HeaderValue::from(m.content_length),
             );
-            if let Some(ref etag) = m.etag {
-                if let Ok(val) = http::header::HeaderValue::from_str(etag) {
-                    headers.insert("etag", val);
-                }
+            if let Some(ref etag) = m.etag
+                && let Ok(val) = http::header::HeaderValue::from_str(etag)
+            {
+                headers.insert("etag", val);
             }
             if let Some(ref dt) = m.last_modified {
                 let formatted = dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
@@ -242,7 +242,7 @@ async fn try_refresh_cached_get_metadata<B: Backend + 'static, C: CacheStore + '
         crate::handlers::head::CacheRefreshOutcome::Updated(updated_meta) => {
             match state
                 .cache
-                .update_metadata_if_unchanged(cache_key, entry.meta.fill_id, updated_meta)
+                .update_metadata_if_unchanged(cache_key, entry.meta.fill_id, *updated_meta)
                 .await
             {
                 Ok(true) => {
@@ -532,6 +532,7 @@ async fn handle_passthrough<B: Backend, C: CacheStore>(
 /// Pushing this behind CacheStore would require the trait to understand
 /// HTTP response bodies and mpsc channels, leaking transport details into
 /// the cache abstraction.
+#[allow(clippy::too_many_arguments)]
 fn spawn_cache_tee<C: CacheStore + 'static>(
     cache: Arc<C>,
     body_stream: BoxByteStream,
@@ -750,29 +751,29 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
     match state.cache.peek(cache_key).await {
         Ok(Some(entry)) if cache_entry_satisfies_read_options(&entry, read_options) => {
             // Entry satisfies — pin the body and serve.
-            if let Ok(Some(pinned)) = state.cache.peek_body(cache_key).await {
-                if cache_entry_satisfies_read_options(&pinned, read_options) {
-                    let meta_for_hit = pinned.meta.clone();
-                    if let Some(resp) = build_cache_response(
-                        pinned,
-                        &parsed.request_id,
-                        "HIT",
-                        read_options.wants_checksum_headers(),
-                    )
-                    .await
-                    {
-                        if let Err(e) = state.cache.note_hit(cache_key, &meta_for_hit).await {
-                            tracing::warn!(
-                                request_id = %parsed.request_id,
-                                error = %e,
-                                operation = "GetObject",
-                                key = key,
-                                "failed to record cache hit"
-                            );
-                        }
-                        waiter.complete().await;
-                        return resp;
+            if let Ok(Some(pinned)) = state.cache.peek_body(cache_key).await
+                && cache_entry_satisfies_read_options(&pinned, read_options)
+            {
+                let meta_for_hit = pinned.meta.clone();
+                if let Some(resp) = build_cache_response(
+                    pinned,
+                    &parsed.request_id,
+                    "HIT",
+                    read_options.wants_checksum_headers(),
+                )
+                .await
+                {
+                    if let Err(e) = state.cache.note_hit(cache_key, &meta_for_hit).await {
+                        tracing::warn!(
+                            request_id = %parsed.request_id,
+                            error = %e,
+                            operation = "GetObject",
+                            key = key,
+                            "failed to record cache hit"
+                        );
                     }
+                    waiter.complete().await;
+                    return resp;
                 }
             }
         }
@@ -788,35 +789,33 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
             // invalidation found the entry was replaced by a concurrent
             // refill. Re-probe: if a newer entry now satisfies, serve it
             // instead of paying a redundant backend GET.
-            if let Ok(Some(refreshed)) = state.cache.peek(cache_key).await {
-                if cache_entry_satisfies_read_options(&refreshed, read_options) {
-                    if let Ok(Some(pinned)) = state.cache.peek_body(cache_key).await {
-                        if cache_entry_satisfies_read_options(&pinned, read_options) {
-                            let meta_for_hit = pinned.meta.clone();
-                            if let Some(resp) = build_cache_response(
-                                pinned,
-                                &parsed.request_id,
-                                "HIT",
-                                read_options.wants_checksum_headers(),
-                            )
-                            .await
-                            {
-                                if let Err(e) =
-                                    state.cache.note_hit(cache_key, &meta_for_hit).await
-                                {
-                                    tracing::warn!(
-                                        request_id = %parsed.request_id,
-                                        error = %e,
-                                        operation = "GetObject",
-                                        key = key,
-                                        "failed to record cache hit after 404 re-probe"
-                                    );
-                                }
-                                waiter.complete().await;
-                                return resp;
-                            }
-                        }
+            if let Ok(Some(refreshed)) = state.cache.peek(cache_key).await
+                && cache_entry_satisfies_read_options(&refreshed, read_options)
+                && let Ok(Some(pinned)) = state.cache.peek_body(cache_key).await
+                && cache_entry_satisfies_read_options(&pinned, read_options)
+            {
+                let meta_for_hit = pinned.meta.clone();
+                if let Some(resp) = build_cache_response(
+                    pinned,
+                    &parsed.request_id,
+                    "HIT",
+                    read_options.wants_checksum_headers(),
+                )
+                .await
+                {
+                    if let Err(e) =
+                        state.cache.note_hit(cache_key, &meta_for_hit).await
+                    {
+                        tracing::warn!(
+                            request_id = %parsed.request_id,
+                            error = %e,
+                            operation = "GetObject",
+                            key = key,
+                            "failed to record cache hit after 404 re-probe"
+                        );
                     }
+                    waiter.complete().await;
+                    return resp;
                 }
             }
         }

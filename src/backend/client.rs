@@ -398,7 +398,6 @@ impl Backend for S3Backend {
             let client = self.client.clone();
             let bucket = bucket.clone();
             let key = key.clone();
-            let options = options;
             async move {
                 let mut request = client.get_object().bucket(&bucket).key(&key);
                 if options.wants_checksum_headers() {
@@ -446,7 +445,6 @@ impl Backend for S3Backend {
             let client = &self.client;
             let bucket = bucket.clone();
             let key = key.clone();
-            let options = options;
             async move {
                 let mut request = client.head_object().bucket(&bucket).key(&key);
                 if options.wants_checksum_headers() {

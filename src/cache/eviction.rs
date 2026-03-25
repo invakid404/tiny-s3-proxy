@@ -369,30 +369,28 @@ async fn run_eviction_pass_inner(
 
         // Re-read metadata under the lock to confirm this is still the same
         // entry we scanned. A concurrent commit_fill() may have replaced it.
-        if let Ok(meta_bytes) = tokio::fs::read(&candidate.meta_path).await {
-            if let Ok(meta) = serde_json::from_slice::<CacheMeta>(&meta_bytes) {
-                if meta.fill_id != candidate.fill_id
-                    || meta.last_accessed_at != candidate.last_accessed_at
-                {
-                    // Entry changed since scan — skip eviction but adjust
-                    // current_size to reflect the actual on-disk size (the
-                    // entry still exists, possibly at a different size).
-                    let actual_body = tokio::fs::metadata(&candidate.body_path)
-                        .await
-                        .map(|m| m.len())
-                        .unwrap_or(0);
-                    let actual_meta = tokio::fs::metadata(&candidate.meta_path)
-                        .await
-                        .map(|m| m.len())
-                        .unwrap_or(0);
-                    let actual_size = actual_body + actual_meta;
-                    // Replace the scanned size with the measured size.
-                    current_size = current_size
-                        .saturating_sub(candidate.size)
-                        .saturating_add(actual_size);
-                    continue;
-                }
-            }
+        if let Ok(meta_bytes) = tokio::fs::read(&candidate.meta_path).await
+            && let Ok(meta) = serde_json::from_slice::<CacheMeta>(&meta_bytes)
+            && (meta.fill_id != candidate.fill_id
+                || meta.last_accessed_at != candidate.last_accessed_at)
+        {
+            // Entry changed since scan — skip eviction but adjust
+            // current_size to reflect the actual on-disk size (the
+            // entry still exists, possibly at a different size).
+            let actual_body = tokio::fs::metadata(&candidate.body_path)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let actual_meta = tokio::fs::metadata(&candidate.meta_path)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let actual_size = actual_body + actual_meta;
+            // Replace the scanned size with the measured size.
+            current_size = current_size
+                .saturating_sub(candidate.size)
+                .saturating_add(actual_size);
+            continue;
         }
 
         let body_removed = tokio::fs::remove_file(&candidate.body_path).await.is_ok();
@@ -461,7 +459,7 @@ mod tests {
     ) {
         let hash = key.hash_hex();
         let (d1, d2) = key.dir_prefix();
-        let dir = cache_dir.join("objects").join(&d1).join(&d2);
+        let dir = cache_dir.join("objects").join(d1).join(d2);
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
         let body_path = dir.join(format!("{}.body", hash));
@@ -519,8 +517,8 @@ mod tests {
         let (d1, d2) = key.dir_prefix();
         let body_path = cache_dir
             .join("objects")
-            .join(&d1)
-            .join(&d2)
+            .join(d1)
+            .join(d2)
             .join(format!("{}.body", hash));
         assert!(body_path.exists());
 
@@ -579,8 +577,8 @@ mod tests {
         let (d1, d2) = key_old.dir_prefix();
         let body_path_old = cache_dir
             .join("objects")
-            .join(&d1)
-            .join(&d2)
+            .join(d1)
+            .join(d2)
             .join(format!("{}.body", hash_old));
         assert!(
             !body_path_old.exists(),
@@ -591,8 +589,8 @@ mod tests {
         let (d1, d2) = key_new.dir_prefix();
         let body_path_new = cache_dir
             .join("objects")
-            .join(&d1)
-            .join(&d2)
+            .join(d1)
+            .join(d2)
             .join(format!("{}.body", hash_new));
         assert!(body_path_new.exists(), "newest entry should remain");
 
@@ -621,7 +619,7 @@ mod tests {
         // Write only the metadata — no body yet.
         let hash = key.hash_hex();
         let (d1, d2) = key.dir_prefix();
-        let dir = cache_dir.join("objects").join(&d1).join(&d2);
+        let dir = cache_dir.join("objects").join(d1).join(d2);
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let meta = CacheMeta {
             bucket: "bucket".into(),

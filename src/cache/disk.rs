@@ -715,15 +715,15 @@ impl DiskCache {
 
         // Create parent directories for final location
         let (final_body, final_meta) = self.paths_for_key(&guard.key);
-        if let Some(parent) = final_body.parent() {
-            if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                let _ = tokio::fs::remove_file(&temp_body_path).await;
-                let _ = tokio::fs::remove_file(&temp_meta).await;
-                return Err(ProxyError::Cache {
-                    source: Box::new(e),
-                    operation: "create object dir".into(),
-                });
-            }
+        if let Some(parent) = final_body.parent()
+            && let Err(e) = tokio::fs::create_dir_all(parent).await
+        {
+            let _ = tokio::fs::remove_file(&temp_body_path).await;
+            let _ = tokio::fs::remove_file(&temp_meta).await;
+            return Err(ProxyError::Cache {
+                source: Box::new(e),
+                operation: "create object dir".into(),
+            });
         }
 
         // Pre-publish generation check via read lock (doesn't block purge).
@@ -784,10 +784,10 @@ impl DiskCache {
                 }
             }
 
-            if let Ok(current_bytes) = tokio::fs::read(&final_meta).await {
-                if let Ok(current_meta) = serde_json::from_slice::<CacheMeta>(&current_bytes) {
-                    meta.preserve_same_etag_head_state_from(&current_meta);
-                }
+            if let Ok(current_bytes) = tokio::fs::read(&final_meta).await
+                && let Ok(current_meta) = serde_json::from_slice::<CacheMeta>(&current_bytes)
+            {
+                meta.preserve_same_etag_head_state_from(&current_meta);
             }
 
             meta.fill_id = match self.reserve_fill_id().await {
@@ -854,28 +854,28 @@ impl DiskCache {
             let backup_body = guard.temp_dir.join(format!("{pid}-{id}.prev.body"));
             let backup_meta = guard.temp_dir.join(format!("{pid}-{id}.prev.meta.json"));
 
-            if old_body_exists {
-                if let Err(e) = tokio::fs::rename(&final_body, &backup_body).await {
-                    let _ = tokio::fs::remove_file(&temp_body_path).await;
-                    let _ = tokio::fs::remove_file(&temp_meta).await;
-                    return Err(ProxyError::Cache {
-                        source: Box::new(e),
-                        operation: "backup existing body".into(),
-                    });
-                }
+            if old_body_exists
+                && let Err(e) = tokio::fs::rename(&final_body, &backup_body).await
+            {
+                let _ = tokio::fs::remove_file(&temp_body_path).await;
+                let _ = tokio::fs::remove_file(&temp_meta).await;
+                return Err(ProxyError::Cache {
+                    source: Box::new(e),
+                    operation: "backup existing body".into(),
+                });
             }
-            if old_meta_exists {
-                if let Err(e) = tokio::fs::rename(&final_meta, &backup_meta).await {
-                    if old_body_exists {
-                        Self::restore_publish_backup(&final_body, &backup_body, "body").await;
-                    }
-                    let _ = tokio::fs::remove_file(&temp_body_path).await;
-                    let _ = tokio::fs::remove_file(&temp_meta).await;
-                    return Err(ProxyError::Cache {
-                        source: Box::new(e),
-                        operation: "backup existing metadata".into(),
-                    });
+            if old_meta_exists
+                && let Err(e) = tokio::fs::rename(&final_meta, &backup_meta).await
+            {
+                if old_body_exists {
+                    Self::restore_publish_backup(&final_body, &backup_body, "body").await;
                 }
+                let _ = tokio::fs::remove_file(&temp_body_path).await;
+                let _ = tokio::fs::remove_file(&temp_meta).await;
+                return Err(ProxyError::Cache {
+                    source: Box::new(e),
+                    operation: "backup existing metadata".into(),
+                });
             }
 
             if let Err(e) = tokio::fs::rename(&temp_body_path, &final_body).await {
@@ -1857,14 +1857,14 @@ mod tests {
         let body_path = tmp
             .path()
             .join("objects")
-            .join(&d1)
-            .join(&d2)
+            .join(d1)
+            .join(d2)
             .join(format!("{}.body", hash));
         let meta_path = tmp
             .path()
             .join("objects")
-            .join(&d1)
-            .join(&d2)
+            .join(d1)
+            .join(d2)
             .join(format!("{}.meta.json", hash));
 
         assert!(
@@ -2205,7 +2205,7 @@ mod tests {
                 .unwrap(),
             "head-sum"
         );
-        assert!(updated.metadata.get("fresh").is_none());
+        assert!(!updated.metadata.contains_key("fresh"));
         assert_eq!(updated.metadata_version, 1);
     }
 
