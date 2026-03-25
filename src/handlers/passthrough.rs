@@ -125,11 +125,9 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
             }
         };
 
-    // 3. Build an http::Request for signing.
-    let mut req_builder = http::Request::builder().method(method).uri(&upstream_url);
-
-    // Copy headers from the original request, stripping SigV4/auth headers,
-    // standard hop-by-hop headers, and any headers nominated by Connection.
+    // 3. Build "base headers" for signing — filtered original headers without
+    //    auth/hop-by-hop headers. These don't change across retry attempts.
+    let mut base_headers = http::HeaderMap::new();
     let connection_nominated = collect_connection_nominated(original_headers);
     for (name, value) in original_headers {
         let name_str = name.as_str();
@@ -139,19 +137,10 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
         {
             continue;
         }
-        req_builder = req_builder.header(name, value);
+        base_headers.append(name.clone(), value.clone());
     }
 
-    let mut signable_request = match req_builder.body(()) {
-        Ok(req) => req,
-        Err(e) => {
-            tracing::error!(error = %e, "passthrough: failed to build signable request");
-            let s3err = S3Error::internal_error("An internal error occurred.", request_id);
-            return s3err.to_response();
-        }
-    };
-
-    // 4. Sign the request with AWS SigV4 using backend credentials.
+    // 4. Prepare credentials and signing settings outside the loop (they don't change).
     let credentials = Credentials::new(
         &state.config.backend_access_key_id,
         &state.config.backend_secret_access_key,
@@ -173,51 +162,6 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
         aws_sigv4::http_request::UriPathNormalizationMode::Disabled;
     signing_settings.payload_checksum_kind =
         aws_sigv4::http_request::PayloadChecksumKind::XAmzSha256;
-    let signing_params = match SigningParams::builder()
-        .identity(&identity)
-        .region(&state.config.backend_region)
-        .name("s3")
-        .time(SystemTime::now())
-        .settings(signing_settings)
-        .build()
-    {
-        Ok(params) => params,
-        Err(e) => {
-            tracing::error!(error = %e, "passthrough: failed to build signing params");
-            let s3err = S3Error::internal_error("An internal error occurred.", request_id);
-            return s3err.to_response();
-        }
-    };
-
-    let signable_body = SignableBody::Bytes(body_bytes.as_ref());
-    let signable = match SignableRequest::new(
-        signable_request.method().as_str(),
-        signable_request.uri().to_string(),
-        signable_request
-            .headers()
-            .iter()
-            .map(|(k, v)| (k.as_str(), std::str::from_utf8(v.as_bytes()).unwrap_or(""))),
-        signable_body,
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(error = %e, "passthrough: failed to create signable request");
-            let s3err = S3Error::internal_error("An internal error occurred.", request_id);
-            return s3err.to_response();
-        }
-    };
-
-    let (signing_instructions, _signature) = match sign(signable, &signing_params.into()) {
-        Ok(output) => output.into_parts(),
-        Err(e) => {
-            tracing::error!(error = %e, "passthrough: failed to sign request");
-            let s3err = S3Error::internal_error("An internal error occurred.", request_id);
-            return s3err.to_response();
-        }
-    };
-
-    // Apply signing instructions (adds Authorization, x-amz-date, etc.).
-    signing_instructions.apply_to_request_http1x(&mut signable_request);
 
     // 5. Send the request via reqwest (reuse client from AppState).
     // Idempotent methods (GET, HEAD, DELETE) are retried on transport errors
@@ -254,6 +198,71 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
     let mut last_err = None;
     let mut upstream_resp = None;
     for attempt in 1..=max_attempts {
+        // Re-sign on every attempt so that x-amz-date and the authorization
+        // header reflect the current wall-clock time. Without this, retries
+        // after backoff can fail with stale-signature errors.
+        let signing_params = match SigningParams::builder()
+            .identity(&identity)
+            .region(&state.config.backend_region)
+            .name("s3")
+            .time(SystemTime::now())
+            .settings(signing_settings.clone())
+            .build()
+        {
+            Ok(params) => params,
+            Err(e) => {
+                tracing::error!(error = %e, "passthrough: failed to build signing params");
+                let s3err = S3Error::internal_error("An internal error occurred.", request_id);
+                return s3err.to_response();
+            }
+        };
+
+        // Build a fresh http::Request from the base headers for signing.
+        let mut sign_req_builder = http::Request::builder()
+            .method(method)
+            .uri(&upstream_url);
+        for (name, value) in &base_headers {
+            sign_req_builder = sign_req_builder.header(name, value);
+        }
+        let mut signable_request = match sign_req_builder.body(()) {
+            Ok(req) => req,
+            Err(e) => {
+                tracing::error!(error = %e, "passthrough: failed to build signable request");
+                let s3err = S3Error::internal_error("An internal error occurred.", request_id);
+                return s3err.to_response();
+            }
+        };
+
+        let signable_body = SignableBody::Bytes(body_bytes.as_ref());
+        let signable = match SignableRequest::new(
+            signable_request.method().as_str(),
+            signable_request.uri().to_string(),
+            signable_request
+                .headers()
+                .iter()
+                .map(|(k, v)| (k.as_str(), std::str::from_utf8(v.as_bytes()).unwrap_or(""))),
+            signable_body,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "passthrough: failed to create signable request");
+                let s3err = S3Error::internal_error("An internal error occurred.", request_id);
+                return s3err.to_response();
+            }
+        };
+
+        let (signing_instructions, _signature) = match sign(signable, &signing_params.into()) {
+            Ok(output) => output.into_parts(),
+            Err(e) => {
+                tracing::error!(error = %e, "passthrough: failed to sign request");
+                let s3err = S3Error::internal_error("An internal error occurred.", request_id);
+                return s3err.to_response();
+            }
+        };
+
+        // Apply signing instructions (adds Authorization, x-amz-date, etc.).
+        signing_instructions.apply_to_request_http1x(&mut signable_request);
+
         let mut req_builder = state
             .http_client
             .request(reqwest_method.clone(), &upstream_url);
@@ -812,5 +821,104 @@ mod tests {
             1,
             "POST should not retry"
         );
+    }
+
+    // ---- Retry re-signs with fresh timestamp ----
+    #[tokio::test]
+    async fn test_retry_resigns_with_fresh_timestamp() {
+        // Custom handler: 503 on first call, 200 on second. Records headers.
+        let call_count = Arc::new(AtomicU32::new(0));
+        let call_count_clone = call_count.clone();
+        let requests_for_handler: Arc<tokio::sync::Mutex<Vec<(String, String, HeaderMap)>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let requests_clone = requests_for_handler.clone();
+
+        let app = axum::Router::new().route(
+            "/{*path}",
+            any(move |req: http::Request<Body>| {
+                let cc = call_count_clone.clone();
+                let reqs = requests_clone.clone();
+                async move {
+                    let method = req.method().to_string();
+                    let uri = req.uri().to_string();
+                    let headers = req.headers().clone();
+                    reqs.lock().await.push((method, uri, headers));
+
+                    let count = cc.fetch_add(1, Ordering::SeqCst);
+                    let status = if count == 0 { 503u16 } else { 200u16 };
+                    http::Response::builder()
+                        .status(status)
+                        .body(Body::from("ok"))
+                        .unwrap()
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = test_config_for_passthrough(&format!("http://{}", addr));
+        config.get_max_attempts = 2;
+        config.retry_base_backoff_ms = 1; // minimal backoff for test speed
+
+        let state = build_passthrough_state(config);
+        let headers = HeaderMap::new();
+
+        let resp = handle_passthrough(
+            &state,
+            "GET",
+            "/test-backend/key",
+            None,
+            &headers,
+            Body::empty(),
+            "req-resign",
+        )
+        .await;
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(call_count.load(Ordering::SeqCst), 2, "should have made 2 attempts");
+
+        let reqs = requests_for_handler.lock().await;
+        assert_eq!(reqs.len(), 2, "mock should have recorded 2 requests");
+
+        // Both requests must have authorization and x-amz-date headers.
+        for (i, (_method, _uri, hdrs)) in reqs.iter().enumerate() {
+            let auth = hdrs
+                .get("authorization")
+                .unwrap_or_else(|| panic!("attempt {}: authorization header must be present", i + 1))
+                .to_str()
+                .unwrap();
+            assert!(
+                auth.starts_with("AWS4-HMAC-SHA256"),
+                "attempt {}: authorization should start with AWS4-HMAC-SHA256, got: {auth}",
+                i + 1
+            );
+            assert!(
+                hdrs.contains_key("x-amz-date"),
+                "attempt {}: x-amz-date header must be present",
+                i + 1
+            );
+        }
+
+        // Verify both have valid x-amz-date format (YYYYMMDDTHHMMSSZ).
+        let date1 = reqs[0].2.get("x-amz-date").unwrap().to_str().unwrap();
+        let date2 = reqs[1].2.get("x-amz-date").unwrap().to_str().unwrap();
+        assert_eq!(date1.len(), 16, "x-amz-date should be 16 chars: {date1}");
+        assert_eq!(date2.len(), 16, "x-amz-date should be 16 chars: {date2}");
+        assert!(date1.ends_with('Z'), "x-amz-date should end with Z: {date1}");
+        assert!(date2.ends_with('Z'), "x-amz-date should end with Z: {date2}");
+
+        // The authorization headers should both be valid SigV4 signatures
+        // (they will differ if the timestamps differ, or be the same if
+        // the retry was fast enough that the second landed in the same second).
+        let auth1 = reqs[0].2.get("authorization").unwrap().to_str().unwrap();
+        let auth2 = reqs[1].2.get("authorization").unwrap().to_str().unwrap();
+        assert!(auth1.contains("Credential="), "first auth missing Credential");
+        assert!(auth2.contains("Credential="), "second auth missing Credential");
+        assert!(auth1.contains("Signature="), "first auth missing Signature");
+        assert!(auth2.contains("Signature="), "second auth missing Signature");
     }
 }
