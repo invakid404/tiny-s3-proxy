@@ -7,7 +7,7 @@ use crate::cache::entry::CacheEntry;
 use crate::cache::key::CacheKey;
 use crate::cache::metadata::CacheMeta;
 use crate::cache::policy::CachePolicy;
-use crate::cache::{CacheStats, CacheStatsSnapshot, CacheStore, FillGuard};
+use crate::cache::{CacheStats, CacheStatsSnapshot, CacheStore, FillGuard, FillId};
 use crate::error::ProxyError;
 
 /// Check if a path exists, distinguishing NotFound from real I/O errors.
@@ -393,7 +393,7 @@ impl DiskCache {
                                     Ok(meta_bytes) => {
                                         match serde_json::from_slice::<CacheMeta>(&meta_bytes) {
                                             Ok(meta) => {
-                                                max_fill_id = max_fill_id.max(meta.fill_id);
+                                                max_fill_id = max_fill_id.max(meta.fill_id.as_u64());
                                             }
                                             Err(e) => {
                                                 tracing::warn!(
@@ -612,7 +612,7 @@ impl DiskCache {
         meta_path: PathBuf,
         tmp_dir: PathBuf,
         hash: String,
-        expected_fill_id: u64,
+        expected_fill_id: FillId,
         now: chrono::DateTime<chrono::Utc>,
     ) {
         static ACCESS_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -791,7 +791,7 @@ impl DiskCache {
             }
 
             meta.fill_id = match self.reserve_fill_id().await {
-                Ok(fill_id) => fill_id,
+                Ok(fill_id) => FillId::new(fill_id),
                 Err(e) => {
                     let _ = tokio::fs::remove_file(&temp_body_path).await;
                     let _ = tokio::fs::remove_file(&temp_meta).await;
@@ -1122,7 +1122,7 @@ impl CacheStore for DiskCache {
     async fn purge_if_unchanged(
         &self,
         key: &CacheKey,
-        expected_fill_id: u64,
+        expected_fill_id: FillId,
     ) -> Result<bool, ProxyError> {
         let fill_entry = {
             let fills = self.active_fills.read().await;
@@ -1249,7 +1249,7 @@ impl CacheStore for DiskCache {
     async fn poison_if_unchanged(
         &self,
         key: &CacheKey,
-        expected_fill_id: u64,
+        expected_fill_id: FillId,
     ) -> Result<bool, ProxyError> {
         let fill_entry = {
             let fills = self.active_fills.read().await;
@@ -1298,7 +1298,7 @@ impl CacheStore for DiskCache {
     async fn update_metadata_if_unchanged(
         &self,
         key: &CacheKey,
-        expected_fill_id: u64,
+        expected_fill_id: FillId,
         meta: CacheMeta,
     ) -> Result<bool, ProxyError> {
         static UPDATE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1670,7 +1670,7 @@ mod tests {
             content_type: Some("application/javascript".into()),
             content_length: body_len as i64,
             cache_written_at: now,
-            fill_id: 0, // stamped by commit_fill
+            fill_id: FillId::ZERO, // stamped by commit_fill
             metadata_version: 0,
             last_accessed_at: now,
             hit_count: 0,
@@ -1978,7 +1978,7 @@ mod tests {
                     content_type: None,
                     content_length: body.len() as i64,
                     cache_written_at: Utc::now(),
-                    fill_id: 0,
+                    fill_id: FillId::ZERO,
                     metadata_version: 0,
                     last_accessed_at: Utc::now(),
                     hit_count: 0,
@@ -2007,7 +2007,7 @@ mod tests {
                 content_type: None,
                 content_length: body.len() as i64,
                 cache_written_at: Utc::now(),
-                fill_id: 0,
+                fill_id: FillId::ZERO,
                 metadata_version: 0,
                 last_accessed_at: Utc::now(),
                 hit_count: 0,
@@ -2347,7 +2347,7 @@ mod tests {
         let guard = cache1.begin_fill(&key).await.unwrap();
         cache1.commit_fill(guard, temp_path, meta).await.unwrap();
         let old_fill_id = cache1.lookup(&key).await.unwrap().unwrap().meta.fill_id;
-        assert_eq!(read_fill_id_counter(tmp.path()).await, old_fill_id + 1);
+        assert_eq!(read_fill_id_counter(tmp.path()).await, old_fill_id.as_u64() + 1);
         drop(cache1);
 
         let cache2 = DiskCache::new(cache_dir.clone(), 1_000_000, test_policy())
@@ -2361,10 +2361,10 @@ mod tests {
         let new_fill_id = cache2.lookup(&key).await.unwrap().unwrap().meta.fill_id;
 
         assert!(
-            new_fill_id > old_fill_id,
+            new_fill_id.as_u64() > old_fill_id.as_u64(),
             "fill_id did not survive restart: old={old_fill_id}, new={new_fill_id}"
         );
-        assert_eq!(read_fill_id_counter(tmp.path()).await, new_fill_id + 1);
+        assert_eq!(read_fill_id_counter(tmp.path()).await, new_fill_id.as_u64() + 1);
 
         assert!(!cache2.purge_if_unchanged(&key, old_fill_id).await.unwrap());
     }
@@ -2400,8 +2400,8 @@ mod tests {
         cache2.commit_fill(guard2, temp_path2, meta2).await.unwrap();
 
         let new_fill_id = cache2.lookup(&key).await.unwrap().unwrap().meta.fill_id;
-        assert!(new_fill_id > old_fill_id);
-        assert_eq!(read_fill_id_counter(tmp.path()).await, new_fill_id + 1);
+        assert!(new_fill_id.as_u64() > old_fill_id.as_u64());
+        assert_eq!(read_fill_id_counter(tmp.path()).await, new_fill_id.as_u64() + 1);
     }
 
     #[tokio::test]
@@ -2431,7 +2431,7 @@ mod tests {
 
         let legacy_body = b"legacy data".to_vec();
         let mut legacy_meta = test_meta(legacy_body.len());
-        legacy_meta.fill_id = 7;
+        legacy_meta.fill_id = FillId::new(7);
         tokio::fs::write(&body_path, &legacy_body).await.unwrap();
         tokio::fs::write(&meta_path, serde_json::to_vec(&legacy_meta).unwrap())
             .await
@@ -2452,7 +2452,7 @@ mod tests {
             .unwrap();
 
         let fill_id = cache2.lookup(&key).await.unwrap().unwrap().meta.fill_id;
-        assert_eq!(fill_id, 100);
+        assert_eq!(fill_id, FillId::new(100));
         assert_eq!(read_fill_id_counter(tmp.path()).await, 101);
     }
 
@@ -2508,7 +2508,7 @@ mod tests {
         let new_temp_path = write_temp_body(tmp.path(), &new_body).await;
         let new_meta = test_meta(new_body.len());
 
-        let wrong_fill_id = u64::MAX;
+        let wrong_fill_id = FillId::new(u64::MAX);
         assert!(!cache.purge_if_unchanged(&key, wrong_fill_id).await.unwrap());
 
         cache

@@ -368,6 +368,7 @@ mod tests {
     use axum::body::Body;
     use axum::routing::any;
     use http::HeaderMap;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
 
@@ -445,7 +446,7 @@ mod tests {
             backend_secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
             backend_use_path_style: true,
             backend_allow_http: true,
-            cache_dir: "/tmp/test-cache".to_string(),
+            cache_dir: PathBuf::from("/tmp/test-cache"),
             cache_max_bytes: 1024 * 1024,
             cache_max_object_bytes: 512 * 1024,
             cacheable_prefixes: vec![],

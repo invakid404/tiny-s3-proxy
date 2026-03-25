@@ -69,7 +69,7 @@ mod tests {
             backend_secret_access_key: "secret".to_string(),
             backend_use_path_style: true,
             backend_allow_http: false,
-            cache_dir: "/cache".to_string(),
+            cache_dir: std::path::PathBuf::from("/cache"),
             cache_max_bytes: 1024,
             cache_max_object_bytes: 512,
             cacheable_prefixes: vec![],

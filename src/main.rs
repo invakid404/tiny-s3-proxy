@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use metrics_exporter_prometheus::PrometheusHandle;
@@ -28,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         backend_endpoint = %config.backend_endpoint,
         backend_bucket = %config.backend_bucket,
         frontend_bucket = %config.frontend_bucket,
-        cache_dir = %config.cache_dir,
+        cache_dir = %config.cache_dir.display(),
         auth_mode = ?config.auth_mode,
         "starting tiny-s3-proxy"
     );
@@ -62,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.cache_max_object_bytes,
     );
     let disk_cache = cache::DiskCache::new(
-        PathBuf::from(&config.cache_dir),
+        config.cache_dir.clone(),
         config.cache_max_bytes,
         cache_policy.clone(),
     )
@@ -71,7 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Grab the stats reference from DiskCache before wrapping in Arc
     let disk_cache = Arc::new(disk_cache);
     let eviction_stats = disk_cache.stats_ref().clone();
-    tracing::info!(cache_dir = %config.cache_dir, "disk cache initialized");
+    tracing::info!(cache_dir = %config.cache_dir.display(), "disk cache initialized");
 
     let singleflight = Arc::new(cache::SingleFlight::new());
 
@@ -101,7 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // 7. Spawn eviction loop
-    let eviction_cache_dir = PathBuf::from(&config.cache_dir);
+    let eviction_cache_dir = config.cache_dir.clone();
     let eviction_max = config.cache_max_bytes;
     let eviction_interval = config.cache_eviction_interval_secs;
     let eviction_disk_cache = disk_cache.clone();
@@ -122,7 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 9. Build admin router
     let admin_state = admin::AdminState {
         prometheus_handle: setup_metrics(),
-        cache_dir: PathBuf::from(&config.cache_dir),
+        cache_dir: config.cache_dir.clone(),
     };
     let admin_app = admin::build_admin_router(admin_state);
 

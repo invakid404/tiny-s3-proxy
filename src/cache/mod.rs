@@ -17,6 +17,37 @@ use metadata::CacheMeta;
 pub use disk::DiskCache;
 pub use singleflight::{FlightResult, FlightWaiter, SingleFlight};
 
+/// Monotonically-increasing generation counter used as a CAS token to
+/// detect concurrent cache fills and invalidations. Prevents accidental
+/// use of unrelated u64 values in fill-id comparisons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct FillId(u64);
+
+impl FillId {
+    pub const ZERO: FillId = FillId(0);
+
+    pub fn new(val: u64) -> Self {
+        Self(val)
+    }
+
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for FillId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl Default for FillId {
+    fn default() -> Self {
+        Self::ZERO
+    }
+}
+
 /// Trait defining the cache storage interface.
 pub trait CacheStore: Send + Sync {
     /// Look up a cached entry. Returns None on miss.
@@ -92,7 +123,7 @@ pub trait CacheStore: Send + Sync {
     fn purge_if_unchanged(
         &self,
         key: &CacheKey,
-        expected_fill_id: u64,
+        expected_fill_id: FillId,
     ) -> impl std::future::Future<Output = Result<bool, ProxyError>> + Send;
 
     /// Mark a key as poisoned so lookup returns miss until the entry is
@@ -117,7 +148,7 @@ pub trait CacheStore: Send + Sync {
     fn poison_if_unchanged(
         &self,
         key: &CacheKey,
-        expected_fill_id: u64,
+        expected_fill_id: FillId,
     ) -> impl std::future::Future<Output = Result<bool, ProxyError>> + Send;
 
     /// Update metadata for an existing cached entry when the stored entry
@@ -133,7 +164,7 @@ pub trait CacheStore: Send + Sync {
     fn update_metadata_if_unchanged(
         &self,
         key: &CacheKey,
-        expected_fill_id: u64,
+        expected_fill_id: FillId,
         meta: CacheMeta,
     ) -> impl std::future::Future<Output = Result<bool, ProxyError>> + Send;
 

@@ -1,4 +1,5 @@
 use std::env;
+use std::path::PathBuf;
 use thiserror::Error;
 
 /// Errors that can occur when loading configuration.
@@ -43,7 +44,7 @@ pub struct Config {
     pub backend_allow_http: bool,
 
     // Cache
-    pub cache_dir: String,
+    pub cache_dir: PathBuf,
     pub cache_max_bytes: u64,
     pub cache_max_object_bytes: u64,
     pub cacheable_prefixes: Vec<String>,
@@ -83,7 +84,7 @@ impl Config {
             backend_allow_http: parse_bool_env("BACKEND_ALLOW_HTTP", false)?,
 
             // Cache
-            cache_dir: get_env_or_default("CACHE_DIR", "/cache"),
+            cache_dir: PathBuf::from(get_env_or_default("CACHE_DIR", "/cache")),
             cache_max_bytes: parse_u64_env("CACHE_MAX_BYTES", 10_737_418_240)?,
             cache_max_object_bytes: parse_u64_env("CACHE_MAX_OBJECT_BYTES", 536_870_912)?,
             cacheable_prefixes: {
@@ -291,7 +292,7 @@ mod tests {
             assert!(config.backend_use_path_style);
             assert!(!config.backend_allow_http);
 
-            assert_eq!(config.cache_dir, "/cache");
+            assert_eq!(config.cache_dir, PathBuf::from("/cache"));
             assert_eq!(config.cache_max_bytes, 10_737_418_240);
             assert_eq!(config.cache_max_object_bytes, 536_870_912);
             assert!(config.cacheable_prefixes.is_empty());
