@@ -1,5 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::LazyLock;
 
+static PID: LazyLock<u32> = LazyLock::new(std::process::id);
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Generate a lightweight request ID using process ID + monotonic counter.
@@ -7,6 +9,5 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 /// for the counter part, but we return String for compatibility.
 pub fn generate() -> String {
     let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-    format!("{pid}-{count}")
+    format!("{}-{}", *PID, count)
 }
