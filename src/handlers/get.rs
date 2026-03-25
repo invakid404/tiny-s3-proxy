@@ -1753,7 +1753,7 @@ mod tests {
             "headsum-initial"
         );
 
-        let mut refreshed_meta = current.meta.clone();
+        let mut refreshed_meta = (*current.meta).clone();
         refreshed_meta.head_metadata_checked = true;
         refreshed_meta.head_checksum_checked = true;
         refreshed_meta.head_extra_headers.insert(
@@ -2208,7 +2208,7 @@ mod tests {
         let body_path = temp_dir.join("stale-test.body");
         std::fs::write(&body_path, body).expect("write stale body file");
         CacheEntry {
-            meta: test_cache_meta(bucket, key, body),
+            meta: Arc::new(test_cache_meta(bucket, key, body)),
             body_path,
             body_file: None,
         }
@@ -2384,7 +2384,7 @@ mod tests {
         let body_path = state.cache.temp_dir.path().join("follower-test.body");
         tokio::fs::write(&body_path, &body).await.unwrap();
         let entry = CacheEntry {
-            meta,
+            meta: Arc::new(meta),
             body_path,
             body_file: None,
         };
@@ -2481,7 +2481,7 @@ mod tests {
         let body_path = state.cache.temp_dir.path().join("plain-fill.body");
         tokio::fs::write(&body_path, &plain_body).await.unwrap();
         let entry = CacheEntry {
-            meta,
+            meta: Arc::new(meta),
             body_path,
             body_file: None,
         };

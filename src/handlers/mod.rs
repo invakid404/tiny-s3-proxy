@@ -1164,7 +1164,7 @@ pub mod test_utils {
             let body_path = self.temp_dir.path().join(format!("{}.body", id));
             std::fs::write(&body_path, body).expect("write mock body");
             let entry = CacheEntry {
-                meta,
+                meta: Arc::new(meta),
                 body_path,
                 body_file: None,
             };
@@ -1188,7 +1188,7 @@ pub mod test_utils {
             let body_path = self.temp_dir.path().join(format!("{}.body", id));
             std::fs::write(&body_path, body).expect("write mock body");
             let entry = CacheEntry {
-                meta,
+                meta: Arc::new(meta),
                 body_path,
                 body_file: None,
             };
@@ -1218,7 +1218,7 @@ pub mod test_utils {
             let body_path = self.temp_dir.path().join(format!("{}.body", id));
             std::fs::write(&body_path, body).expect("write mock body");
             let entry = CacheEntry {
-                meta,
+                meta: Arc::new(meta),
                 body_path,
                 body_file: None,
             };
@@ -1295,10 +1295,11 @@ pub mod test_utils {
             if let Some(update) = pending_update
                 && let Some(current) = self.entries.lock().unwrap().get_mut(&update.key_hash)
             {
-                current.meta.head_extra_headers = update.head_extra_headers;
-                current.meta.head_checksum_headers = update.head_checksum_headers;
-                current.meta.head_metadata_checked = update.head_metadata_checked;
-                current.meta.head_checksum_checked = update.head_checksum_checked;
+                let meta = Arc::make_mut(&mut current.meta);
+                meta.head_extra_headers = update.head_extra_headers;
+                meta.head_checksum_headers = update.head_checksum_headers;
+                meta.head_metadata_checked = update.head_metadata_checked;
+                meta.head_checksum_checked = update.head_checksum_checked;
             }
             Ok(entry)
         }
@@ -1393,7 +1394,7 @@ pub mod test_utils {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             meta.metadata_version = 0;
             let entry = CacheEntry {
-                meta,
+                meta: Arc::new(meta),
                 body_path: temp_body_path,
                 body_file: None,
             };
@@ -1534,7 +1535,7 @@ pub mod test_utils {
             // refresh-collision test coverage — follow-up updates that should
             // fail the CAS check would silently succeed in tests.
             meta.metadata_version = entry.meta.metadata_version.saturating_add(1);
-            entry.meta = meta;
+            entry.meta = Arc::new(meta);
             Ok(true)
         }
 

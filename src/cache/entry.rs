@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use super::metadata::CacheMeta;
 
@@ -9,8 +10,11 @@ use super::metadata::CacheMeta;
 /// even if another fill later replaces the path on disk. It is `None` for
 /// metadata-only probes (`peek`); in that case `open_file_stream` reopens
 /// via `body_path`.
+///
+/// `meta` is wrapped in `Arc` so that cloning a `CacheEntry` (or just the
+/// metadata) is O(1) instead of deep-copying all String/HashMap fields.
 pub struct CacheEntry {
-    pub meta: CacheMeta,
+    pub meta: Arc<CacheMeta>,
     pub body_path: PathBuf,
     pub body_file: Option<tokio::fs::File>,
 }
