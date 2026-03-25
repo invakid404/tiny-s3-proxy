@@ -968,6 +968,133 @@ impl DiskCache {
 
         Ok(())
     }
+
+    /// Core purge implementation. When `expected_fill_id` is `Some`, the purge
+    /// is conditional: it only proceeds if the current entry's fill_id matches.
+    /// Returns `Ok(true)` if the entry was purged, `Ok(false)` if the fill_id
+    /// did not match (only possible when `expected_fill_id` is `Some`).
+    async fn purge_inner(
+        &self,
+        key: &CacheKey,
+        expected_fill_id: Option<u64>,
+    ) -> Result<bool, ProxyError> {
+        // Look up the per-key fill entry. If an active fill exists, acquire
+        // its commit_lock so we serialize against commit_fill's publish step.
+        // For unconditional purge, bump the generation inside the critical
+        // section immediately. For conditional purge, defer the bump until
+        // after the fill_id check passes.
+        let fill_entry = {
+            let fills = self.active_fills.read().await;
+            fills.get(key).cloned()
+        };
+        let _commit_lock = match fill_entry {
+            Some(ref entry) => {
+                let guard = entry.commit_lock.lock().await;
+                if expected_fill_id.is_none() {
+                    entry.generation.fetch_add(1, Ordering::Release);
+                }
+                Some(guard)
+            }
+            // No active fill — nothing to synchronize with.
+            None => None,
+        };
+
+        let (body_path, meta_path) = self.paths_for_key(key);
+        let meta_lock = self.meta_lock_for(key);
+        let _meta_guard = meta_lock.lock().await;
+
+        // For conditional purge, check the fill_id before proceeding.
+        if let Some(expected) = expected_fill_id {
+            let current_bytes = match tokio::fs::read(&meta_path).await {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(e) => {
+                    return Err(ProxyError::Cache {
+                        source: Box::new(e),
+                        operation: "read metadata for conditional purge".into(),
+                    });
+                }
+            };
+            let current_meta = serde_json::from_slice::<CacheMeta>(&current_bytes).map_err(
+                |e| ProxyError::Cache {
+                    source: Box::new(e),
+                    operation: "parse metadata for conditional purge".into(),
+                },
+            )?;
+            if current_meta.fill_id != expected {
+                return Ok(false);
+            }
+            // fill_id matched — now bump the generation to fence in-flight fills.
+            if let Some(ref entry) = fill_entry {
+                entry.generation.fetch_add(1, Ordering::Release);
+            }
+        }
+
+        // Use async filesystem checks instead of blocking .exists()
+        let check_suffix = if expected_fill_id.is_some() {
+            "conditional purge"
+        } else {
+            "purge"
+        };
+        let body_exists =
+            check_exists(&body_path, &format!("check body for {}", check_suffix)).await?;
+        let meta_exists =
+            check_exists(&meta_path, &format!("check meta for {}", check_suffix)).await?;
+
+        if !body_exists && !meta_exists {
+            self.clear_poisoned_in_memory(key);
+            let _ = tokio::fs::remove_file(&self.poison_path_for_key(key)).await;
+            return Ok(false);
+        }
+
+        let body_size = tokio::fs::metadata(&body_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let meta_size = tokio::fs::metadata(&meta_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        let mut removed = false;
+        if body_exists {
+            tokio::fs::remove_file(&body_path)
+                .await
+                .map_err(|e| ProxyError::Cache {
+                    source: Box::new(e),
+                    operation: "remove body".into(),
+                })?;
+            removed = true;
+        }
+        if meta_exists {
+            tokio::fs::remove_file(&meta_path)
+                .await
+                .map_err(|e| ProxyError::Cache {
+                    source: Box::new(e),
+                    operation: "remove metadata".into(),
+                })?;
+            removed = true;
+        }
+
+        if removed {
+            let _ = self.stats.entry_count.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |current| Some(current.saturating_sub(1)),
+            );
+            let total_removed = body_size + meta_size;
+            let _ = self.stats.total_bytes.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |current| Some(current.saturating_sub(total_removed)),
+            );
+        }
+
+        self.clear_poisoned_in_memory(key);
+        let _ = tokio::fs::remove_file(&self.poison_path_for_key(key)).await;
+
+        Ok(removed)
+    }
 }
 
 impl CacheStore for DiskCache {
@@ -1037,86 +1164,7 @@ impl CacheStore for DiskCache {
     }
 
     async fn purge(&self, key: &CacheKey) -> Result<bool, ProxyError> {
-        // Look up the per-key fill entry. If an active fill exists, acquire
-        // its commit_lock so we serialize against commit_fill's publish step,
-        // then bump the generation inside the critical section. This prevents
-        // the race where purge bumps the generation after commit_fill's final
-        // check but before the rename.
-        let fill_entry = {
-            let fills = self.active_fills.read().await;
-            fills.get(key).cloned()
-        };
-        let _commit_lock = match fill_entry {
-            Some(ref entry) => {
-                let guard = entry.commit_lock.lock().await;
-                entry.generation.fetch_add(1, Ordering::Release);
-                Some(guard)
-            }
-            // No active fill — nothing to synchronize with.
-            None => None,
-        };
-
-        let (body_path, meta_path) = self.paths_for_key(key);
-        let meta_lock = self.meta_lock_for(key);
-        let _meta_guard = meta_lock.lock().await;
-
-        // Use async filesystem checks instead of blocking .exists()
-        let body_exists = check_exists(&body_path, "check body for purge").await?;
-        let meta_exists = check_exists(&meta_path, "check meta for purge").await?;
-
-        if !body_exists && !meta_exists {
-            self.clear_poisoned_in_memory(key);
-            let _ = tokio::fs::remove_file(&self.poison_path_for_key(key)).await;
-            return Ok(false);
-        }
-
-        let body_size = tokio::fs::metadata(&body_path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let meta_size = tokio::fs::metadata(&meta_path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
-
-        let mut removed = false;
-        if body_exists {
-            tokio::fs::remove_file(&body_path)
-                .await
-                .map_err(|e| ProxyError::Cache {
-                    source: Box::new(e),
-                    operation: "remove body".into(),
-                })?;
-            removed = true;
-        }
-        if meta_exists {
-            tokio::fs::remove_file(&meta_path)
-                .await
-                .map_err(|e| ProxyError::Cache {
-                    source: Box::new(e),
-                    operation: "remove metadata".into(),
-                })?;
-            removed = true;
-        }
-
-        if removed {
-            let _ = self.stats.entry_count.fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |current| Some(current.saturating_sub(1)),
-            );
-            let total_removed = body_size + meta_size;
-            let _ = self.stats.total_bytes.fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |current| Some(current.saturating_sub(total_removed)),
-            );
-        }
-
-        self.clear_poisoned_in_memory(key);
-        let _ = tokio::fs::remove_file(&self.poison_path_for_key(key)).await;
-
-        Ok(removed)
+        self.purge_inner(key, None).await
     }
 
     async fn purge_if_unchanged(
@@ -1124,100 +1172,7 @@ impl CacheStore for DiskCache {
         key: &CacheKey,
         expected_fill_id: u64,
     ) -> Result<bool, ProxyError> {
-        let fill_entry = {
-            let fills = self.active_fills.read().await;
-            fills.get(key).cloned()
-        };
-        let _commit_lock = match fill_entry {
-            Some(ref entry) => {
-                let guard = entry.commit_lock.lock().await;
-                Some(guard)
-            }
-            None => None,
-        };
-
-        let (body_path, meta_path) = self.paths_for_key(key);
-        let meta_lock = self.meta_lock_for(key);
-        let _meta_guard = meta_lock.lock().await;
-
-        let current_bytes = match tokio::fs::read(&meta_path).await {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(e) => {
-                return Err(ProxyError::Cache {
-                    source: Box::new(e),
-                    operation: "read metadata for conditional purge".into(),
-                });
-            }
-        };
-        let current_meta =
-            serde_json::from_slice::<CacheMeta>(&current_bytes).map_err(|e| ProxyError::Cache {
-                source: Box::new(e),
-                operation: "parse metadata for conditional purge".into(),
-            })?;
-        if current_meta.fill_id != expected_fill_id {
-            return Ok(false);
-        }
-        if let Some(ref entry) = fill_entry {
-            entry.generation.fetch_add(1, Ordering::Release);
-        }
-
-        let body_exists = check_exists(&body_path, "check body for conditional purge").await?;
-        let meta_exists = check_exists(&meta_path, "check meta for conditional purge").await?;
-
-        if !body_exists && !meta_exists {
-            self.clear_poisoned_in_memory(key);
-            let _ = tokio::fs::remove_file(&self.poison_path_for_key(key)).await;
-            return Ok(false);
-        }
-
-        let body_size = tokio::fs::metadata(&body_path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let meta_size = tokio::fs::metadata(&meta_path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
-
-        let mut removed = false;
-        if body_exists {
-            tokio::fs::remove_file(&body_path)
-                .await
-                .map_err(|e| ProxyError::Cache {
-                    source: Box::new(e),
-                    operation: "remove body".into(),
-                })?;
-            removed = true;
-        }
-        if meta_exists {
-            tokio::fs::remove_file(&meta_path)
-                .await
-                .map_err(|e| ProxyError::Cache {
-                    source: Box::new(e),
-                    operation: "remove metadata".into(),
-                })?;
-            removed = true;
-        }
-
-        if removed {
-            let _ = self.stats.entry_count.fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |current| Some(current.saturating_sub(1)),
-            );
-            let total_removed = body_size + meta_size;
-            let _ = self.stats.total_bytes.fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |current| Some(current.saturating_sub(total_removed)),
-            );
-        }
-
-        self.clear_poisoned_in_memory(key);
-        let _ = tokio::fs::remove_file(&self.poison_path_for_key(key)).await;
-
-        Ok(removed)
+        self.purge_inner(key, Some(expected_fill_id)).await
     }
 
     async fn poison(&self, key: &CacheKey) -> Result<(), ProxyError> {

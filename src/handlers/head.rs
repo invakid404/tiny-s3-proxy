@@ -12,7 +12,7 @@ use crate::s3::errors::S3Error;
 use crate::s3::headers::{common_headers, head_object_headers, with_cache_status};
 use crate::s3::ops::ParsedRequest;
 
-use super::purge_then_poison_if_unchanged;
+use super::{InvalidationMessages, purge_then_poison_if_unchanged};
 
 // Keep this list in sync with HEAD-only extraction in backend/client.rs.
 // Today only `x-amz-archive-status` is added exclusively on the typed HEAD
@@ -328,18 +328,21 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
                         }
                     }
                     CacheRefreshOutcome::EtagMismatch => {
+                        const ETAG_MISMATCH_MSGS: InvalidationMessages = InvalidationMessages {
+                            purge_success: "purged stale cache entry after HEAD etag mismatch",
+                            purge_changed: "HEAD etag mismatch observed, but cache entry changed before invalidation",
+                            purge_fail: "failed to purge stale cache entry after HEAD etag mismatch",
+                            poison_success: "poisoned stale cache entry after purge failure",
+                            poison_fail: "failed to poison stale cache entry after purge failure",
+                        };
                         let _ = purge_then_poison_if_unchanged(
                             &state.cache,
                             &cache_key,
-                                cached_meta.fill_id,
-                                &parsed.request_id,
-                                "HeadObject",
-                                key,
-                                "purged stale cache entry after HEAD etag mismatch",
-                            "HEAD etag mismatch observed, but cache entry changed before invalidation",
-                            "failed to purge stale cache entry after HEAD etag mismatch",
-                            "poisoned stale cache entry after purge failure",
-                            "failed to poison stale cache entry after purge failure",
+                            cached_meta.fill_id,
+                            &parsed.request_id,
+                            "HeadObject",
+                            key,
+                            &ETAG_MISMATCH_MSGS,
                         )
                         .await;
                     }
@@ -381,6 +384,13 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
                     crate::error::ProxyError::UpstreamS3 {
                         status_code: 404, ..
                     } => {
+                        const HEAD_404_MSGS: InvalidationMessages = InvalidationMessages {
+                            purge_success: "purged stale cache entry after HEAD returned not found",
+                            purge_changed: "HEAD returned not found, but cache entry changed before invalidation",
+                            purge_fail: "failed to purge stale cache entry after HEAD returned not found",
+                            poison_success: "poisoned stale cache entry after purge failure following HEAD not found",
+                            poison_fail: "failed to poison stale cache entry after purge failure following HEAD not found",
+                        };
                         let invalidated = purge_then_poison_if_unchanged(
                             &state.cache,
                             &cache_key,
@@ -388,11 +398,7 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
                             &parsed.request_id,
                             "HeadObject",
                             key,
-                            "purged stale cache entry after HEAD returned not found",
-                            "HEAD returned not found, but cache entry changed before invalidation",
-                            "failed to purge stale cache entry after HEAD returned not found",
-                            "poisoned stale cache entry after purge failure following HEAD not found",
-                            "failed to poison stale cache entry after purge failure following HEAD not found",
+                            &HEAD_404_MSGS,
                         )
                         .await;
                         if !invalidated {
@@ -474,6 +480,13 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
                                             }
                                             CacheRefreshOutcome::EtagMismatch
                                             | CacheRefreshOutcome::NoStrongMatch => {
+                                                const RETRY_VALIDATION_MSGS: InvalidationMessages = InvalidationMessages {
+                                                    purge_success: "purged disproved cache entry after retry HEAD validation failed",
+                                                    purge_changed: "retry HEAD validation failed, but replacement entry changed before invalidation",
+                                                    purge_fail: "failed to purge disproved cache entry after retry HEAD validation failed",
+                                                    poison_success: "poisoned disproved cache entry after retry HEAD purge failure",
+                                                    poison_fail: "failed to poison disproved cache entry after retry HEAD purge failure",
+                                                };
                                                 let _ = purge_then_poison_if_unchanged(
                                                     &state.cache,
                                                     &cache_key,
@@ -481,11 +494,7 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
                                                     &parsed.request_id,
                                                     "HeadObject",
                                                     key,
-                                                    "purged disproved cache entry after retry HEAD validation failed",
-                                                    "retry HEAD validation failed, but replacement entry changed before invalidation",
-                                                    "failed to purge disproved cache entry after retry HEAD validation failed",
-                                                    "poisoned disproved cache entry after retry HEAD purge failure",
-                                                    "failed to poison disproved cache entry after retry HEAD purge failure",
+                                                    &RETRY_VALIDATION_MSGS,
                                                 )
                                                 .await;
                                                 // The retry HEAD proved the object exists.
@@ -511,6 +520,13 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
                                                 ..
                                             }
                                         ) {
+                                            const RETRY_404_MSGS: InvalidationMessages = InvalidationMessages {
+                                                purge_success: "purged disproved cache entry after retry HEAD returned not found",
+                                                purge_changed: "retry HEAD returned not found, but replacement entry changed before invalidation",
+                                                purge_fail: "failed to purge disproved cache entry after retry HEAD returned not found",
+                                                poison_success: "poisoned disproved cache entry after retry HEAD purge failure",
+                                                poison_fail: "failed to poison disproved cache entry after retry HEAD purge failure",
+                                            };
                                             let _ = purge_then_poison_if_unchanged(
                                                 &state.cache,
                                                 &cache_key,
@@ -518,11 +534,7 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
                                                 &parsed.request_id,
                                                 "HeadObject",
                                                 key,
-                                                "purged disproved cache entry after retry HEAD returned not found",
-                                                "retry HEAD returned not found, but replacement entry changed before invalidation",
-                                                "failed to purge disproved cache entry after retry HEAD returned not found",
-                                                "poisoned disproved cache entry after retry HEAD purge failure",
-                                                "failed to poison disproved cache entry after retry HEAD purge failure",
+                                                &RETRY_404_MSGS,
                                             )
                                             .await;
                                         }

@@ -20,7 +20,7 @@ use crate::s3::headers::{
 };
 use crate::s3::ops::ParsedRequest;
 
-use super::purge_then_poison_if_unchanged;
+use super::{InvalidationMessages, purge_then_poison_if_unchanged};
 
 /// Build an HTTP response from metadata + a streaming body.
 fn build_streaming_response(
@@ -191,6 +191,13 @@ async fn try_refresh_cached_get_metadata<B: Backend + 'static, C: CacheStore + '
                     ..
                 }
             ) {
+                const HEAD_404_MSGS: InvalidationMessages = InvalidationMessages {
+                    purge_success: "purged stale cache entry after HEAD returned not found during GET refresh",
+                    purge_changed: "HEAD returned not found during GET refresh, but cache entry changed before invalidation",
+                    purge_fail: "failed to purge stale cache entry after HEAD returned not found during GET refresh",
+                    poison_success: "poisoned stale cache entry after purge failure during GET refresh",
+                    poison_fail: "failed to poison stale cache entry after purge failure during GET refresh",
+                };
                 let invalidated = purge_then_poison_if_unchanged(
                     &state.cache,
                     cache_key,
@@ -198,11 +205,7 @@ async fn try_refresh_cached_get_metadata<B: Backend + 'static, C: CacheStore + '
                     &parsed.request_id,
                     "GetObject",
                     key,
-                    "purged stale cache entry after HEAD returned not found during GET refresh",
-                    "HEAD returned not found during GET refresh, but cache entry changed before invalidation",
-                    "failed to purge stale cache entry after HEAD returned not found during GET refresh",
-                    "poisoned stale cache entry after purge failure during GET refresh",
-                    "failed to poison stale cache entry after purge failure during GET refresh",
+                    &HEAD_404_MSGS,
                 )
                 .await;
 
@@ -273,6 +276,13 @@ async fn try_refresh_cached_get_metadata<B: Backend + 'static, C: CacheStore + '
             }
         }
         crate::handlers::head::CacheRefreshOutcome::EtagMismatch => {
+            const ETAG_MISMATCH_MSGS: InvalidationMessages = InvalidationMessages {
+                purge_success: "purged stale cache entry after HEAD etag mismatch during GET refresh",
+                purge_changed: "HEAD etag mismatch observed during GET refresh, but cache entry changed before invalidation",
+                purge_fail: "failed to purge stale cache entry after HEAD etag mismatch during GET refresh",
+                poison_success: "poisoned stale cache entry after purge failure during GET refresh",
+                poison_fail: "failed to poison stale cache entry after purge failure during GET refresh",
+            };
             let _ = purge_then_poison_if_unchanged(
                 &state.cache,
                 cache_key,
@@ -280,11 +290,7 @@ async fn try_refresh_cached_get_metadata<B: Backend + 'static, C: CacheStore + '
                 &parsed.request_id,
                 "GetObject",
                 key,
-                "purged stale cache entry after HEAD etag mismatch during GET refresh",
-                "HEAD etag mismatch observed during GET refresh, but cache entry changed before invalidation",
-                "failed to purge stale cache entry after HEAD etag mismatch during GET refresh",
-                "poisoned stale cache entry after purge failure during GET refresh",
-                "failed to poison stale cache entry after purge failure during GET refresh",
+                &ETAG_MISMATCH_MSGS,
             )
             .await;
             return None;
