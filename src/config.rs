@@ -60,6 +60,7 @@ pub struct Config {
     pub upstream_connect_timeout_ms: u64,
     pub upstream_request_timeout_ms: u64,
     pub max_request_body_bytes: u64,
+    pub passthrough_unsigned_payload: bool,
 }
 
 impl Config {
@@ -107,6 +108,7 @@ impl Config {
             upstream_connect_timeout_ms: parse_u64_env("UPSTREAM_CONNECT_TIMEOUT_MS", 5000)?,
             upstream_request_timeout_ms: parse_u64_env("UPSTREAM_REQUEST_TIMEOUT_MS", 30000)?,
             max_request_body_bytes: parse_u64_env("MAX_REQUEST_BODY_BYTES", 268_435_456)?, // 256 MiB default
+            passthrough_unsigned_payload: parse_bool_env("PASSTHROUGH_UNSIGNED_PAYLOAD", false)?,
         };
 
         if config.auth_mode == AuthMode::AccessKeyAllowlist
@@ -227,6 +229,7 @@ mod tests {
         "UPSTREAM_CONNECT_TIMEOUT_MS",
         "UPSTREAM_REQUEST_TIMEOUT_MS",
         "MAX_REQUEST_BODY_BYTES",
+        "PASSTHROUGH_UNSIGNED_PAYLOAD",
     ];
 
     fn with_env_vars<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
@@ -306,6 +309,7 @@ mod tests {
             assert_eq!(config.retry_base_backoff_ms, 100);
             assert_eq!(config.upstream_connect_timeout_ms, 5000);
             assert_eq!(config.upstream_request_timeout_ms, 30000);
+            assert!(!config.passthrough_unsigned_payload);
         });
     }
 

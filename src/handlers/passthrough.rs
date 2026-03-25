@@ -37,6 +37,18 @@ const SKIP_REQUEST_HEADERS: &[&str] = &[
     "content-length", // reqwest sets this from body
 ];
 
+/// Compute the lowercase hex SHA-256 of `bytes`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(64);
+    for byte in digest.as_slice() {
+        write!(hex, "{byte:02x}").unwrap();
+    }
+    hex
+}
+
 /// Collect header names nominated as hop-by-hop by `Connection` headers.
 /// Per RFC 9110 Section 7.6.1, each token in `Connection` names a header
 /// that the sender considers hop-by-hop and that MUST be removed by the
@@ -143,56 +155,8 @@ where
         "passthrough: proxying unsupported operation to backend"
     );
 
-    // 2. Read the body bytes (needed for signing and forwarding).
-    let body_bytes =
-        match axum::body::to_bytes(body, state.config.max_request_body_bytes as usize).await {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                tracing::error!(error = %e, "passthrough: failed to read request body");
-                let s3err = S3Error::from_body_error(&e, request_id);
-                return s3err.to_response();
-            }
-        };
-
-    // 3. Build "base headers" for signing — filtered original headers without
-    //    auth/hop-by-hop headers. These don't change across retry attempts.
-    let mut base_headers = http::HeaderMap::new();
-    let connection_nominated = collect_connection_nominated(original_headers);
-    for (name, value) in original_headers {
-        let name_str = name.as_str();
-        if SKIP_REQUEST_HEADERS.contains(&name_str)
-            || HOP_BY_HOP_HEADERS.contains(&name_str)
-            || connection_nominated.iter().any(|h| h == name_str)
-        {
-            continue;
-        }
-        base_headers.append(name.clone(), value.clone());
-    }
-
-    // 4. Prepare credentials and signing settings outside the loop (they don't change).
-    let credentials = Credentials::new(
-        &state.config.backend_access_key_id,
-        &state.config.backend_secret_access_key,
-        None,
-        None,
-        "tiny-s3-proxy-passthrough",
-    );
-    let identity = credentials.into();
-
-    // S3-specific signing settings:
-    // - Single URI-encoding: S3 does NOT double-encode, unlike generic SigV4.
-    //   The URI we sign is already percent-encoded from the client request, so
-    //   we must not re-encode it during canonicalization.
-    // - No path normalization: preserve // and . segments in object keys.
-    // - Payload checksum: include x-amz-content-sha256 header as S3 requires.
-    let mut signing_settings = SigningSettings::default();
-    signing_settings.percent_encoding_mode = aws_sigv4::http_request::PercentEncodingMode::Single;
-    signing_settings.uri_path_normalization_mode =
-        aws_sigv4::http_request::UriPathNormalizationMode::Disabled;
-    signing_settings.payload_checksum_kind =
-        aws_sigv4::http_request::PayloadChecksumKind::XAmzSha256;
-
-    // 5. Send the request via reqwest (reuse client from AppState).
+    // 2. Determine retry strategy BEFORE reading the body so we know whether
+    //    to buffer (needed for retries) or stream (avoids buffering large uploads).
     // Idempotent methods (GET, HEAD, DELETE) are retried on transport errors
     // and retryable status codes, using the same config-driven attempt counts
     // and backoff as the typed backend path. Non-idempotent methods are sent
@@ -216,6 +180,76 @@ where
         _ => (false, 1, 0),
     };
 
+    let unsigned_payload = state.config.passthrough_unsigned_payload;
+    // Buffer the body when payload signing requires the bytes, OR we may
+    // retry (idempotent methods need the body available for each attempt).
+    let needs_buffer = !unsigned_payload || is_idempotent;
+
+    // 3. Conditionally buffer the body or keep it as a stream.
+    let (body_bytes, stream_body) = if needs_buffer {
+        let bytes =
+            match axum::body::to_bytes(body, state.config.max_request_body_bytes as usize).await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::error!(error = %e, "passthrough: failed to read request body");
+                    let s3err = S3Error::from_body_error(&e, request_id);
+                    return s3err.to_response();
+                }
+            };
+        (Some(bytes), None)
+    } else {
+        // Non-retryable + unsigned payload: stream directly, no buffering.
+        (None, Some(body))
+    };
+
+    // 4. Build "base headers" for signing — filtered original headers without
+    //    auth/hop-by-hop headers. These don't change across retry attempts.
+    let mut base_headers = http::HeaderMap::new();
+    let connection_nominated = collect_connection_nominated(original_headers);
+    for (name, value) in original_headers {
+        let name_str = name.as_str();
+        if SKIP_REQUEST_HEADERS.contains(&name_str)
+            || HOP_BY_HOP_HEADERS.contains(&name_str)
+            || connection_nominated.iter().any(|h| h == name_str)
+        {
+            continue;
+        }
+        base_headers.append(name.clone(), value.clone());
+    }
+
+    // 5. Prepare credentials and signing settings outside the loop (they don't change).
+    let credentials = Credentials::new(
+        &state.config.backend_access_key_id,
+        &state.config.backend_secret_access_key,
+        None,
+        None,
+        "tiny-s3-proxy-passthrough",
+    );
+    let identity = credentials.into();
+
+    // S3-specific signing settings:
+    // - Single URI-encoding: S3 does NOT double-encode, unlike generic SigV4.
+    //   The URI we sign is already percent-encoded from the client request, so
+    //   we must not re-encode it during canonicalization.
+    // - No path normalization: preserve // and . segments in object keys.
+    // - Payload checksum: include x-amz-content-sha256 header as S3 requires.
+    let mut signing_settings = SigningSettings::default();
+    signing_settings.percent_encoding_mode = aws_sigv4::http_request::PercentEncodingMode::Single;
+    signing_settings.uri_path_normalization_mode =
+        aws_sigv4::http_request::UriPathNormalizationMode::Disabled;
+    signing_settings.payload_checksum_kind =
+        aws_sigv4::http_request::PayloadChecksumKind::XAmzSha256;
+
+    // 6. Pre-compute the payload hash once. It does not change across retry
+    //    attempts (the body bytes are buffered), so re-hashing per attempt
+    //    would be wasted CPU. For UNSIGNED-PAYLOAD the literal sentinel is
+    //    used; for the streaming path the signer emits the same sentinel via
+    //    SignableBody::UnsignedPayload directly.
+    let precomputed_payload_hash: Option<String> = match (body_bytes.as_ref(), unsigned_payload) {
+        (Some(bytes), false) => Some(sha256_hex(bytes.as_ref())),
+        _ => None,
+    };
+
     let reqwest_method = match reqwest::Method::from_bytes(method.as_bytes()) {
         Ok(m) => m,
         Err(_) => {
@@ -224,12 +258,175 @@ where
         }
     };
 
-    let mut last_err = None;
-    let mut upstream_resp = None;
-    for attempt in 1..=max_attempts {
-        // Re-sign on every attempt so that x-amz-date and the authorization
-        // header reflect the current wall-clock time. Without this, retries
-        // after backoff can fail with stale-signature errors.
+    // 7. Send the request via reqwest (reuse client from AppState).
+    //    Two send paths:
+    //    - Buffered: body_bytes is Some → retry loop with O(1) Bytes::clone.
+    //    - Streaming: stream_body is Some → single attempt, body streamed
+    //      directly. The streaming path is only taken for non-retryable
+    //      methods with unsigned payload, so a retry loop is not applicable.
+    let upstream_resp = if let Some(body_bytes) = body_bytes {
+        // -- Buffered path (retryable or signed-payload) --
+        let mut last_err = None;
+        let mut resp = None;
+        for attempt in 1..=max_attempts {
+            // Re-sign on every attempt so that x-amz-date and the authorization
+            // header reflect the current wall-clock time. Without this, retries
+            // after backoff can fail with stale-signature errors.
+            let signing_params = match SigningParams::builder()
+                .identity(&identity)
+                .region(&state.config.backend_region)
+                .name("s3")
+                .time(now())
+                .settings(signing_settings.clone())
+                .build()
+            {
+                Ok(params) => params,
+                Err(e) => {
+                    tracing::error!(error = %e, "passthrough: failed to build signing params");
+                    let s3err =
+                        S3Error::internal_error("An internal error occurred.", request_id);
+                    return s3err.to_response();
+                }
+            };
+
+            // Build a fresh http::Request from the base headers for signing.
+            let mut sign_req_builder =
+                http::Request::builder().method(method).uri(&upstream_url);
+            for (name, value) in &base_headers {
+                sign_req_builder = sign_req_builder.header(name, value);
+            }
+            let mut signable_request = match sign_req_builder.body(()) {
+                Ok(req) => req,
+                Err(e) => {
+                    tracing::error!(error = %e, "passthrough: failed to build signable request");
+                    let s3err =
+                        S3Error::internal_error("An internal error occurred.", request_id);
+                    return s3err.to_response();
+                }
+            };
+
+            let signable_body = if unsigned_payload {
+                SignableBody::UnsignedPayload
+            } else {
+                SignableBody::Precomputed(
+                    precomputed_payload_hash
+                        .as_ref()
+                        .expect("payload hash precomputed when payload is signed")
+                        .clone(),
+                )
+            };
+            let signable = match SignableRequest::new(
+                signable_request.method().as_str(),
+                signable_request.uri().to_string(),
+                signable_request
+                    .headers()
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), std::str::from_utf8(v.as_bytes()).unwrap_or(""))),
+                signable_body,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(error = %e, "passthrough: failed to create signable request");
+                    let s3err =
+                        S3Error::internal_error("An internal error occurred.", request_id);
+                    return s3err.to_response();
+                }
+            };
+
+            let (signing_instructions, _signature) =
+                match sign(signable, &signing_params.into()) {
+                    Ok(output) => output.into_parts(),
+                    Err(e) => {
+                        tracing::error!(error = %e, "passthrough: failed to sign request");
+                        let s3err =
+                            S3Error::internal_error("An internal error occurred.", request_id);
+                        return s3err.to_response();
+                    }
+                };
+
+            // Apply signing instructions (adds Authorization, x-amz-date, etc.).
+            signing_instructions.apply_to_request_http1x(&mut signable_request);
+
+            let mut req_builder = state
+                .http_client
+                .request(reqwest_method.clone(), &upstream_url);
+            for (name, value) in signable_request.headers() {
+                if let Ok(v) = value.to_str() {
+                    req_builder = req_builder.header(name.as_str(), v);
+                }
+            }
+            // Bytes clone is O(1) (reference-counted), safe for retries.
+            if !body_bytes.is_empty() {
+                req_builder = req_builder.body(body_bytes.clone());
+            }
+
+            match req_builder.send().await {
+                Ok(r) => {
+                    // Retry on retryable status codes for idempotent methods.
+                    let status = r.status().as_u16();
+                    if is_idempotent
+                        && attempt < max_attempts
+                        && matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+                    {
+                        let delay = base_backoff_ms
+                            .saturating_mul(2u64.saturating_pow(attempt - 1))
+                            .min(30_000);
+                        tracing::warn!(
+                            status,
+                            attempt,
+                            max_attempts,
+                            delay_ms = delay,
+                            "passthrough: retrying idempotent request on retryable status"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                        continue;
+                    }
+                    resp = Some(r);
+                    break;
+                }
+                Err(e) => {
+                    if attempt < max_attempts {
+                        let delay = base_backoff_ms
+                            .saturating_mul(2u64.saturating_pow(attempt - 1))
+                            .min(30_000);
+                        tracing::warn!(
+                            error = %e,
+                            attempt,
+                            max_attempts,
+                            delay_ms = delay,
+                            "passthrough: retrying idempotent request"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        match resp {
+            Some(r) => r,
+            None => {
+                let e = last_err.unwrap();
+                tracing::error!(error = %e, "passthrough: upstream request failed after {max_attempts} attempts");
+                let proxy_err = if e.is_timeout() {
+                    crate::error::ProxyError::Timeout {
+                        operation: "passthrough".into(),
+                    }
+                } else {
+                    crate::error::ProxyError::Backend {
+                        source: format!("{e}").into(),
+                        operation: "passthrough".into(),
+                    }
+                };
+                let s3err = S3Error::from_proxy_error(&proxy_err, request_id, None);
+                return s3err.to_response();
+            }
+        }
+    } else {
+        // -- Streaming path (unsigned payload, non-retryable) --
+        let stream_body =
+            stream_body.expect("stream_body must be Some when body_bytes is None");
+
         let signing_params = match SigningParams::builder()
             .identity(&identity)
             .region(&state.config.backend_region)
@@ -246,7 +443,6 @@ where
             }
         };
 
-        // Build a fresh http::Request from the base headers for signing.
         let mut sign_req_builder = http::Request::builder().method(method).uri(&upstream_url);
         for (name, value) in &base_headers {
             sign_req_builder = sign_req_builder.header(name, value);
@@ -260,7 +456,6 @@ where
             }
         };
 
-        let signable_body = SignableBody::Bytes(body_bytes.as_ref());
         let signable = match SignableRequest::new(
             signable_request.method().as_str(),
             signable_request.uri().to_string(),
@@ -268,7 +463,7 @@ where
                 .headers()
                 .iter()
                 .map(|(k, v)| (k.as_str(), std::str::from_utf8(v.as_bytes()).unwrap_or(""))),
-            signable_body,
+            SignableBody::UnsignedPayload,
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -287,82 +482,33 @@ where
             }
         };
 
-        // Apply signing instructions (adds Authorization, x-amz-date, etc.).
         signing_instructions.apply_to_request_http1x(&mut signable_request);
 
-        let mut req_builder = state
-            .http_client
-            .request(reqwest_method.clone(), &upstream_url);
+        let mut req_builder = state.http_client.request(reqwest_method, &upstream_url);
         for (name, value) in signable_request.headers() {
             if let Ok(v) = value.to_str() {
                 req_builder = req_builder.header(name.as_str(), v);
             }
         }
-        // Bytes clone is O(1) (reference-counted), safe for retries.
-        if !body_bytes.is_empty() {
-            req_builder = req_builder.body(body_bytes.clone());
-        }
+        req_builder = req_builder.body(reqwest::Body::wrap_stream(stream_body.into_data_stream()));
 
         match req_builder.send().await {
-            Ok(resp) => {
-                // Retry on retryable status codes for idempotent methods.
-                let status = resp.status().as_u16();
-                if is_idempotent
-                    && attempt < max_attempts
-                    && matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
-                {
-                    let delay = base_backoff_ms
-                        .saturating_mul(2u64.saturating_pow(attempt - 1))
-                        .min(30_000);
-                    tracing::warn!(
-                        status,
-                        attempt,
-                        max_attempts,
-                        delay_ms = delay,
-                        "passthrough: retrying idempotent request on retryable status"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                    continue;
-                }
-                upstream_resp = Some(resp);
-                break;
-            }
+            Ok(r) => r,
             Err(e) => {
-                if attempt < max_attempts {
-                    let delay = base_backoff_ms
-                        .saturating_mul(2u64.saturating_pow(attempt - 1))
-                        .min(30_000);
-                    tracing::warn!(
-                        error = %e,
-                        attempt,
-                        max_attempts,
-                        delay_ms = delay,
-                        "passthrough: retrying idempotent request"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                }
-                last_err = Some(e);
+                tracing::error!(error = %e, "passthrough: streaming upstream request failed");
+                let proxy_err = if e.is_timeout() {
+                    crate::error::ProxyError::Timeout {
+                        operation: "passthrough".into(),
+                    }
+                } else {
+                    crate::error::ProxyError::Backend {
+                        source: format!("{e}").into(),
+                        operation: "passthrough".into(),
+                    }
+                };
+                let s3err = S3Error::from_proxy_error(&proxy_err, request_id, None);
+                return s3err.to_response();
             }
-        }
-    }
-
-    let upstream_resp = match upstream_resp {
-        Some(resp) => resp,
-        None => {
-            let e = last_err.unwrap();
-            tracing::error!(error = %e, "passthrough: upstream request failed after {max_attempts} attempts");
-            let proxy_err = if e.is_timeout() {
-                crate::error::ProxyError::Timeout {
-                    operation: "passthrough".into(),
-                }
-            } else {
-                crate::error::ProxyError::Backend {
-                    source: format!("{e}").into(),
-                    operation: "passthrough".into(),
-                }
-            };
-            let s3err = S3Error::from_proxy_error(&proxy_err, request_id, None);
-            return s3err.to_response();
         }
     };
 
@@ -424,8 +570,8 @@ mod tests {
 
     /// State shared with the mock upstream server.
     struct MockUpstream {
-        /// (method, uri, headers) for each request received.
-        requests: tokio::sync::Mutex<Vec<(String, String, HeaderMap)>>,
+        /// (method, uri, headers, body) for each request received.
+        requests: tokio::sync::Mutex<Vec<(String, String, HeaderMap, bytes::Bytes)>>,
         /// Status code the mock will return. Can be mutated between calls.
         response_status: AtomicU32,
         /// How many times the mock has been called.
@@ -467,7 +613,10 @@ mod tests {
         let method = req.method().to_string();
         let uri = req.uri().to_string();
         let headers = req.headers().clone();
-        state.requests.lock().await.push((method, uri, headers));
+        let body_bytes = axum::body::to_bytes(req.into_body(), 64 * 1024 * 1024)
+            .await
+            .unwrap_or_default();
+        state.requests.lock().await.push((method, uri, headers, body_bytes));
         let count = state.call_count.fetch_add(1, Ordering::SeqCst);
 
         let status = state.response_status.load(Ordering::SeqCst);
@@ -511,6 +660,7 @@ mod tests {
             upstream_connect_timeout_ms: 5000,
             upstream_request_timeout_ms: 30000,
             max_request_body_bytes: 268_435_456,
+            passthrough_unsigned_payload: false,
         }
     }
 
@@ -994,6 +1144,93 @@ mod tests {
         assert_ne!(
             auth1, auth2,
             "retry must be signed with a fresh Authorization signature"
+        );
+    }
+
+    // ---- UNSIGNED-PAYLOAD header set for GET when enabled ----
+    #[tokio::test]
+    async fn test_unsigned_payload_header_set() {
+        let mock = MockUpstream::new(200);
+        let addr = start_mock_upstream(mock.clone()).await;
+
+        let mut config = test_config_for_passthrough(&addr);
+        config.passthrough_unsigned_payload = true;
+        let state = build_passthrough_state(config);
+
+        let headers = HeaderMap::new();
+        let resp = handle_passthrough(
+            &state,
+            "GET",
+            "/test-backend/key",
+            None,
+            &headers,
+            Body::empty(),
+            "req-unsigned",
+        )
+        .await;
+
+        assert_eq!(resp.status(), 200);
+
+        let reqs = mock.requests.lock().await;
+        assert_eq!(reqs.len(), 1);
+        let upstream_headers = &reqs[0].2;
+        let sha_header = upstream_headers
+            .get("x-amz-content-sha256")
+            .expect("x-amz-content-sha256 header must be present")
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            sha_header, "UNSIGNED-PAYLOAD",
+            "expected UNSIGNED-PAYLOAD, got: {sha_header}"
+        );
+    }
+
+    // ---- UNSIGNED-PAYLOAD streaming PUT ----
+    #[tokio::test]
+    async fn test_unsigned_payload_streaming_put() {
+        let mock = MockUpstream::new(200);
+        let addr = start_mock_upstream(mock.clone()).await;
+
+        let mut config = test_config_for_passthrough(&addr);
+        config.passthrough_unsigned_payload = true;
+        let state = build_passthrough_state(config);
+
+        let payload = b"hello streaming world";
+        let headers = HeaderMap::new();
+        let resp = handle_passthrough(
+            &state,
+            "PUT",
+            "/test-backend/upload-key",
+            None,
+            &headers,
+            Body::from(&payload[..]),
+            "req-unsigned-put",
+        )
+        .await;
+
+        assert_eq!(resp.status(), 200);
+
+        let reqs = mock.requests.lock().await;
+        assert_eq!(reqs.len(), 1);
+
+        // Verify the upstream received the body.
+        let upstream_body = &reqs[0].3;
+        assert_eq!(
+            upstream_body.as_ref(),
+            payload,
+            "upstream should receive the full body"
+        );
+
+        // Verify UNSIGNED-PAYLOAD header.
+        let upstream_headers = &reqs[0].2;
+        let sha_header = upstream_headers
+            .get("x-amz-content-sha256")
+            .expect("x-amz-content-sha256 header must be present")
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            sha_header, "UNSIGNED-PAYLOAD",
+            "expected UNSIGNED-PAYLOAD, got: {sha_header}"
         );
     }
 }

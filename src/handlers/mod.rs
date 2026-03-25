@@ -1342,6 +1342,7 @@ pub mod test_utils {
             upstream_connect_timeout_ms: 5000,
             upstream_request_timeout_ms: 30000,
             max_request_body_bytes: 268_435_456,
+            passthrough_unsigned_payload: false,
         }
     }
 
