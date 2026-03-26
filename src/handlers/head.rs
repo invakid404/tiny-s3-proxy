@@ -225,7 +225,7 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
     key: &str,
 ) -> Response<Body> {
     let read_options = parsed.read_options();
-    let mut cache_refresh_target: Option<CacheMeta> = None;
+    let mut cache_refresh_target: Option<Arc<CacheMeta>> = None;
 
     // Probe cache first without accounting so refresh-only HEAD checks do not
     // look like cache hits when the response still has to go upstream.

@@ -1632,7 +1632,7 @@ impl DiskCache {
         }
 
         Ok(Some(CacheEntry {
-            meta,
+            meta: Arc::new(meta),
             body_path,
             body_file,
         }))
@@ -2109,7 +2109,8 @@ mod tests {
         let before_size = tokio::fs::metadata(&meta_path).await.unwrap().len();
         let before_stats = cache.stats().await;
 
-        let mut updated_meta = cache.lookup(&key).await.unwrap().unwrap().meta;
+        let entry_meta = cache.lookup(&key).await.unwrap().unwrap().meta;
+        let mut updated_meta = (*entry_meta).clone();
         updated_meta.extra_headers.insert(
             "x-amz-checksum-sha256".to_string(),
             "a-very-long-checksum-value-to-grow-the-metadata-file".to_string(),
