@@ -9,12 +9,20 @@ pub mod put;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Log messages for cache invalidation operations.
+pub(crate) struct InvalidationMessages {
+    pub purge_success: &'static str,
+    pub purge_changed: &'static str,
+    pub purge_fail: &'static str,
+    pub poison_success: &'static str,
+    pub poison_fail: &'static str,
+}
+
 /// Shared invalidation helper used by both GET and HEAD handlers.
 /// Returns `true` if the entry was successfully purged/poisoned (the 404
 /// is authoritative for the observed generation), or `false` if the entry
 /// was replaced by a newer generation (the 404 may be stale — callers
 /// should re-probe the cache instead of returning the 404).
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn purge_then_poison_if_unchanged<C: crate::cache::CacheStore>(
     cache: &Arc<C>,
     cache_key: &crate::cache::key::CacheKey,
@@ -22,11 +30,7 @@ pub(crate) async fn purge_then_poison_if_unchanged<C: crate::cache::CacheStore>(
     request_id: &str,
     operation: &str,
     key: &str,
-    purge_success_msg: &str,
-    purge_changed_msg: &str,
-    purge_fail_msg: &str,
-    poison_success_msg: &str,
-    poison_fail_msg: &str,
+    msgs: &InvalidationMessages,
 ) -> bool {
     match cache.purge_if_unchanged(cache_key, expected_fill_id).await {
         Ok(true) => {
@@ -35,7 +39,7 @@ pub(crate) async fn purge_then_poison_if_unchanged<C: crate::cache::CacheStore>(
                 operation = operation,
                 key = key,
                 "{}",
-                purge_success_msg
+                msgs.purge_success
             );
             true
         }
@@ -45,7 +49,7 @@ pub(crate) async fn purge_then_poison_if_unchanged<C: crate::cache::CacheStore>(
                 operation = operation,
                 key = key,
                 "{}",
-                purge_changed_msg
+                msgs.purge_changed
             );
             false
         }
@@ -56,7 +60,7 @@ pub(crate) async fn purge_then_poison_if_unchanged<C: crate::cache::CacheStore>(
                 key = key,
                 error = %purge_err,
                 "{}",
-                purge_fail_msg
+                msgs.purge_fail
             );
             match cache.poison_if_unchanged(cache_key, expected_fill_id).await {
                 Ok(true) => {
@@ -65,7 +69,7 @@ pub(crate) async fn purge_then_poison_if_unchanged<C: crate::cache::CacheStore>(
                         operation = operation,
                         key = key,
                         "{}",
-                        poison_success_msg
+                        msgs.poison_success
                     );
                     true
                 }
@@ -77,7 +81,7 @@ pub(crate) async fn purge_then_poison_if_unchanged<C: crate::cache::CacheStore>(
                         key = key,
                         error = %poison_err,
                         "{}",
-                        poison_fail_msg
+                        msgs.poison_fail
                     );
                     // Both purge and poison failed — treat as invalidated
                     // (conservative: don't return stale 404).
