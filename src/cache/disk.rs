@@ -544,6 +544,44 @@ impl DiskCache {
         self.poisoned_hashes.lock().unwrap().remove(key.hash_hex());
     }
 
+    async fn cleanup_orphaned_body_after_metadata_miss(
+        &self,
+        body_path: &std::path::Path,
+        remove_operation: Option<&str>,
+    ) -> Result<(), ProxyError> {
+        let body_meta = tokio::fs::metadata(body_path).await.ok();
+        let body_size = body_meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let body_existed = body_meta.is_some();
+        let body_removed = match tokio::fs::remove_file(body_path).await {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(e) => {
+                if let Some(operation) = remove_operation {
+                    return Err(ProxyError::Cache {
+                        source: Box::new(e),
+                        operation: operation.into(),
+                    });
+                }
+                false
+            }
+        };
+        if body_removed && body_existed {
+            let _ = self.stats.entry_count.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |current| Some(current.saturating_sub(1)),
+            );
+            if body_size > 0 {
+                let _ = self.stats.total_bytes.fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |current| Some(current.saturating_sub(body_size)),
+                );
+            }
+        }
+        Ok(())
+    }
+
     async fn write_poison_marker(&self, key: &CacheKey) -> Result<(), ProxyError> {
         let path = self.poison_path_for_key(key);
         if let Some(parent) = path.parent() {
@@ -854,9 +892,7 @@ impl DiskCache {
             let backup_body = guard.temp_dir.join(format!("{pid}-{id}.prev.body"));
             let backup_meta = guard.temp_dir.join(format!("{pid}-{id}.prev.meta.json"));
 
-            if old_body_exists
-                && let Err(e) = tokio::fs::rename(&final_body, &backup_body).await
-            {
+            if old_body_exists && let Err(e) = tokio::fs::rename(&final_body, &backup_body).await {
                 let _ = tokio::fs::remove_file(&temp_body_path).await;
                 let _ = tokio::fs::remove_file(&temp_meta).await;
                 return Err(ProxyError::Cache {
@@ -864,9 +900,7 @@ impl DiskCache {
                     operation: "backup existing body".into(),
                 });
             }
-            if old_meta_exists
-                && let Err(e) = tokio::fs::rename(&final_meta, &backup_meta).await
-            {
+            if old_meta_exists && let Err(e) = tokio::fs::rename(&final_meta, &backup_meta).await {
                 if old_body_exists {
                     Self::restore_publish_backup(&final_body, &backup_body, "body").await;
                 }
@@ -1007,7 +1041,16 @@ impl DiskCache {
         if let Some(expected) = expected_fill_id {
             let current_bytes = match tokio::fs::read(&meta_path).await {
                 Ok(bytes) => bytes,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    self.cleanup_orphaned_body_after_metadata_miss(
+                        &body_path,
+                        Some("remove orphaned body for conditional purge"),
+                    )
+                    .await?;
+                    self.clear_poisoned_in_memory(key);
+                    let _ = tokio::fs::remove_file(&self.poison_path_for_key(key)).await;
+                    return Ok(false);
+                }
                 Err(e) => {
                     return Err(ProxyError::Cache {
                         source: Box::new(e),
@@ -1015,12 +1058,13 @@ impl DiskCache {
                     });
                 }
             };
-            let current_meta = serde_json::from_slice::<CacheMeta>(&current_bytes).map_err(
-                |e| ProxyError::Cache {
-                    source: Box::new(e),
-                    operation: "parse metadata for conditional purge".into(),
-                },
-            )?;
+            let current_meta =
+                serde_json::from_slice::<CacheMeta>(&current_bytes).map_err(|e| {
+                    ProxyError::Cache {
+                        source: Box::new(e),
+                        operation: "parse metadata for conditional purge".into(),
+                    }
+                })?;
             if current_meta.fill_id != expected {
                 return Ok(false);
             }
@@ -1038,6 +1082,7 @@ impl DiskCache {
         };
         let body_exists =
             check_exists(&body_path, &format!("check body for {}", check_suffix)).await?;
+        // When expected_fill_id is set, we already read and validated metadata above, so meta_exists is known true and can skip check_exists.
         let meta_exists = if expected_fill_id.is_some() {
             true
         } else {
@@ -1431,29 +1476,9 @@ impl DiskCache {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Metadata gone — clean up any orphaned body file and stats.
-                let body_meta = tokio::fs::metadata(&body_path).await.ok();
-                let body_size = body_meta.as_ref().map(|m| m.len()).unwrap_or(0);
-                let body_existed = body_meta.is_some();
-                let body_removed = match tokio::fs::remove_file(&body_path).await {
-                    Ok(()) => true,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-                    Err(_) => false,
-                };
+                self.cleanup_orphaned_body_after_metadata_miss(&body_path, None)
+                    .await?;
                 drop(meta_guard);
-                if body_removed && body_existed {
-                    let _ = self.stats.entry_count.fetch_update(
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                        |c| Some(c.saturating_sub(1)),
-                    );
-                    if body_size > 0 {
-                        let _ = self.stats.total_bytes.fetch_update(
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                            |c| Some(c.saturating_sub(body_size)),
-                        );
-                    }
-                }
                 if track_access {
                     self.stats.miss_count.fetch_add(1, Ordering::Relaxed);
                 }
@@ -2477,6 +2502,50 @@ mod tests {
         let entry = cache.lookup(&key).await.unwrap().unwrap();
         let body = tokio::fs::read(&entry.body_path).await.unwrap();
         assert_eq!(body, new_body);
+    }
+
+    #[tokio::test]
+    async fn test_purge_if_unchanged_metadata_miss_cleans_up_orphan_body_and_poison() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = DiskCache::new(tmp.path().to_path_buf(), 1_000_000, test_policy())
+            .await
+            .unwrap();
+
+        let key = test_key();
+        let body = b"orphan data".to_vec();
+        let meta = test_meta(body.len());
+        let temp_path = write_temp_body(tmp.path(), &body).await;
+        let guard = cache.begin_fill(&key).await.unwrap();
+        cache.commit_fill(guard, temp_path, meta).await.unwrap();
+
+        let entry = cache.lookup(&key).await.unwrap().unwrap();
+        let expected_fill_id = entry.meta.fill_id;
+        cache.poison(&key).await.unwrap();
+        let total_bytes_before = cache.stats().await.total_bytes;
+
+        let (body_path, meta_path) = cache.paths_for_key(&key);
+        let poison_path = cache.poison_path_for_key(&key);
+        assert!(tokio::fs::try_exists(&body_path).await.unwrap());
+        assert!(tokio::fs::try_exists(&poison_path).await.unwrap());
+
+        tokio::fs::remove_file(&meta_path).await.unwrap();
+
+        assert!(
+            !cache
+                .purge_if_unchanged(&key, expected_fill_id)
+                .await
+                .unwrap()
+        );
+        assert!(!tokio::fs::try_exists(&body_path).await.unwrap());
+        assert!(!tokio::fs::try_exists(&poison_path).await.unwrap());
+        assert!(!cache.is_poisoned_in_memory(&key));
+
+        let s = cache.stats().await;
+        assert_eq!(s.entry_count, 0);
+        assert_eq!(
+            s.total_bytes,
+            total_bytes_before.saturating_sub(body.len() as u64)
+        );
     }
 
     #[tokio::test]
