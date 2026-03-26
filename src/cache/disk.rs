@@ -1038,8 +1038,11 @@ impl DiskCache {
         };
         let body_exists =
             check_exists(&body_path, &format!("check body for {}", check_suffix)).await?;
-        let meta_exists =
-            check_exists(&meta_path, &format!("check meta for {}", check_suffix)).await?;
+        let meta_exists = if expected_fill_id.is_some() {
+            true
+        } else {
+            check_exists(&meta_path, &format!("check meta for {}", check_suffix)).await?
+        };
 
         if !body_exists && !meta_exists {
             self.clear_poisoned_in_memory(key);
