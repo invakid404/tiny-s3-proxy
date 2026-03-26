@@ -3,6 +3,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use http::Response;
 
+use crate::backend::models::HeadObjectInput;
 use crate::backend::Backend;
 use crate::cache::CacheStore;
 use crate::cache::key::CacheKey;
@@ -296,7 +297,7 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
     // Passthrough to backend (retry handled by the backend client)
     let result = state
         .backend
-        .head_object(&state.backend_bucket, key, read_options)
+        .head_object(HeadObjectInput { bucket: &state.backend_bucket, key, options: read_options })
         .await;
 
     match result {
@@ -447,7 +448,7 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
                                 }
                                 match state
                                     .backend
-                                    .head_object(&state.backend_bucket, key, read_options)
+                                    .head_object(HeadObjectInput { bucket: &state.backend_bucket, key, options: read_options })
                                     .await
                                 {
                                     Ok(retry_output) => {
@@ -643,9 +644,10 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
 mod tests {
     use super::*;
     use crate::backend::models::{
-        CompleteMultipartOutput, CreateMultipartOutput, DeleteObjectOutput, HeadObjectOutput,
-        ListObjectsInput, ListObjectsOutput, PutObjectInput, PutObjectOutput, ReadOptions,
-        UploadPartInput, UploadPartOutput,
+        AbortMultipartUploadInput, CompleteMultipartOutput, CreateMultipartOutput,
+        CreateMultipartUploadInput, DeleteObjectInput, DeleteObjectOutput, GetObjectInput,
+        HeadObjectInput, HeadObjectOutput, ListObjectsInput, ListObjectsOutput, PutObjectInput,
+        PutObjectOutput, ReadOptions, UploadPartInput, UploadPartOutput,
     };
     use crate::error::ProxyError;
     use crate::handlers::test_utils::*;
@@ -752,9 +754,7 @@ mod tests {
     impl Backend for Sequential404Then200HeadBackend {
         async fn get_object(
             &self,
-            _bucket: &str,
-            _key: &str,
-            _options: ReadOptions,
+            _req: GetObjectInput<'_>,
         ) -> Result<
             (
                 crate::backend::models::GetObjectMeta,
@@ -770,11 +770,9 @@ mod tests {
 
         async fn head_object(
             &self,
-            _bucket: &str,
-            _key: &str,
-            options: ReadOptions,
+            req: HeadObjectInput<'_>,
         ) -> Result<HeadObjectOutput, ProxyError> {
-            self.head_calls.lock().unwrap().push(options);
+            self.head_calls.lock().unwrap().push(req.options);
             let call = self.count.fetch_add(1, Ordering::SeqCst);
             if call == 0 {
                 Err(ProxyError::UpstreamS3 {
@@ -791,44 +789,22 @@ mod tests {
         async fn put_object(&self, _req: PutObjectInput) -> Result<PutObjectOutput, ProxyError> {
             unreachable!()
         }
-        async fn delete_object(
-            &self,
-            _bucket: &str,
-            _key: &str,
-        ) -> Result<DeleteObjectOutput, ProxyError> {
+        async fn delete_object(&self, _req: DeleteObjectInput<'_>) -> Result<DeleteObjectOutput, ProxyError> {
             unreachable!()
         }
-        async fn list_objects(
-            &self,
-            _req: ListObjectsInput,
-        ) -> Result<ListObjectsOutput, ProxyError> {
+        async fn list_objects(&self, _req: ListObjectsInput) -> Result<ListObjectsOutput, ProxyError> {
             unreachable!()
         }
-        async fn create_multipart_upload(
-            &self,
-            _bucket: &str,
-            _key: &str,
-            _content_type: Option<&str>,
-            _metadata: &std::collections::HashMap<String, String>,
-            _content_headers: &std::collections::HashMap<String, String>,
-        ) -> Result<CreateMultipartOutput, ProxyError> {
+        async fn create_multipart_upload(&self, _req: CreateMultipartUploadInput<'_>) -> Result<CreateMultipartOutput, ProxyError> {
             unreachable!()
         }
         async fn upload_part(&self, _req: UploadPartInput) -> Result<UploadPartOutput, ProxyError> {
             unreachable!()
         }
-        async fn complete_multipart_upload(
-            &self,
-            _req: crate::backend::models::CompleteMultipartInput,
-        ) -> Result<CompleteMultipartOutput, ProxyError> {
+        async fn complete_multipart_upload(&self, _req: crate::backend::models::CompleteMultipartInput) -> Result<CompleteMultipartOutput, ProxyError> {
             unreachable!()
         }
-        async fn abort_multipart_upload(
-            &self,
-            _bucket: &str,
-            _key: &str,
-            _upload_id: &str,
-        ) -> Result<(), ProxyError> {
+        async fn abort_multipart_upload(&self, _req: AbortMultipartUploadInput<'_>) -> Result<(), ProxyError> {
             unreachable!()
         }
     }
@@ -848,90 +824,25 @@ mod tests {
     }
 
     impl Backend for Sequential404ThenErrorHeadBackend {
-        async fn get_object(
-            &self,
-            _bucket: &str,
-            _key: &str,
-            _options: ReadOptions,
-        ) -> Result<
-            (
-                crate::backend::models::GetObjectMeta,
-                crate::backend::BoxByteStream,
-            ),
-            ProxyError,
-        > {
-            Err(ProxyError::Backend {
-                source: "unexpected get_object".into(),
-                operation: "get_object".into(),
-            })
+        async fn get_object(&self, _req: GetObjectInput<'_>) -> Result<(crate::backend::models::GetObjectMeta, crate::backend::BoxByteStream), ProxyError> {
+            Err(ProxyError::Backend { source: "unexpected get_object".into(), operation: "get_object".into() })
         }
-
-        async fn head_object(
-            &self,
-            _bucket: &str,
-            _key: &str,
-            options: ReadOptions,
-        ) -> Result<HeadObjectOutput, ProxyError> {
-            self.head_calls.lock().unwrap().push(options);
+        async fn head_object(&self, req: HeadObjectInput<'_>) -> Result<HeadObjectOutput, ProxyError> {
+            self.head_calls.lock().unwrap().push(req.options);
             let call = self.count.fetch_add(1, Ordering::SeqCst);
             if call == 0 {
-                Err(ProxyError::UpstreamS3 {
-                    status_code: 404,
-                    s3_code: "NoSuchKey".into(),
-                    message: "deleted".into(),
-                    operation: "head_object".into(),
-                })
+                Err(ProxyError::UpstreamS3 { status_code: 404, s3_code: "NoSuchKey".into(), message: "deleted".into(), operation: "head_object".into() })
             } else {
-                Err(ProxyError::Backend {
-                    source: "retry failed".into(),
-                    operation: "head_object".into(),
-                })
+                Err(ProxyError::Backend { source: "retry failed".into(), operation: "head_object".into() })
             }
         }
-
-        async fn put_object(&self, _req: PutObjectInput) -> Result<PutObjectOutput, ProxyError> {
-            unreachable!()
-        }
-        async fn delete_object(
-            &self,
-            _bucket: &str,
-            _key: &str,
-        ) -> Result<DeleteObjectOutput, ProxyError> {
-            unreachable!()
-        }
-        async fn list_objects(
-            &self,
-            _req: ListObjectsInput,
-        ) -> Result<ListObjectsOutput, ProxyError> {
-            unreachable!()
-        }
-        async fn create_multipart_upload(
-            &self,
-            _bucket: &str,
-            _key: &str,
-            _content_type: Option<&str>,
-            _metadata: &std::collections::HashMap<String, String>,
-            _content_headers: &std::collections::HashMap<String, String>,
-        ) -> Result<CreateMultipartOutput, ProxyError> {
-            unreachable!()
-        }
-        async fn upload_part(&self, _req: UploadPartInput) -> Result<UploadPartOutput, ProxyError> {
-            unreachable!()
-        }
-        async fn complete_multipart_upload(
-            &self,
-            _req: crate::backend::models::CompleteMultipartInput,
-        ) -> Result<CompleteMultipartOutput, ProxyError> {
-            unreachable!()
-        }
-        async fn abort_multipart_upload(
-            &self,
-            _bucket: &str,
-            _key: &str,
-            _upload_id: &str,
-        ) -> Result<(), ProxyError> {
-            unreachable!()
-        }
+        async fn put_object(&self, _req: PutObjectInput) -> Result<PutObjectOutput, ProxyError> { unreachable!() }
+        async fn delete_object(&self, _req: DeleteObjectInput<'_>) -> Result<DeleteObjectOutput, ProxyError> { unreachable!() }
+        async fn list_objects(&self, _req: ListObjectsInput) -> Result<ListObjectsOutput, ProxyError> { unreachable!() }
+        async fn create_multipart_upload(&self, _req: CreateMultipartUploadInput<'_>) -> Result<CreateMultipartOutput, ProxyError> { unreachable!() }
+        async fn upload_part(&self, _req: UploadPartInput) -> Result<UploadPartOutput, ProxyError> { unreachable!() }
+        async fn complete_multipart_upload(&self, _req: crate::backend::models::CompleteMultipartInput) -> Result<CompleteMultipartOutput, ProxyError> { unreachable!() }
+        async fn abort_multipart_upload(&self, _req: AbortMultipartUploadInput<'_>) -> Result<(), ProxyError> { unreachable!() }
     }
 
     struct Sequential404Then404HeadBackend {
@@ -949,88 +860,22 @@ mod tests {
     }
 
     impl Backend for Sequential404Then404HeadBackend {
-        async fn get_object(
-            &self,
-            _bucket: &str,
-            _key: &str,
-            _options: ReadOptions,
-        ) -> Result<
-            (
-                crate::backend::models::GetObjectMeta,
-                crate::backend::BoxByteStream,
-            ),
-            ProxyError,
-        > {
-            Err(ProxyError::Backend {
-                source: "unexpected get_object".into(),
-                operation: "get_object".into(),
-            })
+        async fn get_object(&self, _req: GetObjectInput<'_>) -> Result<(crate::backend::models::GetObjectMeta, crate::backend::BoxByteStream), ProxyError> {
+            Err(ProxyError::Backend { source: "unexpected get_object".into(), operation: "get_object".into() })
         }
-
-        async fn head_object(
-            &self,
-            _bucket: &str,
-            _key: &str,
-            options: ReadOptions,
-        ) -> Result<HeadObjectOutput, ProxyError> {
-            self.head_calls.lock().unwrap().push(options);
+        async fn head_object(&self, req: HeadObjectInput<'_>) -> Result<HeadObjectOutput, ProxyError> {
+            self.head_calls.lock().unwrap().push(req.options);
             let call = self.count.fetch_add(1, Ordering::SeqCst);
-            let message = if call == 0 {
-                "deleted"
-            } else {
-                "still deleted"
-            };
-            Err(ProxyError::UpstreamS3 {
-                status_code: 404,
-                s3_code: "NoSuchKey".into(),
-                message: message.into(),
-                operation: "head_object".into(),
-            })
+            let message = if call == 0 { "deleted" } else { "still deleted" };
+            Err(ProxyError::UpstreamS3 { status_code: 404, s3_code: "NoSuchKey".into(), message: message.into(), operation: "head_object".into() })
         }
-
-        async fn put_object(&self, _req: PutObjectInput) -> Result<PutObjectOutput, ProxyError> {
-            unreachable!()
-        }
-        async fn delete_object(
-            &self,
-            _bucket: &str,
-            _key: &str,
-        ) -> Result<DeleteObjectOutput, ProxyError> {
-            unreachable!()
-        }
-        async fn list_objects(
-            &self,
-            _req: ListObjectsInput,
-        ) -> Result<ListObjectsOutput, ProxyError> {
-            unreachable!()
-        }
-        async fn create_multipart_upload(
-            &self,
-            _bucket: &str,
-            _key: &str,
-            _content_type: Option<&str>,
-            _metadata: &std::collections::HashMap<String, String>,
-            _content_headers: &std::collections::HashMap<String, String>,
-        ) -> Result<CreateMultipartOutput, ProxyError> {
-            unreachable!()
-        }
-        async fn upload_part(&self, _req: UploadPartInput) -> Result<UploadPartOutput, ProxyError> {
-            unreachable!()
-        }
-        async fn complete_multipart_upload(
-            &self,
-            _req: crate::backend::models::CompleteMultipartInput,
-        ) -> Result<CompleteMultipartOutput, ProxyError> {
-            unreachable!()
-        }
-        async fn abort_multipart_upload(
-            &self,
-            _bucket: &str,
-            _key: &str,
-            _upload_id: &str,
-        ) -> Result<(), ProxyError> {
-            unreachable!()
-        }
+        async fn put_object(&self, _req: PutObjectInput) -> Result<PutObjectOutput, ProxyError> { unreachable!() }
+        async fn delete_object(&self, _req: DeleteObjectInput<'_>) -> Result<DeleteObjectOutput, ProxyError> { unreachable!() }
+        async fn list_objects(&self, _req: ListObjectsInput) -> Result<ListObjectsOutput, ProxyError> { unreachable!() }
+        async fn create_multipart_upload(&self, _req: CreateMultipartUploadInput<'_>) -> Result<CreateMultipartOutput, ProxyError> { unreachable!() }
+        async fn upload_part(&self, _req: UploadPartInput) -> Result<UploadPartOutput, ProxyError> { unreachable!() }
+        async fn complete_multipart_upload(&self, _req: crate::backend::models::CompleteMultipartInput) -> Result<CompleteMultipartOutput, ProxyError> { unreachable!() }
+        async fn abort_multipart_upload(&self, _req: AbortMultipartUploadInput<'_>) -> Result<(), ProxyError> { unreachable!() }
     }
 
     struct BlockingHeadErrorBackend {
@@ -1050,110 +895,37 @@ mod tests {
     }
 
     impl Backend for BlockingHeadErrorBackend {
-        async fn get_object(
-            &self,
-            _bucket: &str,
-            _key: &str,
-            _options: ReadOptions,
-        ) -> Result<
-            (
-                crate::backend::models::GetObjectMeta,
-                crate::backend::BoxByteStream,
-            ),
-            ProxyError,
-        > {
-            Err(ProxyError::Backend {
-                source: "unexpected get_object".into(),
-                operation: "get_object".into(),
-            })
+        async fn get_object(&self, _req: GetObjectInput<'_>) -> Result<(crate::backend::models::GetObjectMeta, crate::backend::BoxByteStream), ProxyError> {
+            Err(ProxyError::Backend { source: "unexpected get_object".into(), operation: "get_object".into() })
         }
-
-        async fn head_object(
-            &self,
-            _bucket: &str,
-            _key: &str,
-            options: ReadOptions,
-        ) -> Result<HeadObjectOutput, ProxyError> {
-            self.head_read_calls.lock().unwrap().push(options);
+        async fn head_object(&self, req: HeadObjectInput<'_>) -> Result<HeadObjectOutput, ProxyError> {
+            self.head_read_calls.lock().unwrap().push(req.options);
             if let Some(tx) = self.started.lock().unwrap().take() {
                 let _ = tx.send(());
             }
             self.release.notified().await;
-            Err(ProxyError::Backend {
-                source: "backend down".into(),
-                operation: "head_object".into(),
-            })
+            Err(ProxyError::Backend { source: "backend down".into(), operation: "head_object".into() })
         }
-
         async fn put_object(&self, _req: PutObjectInput) -> Result<PutObjectOutput, ProxyError> {
-            Err(ProxyError::Backend {
-                source: "unexpected put_object".into(),
-                operation: "put_object".into(),
-            })
+            Err(ProxyError::Backend { source: "unexpected put_object".into(), operation: "put_object".into() })
         }
-
-        async fn delete_object(
-            &self,
-            _bucket: &str,
-            _key: &str,
-        ) -> Result<DeleteObjectOutput, ProxyError> {
-            Err(ProxyError::Backend {
-                source: "unexpected delete_object".into(),
-                operation: "delete_object".into(),
-            })
+        async fn delete_object(&self, _req: DeleteObjectInput<'_>) -> Result<DeleteObjectOutput, ProxyError> {
+            Err(ProxyError::Backend { source: "unexpected delete_object".into(), operation: "delete_object".into() })
         }
-
-        async fn list_objects(
-            &self,
-            _req: ListObjectsInput,
-        ) -> Result<ListObjectsOutput, ProxyError> {
-            Err(ProxyError::Backend {
-                source: "unexpected list_objects".into(),
-                operation: "list_objects".into(),
-            })
+        async fn list_objects(&self, _req: ListObjectsInput) -> Result<ListObjectsOutput, ProxyError> {
+            Err(ProxyError::Backend { source: "unexpected list_objects".into(), operation: "list_objects".into() })
         }
-
-        async fn create_multipart_upload(
-            &self,
-            _bucket: &str,
-            _key: &str,
-            _content_type: Option<&str>,
-            _metadata: &std::collections::HashMap<String, String>,
-            _content_headers: &std::collections::HashMap<String, String>,
-        ) -> Result<CreateMultipartOutput, ProxyError> {
-            Err(ProxyError::Backend {
-                source: "unexpected create_multipart_upload".into(),
-                operation: "create_multipart_upload".into(),
-            })
+        async fn create_multipart_upload(&self, _req: CreateMultipartUploadInput<'_>) -> Result<CreateMultipartOutput, ProxyError> {
+            Err(ProxyError::Backend { source: "unexpected create_multipart_upload".into(), operation: "create_multipart_upload".into() })
         }
-
         async fn upload_part(&self, _req: UploadPartInput) -> Result<UploadPartOutput, ProxyError> {
-            Err(ProxyError::Backend {
-                source: "unexpected upload_part".into(),
-                operation: "upload_part".into(),
-            })
+            Err(ProxyError::Backend { source: "unexpected upload_part".into(), operation: "upload_part".into() })
         }
-
-        async fn complete_multipart_upload(
-            &self,
-            _req: crate::backend::models::CompleteMultipartInput,
-        ) -> Result<CompleteMultipartOutput, ProxyError> {
-            Err(ProxyError::Backend {
-                source: "unexpected complete_multipart_upload".into(),
-                operation: "complete_multipart_upload".into(),
-            })
+        async fn complete_multipart_upload(&self, _req: crate::backend::models::CompleteMultipartInput) -> Result<CompleteMultipartOutput, ProxyError> {
+            Err(ProxyError::Backend { source: "unexpected complete_multipart_upload".into(), operation: "complete_multipart_upload".into() })
         }
-
-        async fn abort_multipart_upload(
-            &self,
-            _bucket: &str,
-            _key: &str,
-            _upload_id: &str,
-        ) -> Result<(), ProxyError> {
-            Err(ProxyError::Backend {
-                source: "unexpected abort_multipart_upload".into(),
-                operation: "abort_multipart_upload".into(),
-            })
+        async fn abort_multipart_upload(&self, _req: AbortMultipartUploadInput<'_>) -> Result<(), ProxyError> {
+            Err(ProxyError::Backend { source: "unexpected abort_multipart_upload".into(), operation: "abort_multipart_upload".into() })
         }
     }
 

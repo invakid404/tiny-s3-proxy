@@ -4,7 +4,7 @@ use axum::body::Body;
 use bytes::Bytes;
 use http::Response;
 
-use crate::backend::models::{CompleteMultipartInput, UploadPartInput};
+use crate::backend::models::{AbortMultipartUploadInput, CompleteMultipartInput, CreateMultipartUploadInput, UploadPartInput};
 use crate::backend::Backend;
 use crate::cache::key::CacheKey;
 use crate::cache::CacheStore;
@@ -24,13 +24,13 @@ pub async fn handle_create_multipart<B: Backend, C: CacheStore>(
 ) -> Response<Body> {
     let result = state
         .backend
-        .create_multipart_upload(
-            &state.backend_bucket,
+        .create_multipart_upload(CreateMultipartUploadInput {
+            bucket: &state.backend_bucket,
             key,
-            parsed.content_type.as_deref(),
-            &parsed.user_metadata,
-            &parsed.content_headers,
-        )
+            content_type: parsed.content_type.as_deref(),
+            metadata: &parsed.user_metadata,
+            content_headers: &parsed.content_headers,
+        })
         .await;
 
     match result {
@@ -292,7 +292,7 @@ pub async fn handle_abort_multipart<B: Backend, C: CacheStore>(
 ) -> Response<Body> {
     let result = state
         .backend
-        .abort_multipart_upload(&state.backend_bucket, key, upload_id)
+        .abort_multipart_upload(AbortMultipartUploadInput { bucket: &state.backend_bucket, key, upload_id })
         .await;
 
     match result {
