@@ -226,11 +226,11 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
 ) -> Response<Body> {
     let read_options = parsed.read_options();
     let mut cache_refresh_target: Option<Arc<CacheMeta>> = None;
+    let cache_key = CacheKey::new(&*state.backend_bucket, key);
 
     // Probe cache first without accounting so refresh-only HEAD checks do not
     // look like cache hits when the response still has to go upstream.
     if state.policy.is_cacheable(key) {
-        let cache_key = CacheKey::new(&*state.backend_bucket, key);
         match state.cache.peek(&cache_key).await {
             Ok(Some(entry)) => {
                 if !cache_entry_satisfies_head_request(&entry.meta, read_options) {
@@ -302,7 +302,6 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
     match result {
         Ok(output) => {
             if let Some(ref cached_meta) = cache_refresh_target {
-                let cache_key = CacheKey::new(&*state.backend_bucket, key);
                 match refreshed_cache_meta(
                     cached_meta,
                     &output,
@@ -376,7 +375,6 @@ pub async fn handle_head<B: Backend, C: CacheStore>(
         }
         Err(e) => {
             if let Some(cached_meta) = cache_refresh_target.as_ref() {
-                let cache_key = CacheKey::new(&*state.backend_bucket, key);
                 match &e {
                     crate::error::ProxyError::UpstreamS3 {
                         status_code: 404, ..

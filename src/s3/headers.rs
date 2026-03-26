@@ -10,8 +10,13 @@ pub(crate) fn is_checksum_response_header(name: &str) -> bool {
 }
 
 /// Format a DateTime to RFC 7231 (HTTP-date) format.
+/// Pre-allocates the exact 29-byte capacity to avoid reallocation.
 fn format_last_modified(dt: &chrono::DateTime<chrono::Utc>) -> String {
-    dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
+    use std::fmt::Write;
+    // RFC 7231 date: "Mon, 01 Jan 2024 00:00:00 GMT" — always 29 bytes
+    let mut buf = String::with_capacity(29);
+    write!(buf, "{}", dt.format("%a, %d %b %Y %H:%M:%S GMT")).unwrap();
+    buf
 }
 
 /// Build response headers for `x-amz-meta-*` user metadata.
@@ -110,15 +115,15 @@ pub fn head_object_headers(output: &HeadObjectOutput, include_checksum_headers: 
 }
 
 /// Build common S3 response headers.
+/// Pre-allocates capacity for 3 headers and uses `from_static` for constant values.
 pub fn common_headers(request_id: &str) -> HeaderMap {
-    let mut headers = HeaderMap::new();
+    let mut headers = HeaderMap::with_capacity(3);
 
+    headers.insert("server", HeaderValue::from_static("tiny-s3-proxy"));
+    headers.insert("x-amz-id-2", HeaderValue::from_static("tiny-s3-proxy-id-2"));
     if let Ok(val) = HeaderValue::from_str(request_id) {
         headers.insert("x-amz-request-id", val);
     }
-
-    headers.insert("x-amz-id-2", HeaderValue::from_static("tiny-s3-proxy-id-2"));
-    headers.insert("server", HeaderValue::from_static("tiny-s3-proxy"));
 
     headers
 }
