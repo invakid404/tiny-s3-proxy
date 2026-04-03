@@ -5,6 +5,7 @@ use std::sync::atomic::Ordering;
 use crate::cache::metadata::CacheMeta;
 
 use super::CacheStats;
+use super::layout::collect_hash_dirs_strict;
 
 /// Concurrency limit for parallel hash-directory scans during eviction.
 const EVICTION_SCAN_CONCURRENCY: usize = 64;
@@ -101,35 +102,15 @@ pub async fn run_eviction_loop(
     }
 }
 
-/// Collect all `objects/XX/YY/` directory paths for parallel processing.
-async fn collect_hash_dirs(
-    objects_dir: &std::path::Path,
-) -> Result<Vec<PathBuf>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut hash_dirs = Vec::new();
-    let mut d1_entries = tokio::fs::read_dir(objects_dir).await?;
-
-    while let Some(d1_entry) = d1_entries.next_entry().await? {
-        let d1_path = d1_entry.path();
-        if !d1_path.is_dir() {
-            continue;
-        }
-
-        let mut d2_entries = match tokio::fs::read_dir(&d1_path).await {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(Box::new(e)),
-        };
-
-        while let Some(d2_entry) = d2_entries.next_entry().await? {
-            let d2_path = d2_entry.path();
-            if !d2_path.is_dir() {
-                continue;
-            }
-            hash_dirs.push(d2_path);
-        }
-    }
-
-    Ok(hash_dirs)
+fn boxed_io_error(
+    operation: &'static str,
+    path: &std::path::Path,
+    error: std::io::Error,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    Box::new(std::io::Error::new(
+        error.kind(),
+        format!("{operation} {}: {error}", path.display()),
+    ))
 }
 
 /// Scan a single hash directory and return candidates, stats, and deferred
@@ -178,9 +159,7 @@ async fn scan_hash_dir_for_eviction(
                     }
                     Ok(true) => {} // meta exists, not an orphan
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // race: dir vanished
-                    Err(e) => {
-                        tracing::warn!(path = %meta_path.display(), error = %e, "orphan body probe failed, skipping");
-                    }
+                    Err(e) => return Err(boxed_io_error("probe orphan metadata", &meta_path, e)),
                 }
             } else if file_name.ends_with(".poisoned") {
                 let hash = file_name.trim_end_matches(".poisoned").to_string();
@@ -189,16 +168,14 @@ async fn scan_hash_dir_for_eviction(
                     Ok(false) => {
                         result
                             .deferred_cleanups
-                        .push(DeferredCleanup::OrphanPoison {
-                            poison_path: file_path,
-                            hash,
-                        });
+                            .push(DeferredCleanup::OrphanPoison {
+                                poison_path: file_path,
+                                hash,
+                            });
                     }
                     Ok(true) => {} // meta exists, not an orphan
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // race
-                    Err(e) => {
-                        tracing::warn!(path = %meta_path.display(), error = %e, "orphan poison probe failed, skipping");
-                    }
+                    Err(e) => return Err(boxed_io_error("probe orphan metadata", &meta_path, e)),
                 }
             }
             continue;
@@ -210,23 +187,11 @@ async fn scan_hash_dir_for_eviction(
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue, // race: entry removed
             Err(e) => {
-                // Unreadable metadata — defer locked recheck rather than
-                // aborting the entire eviction pass.
-                tracing::warn!(
-                    path = %file_path.display(),
-                    error = %e,
-                    "metadata unreadable during eviction scan, deferring cleanup"
-                );
-                let hash = hash_for_cleanup.to_string();
-                let body = d2_path.join(format!("{}.body", hash));
-                let poison = d2_path.join(format!("{hash}.poisoned"));
-                result.deferred_cleanups.push(DeferredCleanup::CorruptEntry(EntryPaths {
-                    meta_path: file_path,
-                    body_path: body,
-                    poison_path: poison,
-                    hash,
-                }));
-                continue;
+                return Err(boxed_io_error(
+                    "read metadata during eviction scan",
+                    &file_path,
+                    e,
+                ));
             }
         };
         let meta: CacheMeta = match serde_json::from_slice::<CacheMeta>(&meta_bytes) {
@@ -236,12 +201,14 @@ async fn scan_hash_dir_for_eviction(
                 let hash = hash_for_cleanup.to_string();
                 let body = d2_path.join(format!("{}.body", hash));
                 let poison = d2_path.join(format!("{hash}.poisoned"));
-                result.deferred_cleanups.push(DeferredCleanup::CorruptEntry(EntryPaths {
-                    meta_path: file_path,
-                    body_path: body,
-                    poison_path: poison,
-                    hash,
-                }));
+                result
+                    .deferred_cleanups
+                    .push(DeferredCleanup::CorruptEntry(EntryPaths {
+                        meta_path: file_path,
+                        body_path: body,
+                        poison_path: poison,
+                        hash,
+                    }));
                 continue;
             }
         };
@@ -267,12 +234,14 @@ async fn scan_hash_dir_for_eviction(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Body appears missing — defer locked recheck.
                 let poison = d2_path.join(format!("{hash}.poisoned"));
-                result.deferred_cleanups.push(DeferredCleanup::MissingBody(EntryPaths {
-                    meta_path: file_path,
-                    body_path,
-                    poison_path: poison,
-                    hash: hash.to_string(),
-                }));
+                result
+                    .deferred_cleanups
+                    .push(DeferredCleanup::MissingBody(EntryPaths {
+                        meta_path: file_path,
+                        body_path,
+                        poison_path: poison,
+                        hash: hash.to_string(),
+                    }));
                 continue;
             }
             Err(e) => {
@@ -315,7 +284,10 @@ async fn remove_file_or_reclaim_size(path: &std::path::Path) -> u64 {
         Ok(()) => 0,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
         Err(e) => {
-            let size = tokio::fs::metadata(path).await.map(|m| m.len()).unwrap_or(0);
+            let size = tokio::fs::metadata(path)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
             tracing::warn!(
                 path = %path.display(),
                 error = %e,
@@ -340,7 +312,10 @@ async fn remove_entry_files(paths: &EntryPaths) -> u64 {
 /// Outcome of attempting to recover a cache entry under lock.
 enum RecoverOutcome {
     /// Entry is valid — body exists and metadata parsed successfully.
-    Recovered { size: u64, candidate: EvictionCandidate },
+    Recovered {
+        size: u64,
+        candidate: EvictionCandidate,
+    },
     /// Body file does not exist (NotFound).
     MissingBody,
     /// Body file exists but could not be stat'd (I/O or permission error).
@@ -399,7 +374,7 @@ async fn process_deferred_cleanups(
     candidates: &mut Vec<EvictionCandidate>,
     scan_total_bytes: &mut u64,
     scan_entry_count: &mut u64,
-) {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     for cleanup in cleanups {
         match cleanup {
             DeferredCleanup::OrphanBody { body_path, hash } => {
@@ -417,7 +392,10 @@ async fn process_deferred_cleanups(
                     Err(e) => {
                         // Can't confirm orphan status — conservatively count body bytes
                         // so stats don't undercount.
-                        let size = tokio::fs::metadata(&body_path).await.map(|m| m.len()).unwrap_or(0);
+                        let size = tokio::fs::metadata(&body_path)
+                            .await
+                            .map(|m| m.len())
+                            .unwrap_or(0);
                         *scan_total_bytes += size;
                         tracing::warn!(
                             path = %meta_path.display(),
@@ -466,12 +444,18 @@ async fn process_deferred_cleanups(
                         tracing::debug!(path = %paths.meta_path.display(), "removed corrupt entry with missing body");
                     }
                     RecoverOutcome::BodyStatError(e) => {
-                        // Body exists but unreadable — don't delete, treat as transient.
-                        tracing::warn!(path = %paths.body_path.display(), error = %e, "corrupt entry body unreadable under lock, skipping");
+                        return Err(boxed_io_error(
+                            "stat body during locked eviction cleanup",
+                            &paths.body_path,
+                            e,
+                        ));
                     }
                     RecoverOutcome::MetaReadError(e) => {
-                        tracing::warn!(path = %paths.meta_path.display(), error = %e, "corrupt entry meta unreadable under lock, removing");
-                        *scan_total_bytes += remove_entry_files(&paths).await;
+                        return Err(boxed_io_error(
+                            "read metadata during locked eviction cleanup",
+                            &paths.meta_path,
+                            e,
+                        ));
                     }
                     RecoverOutcome::MetaParseError(e) => {
                         tracing::warn!(path = %paths.meta_path.display(), error = %e, "corrupt entry meta still unparseable under lock, removing");
@@ -502,10 +486,20 @@ async fn process_deferred_cleanups(
                         *scan_total_bytes += remove_file_or_reclaim_size(&paths.poison_path).await;
                     }
                     RecoverOutcome::BodyStatError(e) => {
-                        // Body unreadable — don't delete, treat as transient.
-                        tracing::warn!(path = %paths.body_path.display(), error = %e, "missing-body entry body stat failed under lock, skipping");
+                        return Err(boxed_io_error(
+                            "stat body during locked missing-body cleanup",
+                            &paths.body_path,
+                            e,
+                        ));
                     }
-                    RecoverOutcome::MetaReadError(_) | RecoverOutcome::MetaParseError(_) => {
+                    RecoverOutcome::MetaReadError(e) => {
+                        return Err(boxed_io_error(
+                            "read metadata during locked missing-body cleanup",
+                            &paths.meta_path,
+                            e,
+                        ));
+                    }
+                    RecoverOutcome::MetaParseError(_) => {
                         // Body missing and meta is broken — clean up everything.
                         *scan_total_bytes += remove_entry_files(&paths).await;
                     }
@@ -513,6 +507,8 @@ async fn process_deferred_cleanups(
             }
         }
     }
+
+    Ok(())
 }
 
 /// Walk the objects directory, collect all cache entries as eviction candidates,
@@ -542,11 +538,16 @@ async fn collect_candidates(
     disk_cache: Option<&super::DiskCache>,
 ) -> Result<ScanResult, Box<dyn std::error::Error + Send + Sync>> {
     // Phase 1: Collect all hash directory paths.
-    let hash_dirs = collect_hash_dirs(objects_dir).await?;
+    let hash_dirs = collect_hash_dirs_strict(objects_dir)
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
     if hash_dirs.is_empty() {
         stats.total_bytes.store(0, Ordering::Relaxed);
         stats.entry_count.store(0, Ordering::Relaxed);
-        return Ok(ScanResult { candidates: Vec::new(), total_bytes: 0 });
+        return Ok(ScanResult {
+            candidates: Vec::new(),
+            total_bytes: 0,
+        });
     }
 
     // Phase 2: Process each hash directory in parallel.
@@ -592,7 +593,7 @@ async fn collect_candidates(
         &mut scan_total_bytes,
         &mut scan_entry_count,
     )
-    .await;
+    .await?;
 
     // Reconcile: overwrite atomics with the authoritative filesystem totals.
     // Any drift from concurrent commit_fill/purge since the last reconciliation
@@ -600,7 +601,10 @@ async fn collect_candidates(
     stats.total_bytes.store(scan_total_bytes, Ordering::Relaxed);
     stats.entry_count.store(scan_entry_count, Ordering::Relaxed);
 
-    Ok(ScanResult { candidates, total_bytes: scan_total_bytes })
+    Ok(ScanResult {
+        candidates,
+        total_bytes: scan_total_bytes,
+    })
 }
 
 /// Single eviction pass: scan cache (reconciling stats), sort by LRU, evict
@@ -880,7 +884,9 @@ mod tests {
         let stats = Arc::new(CacheStats::default());
 
         // Set limit so only ~1 entry fits (body + meta ~= 1200 bytes each, so ~1500 is one entry)
-        run_eviction_pass_inner(&cache_dir, 1500, &stats, None).await.unwrap();
+        run_eviction_pass_inner(&cache_dir, 1500, &stats, None)
+            .await
+            .unwrap();
 
         // The oldest entries should be evicted, newest should remain
         let hash_old = key_old.hash_hex();

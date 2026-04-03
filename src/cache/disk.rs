@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use super::layout::collect_hash_dirs_best_effort;
 use crate::cache::entry::CacheEntry;
 use crate::cache::key::CacheKey;
 use crate::cache::metadata::CacheMeta;
@@ -109,8 +110,7 @@ impl DiskCache {
 
         // Load startup stats and derive the next fill_id to allocate.
         let scan = Self::scan_existing_stats(&cache_dir).await?;
-        let next_fill_id =
-            Self::load_next_fill_id(&cache_dir, &scan).await?;
+        let next_fill_id = Self::load_next_fill_id(&cache_dir, &scan).await?;
 
         Ok(Self {
             cache_dir,
@@ -186,13 +186,13 @@ impl DiskCache {
         let counter_path = Self::fill_id_counter_path_for(cache_dir);
         match Self::read_persisted_fill_id_counter(&counter_path).await? {
             Some(counter_file_value) => Ok(counter_file_value.max(scan_next_fill_id)),
-            None if scan.saw_cache_files && scan.fill_id_incomplete => {
-                // Counter file missing AND some metadata was corrupt, so
-                // scan_max_fill_id may be too low. Refuse to start rather
+            None if scan.fill_id_incomplete => {
+                // Counter file missing and the startup scan was incomplete,
+                // so scan_max_fill_id may be too low. Refuse to start rather
                 // than risk allocating colliding fill_ids.
                 Err(ProxyError::Cache {
-                    source: "fill_id counter file missing and startup scan found corrupt \
-                             metadata; cannot safely determine next fill_id"
+                    source: "fill_id counter file missing and startup scan was incomplete; \
+                             cannot safely determine next fill_id"
                         .into(),
                     operation: "load_next_fill_id".into(),
                 })
@@ -314,8 +314,9 @@ impl DiskCache {
         let stats = CacheStats::default();
 
         // Phase 1: Collect all hash directory paths (objects/XX/YY/).
-        let mut dirs_fill_id_incomplete = false;
-        let hash_dirs = Self::collect_hash_dirs(&objects_dir, &mut dirs_fill_id_incomplete).await?;
+        let collection = collect_hash_dirs_best_effort(&objects_dir).await;
+        let dirs_fill_id_incomplete = collection.incomplete;
+        let hash_dirs = collection.dirs;
         if hash_dirs.is_empty() {
             return Ok(StartupScanResult {
                 stats,
@@ -349,8 +350,12 @@ impl DiskCache {
         while let Some(join_result) = join_set.join_next().await {
             match join_result {
                 Ok(Ok(dir)) => {
-                    agg.stats.total_bytes.fetch_add(dir.total_bytes, Ordering::Relaxed);
-                    agg.stats.entry_count.fetch_add(dir.entry_count, Ordering::Relaxed);
+                    agg.stats
+                        .total_bytes
+                        .fetch_add(dir.total_bytes, Ordering::Relaxed);
+                    agg.stats
+                        .entry_count
+                        .fetch_add(dir.entry_count, Ordering::Relaxed);
                     agg.max_fill_id = agg.max_fill_id.max(dir.max_fill_id);
                     agg.saw_cache_files = agg.saw_cache_files || dir.saw_cache_files;
                     agg.fill_id_incomplete = agg.fill_id_incomplete || dir.fill_id_incomplete;
@@ -368,89 +373,6 @@ impl DiskCache {
         }
 
         Ok(agg)
-    }
-
-    /// Collect all `objects/XX/YY/` directory paths for parallel processing.
-    /// Sets `fill_id_incomplete` if any directories were skipped due to I/O
-    /// errors, meaning the scan may have missed entries with higher fill_ids.
-    async fn collect_hash_dirs(
-        objects_dir: &std::path::Path,
-        fill_id_incomplete: &mut bool,
-    ) -> Result<Vec<PathBuf>, ProxyError> {
-        let mut hash_dirs = Vec::new();
-
-        let mut d1_entries = match tokio::fs::read_dir(objects_dir).await {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(hash_dirs);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    path = %objects_dir.display(),
-                    error = %e,
-                    "failed to read objects directory during startup, starting with empty cache stats"
-                );
-                *fill_id_incomplete = true;
-                return Ok(hash_dirs);
-            }
-        };
-
-        loop {
-            let d1_entry = match d1_entries.next_entry().await {
-                Ok(Some(entry)) => entry,
-                Ok(None) => break,
-                Err(e) => {
-                    tracing::warn!(
-                        path = %objects_dir.display(),
-                        error = %e,
-                        "failed to iterate objects directory during startup, skipping rest"
-                    );
-                    *fill_id_incomplete = true;
-                    break;
-                }
-            };
-            let d1_path = d1_entry.path();
-            if !d1_path.is_dir() {
-                continue;
-            }
-
-            let mut d2_entries = match tokio::fs::read_dir(&d1_path).await {
-                Ok(entries) => entries,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => {
-                    tracing::warn!(
-                        path = %d1_path.display(),
-                        error = %e,
-                        "failed to read cache subtree during startup, skipping"
-                    );
-                    *fill_id_incomplete = true;
-                    continue;
-                }
-            };
-
-            loop {
-                let d2_entry = match d2_entries.next_entry().await {
-                    Ok(Some(entry)) => entry,
-                    Ok(None) => break,
-                    Err(e) => {
-                        tracing::warn!(
-                            path = %d1_path.display(),
-                            error = %e,
-                            "failed to iterate cache subtree during startup, skipping rest"
-                        );
-                        *fill_id_incomplete = true;
-                        break;
-                    }
-                };
-                let d2_path = d2_entry.path();
-                if !d2_path.is_dir() {
-                    continue;
-                }
-                hash_dirs.push(d2_path);
-            }
-        }
-
-        Ok(hash_dirs)
     }
 
     /// Process a single hash directory during startup scan.
@@ -597,10 +519,57 @@ impl DiskCache {
                         tracing::warn!(
                             path = %meta_path.display(),
                             error = %e,
-                                    "failed to probe metadata during startup scan, skipping"
-                                );
-                                result.fill_id_incomplete = true;
+                            "failed to probe metadata during startup scan, skipping"
+                        );
+                        result.fill_id_incomplete = true;
+                    }
+                }
+            } else if file_name.ends_with(".meta.json") {
+                let hash = file_name.trim_end_matches(".meta.json");
+                let body_path = file_path.parent().unwrap().join(format!("{hash}.body"));
+                match tokio::fs::metadata(&body_path).await {
+                    Ok(_) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        result.fill_id_incomplete = true;
+                        tracing::warn!(
+                            path = %body_path.display(),
+                            error = %e,
+                            "failed to probe body for metadata during startup scan, skipping"
+                        );
+                        continue;
+                    }
+                }
+
+                match tokio::fs::read(&file_path).await {
+                    Ok(meta_bytes) => {
+                        result.total_bytes += meta_bytes.len() as u64;
+                        match serde_json::from_slice::<CacheMeta>(&meta_bytes) {
+                            Ok(meta) => {
+                                result.max_fill_id = result.max_fill_id.max(meta.fill_id);
                             }
+                            Err(e) => {
+                                result.fill_id_incomplete = true;
+                                tracing::warn!(
+                                    path = %file_path.display(),
+                                    error = %e,
+                                    "corrupt metadata-only leftover during startup scan, skipping fill_id"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        result.fill_id_incomplete = true;
+                        if let Ok(meta) = tokio::fs::metadata(&file_path).await {
+                            result.total_bytes += meta.len();
+                        }
+                        tracing::warn!(
+                            path = %file_path.display(),
+                            error = %e,
+                            "failed to read metadata-only leftover during startup scan, counting bytes conservatively"
+                        );
+                    }
                 }
             }
         }
@@ -2617,6 +2586,53 @@ mod tests {
         let fill_id = cache2.lookup(&key).await.unwrap().unwrap().meta.fill_id;
         assert_eq!(fill_id, 100);
         assert_eq!(read_fill_id_counter(tmp.path()).await, 101);
+    }
+
+    #[tokio::test]
+    async fn test_fill_id_incomplete_scan_without_counter_is_startup_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let scan = StartupScanResult {
+            stats: CacheStats::default(),
+            max_fill_id: 0,
+            saw_cache_files: false,
+            fill_id_incomplete: true,
+        };
+
+        let err = DiskCache::load_next_fill_id(tmp.path(), &scan)
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("startup scan was incomplete"));
+    }
+
+    #[tokio::test]
+    async fn test_scan_existing_stats_counts_metadata_only_leftovers() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+        let key = test_key();
+        let hash = key.hash_hex();
+        let dir = cache_dir.join("objects").join(&hash[..2]).join(&hash[2..4]);
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let mut meta = test_meta(123);
+        meta.fill_id = 41;
+        let meta_bytes = serde_json::to_vec(&meta).unwrap();
+        let meta_path = dir.join(format!("{hash}.meta.json"));
+        tokio::fs::write(&meta_path, &meta_bytes).await.unwrap();
+
+        let scan = DiskCache::scan_existing_stats(&cache_dir).await.unwrap();
+        assert_eq!(
+            scan.stats.total_bytes.load(Ordering::Relaxed),
+            meta_bytes.len() as u64
+        );
+        assert_eq!(scan.stats.entry_count.load(Ordering::Relaxed), 0);
+        assert_eq!(scan.max_fill_id, 41);
+        assert!(scan.saw_cache_files);
+
+        let next_fill_id = DiskCache::load_next_fill_id(&cache_dir, &scan)
+            .await
+            .unwrap();
+        assert_eq!(next_fill_id, 42);
     }
 
     #[tokio::test]
