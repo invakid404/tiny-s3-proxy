@@ -83,8 +83,21 @@ async fn collect_hash_dirs_inner(
             }
         };
         let d1_path = d1_entry.path();
-        if !d1_path.is_dir() {
-            continue;
+        match d1_entry.file_type().await {
+            Ok(ft) if ft.is_dir() => {}
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                handle_walk_error(
+                    mode,
+                    &mut collection.incomplete,
+                    "check hash prefix dir type",
+                    &d1_path,
+                    e,
+                    "failed to check cache subtree type during scan",
+                )?;
+                continue;
+            }
         }
 
         let mut d2_entries = match tokio::fs::read_dir(&d1_path).await {
@@ -120,10 +133,24 @@ async fn collect_hash_dirs_inner(
                 }
             };
             let d2_path = d2_entry.path();
-            if !d2_path.is_dir() {
-                continue;
+            match d2_entry.file_type().await {
+                Ok(ft) if ft.is_dir() => {
+                    collection.dirs.push(d2_path);
+                }
+                Ok(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    handle_walk_error(
+                        mode,
+                        &mut collection.incomplete,
+                        "check hash cache dir type",
+                        &d2_path,
+                        e,
+                        "failed to check cache subtree type during scan",
+                    )?;
+                    continue;
+                }
             }
-            collection.dirs.push(d2_path);
         }
     }
 

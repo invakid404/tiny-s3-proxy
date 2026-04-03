@@ -245,15 +245,11 @@ async fn scan_hash_dir_for_eviction(
                 continue;
             }
             Err(e) => {
-                // Non-NotFound body stat error — skip this entry without
-                // aborting the whole shard. Byte count will be slightly off;
-                // self-corrects on next eviction pass.
-                tracing::warn!(
-                    path = %body_path.display(),
-                    error = %e,
-                    "body stat failed during eviction scan, skipping entry"
-                );
-                continue;
+                return Err(boxed_io_error(
+                    "stat body during eviction scan",
+                    &body_path,
+                    e,
+                ));
             }
         };
 
@@ -1044,6 +1040,61 @@ mod tests {
             snap.total_bytes > 0,
             "total_bytes should reflect actual files"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_eviction_body_stat_error_aborts_without_reconciling_stats() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+        let key = CacheKey::new("bucket", "script_bundle/bad-body.js");
+        let hash = key.hash_hex();
+        let (d1, d2) = key.dir_prefix();
+        let dir = cache_dir.join("objects").join(d1).join(d2);
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let now = Utc::now();
+        let meta = CacheMeta {
+            bucket: "bucket".into(),
+            key: "script_bundle/bad-body.js".into(),
+            etag: None,
+            last_modified: None,
+            content_type: Some("application/octet-stream".into()),
+            content_length: 5,
+            cache_written_at: now,
+            fill_id: 0,
+            metadata_version: 0,
+            last_accessed_at: now,
+            hit_count: 0,
+            source_status: 200,
+            metadata: std::collections::HashMap::new(),
+            extra_headers: std::collections::HashMap::new(),
+            head_extra_headers: std::collections::HashMap::new(),
+            head_checksum_headers: std::collections::HashMap::new(),
+            checksum_mode_checked: false,
+            head_metadata_checked: false,
+            head_checksum_checked: false,
+        };
+        let meta_path = dir.join(format!("{hash}.meta.json"));
+        let body_path = dir.join(format!("{hash}.body"));
+        tokio::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap())
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(&body_path, &body_path).unwrap();
+
+        let stats = Arc::new(CacheStats::default());
+        stats.entry_count.store(9, Ordering::Relaxed);
+        stats.total_bytes.store(999, Ordering::Relaxed);
+
+        let err = run_eviction_pass_inner(&cache_dir, 1_000_000, &stats, None)
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("stat body during eviction scan"));
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.entry_count, 9);
+        assert_eq!(snap.total_bytes, 999);
     }
 
     #[tokio::test]
