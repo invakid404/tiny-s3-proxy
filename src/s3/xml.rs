@@ -260,24 +260,22 @@ pub fn parse_complete_multipart_body(xml_body: &[u8]) -> Result<Vec<CompletedPar
                 }
                 // Empty elements don't change depth (no matching End).
             }
-            Ok(Event::Text(ref e)) => {
-                if inside_part {
-                    let text = e
-                        .decode()
-                        .map_err(|err| format!("XML decode error: {}", err))?
-                        .to_string();
-                    match current_element.as_str() {
-                        "PartNumber" => {
-                            current_part_number = Some(
-                                text.parse::<i32>()
-                                    .map_err(|e| format!("Invalid PartNumber: {}", e))?,
-                            );
-                        }
-                        "ETag" => {
-                            current_etag = Some(text);
-                        }
-                        _ => {}
+            Ok(Event::Text(ref e)) if inside_part => {
+                let text = e
+                    .decode()
+                    .map_err(|err| format!("XML decode error: {}", err))?
+                    .to_string();
+                match current_element.as_str() {
+                    "PartNumber" => {
+                        current_part_number = Some(
+                            text.parse::<i32>()
+                                .map_err(|e| format!("Invalid PartNumber: {}", e))?,
+                        );
                     }
+                    "ETag" => {
+                        current_etag = Some(text);
+                    }
+                    _ => {}
                 }
             }
             Ok(Event::End(ref e)) => {
