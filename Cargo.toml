@@ -5,8 +5,8 @@ edition = "2024"
 
 [dependencies]
 aws-credential-types = "=1.2.14"
-aws-sdk-s3 = "=1.128.0"
-aws-sigv4 = "=1.4.2"
+aws-sdk-s3 = "=1.131.0"
+aws-sigv4 = "=1.4.3"
 aws-smithy-types = "=1.4.7"
 axum = "=0.8.9"
 bytes = "=1.11.1"
