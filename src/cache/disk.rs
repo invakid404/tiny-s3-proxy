@@ -30,6 +30,36 @@ struct StartupScanResult {
     fill_id_incomplete: bool,
 }
 
+/// Compute how many on-disk bytes a failed orphan-body removal left behind.
+/// Used by the startup scan's orphan-cleanup branch when `remove_file` returns
+/// a non-NotFound error: a follow-up stat is the primary signal, but if that
+/// also fails we fall back to `pre_size` rather than `0`. Without the fallback
+/// a parent-dir EACCES would make `metadata(...).unwrap_or(0)` silently
+/// undercount startup totals — eviction reconciliation would then run with an
+/// under-reported budget until a later scan happened to succeed.
+async fn measure_unreclaimed_orphan_bytes(
+    file_path: &std::path::Path,
+    pre_size: Option<u64>,
+    remove_err: &std::io::Error,
+) -> u64 {
+    match tokio::fs::metadata(file_path).await {
+        Ok(m) => m.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(stat_err) => {
+            let counted = pre_size.unwrap_or(0);
+            tracing::warn!(
+                path = %file_path.display(),
+                remove_error = %remove_err,
+                stat_error_kind = ?stat_err.kind(),
+                pre_size = ?pre_size,
+                counted,
+                "orphan body remove and post-stat both failed during startup; using pre-stat fallback",
+            );
+            counted
+        }
+    }
+}
+
 /// Check if a path exists, distinguishing NotFound from real I/O errors.
 async fn check_exists(path: &std::path::Path, operation: &str) -> Result<bool, ProxyError> {
     match tokio::fs::try_exists(path).await {
@@ -418,7 +448,18 @@ impl DiskCache {
             let file_path = file_entry.path();
             let file_name = match file_path.file_name().and_then(|n| n.to_str()) {
                 Some(n) => n.to_string(),
-                None => continue,
+                None => {
+                    // Non-UTF-8 filenames cannot be writer-produced cache
+                    // files (writer only emits UTF-8 hex+ASCII), so this is
+                    // external corruption / junk. Returning Err here would
+                    // abort startup; the authoritative eviction scan will
+                    // surface the same file on its first pass.
+                    tracing::warn!(
+                        path = %file_path.display(),
+                        "non-UTF-8 filename in cache shard during startup scan, skipping"
+                    );
+                    continue;
+                }
             };
             result.saw_cache_files = true;
 
@@ -494,21 +535,31 @@ impl DiskCache {
                     }
                     Ok(false) => {
                         // Orphan body without metadata — try to clean up.
-                        // If removal fails, count the bytes so startup stats
-                        // aren't under-reported.
+                        // Capture the pre-remove size up front: if remove
+                        // fails *and* the post-remove stat also fails, a
+                        // bare `unwrap_or(0)` would silently undercount the
+                        // bytes still on disk. `entry_count` stays unchanged
+                        // either way — an orphan body is not a valid entry.
+                        let pre_size: Option<u64> = match tokio::fs::metadata(&file_path).await {
+                            Ok(m) => Some(m.len()),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(0),
+                            Err(_) => None,
+                        };
                         match tokio::fs::remove_file(&file_path).await {
                             Ok(()) => {}
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(e) => {
-                                let size = tokio::fs::metadata(&file_path)
-                                    .await
-                                    .map(|m| m.len())
-                                    .unwrap_or(0);
-                                result.total_bytes += size;
+                            Err(remove_err) => {
+                                let counted = measure_unreclaimed_orphan_bytes(
+                                    &file_path,
+                                    pre_size,
+                                    &remove_err,
+                                )
+                                .await;
+                                result.total_bytes += counted;
                                 tracing::warn!(
                                     path = %file_path.display(),
-                                    error = %e,
-                                    size,
+                                    error = %remove_err,
+                                    counted,
                                     "failed to remove orphan body during startup, counting bytes"
                                 );
                             }
@@ -3107,5 +3158,198 @@ mod tests {
         let latest_body = tokio::fs::read(&latest.body_path).await.unwrap();
         assert_eq!(latest_body, new_body);
         assert_eq!(latest.meta.etag.as_deref(), Some("\"new-etag\""));
+    }
+
+    /// The startup scan path is fatal-on-Err (`DiskCache::new` propagates any
+    /// error out and aborts the process), so a non-UTF-8 filename inside a
+    /// hash shard must not cause it to bail. The eviction path's stricter
+    /// abort semantics belong to that loop, which can retry. This test pins
+    /// the "warn-and-continue" contract so future refactors don't accidentally
+    /// mirror the eviction abort here.
+    ///
+    /// Linux-only for the same reason as the eviction sibling: APFS/HFS+
+    /// reject non-UTF-8 filenames at the filesystem layer.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn test_startup_scan_does_not_abort_on_non_utf8_filename() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("objects").join("aa").join("bb");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let bad_name = std::ffi::OsString::from_vec(vec![0xff, 0xfe, 0xfd]);
+        let bad_path = dir.join(&bad_name);
+        std::fs::write(&bad_path, b"junk").unwrap();
+
+        let stats = DiskCache::scan_hash_dir(dir.clone())
+            .await
+            .expect("startup scan must not abort on a non-UTF-8 filename");
+
+        assert_eq!(
+            stats.entry_count, 0,
+            "non-UTF-8 junk file must not be counted as a cache entry"
+        );
+        assert_eq!(
+            stats.total_bytes, 0,
+            "non-UTF-8 junk file bytes must not be added to startup totals"
+        );
+        assert!(
+            !stats.fill_id_incomplete,
+            "non-UTF-8 junk does not invalidate the fill_id scan"
+        );
+        assert!(
+            bad_path.exists(),
+            "startup scan must not delete or quarantine the offending file"
+        );
+        // Pin the observability contract: the fix is warn-and-continue, not
+        // silent-skip. A future revert to `None => continue` would still pass
+        // the assertions above, so verify the warn message and structured
+        // path field both made it into the captured logs.
+        assert!(
+            logs_contain("non-UTF-8 filename in cache shard during startup scan, skipping"),
+            "expected warn message text in captured logs"
+        );
+        assert!(
+            logs_contain(&bad_path.display().to_string()),
+            "expected offending path to be carried in the warn event"
+        );
+    }
+
+    /// RAII guard that captures a path's permissions on construction and
+    /// restores them on drop. Defined locally because the eviction module's
+    /// equivalent is private to that module's test scope.
+    #[cfg(unix)]
+    struct ChmodOnDrop {
+        path: std::path::PathBuf,
+        original: std::fs::Permissions,
+    }
+
+    #[cfg(unix)]
+    impl ChmodOnDrop {
+        fn new(path: &std::path::Path) -> Self {
+            let original = std::fs::metadata(path).unwrap().permissions();
+            Self {
+                path: path.to_path_buf(),
+                original,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ChmodOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.path, self.original.clone());
+        }
+    }
+
+    /// Common-case coverage: when the post-remove stat succeeds, that
+    /// measurement wins regardless of any caller-supplied `pre_size`.
+    #[tokio::test]
+    async fn test_measure_unreclaimed_uses_post_stat_when_available() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("orphan.body");
+        tokio::fs::write(&path, vec![0u8; 1500]).await.unwrap();
+
+        let remove_err =
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "synthetic test error");
+        let counted = measure_unreclaimed_orphan_bytes(&path, Some(99_999), &remove_err).await;
+        assert_eq!(
+            counted, 1500,
+            "post-stat measurement should win over pre_size when it succeeds"
+        );
+    }
+
+    /// Common-case coverage: when the post-remove stat returns NotFound (the
+    /// file vanished between remove and stat), count zero — the bytes are
+    /// genuinely off disk regardless of `pre_size`.
+    #[tokio::test]
+    async fn test_measure_unreclaimed_returns_zero_on_post_stat_not_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("never-existed");
+
+        let remove_err =
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "synthetic test error");
+        let counted = measure_unreclaimed_orphan_bytes(&path, Some(99_999), &remove_err).await;
+        assert_eq!(
+            counted, 0,
+            "post-stat NotFound means the bytes are genuinely gone"
+        );
+    }
+
+    /// Locks in the regression behind this commit: when both `remove_file`
+    /// AND the follow-up `metadata` fail with non-NotFound errors (here
+    /// forced via parent dir mode 0o000: no read, no exec, no write — path
+    /// traversal fails), `measure_unreclaimed_orphan_bytes` must fall back
+    /// to `pre_size` rather than silently returning 0.
+    ///
+    /// Under the old `metadata(&file_path).await.map(|m| m.len()).unwrap_or(0)`
+    /// shape the call would have produced 0 for the still-on-disk orphan,
+    /// causing the startup scan's `total_bytes` to be under-reported until a
+    /// later eviction pass re-stat'd successfully.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_measure_unreclaimed_falls_back_to_pre_size_when_stat_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("locked");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("orphan.body");
+        tokio::fs::write(&path, vec![0u8; 1500]).await.unwrap();
+
+        // Block traversal so the post-remove stat fails with EACCES.
+        let _restore = ChmodOnDrop::new(&dir);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let remove_err =
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "synthetic test error");
+        // Pre-stat baseline captured before chmod made traversal impossible.
+        let counted = measure_unreclaimed_orphan_bytes(&path, Some(1500), &remove_err).await;
+
+        assert_eq!(
+            counted, 1500,
+            "stat failure must fall back to pre_size, not silently zero"
+        );
+    }
+
+    /// Integration-level companion: parent dir at 0o500 keeps `read_dir`,
+    /// pre-stat, and post-stat all working while making `remove_file` fail
+    /// with EACCES. Pins the contract that an orphan body whose removal
+    /// fails still contributes to `total_bytes` (here via the post-stat
+    /// branch, which equals the pre-stat baseline). Does not on its own
+    /// distinguish bug from fix — that's what the helper-level test above
+    /// is for — but it locks the end-to-end accounting.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_startup_scan_counts_orphan_when_removal_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("objects").join("aa").join("bb");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let body_path = dir.join("hh.body");
+        tokio::fs::write(&body_path, vec![0u8; 1500]).await.unwrap();
+
+        let _restore = ChmodOnDrop::new(&dir);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let stats = DiskCache::scan_hash_dir(dir.clone())
+            .await
+            .expect("startup scan must not abort when an orphan body cannot be removed");
+
+        assert_eq!(
+            stats.entry_count, 0,
+            "an orphan body is not a valid cache entry"
+        );
+        assert_eq!(
+            stats.total_bytes, 1500,
+            "still-on-disk orphan bytes must be counted toward startup totals"
+        );
+        assert!(
+            body_path.exists(),
+            "orphan body should still be on disk after failed removal"
+        );
     }
 }
