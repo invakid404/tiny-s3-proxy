@@ -806,57 +806,105 @@ async fn try_evict_candidate(
         None => None,
     };
 
-    // Re-read metadata under the lock to confirm this is still the same
-    // entry we scanned. A concurrent commit_fill() may have replaced it.
-    if let Ok(meta_bytes) = tokio::fs::read(&candidate.meta_path).await
-        && let Ok(meta) = serde_json::from_slice::<CacheMeta>(&meta_bytes)
-        && (meta.fill_id != candidate.fill_id
-            || meta.last_accessed_at != candidate.last_accessed_at)
-    {
-        // Entry changed since scan — skip eviction but try to adjust
-        // current_size to reflect the actual on-disk size. Classify each
-        // stat: Some(len) on Ok, Some(0) on NotFound (file genuinely gone),
-        // None on any other I/O error (size unknown). Replace candidate.size
-        // ONLY when both stats are known. If either is unknown, leave
-        // current_size unchanged for this candidate — silently treating an
-        // unknown size as 0 would undercount the budget for the rest of the
-        // pass and could stop eviction early.
-        //
-        // This is local-budget hygiene only; reconciled global stats
-        // (`stats.total_bytes`, `stats.entry_count`) are not touched here.
-        let body_size: Option<u64> = match tokio::fs::metadata(&candidate.body_path).await {
-            Ok(m) => Some(m.len()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(0),
-            Err(e) => {
-                tracing::warn!(
-                    path = %candidate.body_path.display(),
-                    error_kind = ?e.kind(),
-                    "eviction: changed-entry remeasure of body stat failed, treating size as unknown"
-                );
-                None
+    // Re-read metadata under the lock to decide whether to evict.
+    //
+    // Four cases:
+    //   1. Read Ok + parse Ok + identity changed: entry was replaced by a
+    //      concurrent commit_fill — remeasure on-disk size and skip the
+    //      delete (existing branch from 03ce64c).
+    //   2. Read Ok + parse Ok + identity unchanged: proceed to delete.
+    //   3. Read Ok + parse Err: meta is corrupt. Treat as cache-owned
+    //      garbage and proceed to delete (matches the existing semantics
+    //      for corrupt entries cleaned up under lock elsewhere).
+    //   4. Read Err(NotFound): meta is gone. Proceed to delete (cleans up
+    //      any leftover body).
+    //   5. Read Err(other): hard I/O error (PermissionDenied, EIO, …).
+    //      Identity is unknown. Skip this candidate without deleting —
+    //      otherwise we could destroy bytes that may belong to a
+    //      concurrent fill or a still-valid entry. Leave current_size
+    //      and global stats untouched; the next eviction tick retries.
+    match tokio::fs::read(&candidate.meta_path).await {
+        Ok(meta_bytes) => match serde_json::from_slice::<CacheMeta>(&meta_bytes) {
+            Ok(meta) => {
+                if meta.fill_id != candidate.fill_id
+                    || meta.last_accessed_at != candidate.last_accessed_at
+                {
+                    // Case 1: entry changed since scan — remeasure and
+                    // skip the delete. Classify each stat: Some(len) on
+                    // Ok, Some(0) on NotFound, None on other I/O error.
+                    // Replace candidate.size in current_size ONLY when
+                    // both stats are known; otherwise leave current_size
+                    // unchanged so candidate.size stays counted (silently
+                    // treating an unknown size as 0 would undercount the
+                    // budget for the rest of the pass).
+                    //
+                    // Local-budget hygiene only; reconciled global stats
+                    // are not touched on this branch.
+                    let body_size: Option<u64> = match tokio::fs::metadata(&candidate.body_path)
+                        .await
+                    {
+                        Ok(m) => Some(m.len()),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(0),
+                        Err(e) => {
+                            tracing::warn!(
+                                path = %candidate.body_path.display(),
+                                error_kind = ?e.kind(),
+                                "eviction: changed-entry remeasure of body stat failed, treating size as unknown"
+                            );
+                            None
+                        }
+                    };
+                    let meta_size: Option<u64> = match tokio::fs::metadata(&candidate.meta_path)
+                        .await
+                    {
+                        Ok(m) => Some(m.len()),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(0),
+                        Err(e) => {
+                            tracing::warn!(
+                                path = %candidate.meta_path.display(),
+                                error_kind = ?e.kind(),
+                                "eviction: changed-entry remeasure of meta stat failed, treating size as unknown"
+                            );
+                            None
+                        }
+                    };
+                    if let (Some(b), Some(m)) = (body_size, meta_size) {
+                        let actual_size = b + m;
+                        *current_size = current_size
+                            .saturating_sub(candidate.size)
+                            .saturating_add(actual_size);
+                    }
+                    return;
+                }
+                // Case 2: identity unchanged — fall through to delete.
             }
-        };
-        let meta_size: Option<u64> = match tokio::fs::metadata(&candidate.meta_path).await {
-            Ok(m) => Some(m.len()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(0),
             Err(e) => {
+                // Case 3: corrupt metadata. Cache-owned garbage; clean up.
                 tracing::warn!(
                     path = %candidate.meta_path.display(),
-                    error_kind = ?e.kind(),
-                    "eviction: changed-entry remeasure of meta stat failed, treating size as unknown"
+                    error = %e,
+                    "metadata became corrupt during eviction recheck, treating as cache-owned garbage and removing"
                 );
-                None
+                // Fall through to delete.
             }
-        };
-        if let (Some(b), Some(m)) = (body_size, meta_size) {
-            let actual_size = b + m;
-            *current_size = current_size
-                .saturating_sub(candidate.size)
-                .saturating_add(actual_size);
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Case 4: meta gone — fall through to delete (cleans up any
+            // leftover body).
         }
-        // else: leave current_size unchanged so candidate.size stays
-        // counted toward the budget — conservative on uncertainty.
-        return;
+        Err(e) => {
+            // Case 5: hard I/O error — identity unknown. Skip this
+            // candidate to avoid deleting bytes that may belong to a
+            // concurrent fill or a still-valid entry. Leave current_size,
+            // evicted, and global stats untouched. The loop continues to
+            // later candidates and the next eviction tick retries.
+            tracing::warn!(
+                path = %candidate.meta_path.display(),
+                error_kind = ?e.kind(),
+                "eviction: locked meta read failed with hard I/O error, skipping candidate"
+            );
+            return;
+        }
     }
 
     let body_res = tokio::fs::remove_file(&candidate.body_path).await;
@@ -1784,6 +1832,155 @@ mod tests {
         assert!(
             err_msg.contains("non-UTF-8") || err_msg.contains("not valid UTF-8"),
             "error should identify the cause, got: {err_msg}"
+        );
+    }
+
+    /// Locks in the regression behind this commit: when the locked meta
+    /// reread in `try_evict_candidate` hits a hard I/O error (here forced
+    /// by chmod 0o000 on the meta file itself — read fails with EACCES
+    /// while remove_file still succeeds because unlink only needs
+    /// write+exec on the parent dir), the function must skip the
+    /// candidate without falling through to the delete path.
+    ///
+    /// Under the old chained `if let` the read error would have caused
+    /// the chain to short-circuit and the unconditional remove_file
+    /// calls below would have deleted the body and meta — which is
+    /// unsafe because the entry's identity is unknown and the bytes may
+    /// belong to a concurrent fill or a still-valid entry.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_locked_meta_read_io_error_skips_candidate_without_deleting() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("objects").join("aa").join("bb");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let now = Utc::now();
+        let on_disk_meta = CacheMeta {
+            bucket: "bucket".into(),
+            key: "k".into(),
+            etag: None,
+            last_modified: None,
+            content_type: None,
+            content_length: 1000,
+            cache_written_at: now,
+            fill_id: 0,
+            metadata_version: 0,
+            last_accessed_at: now,
+            hit_count: 0,
+            source_status: 200,
+            metadata: std::collections::HashMap::new(),
+            extra_headers: std::collections::HashMap::new(),
+            head_extra_headers: std::collections::HashMap::new(),
+            head_checksum_headers: std::collections::HashMap::new(),
+            checksum_mode_checked: false,
+            head_metadata_checked: false,
+            head_checksum_checked: false,
+        };
+        let meta_path = dir.join("hh.meta.json");
+        let body_path = dir.join("hh.body");
+        tokio::fs::write(&meta_path, serde_json::to_vec(&on_disk_meta).unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&body_path, vec![0u8; 1000]).await.unwrap();
+
+        // Chmod the meta file (not the parent) to 0o000: read(meta) fails
+        // with EACCES, but unlink(meta) and unlink(body) still succeed
+        // because they only need write+exec on the parent dir. This is
+        // exactly the setup where the bug would silently delete the
+        // entry — observable as "body file no longer exists" after the
+        // call.
+        let _restore = ChmodOnDrop::new(&meta_path);
+        std::fs::set_permissions(&meta_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let candidate = EvictionCandidate {
+            body_path: body_path.clone(),
+            meta_path: meta_path.clone(),
+            hash: "hh".into(),
+            fill_id: 0,
+            last_accessed_at: now,
+            size: 1500,
+        };
+
+        let stats = Arc::new(CacheStats::default());
+        stats.entry_count.store(3, Ordering::Relaxed);
+        stats.total_bytes.store(3333, Ordering::Relaxed);
+
+        let mut current_size: u64 = 1500;
+        let mut evicted: u64 = 0;
+        try_evict_candidate(&candidate, &mut current_size, &mut evicted, &stats, None).await;
+
+        // Under the bug (chained if-let): both files would have been
+        // deleted, current_size would be 0, evicted would be 1, stats
+        // decremented. Under the fix: hard read error → return early
+        // without touching anything.
+        assert!(
+            body_path.exists(),
+            "fix must NOT delete body when meta read fails with hard I/O error"
+        );
+        assert!(
+            meta_path.exists(),
+            "fix must NOT delete meta when meta read fails with hard I/O error"
+        );
+        assert_eq!(
+            current_size, 1500,
+            "hard meta-read error must not shrink current_size"
+        );
+        assert_eq!(evicted, 0, "hard meta-read error must not bump evicted");
+        let snap = stats.snapshot();
+        assert_eq!(snap.entry_count, 3, "global entry_count must be untouched");
+        assert_eq!(
+            snap.total_bytes, 3333,
+            "global total_bytes must be untouched"
+        );
+    }
+
+    /// Companion to the above: when the meta file is corrupt (read Ok,
+    /// parse Err), `try_evict_candidate` must fall through to the delete
+    /// path. Corrupt metadata is treated as cache-owned garbage; the same
+    /// semantics are used elsewhere when corrupt entries are cleaned up
+    /// under lock.
+    #[tokio::test]
+    async fn test_locked_meta_parse_failure_falls_through_to_delete() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("objects").join("aa").join("bb");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let meta_path = dir.join("hh.meta.json");
+        let body_path = dir.join("hh.body");
+        tokio::fs::write(&meta_path, b"this is not valid json {{{")
+            .await
+            .unwrap();
+        tokio::fs::write(&body_path, vec![0u8; 1000]).await.unwrap();
+
+        let candidate = EvictionCandidate {
+            body_path: body_path.clone(),
+            meta_path: meta_path.clone(),
+            hash: "hh".into(),
+            fill_id: 0,
+            last_accessed_at: Utc::now(),
+            size: 1500,
+        };
+
+        let stats = Arc::new(CacheStats::default());
+        stats.entry_count.store(1, Ordering::Relaxed);
+        stats.total_bytes.store(1500, Ordering::Relaxed);
+
+        let mut current_size: u64 = 1500;
+        let mut evicted: u64 = 0;
+        try_evict_candidate(&candidate, &mut current_size, &mut evicted, &stats, None).await;
+
+        // Corrupt meta is treated as cache-owned garbage and removed.
+        assert!(!body_path.exists(), "body should be deleted on parse error");
+        assert!(!meta_path.exists(), "meta should be deleted on parse error");
+        assert_eq!(
+            current_size, 0,
+            "current_size should drop by candidate.size"
+        );
+        assert_eq!(
+            evicted, 1,
+            "eviction should be counted on parse-error cleanup"
         );
     }
 }
