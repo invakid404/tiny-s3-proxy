@@ -1644,8 +1644,10 @@ mod tests {
     /// returned 0, the caller's `*scan_total_bytes += 0` would have left
     /// orphan/corrupt bytes uncounted, and the eviction loop's budget would
     /// have undercounted disk usage indefinitely (until a future scan didn't
-    /// hit the stat failure). The new code uses `pre_known.unwrap_or(0)` so
-    /// the caller-supplied baseline survives the stat failure.
+    /// hit the stat failure). The helper now matches on `pre_known`:
+    /// `Some(pre) => Ok(pre)` so the caller-supplied baseline survives the
+    /// stat failure, and `None => Err(...)` so the residual silent-zero
+    /// case aborts the pass instead of undercounting.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_measure_unreclaimed_falls_back_to_pre_known_when_stat_fails() {
