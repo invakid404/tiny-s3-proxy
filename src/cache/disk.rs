@@ -418,7 +418,18 @@ impl DiskCache {
             let file_path = file_entry.path();
             let file_name = match file_path.file_name().and_then(|n| n.to_str()) {
                 Some(n) => n.to_string(),
-                None => continue,
+                None => {
+                    // Non-UTF-8 filenames cannot be writer-produced cache
+                    // files (writer only emits UTF-8 hex+ASCII), so this is
+                    // external corruption / junk. Returning Err here would
+                    // abort startup; the authoritative eviction scan will
+                    // surface the same file on its first pass.
+                    tracing::warn!(
+                        path = %file_path.display(),
+                        "non-UTF-8 filename in cache shard during startup scan, skipping"
+                    );
+                    continue;
+                }
             };
             result.saw_cache_files = true;
 
@@ -3107,5 +3118,49 @@ mod tests {
         let latest_body = tokio::fs::read(&latest.body_path).await.unwrap();
         assert_eq!(latest_body, new_body);
         assert_eq!(latest.meta.etag.as_deref(), Some("\"new-etag\""));
+    }
+
+    /// The startup scan path is fatal-on-Err (`DiskCache::new` propagates any
+    /// error out and aborts the process), so a non-UTF-8 filename inside a
+    /// hash shard must not cause it to bail. The eviction path's stricter
+    /// abort semantics belong to that loop, which can retry. This test pins
+    /// the "warn-and-continue" contract so future refactors don't accidentally
+    /// mirror the eviction abort here.
+    ///
+    /// Linux-only for the same reason as the eviction sibling: APFS/HFS+
+    /// reject non-UTF-8 filenames at the filesystem layer.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_startup_scan_does_not_abort_on_non_utf8_filename() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("objects").join("aa").join("bb");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let bad_name = std::ffi::OsString::from_vec(vec![0xff, 0xfe, 0xfd]);
+        let bad_path = dir.join(&bad_name);
+        std::fs::write(&bad_path, b"junk").unwrap();
+
+        let stats = DiskCache::scan_hash_dir(dir.clone())
+            .await
+            .expect("startup scan must not abort on a non-UTF-8 filename");
+
+        assert_eq!(
+            stats.entry_count, 0,
+            "non-UTF-8 junk file must not be counted as a cache entry"
+        );
+        assert_eq!(
+            stats.total_bytes, 0,
+            "non-UTF-8 junk file bytes must not be added to startup totals"
+        );
+        assert!(
+            !stats.fill_id_incomplete,
+            "non-UTF-8 junk does not invalidate the fill_id scan"
+        );
+        assert!(
+            bad_path.exists(),
+            "startup scan must not delete or quarantine the offending file"
+        );
     }
 }
