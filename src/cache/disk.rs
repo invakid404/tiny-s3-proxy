@@ -85,6 +85,7 @@ async fn measure_unreclaimed_orphan_bytes(
                 tracing::warn!(
                     path = %file_path.display(),
                     remove_error = %remove_err,
+                    stat_error = %stat_err,
                     stat_error_kind = ?stat_err.kind(),
                     pre_size = pre,
                     "orphan body remove and post-stat both failed during startup; using pre-stat fallback",
