@@ -748,32 +748,77 @@ async fn run_eviction_pass_inner(
             );
         } else {
             // At least one removal failed with a non-NotFound error — bytes
-            // are still (at least partially) on disk. Adjust current_size to
-            // reflect what's actually still there: replace the scanned size
-            // with the measured remaining body+meta size. Do NOT decrement
-            // entry_count / total_bytes — counting this as a full eviction
-            // would falsely lower the budget and could stop the loop early,
-            // leaving the cache over max_bytes indefinitely. The next scan
-            // reconciles.
-            let actual_body = tokio::fs::metadata(&candidate.body_path)
-                .await
-                .map(|m| m.len())
-                .unwrap_or(0);
-            let actual_meta = tokio::fs::metadata(&candidate.meta_path)
-                .await
-                .map(|m| m.len())
-                .unwrap_or(0);
-            let actual_remaining = actual_body + actual_meta;
-            current_size = current_size
-                .saturating_sub(candidate.size)
-                .saturating_add(actual_remaining);
-            tracing::warn!(
-                path = %candidate.body_path.display(),
-                body_error = ?body_res.as_ref().err().map(|e| e.kind()),
-                meta_error = ?meta_res.as_ref().err().map(|e| e.kind()),
-                actual_remaining,
-                "eviction: removal failed with I/O error, leaving bytes counted toward budget"
-            );
+            // are still (at least partially) on disk. Try to measure what's
+            // actually remaining. Per path:
+            //   - gone (Ok or NotFound from remove): contributes 0 bytes.
+            //   - remove failed, stat returns Ok(m): contributes m.len().
+            //   - remove failed, stat returns NotFound: contributes 0 (file
+            //     vanished between the remove call and the stat call).
+            //   - remove failed, stat returns any other error: REMAINING
+            //     IS UNKNOWN — assume bytes are still on disk. Briefly
+            //     overcounting is fine (the next scan reconciles). What we
+            //     must not do is assume 0: undercounting can stop the
+            //     eviction loop early and leave the cache over max_bytes
+            //     indefinitely.
+            //
+            // Do NOT decrement entry_count / total_bytes here under any
+            // outcome — those reconcile on the next scan.
+            let body_remaining: Option<u64> = if body_gone {
+                Some(0)
+            } else {
+                match tokio::fs::metadata(&candidate.body_path).await {
+                    Ok(m) => Some(m.len()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(0),
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %candidate.body_path.display(),
+                            error_kind = ?e.kind(),
+                            "eviction: stat after failed body remove returned error, assuming bytes still on disk"
+                        );
+                        None
+                    }
+                }
+            };
+            let meta_remaining: Option<u64> = if meta_gone {
+                Some(0)
+            } else {
+                match tokio::fs::metadata(&candidate.meta_path).await {
+                    Ok(m) => Some(m.len()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(0),
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %candidate.meta_path.display(),
+                            error_kind = ?e.kind(),
+                            "eviction: stat after failed meta remove returned error, assuming bytes still on disk"
+                        );
+                        None
+                    }
+                }
+            };
+
+            if let (Some(b), Some(m)) = (body_remaining, meta_remaining) {
+                let actual_remaining = b + m;
+                current_size = current_size
+                    .saturating_sub(candidate.size)
+                    .saturating_add(actual_remaining);
+                tracing::warn!(
+                    path = %candidate.body_path.display(),
+                    body_error = ?body_res.as_ref().err().map(|e| e.kind()),
+                    meta_error = ?meta_res.as_ref().err().map(|e| e.kind()),
+                    actual_remaining,
+                    "eviction: removal failed with I/O error, budget adjusted to measured remaining size"
+                );
+            } else {
+                // Stat uncertainty on at least one path. Leave current_size
+                // unchanged so the entry's full candidate.size stays counted
+                // toward the budget — this is the conservative direction.
+                tracing::warn!(
+                    path = %candidate.body_path.display(),
+                    body_error = ?body_res.as_ref().err().map(|e| e.kind()),
+                    meta_error = ?meta_res.as_ref().err().map(|e| e.kind()),
+                    "eviction: removal failed and stat uncertain, keeping full entry size in budget"
+                );
+            }
         }
     }
 
@@ -1165,5 +1210,75 @@ mod tests {
         let snap = stats.snapshot();
         assert_eq!(snap.entry_count, 1);
         assert!(snap.total_bytes < 1000);
+    }
+
+    /// Partial-failure budget shape: when remove_file returns a non-NotFound
+    /// error (here forced via parent dir mode 0o500: r-x, no write), the
+    /// eviction loop must NOT decrement entry_count / eviction_count and must
+    /// NOT treat candidate.size as reclaimed. The entry's bytes stay counted
+    /// in the budget so the loop keeps trying to evict the next candidate.
+    ///
+    /// This locks in the contract Finding 2 was meant to enforce; if a future
+    /// change re-collapses NotFound and real I/O errors (or assumes 0 bytes
+    /// remaining on a stat failure), the assertions here will catch it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_eviction_remove_failure_does_not_undercount_budget() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+        tokio::fs::create_dir_all(cache_dir.join("objects"))
+            .await
+            .unwrap();
+
+        let key = CacheKey::new("bucket", "script_bundle/locked.js");
+        let body = vec![0u8; 1000];
+        setup_cache_entry(
+            &cache_dir,
+            &key,
+            &body,
+            Utc::now() - chrono::Duration::hours(1),
+        )
+        .await;
+
+        // Lock the entry's parent dir to r-x so remove_file fails with
+        // EACCES while metadata still succeeds (exec bit allows traversal).
+        let (d1, d2) = key.dir_prefix();
+        let parent = cache_dir.join("objects").join(d1).join(d2);
+        let original = std::fs::metadata(&parent).unwrap().permissions();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let stats = Arc::new(CacheStats::default());
+
+        // Tiny limit forces the eviction loop to attempt removal.
+        let result = run_eviction_pass_inner(&cache_dir, 1, &stats, None).await;
+
+        // Restore perms before any assert that might unwind so TempDir
+        // cleanup can remove the now-undeletable contents.
+        std::fs::set_permissions(&parent, original).unwrap();
+
+        result.unwrap();
+
+        // Files must still be on disk — remove failed.
+        let hash = key.hash_hex();
+        assert!(parent.join(format!("{hash}.body")).exists());
+        assert!(parent.join(format!("{hash}.meta.json")).exists());
+
+        let snap = stats.snapshot();
+        // Reconciliation in the scan set entry_count to 1; the failed
+        // removal in the eviction loop must NOT decrement it.
+        assert_eq!(
+            snap.entry_count, 1,
+            "failed eviction must not decrement entry_count"
+        );
+        assert_eq!(
+            snap.eviction_count, 0,
+            "failed eviction must not bump eviction_count"
+        );
+        assert!(
+            snap.total_bytes > 0,
+            "total_bytes should still reflect on-disk bytes"
+        );
     }
 }
