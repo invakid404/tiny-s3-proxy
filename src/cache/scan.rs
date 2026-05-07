@@ -48,7 +48,11 @@ where
     Fut: Future<Output = Result<T, E>> + Send + 'static,
     J: Fn(tokio::task::JoinError) -> E,
 {
-    let cap = max_in_flight.max(1);
+    assert!(
+        max_in_flight > 0,
+        "bounded_parallel_scan requires max_in_flight > 0"
+    );
+    let cap = max_in_flight;
     let mut join_set: tokio::task::JoinSet<Result<T, E>> = tokio::task::JoinSet::new();
     let mut iter = paths.into_iter();
     let mut results = Vec::new();
@@ -192,5 +196,24 @@ mod tests {
             Err("mapped-join-error"),
             "synchronous panic should surface through map_join_error",
         );
+    }
+
+    /// `max_in_flight = 0` is programmer error: `take(0)` would silently
+    /// process nothing and return `Ok(Vec::new())`, dropping every input
+    /// path. Lock in the explicit assert that catches the misuse instead of
+    /// the prior `.max(1)` coercion (which violated the documented "at most
+    /// `max_in_flight`" contract).
+    #[tokio::test]
+    #[should_panic(expected = "bounded_parallel_scan requires max_in_flight > 0")]
+    async fn bounded_parallel_scan_rejects_zero_concurrency() {
+        // Non-empty paths so it's clear that a zero cap would drop work.
+        let paths = vec![PathBuf::from("a"), PathBuf::from("b")];
+        let _ = bounded_parallel_scan(
+            paths,
+            0,
+            |_p| async { Ok::<(), std::convert::Infallible>(()) },
+            |e| -> std::convert::Infallible { panic!("unexpected join error: {e}") },
+        )
+        .await;
     }
 }
