@@ -25,36 +25,98 @@ struct EvictionPassSummary {
     over_budget_bytes_after: u64,
 }
 
-/// Failure-path classification for `s3proxy_cache_scan_failed_total{phase="eviction"}`.
-/// The label set is intentionally finite to keep cardinality bounded — full
-/// error strings would explode the label space and bypass the careful
-/// per-error tracing the existing code already emits.
-///
-/// Inputs are the boxed-error display strings produced by `boxed_io_error`,
-/// which prefix each error with the failing operation name; matching against
-/// those prefixes maps each known site to one of the spec'd reason values.
-fn eviction_failure_reason(message: &str) -> &'static str {
-    if message.contains("eviction hash-dir scan task failed") {
-        "join"
-    } else if message.contains("orphan body during locked eviction cleanup")
-        || message.contains("body during locked eviction cleanup")
-        || message.contains("metadata during locked eviction cleanup")
-        || message.contains("body during locked missing-body cleanup")
-        || message.contains("metadata during locked missing-body cleanup")
-        || message.contains("stat after failed remove")
-    {
-        "deferred_cleanup"
-    } else if message.contains("read metadata during eviction scan")
-        || message.contains("stat body during eviction scan")
-        || message.contains("non-UTF-8 filename inside cache hash shard")
-        || message.contains("probe orphan metadata")
-    {
-        "hash_dir_scan"
-    } else if message.contains("read objects dir") || message.contains("iterate objects dir") {
-        "hash_dir_walk"
-    } else {
-        "other"
+/// Finite failure-classification enum used as the `reason` label for
+/// `s3proxy_cache_scan_failed_total{phase="eviction"}`. Each error-returning
+/// site in the eviction scan path constructs an [`EvictionScanError`] with
+/// the matching variant; the label is recorded directly via
+/// [`ScanFailureReason::as_label`] without any string parsing. Keeping the
+/// classification typed means a renamed error message in an unrelated PR
+/// cannot silently degrade the metric to `reason="other"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScanFailureReason {
+    /// `tokio::fs::try_exists(objects_dir)` failed before any walk began.
+    ObjectsDirProbe,
+    /// Strict layout walk over `objects/XX/YY/` returned an I/O error.
+    HashDirWalk,
+    /// Per-shard scan inside `scan_hash_dir_for_eviction` failed (read_dir,
+    /// next_entry, metadata, or non-UTF-8 filename).
+    HashDirScan,
+    /// `bounded_parallel_scan` reported a `JoinError` (a shard task panicked).
+    Join,
+    /// `process_deferred_cleanups` skipped, partially failed, or aborted.
+    DeferredCleanup,
+    /// Reserved for unforeseen error paths. Should stay empty in practice
+    /// because every existing return site maps explicitly above.
+    #[allow(dead_code)]
+    Other,
+}
+
+impl ScanFailureReason {
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::ObjectsDirProbe => "objects_dir_probe",
+            Self::HashDirWalk => "hash_dir_walk",
+            Self::HashDirScan => "hash_dir_scan",
+            Self::Join => "join",
+            Self::DeferredCleanup => "deferred_cleanup",
+            Self::Other => "other",
+        }
     }
+}
+
+/// Tagged eviction-scan error: the reason variant carries the metric label
+/// directly so the failure-path metric can be emitted without inspecting the
+/// inner error's display string.
+#[derive(Debug)]
+struct EvictionScanError {
+    reason: ScanFailureReason,
+    source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+impl EvictionScanError {
+    fn new(
+        reason: ScanFailureReason,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Self {
+        Self {
+            reason,
+            source: source.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for EvictionScanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "eviction scan failure ({}): {}",
+            self.reason.as_label(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for EvictionScanError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.source)
+    }
+}
+
+/// Construct an [`EvictionScanError`] from an `io::Error` while preserving
+/// the operation/path context that the existing log lines and tests expect.
+fn eviction_io_error(
+    reason: ScanFailureReason,
+    operation: &'static str,
+    path: &std::path::Path,
+    error: std::io::Error,
+) -> EvictionScanError {
+    EvictionScanError::new(
+        reason,
+        std::io::Error::new(
+            error.kind(),
+            format!("{operation} {}: {error}", path.display()),
+        ),
+    )
 }
 
 /// Entry info for eviction sorting.
@@ -163,9 +225,11 @@ fn boxed_io_error(
 /// Scan a single hash directory and return candidates, stats, and deferred
 /// cleanups that require per-key locks (which cannot be acquired inside a
 /// spawned task because `DiskCache` is not `Send`-safe across spawn boundaries).
-async fn scan_hash_dir_for_eviction(
-    d2_path: PathBuf,
-) -> Result<DirScanResult, Box<dyn std::error::Error + Send + Sync>> {
+///
+/// All error returns are tagged with [`ScanFailureReason::HashDirScan`] so
+/// the call-site at `run_eviction_pass_inner` can record the correct metric
+/// label without parsing the error display string.
+async fn scan_hash_dir_for_eviction(d2_path: PathBuf) -> Result<DirScanResult, EvictionScanError> {
     let mut result = DirScanResult {
         candidates: Vec::new(),
         total_bytes: 0,
@@ -176,14 +240,28 @@ async fn scan_hash_dir_for_eviction(
     let mut file_entries = match tokio::fs::read_dir(&d2_path).await {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(result),
-        Err(e) => return Err(Box::new(e)),
+        Err(e) => {
+            return Err(eviction_io_error(
+                ScanFailureReason::HashDirScan,
+                "read hash shard dir",
+                &d2_path,
+                e,
+            ));
+        }
     };
 
     loop {
         let file_entry = match file_entries.next_entry().await {
             Ok(Some(entry)) => entry,
             Ok(None) => break,
-            Err(e) => return Err(Box::new(e)),
+            Err(e) => {
+                return Err(eviction_io_error(
+                    ScanFailureReason::HashDirScan,
+                    "iterate hash shard dir",
+                    &d2_path,
+                    e,
+                ));
+            }
         };
         let file_path = file_entry.path();
         // The cache writer only emits UTF-8 hex-hash filenames + ASCII
@@ -197,7 +275,8 @@ async fn scan_hash_dir_for_eviction(
         let file_name = match file_path.file_name().and_then(|n| n.to_str()) {
             Some(n) => n.to_string(),
             None => {
-                return Err(boxed_io_error(
+                return Err(eviction_io_error(
+                    ScanFailureReason::HashDirScan,
                     "non-UTF-8 filename inside cache hash shard",
                     &file_path,
                     std::io::Error::new(
@@ -223,7 +302,14 @@ async fn scan_hash_dir_for_eviction(
                     }
                     Ok(true) => {} // meta exists, not an orphan
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // race: dir vanished
-                    Err(e) => return Err(boxed_io_error("probe orphan metadata", &meta_path, e)),
+                    Err(e) => {
+                        return Err(eviction_io_error(
+                            ScanFailureReason::HashDirScan,
+                            "probe orphan metadata",
+                            &meta_path,
+                            e,
+                        ));
+                    }
                 }
             } else if file_name.ends_with(".poisoned") {
                 let hash = file_name.trim_end_matches(".poisoned").to_string();
@@ -239,7 +325,14 @@ async fn scan_hash_dir_for_eviction(
                     }
                     Ok(true) => {} // meta exists, not an orphan
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // race
-                    Err(e) => return Err(boxed_io_error("probe orphan metadata", &meta_path, e)),
+                    Err(e) => {
+                        return Err(eviction_io_error(
+                            ScanFailureReason::HashDirScan,
+                            "probe orphan metadata",
+                            &meta_path,
+                            e,
+                        ));
+                    }
                 }
             }
             continue;
@@ -251,7 +344,8 @@ async fn scan_hash_dir_for_eviction(
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue, // race: entry removed
             Err(e) => {
-                return Err(boxed_io_error(
+                return Err(eviction_io_error(
+                    ScanFailureReason::HashDirScan,
                     "read metadata during eviction scan",
                     &file_path,
                     e,
@@ -309,7 +403,8 @@ async fn scan_hash_dir_for_eviction(
                 continue;
             }
             Err(e) => {
-                return Err(boxed_io_error(
+                return Err(eviction_io_error(
+                    ScanFailureReason::HashDirScan,
                     "stat body during eviction scan",
                     &body_path,
                     e,
@@ -515,11 +610,24 @@ fn record_deferred_cleanup_failure(failed: &mut u64, kind: &'static str) {
     .increment(1);
 }
 
+/// Wrap a `Box<dyn Error>` returned by a per-file helper as an
+/// [`EvictionScanError`] tagged with [`ScanFailureReason::DeferredCleanup`]
+/// after bumping the kind-labeled counter for the originating cleanup.
+fn deferred_cleanup_err(
+    failed: &mut u64,
+    kind: &'static str,
+    source: Box<dyn std::error::Error + Send + Sync>,
+) -> EvictionScanError {
+    record_deferred_cleanup_failure(failed, kind);
+    EvictionScanError::new(ScanFailureReason::DeferredCleanup, source)
+}
+
 /// Process deferred cleanups that require per-key lock coordination.
 ///
 /// `deferred_cleanup_failed` is incremented (and the corresponding
 /// kind-labeled counter is bumped) on every branch that skips, partially
-/// fails, or aborts a cleanup. Successful cleanups do not bump it.
+/// fails, or aborts a cleanup. Successful cleanups do not bump it. Every
+/// `Err` return is tagged with [`ScanFailureReason::DeferredCleanup`].
 async fn process_deferred_cleanups(
     cleanups: Vec<DeferredCleanup>,
     disk_cache: Option<&super::DiskCache>,
@@ -527,7 +635,7 @@ async fn process_deferred_cleanups(
     scan_total_bytes: &mut u64,
     scan_entry_count: &mut u64,
     deferred_cleanup_failed: &mut u64,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), EvictionScanError> {
     for cleanup in cleanups {
         match cleanup {
             DeferredCleanup::OrphanBody { body_path, hash } => {
@@ -538,16 +646,10 @@ async fn process_deferred_cleanups(
                     .join(format!("{}.meta.json", hash));
                 match tokio::fs::try_exists(&meta_path).await {
                     Ok(false) => {
-                        *scan_total_bytes += match remove_file_or_reclaim_size(&body_path).await {
-                            Ok(n) => n,
-                            Err(e) => {
-                                record_deferred_cleanup_failure(
-                                    deferred_cleanup_failed,
-                                    "orphan_body",
-                                );
-                                return Err(e);
-                            }
-                        };
+                        *scan_total_bytes +=
+                            remove_file_or_reclaim_size(&body_path).await.map_err(|e| {
+                                deferred_cleanup_err(deferred_cleanup_failed, "orphan_body", e)
+                            })?;
                         tracing::debug!(path = %body_path.display(), "removed orphan body file");
                     }
                     Ok(true) => {} // meta appeared (concurrent fill), not an orphan
@@ -596,7 +698,8 @@ async fn process_deferred_cleanups(
                                     stat_error_kind = ?e2.kind(),
                                     "failed to recheck orphan body status AND stat the body — aborting eviction pass"
                                 );
-                                return Err(boxed_io_error(
+                                return Err(eviction_io_error(
+                                    ScanFailureReason::DeferredCleanup,
                                     "stat orphan body during locked eviction cleanup",
                                     &body_path,
                                     e2,
@@ -614,16 +717,11 @@ async fn process_deferred_cleanups(
                     .join(format!("{}.meta.json", hash));
                 match tokio::fs::try_exists(&meta_path).await {
                     Ok(false) => {
-                        *scan_total_bytes += match remove_file_or_reclaim_size(&poison_path).await {
-                            Ok(n) => n,
-                            Err(e) => {
-                                record_deferred_cleanup_failure(
-                                    deferred_cleanup_failed,
-                                    "orphan_poison",
-                                );
-                                return Err(e);
-                            }
-                        };
+                        *scan_total_bytes += remove_file_or_reclaim_size(&poison_path)
+                            .await
+                            .map_err(|e| {
+                                deferred_cleanup_err(deferred_cleanup_failed, "orphan_poison", e)
+                            })?;
                         tracing::debug!(path = %poison_path.display(), "removed orphan poison marker");
                     }
                     Ok(true) => {} // meta appeared, poison is valid
@@ -650,33 +748,22 @@ async fn process_deferred_cleanups(
                     RecoverOutcome::MissingBody => {
                         // Body gone and meta was already proven corrupt —
                         // clean up the leftover meta and poison.
-                        *scan_total_bytes +=
-                            match remove_file_or_reclaim_size(&paths.meta_path).await {
-                                Ok(n) => n,
-                                Err(e) => {
-                                    record_deferred_cleanup_failure(
-                                        deferred_cleanup_failed,
-                                        "corrupt_entry",
-                                    );
-                                    return Err(e);
-                                }
-                            };
-                        *scan_total_bytes +=
-                            match remove_file_or_reclaim_size(&paths.poison_path).await {
-                                Ok(n) => n,
-                                Err(e) => {
-                                    record_deferred_cleanup_failure(
-                                        deferred_cleanup_failed,
-                                        "corrupt_entry",
-                                    );
-                                    return Err(e);
-                                }
-                            };
+                        *scan_total_bytes += remove_file_or_reclaim_size(&paths.meta_path)
+                            .await
+                            .map_err(|e| {
+                                deferred_cleanup_err(deferred_cleanup_failed, "corrupt_entry", e)
+                            })?;
+                        *scan_total_bytes += remove_file_or_reclaim_size(&paths.poison_path)
+                            .await
+                            .map_err(|e| {
+                                deferred_cleanup_err(deferred_cleanup_failed, "corrupt_entry", e)
+                            })?;
                         tracing::debug!(path = %paths.meta_path.display(), "removed corrupt entry with missing body");
                     }
                     RecoverOutcome::BodyStatError(e) => {
                         record_deferred_cleanup_failure(deferred_cleanup_failed, "corrupt_entry");
-                        return Err(boxed_io_error(
+                        return Err(eviction_io_error(
+                            ScanFailureReason::DeferredCleanup,
                             "stat body during locked eviction cleanup",
                             &paths.body_path,
                             e,
@@ -684,7 +771,8 @@ async fn process_deferred_cleanups(
                     }
                     RecoverOutcome::MetaReadError(e) => {
                         record_deferred_cleanup_failure(deferred_cleanup_failed, "corrupt_entry");
-                        return Err(boxed_io_error(
+                        return Err(eviction_io_error(
+                            ScanFailureReason::DeferredCleanup,
                             "read metadata during locked eviction cleanup",
                             &paths.meta_path,
                             e,
@@ -692,28 +780,17 @@ async fn process_deferred_cleanups(
                     }
                     RecoverOutcome::MetaParseError(e) => {
                         tracing::warn!(path = %paths.meta_path.display(), error = %e, "corrupt entry meta still unparseable under lock, removing");
-                        *scan_total_bytes += match remove_entry_files(&paths).await {
-                            Ok(n) => n,
-                            Err(e) => {
-                                record_deferred_cleanup_failure(
-                                    deferred_cleanup_failed,
-                                    "corrupt_entry",
-                                );
-                                return Err(e);
-                            }
-                        };
+                        *scan_total_bytes += remove_entry_files(&paths).await.map_err(|e| {
+                            deferred_cleanup_err(deferred_cleanup_failed, "corrupt_entry", e)
+                        })?;
                     }
                 }
             }
             DeferredCleanup::MalformedHash(paths) => {
                 let _guard = acquire_meta_lock(disk_cache, &paths.hash).await;
-                *scan_total_bytes += match remove_entry_files(&paths).await {
-                    Ok(n) => n,
-                    Err(e) => {
-                        record_deferred_cleanup_failure(deferred_cleanup_failed, "malformed_hash");
-                        return Err(e);
-                    }
-                };
+                *scan_total_bytes += remove_entry_files(&paths).await.map_err(|e| {
+                    deferred_cleanup_err(deferred_cleanup_failed, "malformed_hash", e)
+                })?;
                 tracing::warn!(
                     path = %paths.meta_path.display(),
                     "removed cache entry with malformed filename stem"
@@ -730,32 +807,21 @@ async fn process_deferred_cleanups(
                     }
                     RecoverOutcome::MissingBody => {
                         // Still missing — clean up the leftover meta and poison.
-                        *scan_total_bytes +=
-                            match remove_file_or_reclaim_size(&paths.meta_path).await {
-                                Ok(n) => n,
-                                Err(e) => {
-                                    record_deferred_cleanup_failure(
-                                        deferred_cleanup_failed,
-                                        "missing_body",
-                                    );
-                                    return Err(e);
-                                }
-                            };
-                        *scan_total_bytes +=
-                            match remove_file_or_reclaim_size(&paths.poison_path).await {
-                                Ok(n) => n,
-                                Err(e) => {
-                                    record_deferred_cleanup_failure(
-                                        deferred_cleanup_failed,
-                                        "missing_body",
-                                    );
-                                    return Err(e);
-                                }
-                            };
+                        *scan_total_bytes += remove_file_or_reclaim_size(&paths.meta_path)
+                            .await
+                            .map_err(|e| {
+                                deferred_cleanup_err(deferred_cleanup_failed, "missing_body", e)
+                            })?;
+                        *scan_total_bytes += remove_file_or_reclaim_size(&paths.poison_path)
+                            .await
+                            .map_err(|e| {
+                                deferred_cleanup_err(deferred_cleanup_failed, "missing_body", e)
+                            })?;
                     }
                     RecoverOutcome::BodyStatError(e) => {
                         record_deferred_cleanup_failure(deferred_cleanup_failed, "missing_body");
-                        return Err(boxed_io_error(
+                        return Err(eviction_io_error(
+                            ScanFailureReason::DeferredCleanup,
                             "stat body during locked missing-body cleanup",
                             &paths.body_path,
                             e,
@@ -763,7 +829,8 @@ async fn process_deferred_cleanups(
                     }
                     RecoverOutcome::MetaReadError(e) => {
                         record_deferred_cleanup_failure(deferred_cleanup_failed, "missing_body");
-                        return Err(boxed_io_error(
+                        return Err(eviction_io_error(
+                            ScanFailureReason::DeferredCleanup,
                             "read metadata during locked missing-body cleanup",
                             &paths.meta_path,
                             e,
@@ -771,16 +838,9 @@ async fn process_deferred_cleanups(
                     }
                     RecoverOutcome::MetaParseError(_) => {
                         // Body missing and meta is broken — clean up everything.
-                        *scan_total_bytes += match remove_entry_files(&paths).await {
-                            Ok(n) => n,
-                            Err(e) => {
-                                record_deferred_cleanup_failure(
-                                    deferred_cleanup_failed,
-                                    "missing_body",
-                                );
-                                return Err(e);
-                            }
-                        };
+                        *scan_total_bytes += remove_entry_files(&paths).await.map_err(|e| {
+                            deferred_cleanup_err(deferred_cleanup_failed, "missing_body", e)
+                        })?;
                     }
                 }
             }
@@ -822,11 +882,11 @@ async fn collect_candidates(
     objects_dir: &std::path::Path,
     stats: &Arc<CacheStats>,
     disk_cache: Option<&super::DiskCache>,
-) -> Result<ScanResult, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<ScanResult, EvictionScanError> {
     // Phase 1: Collect all hash directory paths.
     let hash_dirs = collect_hash_dirs_strict(objects_dir)
         .await
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        .map_err(|e| EvictionScanError::new(ScanFailureReason::HashDirWalk, e))?;
     if hash_dirs.is_empty() {
         stats.total_bytes.store(0, Ordering::Relaxed);
         stats.entry_count.store(0, Ordering::Relaxed);
@@ -848,9 +908,10 @@ async fn collect_candidates(
         CACHE_HASH_DIR_SCAN_CONCURRENCY,
         scan_hash_dir_for_eviction,
         |e| {
-            Box::new(std::io::Error::other(format!(
-                "eviction hash-dir scan task failed: {e}"
-            ))) as Box<dyn std::error::Error + Send + Sync>
+            EvictionScanError::new(
+                ScanFailureReason::Join,
+                std::io::Error::other(format!("eviction hash-dir scan task failed: {e}")),
+            )
         },
     )
     .await?;
@@ -944,7 +1005,7 @@ async fn run_eviction_pass_inner(
             metrics::counter!(
                 "s3proxy_cache_scan_failed_total",
                 "phase" => "eviction",
-                "reason" => "objects_dir_probe",
+                "reason" => ScanFailureReason::ObjectsDirProbe.as_label(),
             )
             .increment(1);
             tracing::warn!(
@@ -956,17 +1017,20 @@ async fn run_eviction_pass_inner(
         }
     }
 
-    // collect_candidates walks the filesystem and reconciles stats.
+    // collect_candidates walks the filesystem and reconciles stats. The
+    // reason label is taken directly from the typed `ScanFailureReason`
+    // variant carried by the error, so renaming the inner error message
+    // can never silently degrade observability to `reason="other"`.
     let scan = match collect_candidates(&objects_dir, stats, disk_cache).await {
         Ok(s) => s,
         Err(e) => {
             metrics::counter!(
                 "s3proxy_cache_scan_failed_total",
                 "phase" => "eviction",
-                "reason" => eviction_failure_reason(&e.to_string()),
+                "reason" => e.reason.as_label(),
             )
             .increment(1);
-            return Err(e);
+            return Err(Box::new(e));
         }
     };
     let candidate_count = scan.candidates.len() as u64;
@@ -2524,6 +2588,107 @@ mod tests {
                 "s3proxy_cache_deferred_cleanup_failed_total{kind=\"malformed_hash\"} 1",
             ),
             "expected deferred_cleanup_failed_total{{kind=malformed_hash}}, got:\n{rendered}",
+        );
+    }
+
+    /// Regression test: when `read_dir(d2_path)` inside
+    /// `scan_hash_dir_for_eviction` fails (here forced by chmod 0o000 on the
+    /// leaf shard dir while leaving the layout walk intact), the failure
+    /// must be classified as `reason="hash_dir_scan"` — not `reason="other"`.
+    ///
+    /// Under the prior substring-matching `eviction_failure_reason` helper,
+    /// this leaf path returned a raw `Box<io::Error>` with no operation tag
+    /// in its display string and was misclassified as `other`. The typed
+    /// `ScanFailureReason::HashDirScan` carried in `EvictionScanError`
+    /// removes that ambiguity.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_eviction_pass_classifies_hash_dir_read_dir_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+        let shard = cache_dir.join("objects").join("aa").join("bb");
+        tokio::fs::create_dir_all(&shard).await.unwrap();
+
+        // Block read_dir(shard) without breaking the d1 layout walk above
+        // it. file_type() on the shard entry uses DT_TYPE from getdents and
+        // does not require traversal, so the strict layout walk succeeds.
+        let _restore = ChmodOnDrop::new(&shard);
+        std::fs::set_permissions(&shard, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let stats = Arc::new(CacheStats::default());
+        let err = run_eviction_pass_inner(&cache_dir, 1_000_000, &stats, None)
+            .await
+            .expect_err("read_dir on locked shard should propagate as scan error");
+        assert!(
+            err.to_string().contains("read hash shard dir"),
+            "unexpected error: {err}",
+        );
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(
+                "s3proxy_cache_scan_failed_total{phase=\"eviction\",reason=\"hash_dir_scan\"} 1",
+            ),
+            "expected scan_failed_total{{reason=hash_dir_scan}}, got:\n{rendered}",
+        );
+    }
+
+    /// Regression test: when the strict layout walk in
+    /// `collect_hash_dirs_strict` fails (here forced by chmod 0o000 on a
+    /// `objects/<d1>/` hash-prefix dir so `read_dir(d1)` returns EACCES),
+    /// the failure must be classified as `reason="hash_dir_walk"` — not
+    /// `reason="other"`.
+    ///
+    /// The previous substring matcher only recognized `"read objects dir"`
+    /// and `"iterate objects dir"`; the actual layout-walk operations are
+    /// `"read hash prefix dir"` / `"iterate hash prefix dir"` (and their
+    /// `check ... type` siblings). Routing through
+    /// `ScanFailureReason::HashDirWalk` removes the dependency on the
+    /// operation name.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_eviction_pass_classifies_layout_walk_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+        let d1 = cache_dir.join("objects").join("aa");
+        tokio::fs::create_dir_all(d1.join("bb")).await.unwrap();
+
+        // Block read_dir(d1) without affecting the objects_dir probe above.
+        // The probe's try_exists only stats objects_dir itself and succeeds.
+        // file_type() on d1 (from objects_dir's getdents) does not need
+        // traversal, so the walk reaches the read_dir(d1) call before
+        // failing.
+        let _restore = ChmodOnDrop::new(&d1);
+        std::fs::set_permissions(&d1, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let stats = Arc::new(CacheStats::default());
+        let err = run_eviction_pass_inner(&cache_dir, 1_000_000, &stats, None)
+            .await
+            .expect_err("strict layout walk on locked prefix dir should propagate");
+        assert!(
+            err.to_string().contains("read hash prefix dir")
+                || err.to_string().contains("iterate hash prefix dir"),
+            "unexpected error: {err}",
+        );
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(
+                "s3proxy_cache_scan_failed_total{phase=\"eviction\",reason=\"hash_dir_walk\"} 1",
+            ),
+            "expected scan_failed_total{{reason=hash_dir_walk}}, got:\n{rendered}",
         );
     }
 }
