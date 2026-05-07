@@ -3171,6 +3171,7 @@ mod tests {
     /// reject non-UTF-8 filenames at the filesystem layer.
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    #[tracing_test::traced_test]
     async fn test_startup_scan_does_not_abort_on_non_utf8_filename() {
         use std::os::unix::ffi::OsStringExt;
 
@@ -3201,6 +3202,18 @@ mod tests {
         assert!(
             bad_path.exists(),
             "startup scan must not delete or quarantine the offending file"
+        );
+        // Pin the observability contract: the fix is warn-and-continue, not
+        // silent-skip. A future revert to `None => continue` would still pass
+        // the assertions above, so verify the warn message and structured
+        // path field both made it into the captured logs.
+        assert!(
+            logs_contain("non-UTF-8 filename in cache shard during startup scan, skipping"),
+            "expected warn message text in captured logs"
+        );
+        assert!(
+            logs_contain(&bad_path.display().to_string()),
+            "expected offending path to be carried in the warn event"
         );
     }
 
