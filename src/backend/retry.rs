@@ -151,22 +151,28 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     #[test]
     fn test_retry_policy_for_reads_has_correct_status_codes() {
         let policy = RetryPolicy::for_reads(3, 100);
         assert_eq!(policy.max_attempts, 3);
         assert_eq!(policy.base_backoff, Duration::from_millis(100));
-        assert_eq!(policy.retryable_status_codes, vec![408, 429, 500, 502, 503, 504]);
+        assert_eq!(
+            policy.retryable_status_codes,
+            vec![408, 429, 500, 502, 503, 504]
+        );
     }
 
     #[test]
     fn test_retry_policy_for_idempotent_writes() {
         let policy = RetryPolicy::for_idempotent_writes(2, 200);
         assert_eq!(policy.max_attempts, 2);
-        assert_eq!(policy.retryable_status_codes, vec![408, 429, 500, 502, 503, 504]);
+        assert_eq!(
+            policy.retryable_status_codes,
+            vec![408, 429, 500, 502, 503, 504]
+        );
     }
 
     #[test]

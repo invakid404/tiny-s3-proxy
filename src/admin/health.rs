@@ -10,18 +10,17 @@ pub async fn health_check() -> impl IntoResponse {
 }
 
 /// Readiness check — returns 200 when the cache directory is writable.
-pub async fn ready_check(
-    State(state): State<Arc<super::AdminState>>,
-) -> impl IntoResponse {
+pub async fn ready_check(State(state): State<Arc<super::AdminState>>) -> impl IntoResponse {
     let probe = state.cache_dir.join("tmp").join(".readyz-probe");
     match tokio::fs::write(&probe, b"ok").await {
         Ok(_) => {
             let _ = tokio::fs::remove_file(&probe).await;
             (StatusCode::OK, "ready")
         }
-        Err(_) => {
-            (StatusCode::SERVICE_UNAVAILABLE, "cache directory not writable")
-        }
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cache directory not writable",
+        ),
     }
 }
 

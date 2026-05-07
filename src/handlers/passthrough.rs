@@ -1,12 +1,10 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use axum::body::Body;
 use aws_credential_types::Credentials;
-use aws_sigv4::http_request::{
-    sign, SignableBody, SignableRequest, SigningSettings,
-};
+use aws_sigv4::http_request::{SignableBody, SignableRequest, SigningSettings, sign};
 use aws_sigv4::sign::v4::SigningParams;
+use axum::body::Body;
 use http::Response;
 
 use crate::backend::Backend;
@@ -117,19 +115,18 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
     );
 
     // 2. Read the body bytes (needed for signing and forwarding).
-    let body_bytes = match axum::body::to_bytes(body, state.config.max_request_body_bytes as usize).await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            tracing::error!(error = %e, "passthrough: failed to read request body");
-            let s3err = S3Error::from_body_error(&e, request_id);
-            return s3err.to_response();
-        }
-    };
+    let body_bytes =
+        match axum::body::to_bytes(body, state.config.max_request_body_bytes as usize).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::error!(error = %e, "passthrough: failed to read request body");
+                let s3err = S3Error::from_body_error(&e, request_id);
+                return s3err.to_response();
+            }
+        };
 
     // 3. Build an http::Request for signing.
-    let mut req_builder = http::Request::builder()
-        .method(method)
-        .uri(&upstream_url);
+    let mut req_builder = http::Request::builder().method(method).uri(&upstream_url);
 
     // Copy headers from the original request, stripping SigV4/auth headers,
     // standard hop-by-hop headers, and any headers nominated by Connection.
@@ -171,8 +168,7 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
     // - No path normalization: preserve // and . segments in object keys.
     // - Payload checksum: include x-amz-content-sha256 header as S3 requires.
     let mut signing_settings = SigningSettings::default();
-    signing_settings.percent_encoding_mode =
-        aws_sigv4::http_request::PercentEncodingMode::Single;
+    signing_settings.percent_encoding_mode = aws_sigv4::http_request::PercentEncodingMode::Single;
     signing_settings.uri_path_normalization_mode =
         aws_sigv4::http_request::UriPathNormalizationMode::Disabled;
     signing_settings.payload_checksum_kind =
@@ -197,9 +193,10 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
     let signable = match SignableRequest::new(
         signable_request.method().as_str(),
         signable_request.uri().to_string(),
-        signable_request.headers().iter().map(|(k, v)| {
-            (k.as_str(), std::str::from_utf8(v.as_bytes()).unwrap_or(""))
-        }),
+        signable_request
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.as_str(), std::str::from_utf8(v.as_bytes()).unwrap_or(""))),
         signable_body,
     ) {
         Ok(s) => s,
@@ -228,9 +225,21 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
     // and backoff as the typed backend path. Non-idempotent methods are sent
     // once to avoid duplicate side effects.
     let (is_idempotent, max_attempts, base_backoff_ms) = match method {
-        "GET" => (true, state.config.get_max_attempts.max(1), state.config.retry_base_backoff_ms),
-        "HEAD" => (true, state.config.head_max_attempts.max(1), state.config.retry_base_backoff_ms),
-        "DELETE" => (true, state.config.delete_max_attempts.max(1), state.config.retry_base_backoff_ms),
+        "GET" => (
+            true,
+            state.config.get_max_attempts.max(1),
+            state.config.retry_base_backoff_ms,
+        ),
+        "HEAD" => (
+            true,
+            state.config.head_max_attempts.max(1),
+            state.config.retry_base_backoff_ms,
+        ),
+        "DELETE" => (
+            true,
+            state.config.delete_max_attempts.max(1),
+            state.config.retry_base_backoff_ms,
+        ),
         _ => (false, 1, 0),
     };
 
@@ -245,10 +254,9 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
     let mut last_err = None;
     let mut upstream_resp = None;
     for attempt in 1..=max_attempts {
-        let mut req_builder = state.http_client.request(
-            reqwest_method.clone(),
-            &upstream_url,
-        );
+        let mut req_builder = state
+            .http_client
+            .request(reqwest_method.clone(), &upstream_url);
         for (name, value) in signable_request.headers() {
             if let Ok(v) = value.to_str() {
                 req_builder = req_builder.header(name.as_str(), v);
@@ -267,7 +275,9 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
                     && attempt < max_attempts
                     && matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
                 {
-                    let delay = base_backoff_ms.saturating_mul(2u64.saturating_pow(attempt - 1)).min(30_000);
+                    let delay = base_backoff_ms
+                        .saturating_mul(2u64.saturating_pow(attempt - 1))
+                        .min(30_000);
                     tracing::warn!(
                         status,
                         attempt,
@@ -283,7 +293,9 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
             }
             Err(e) => {
                 if attempt < max_attempts {
-                    let delay = base_backoff_ms.saturating_mul(2u64.saturating_pow(attempt - 1)).min(30_000);
+                    let delay = base_backoff_ms
+                        .saturating_mul(2u64.saturating_pow(attempt - 1))
+                        .min(30_000);
                     tracing::warn!(
                         error = %e,
                         attempt,
@@ -334,7 +346,9 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
     for (name, value) in &resp_headers {
         let name_lower = name.as_str();
         if HOP_BY_HOP_HEADERS.contains(&name_lower)
-            || resp_connection_nominated.iter().any(|h| h.as_str() == name_lower)
+            || resp_connection_nominated
+                .iter()
+                .any(|h| h.as_str() == name_lower)
         {
             continue;
         }
@@ -359,17 +373,17 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::policy::CachePolicy;
     use crate::cache::SingleFlight;
+    use crate::cache::policy::CachePolicy;
     use crate::config::{AuthMode, Config};
-    use crate::handlers::test_utils::*;
     use crate::handlers::AppState;
+    use crate::handlers::test_utils::*;
 
     use axum::body::Body;
     use axum::routing::any;
     use http::HeaderMap;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     /// State shared with the mock upstream server.
     struct MockUpstream {
@@ -463,9 +477,7 @@ mod tests {
         }
     }
 
-    fn build_passthrough_state(
-        config: Config,
-    ) -> Arc<AppState<MockBackend, MockCache>> {
+    fn build_passthrough_state(config: Config) -> Arc<AppState<MockBackend, MockCache>> {
         let cache = MockCache::new();
         Arc::new(AppState {
             backend: Arc::new(MockBackend::new()),
@@ -660,10 +672,7 @@ mod tests {
             rh.push(("keep-alive".to_string(), "timeout=5".to_string()));
             rh.push(("content-type".to_string(), "application/xml".to_string()));
             rh.push(("etag".to_string(), "\"abc123\"".to_string()));
-            rh.push((
-                "x-amz-version-id".to_string(),
-                "v1".to_string(),
-            ));
+            rh.push(("x-amz-version-id".to_string(), "v1".to_string()));
         }
         let addr = start_mock_upstream(mock.clone()).await;
 
@@ -798,6 +807,10 @@ mod tests {
         .await;
 
         assert_eq!(resp.status(), 503);
-        assert_eq!(call_count.load(Ordering::SeqCst), 1, "POST should not retry");
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "POST should not retry"
+        );
     }
 }

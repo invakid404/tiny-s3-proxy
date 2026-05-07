@@ -3,8 +3,8 @@ use std::sync::Arc;
 use axum::body::Body;
 use http::Response;
 
-use crate::backend::models::ListObjectsInput;
 use crate::backend::Backend;
+use crate::backend::models::ListObjectsInput;
 use crate::cache::CacheStore;
 use crate::handlers::AppState;
 use crate::s3::errors::S3Error;
@@ -161,9 +161,7 @@ mod tests {
             "application/xml"
         );
 
-        let body = axum::body::to_bytes(resp.into_body(), 8192)
-            .await
-            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
         let body_str = String::from_utf8_lossy(&body);
         assert!(body_str.contains("<ListBucketResult"));
         assert!(body_str.contains("<Key>scripts/app.js</Key>"));

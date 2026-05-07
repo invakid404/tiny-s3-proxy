@@ -94,8 +94,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         http_client: reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
-            .connect_timeout(std::time::Duration::from_millis(config.upstream_connect_timeout_ms))
-            .read_timeout(std::time::Duration::from_millis(config.upstream_request_timeout_ms))
+            .connect_timeout(std::time::Duration::from_millis(
+                config.upstream_connect_timeout_ms,
+            ))
+            .read_timeout(std::time::Duration::from_millis(
+                config.upstream_request_timeout_ms,
+            ))
             .build()
             .expect("failed to build HTTP client"),
     });
@@ -154,11 +158,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = shutdown_tx.send(true);
     });
 
-    let s3_shutdown = async move { let _ = s3_shutdown_rx.changed().await; };
-    let admin_shutdown = async move { let _ = admin_shutdown_rx.changed().await; };
+    let s3_shutdown = async move {
+        let _ = s3_shutdown_rx.changed().await;
+    };
+    let admin_shutdown = async move {
+        let _ = admin_shutdown_rx.changed().await;
+    };
 
     let s3_future = axum::serve(s3_listener, s3_app).with_graceful_shutdown(s3_shutdown);
-    let admin_future = axum::serve(admin_listener, admin_app).with_graceful_shutdown(admin_shutdown);
+    let admin_future =
+        axum::serve(admin_listener, admin_app).with_graceful_shutdown(admin_shutdown);
 
     let (s3_result, admin_result) = tokio::try_join!(s3_future, admin_future)?;
     // try_join! returns Ok(((), ())) when both complete. If either returns

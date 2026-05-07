@@ -3,10 +3,10 @@ use std::sync::Arc;
 use axum::body::Body;
 use http::Response;
 
-use crate::backend::models::DeleteObjectInput;
 use crate::backend::Backend;
-use crate::cache::key::CacheKey;
+use crate::backend::models::DeleteObjectInput;
 use crate::cache::CacheStore;
+use crate::cache::key::CacheKey;
 use crate::handlers::AppState;
 use crate::s3::errors::S3Error;
 use crate::s3::headers::common_headers;
@@ -19,7 +19,13 @@ pub async fn handle_delete<B: Backend, C: CacheStore>(
     key: &str,
 ) -> Response<Body> {
     // Retry handled by the backend client
-    let result = state.backend.delete_object(DeleteObjectInput { bucket: &state.backend_bucket, key }).await;
+    let result = state
+        .backend
+        .delete_object(DeleteObjectInput {
+            bucket: &state.backend_bucket,
+            key,
+        })
+        .await;
 
     match result {
         Ok(output) => {
@@ -32,7 +38,8 @@ pub async fn handle_delete<B: Backend, C: CacheStore>(
                 "DeleteObject",
                 key,
                 &parsed.request_id,
-            ).await;
+            )
+            .await;
 
             tracing::info!(
                 request_id = %parsed.request_id,
@@ -105,10 +112,11 @@ mod tests {
         let cache_key = CacheKey::new("test-backend", key);
         let meta = test_cache_meta("test-backend", key, b"cached data");
 
-        let backend = MockBackend::new().with_delete(Ok(crate::backend::models::DeleteObjectOutput {
-            delete_marker: None,
-            version_id: None,
-        }));
+        let backend =
+            MockBackend::new().with_delete(Ok(crate::backend::models::DeleteObjectOutput {
+                delete_marker: None,
+                version_id: None,
+            }));
         let cache = MockCache::new().with_entry(&cache_key, b"cached data", meta);
 
         let state = build_app_state(backend, cache, MockAuth::allow_all());
@@ -127,10 +135,11 @@ mod tests {
     async fn test_delete_success_calls_poison_on_purge_failure() {
         let key = "script_bundle/test.js";
 
-        let backend = MockBackend::new().with_delete(Ok(crate::backend::models::DeleteObjectOutput {
-            delete_marker: None,
-            version_id: None,
-        }));
+        let backend =
+            MockBackend::new().with_delete(Ok(crate::backend::models::DeleteObjectOutput {
+                delete_marker: None,
+                version_id: None,
+            }));
 
         let cache = MockCache::new().with_purge_failing();
         let state = build_app_state(backend, cache, MockAuth::allow_all());
@@ -152,11 +161,10 @@ mod tests {
     async fn test_delete_backend_error() {
         let key = "some/key.txt";
 
-        let backend =
-            MockBackend::new().with_delete(Err(crate::error::ProxyError::Backend {
-                source: "delete failed".into(),
-                operation: "delete_object".into(),
-            }));
+        let backend = MockBackend::new().with_delete(Err(crate::error::ProxyError::Backend {
+            source: "delete failed".into(),
+            operation: "delete_object".into(),
+        }));
 
         let state = build_app_state(backend, MockCache::new(), MockAuth::allow_all());
         let parsed = make_parsed(key);

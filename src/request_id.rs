@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 static PID: LazyLock<u32> = LazyLock::new(std::process::id);
 static COUNTER: AtomicU64 = AtomicU64::new(0);

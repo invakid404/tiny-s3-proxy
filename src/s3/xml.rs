@@ -1,6 +1,6 @@
+use quick_xml::Writer;
 use quick_xml::escape::partial_escape;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
-use quick_xml::Writer;
 
 use crate::backend::models::{CompletedPart, ListObjectsOutput};
 
@@ -171,8 +171,8 @@ pub fn serialize_list_objects_v1(output: &ListObjectsOutput) -> String {
 /// so it handles whitespace, namespace prefixes, and other legal XML
 /// variants that a raw byte scan would miss.
 pub fn body_has_checksum_elements(xml_body: &[u8]) -> bool {
-    use quick_xml::events::Event;
     use quick_xml::Reader;
+    use quick_xml::events::Event;
 
     const CHECKSUM_NAMES: &[&str] = &[
         "ChecksumCRC32",
@@ -545,9 +545,11 @@ mod tests {
         let body = b"<NotCompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"e\"</ETag></Part></NotCompleteMultipartUpload>";
         let result = parse_complete_multipart_body(body);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("Missing CompleteMultipartUpload root element"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("Missing CompleteMultipartUpload root element")
+        );
     }
 
     #[test]
@@ -571,9 +573,11 @@ mod tests {
         let body = b"<Wrapper><CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"e\"</ETag></Part></CompleteMultipartUpload></Wrapper>";
         let result = parse_complete_multipart_body(body);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("Missing CompleteMultipartUpload root element"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("Missing CompleteMultipartUpload root element")
+        );
     }
 
     #[test]
