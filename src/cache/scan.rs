@@ -27,6 +27,14 @@ pub(super) const CACHE_HASH_DIR_SCAN_CONCURRENCY: usize = 64;
 /// or a `JoinError`, the `JoinSet` is dropped — aborting in-flight shards —
 /// and unspawned paths never start. `map_join_error` lets the caller adapt
 /// `JoinError` to its own error type.
+///
+/// The `work_fn` invocation is deferred into the spawned task body
+/// (`async move { work_fn(path).await }`) rather than called directly in the
+/// pump. That isolates synchronous panics inside `work_fn` (e.g. its outer
+/// closure body, before the first `await`) inside the spawned task, where
+/// `JoinSet` converts them into `JoinError` and `map_join_error` translates
+/// them into the caller's error type. Calling `work_fn` directly in the pump
+/// would let a synchronous panic unwind the caller's task instead.
 pub(super) async fn bounded_parallel_scan<T, E, F, Fut, J>(
     paths: Vec<PathBuf>,
     max_in_flight: usize,
@@ -46,7 +54,8 @@ where
     let mut results = Vec::new();
 
     for path in iter.by_ref().take(cap) {
-        join_set.spawn(work_fn(path));
+        let work_fn = work_fn.clone();
+        join_set.spawn(async move { work_fn(path).await });
     }
 
     while let Some(join_result) = join_set.join_next().await {
@@ -54,7 +63,8 @@ where
             Ok(Ok(value)) => {
                 results.push(value);
                 if let Some(next_path) = iter.next() {
-                    join_set.spawn(work_fn(next_path));
+                    let work_fn = work_fn.clone();
+                    join_set.spawn(async move { work_fn(next_path).await });
                 }
             }
             Ok(Err(e)) => return Err(e),
@@ -76,24 +86,28 @@ mod tests {
         const N: usize = 8;
         const TOTAL: usize = 200;
 
-        let constructed = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
         let in_flight = Arc::new(AtomicUsize::new(0));
         let max_seen = Arc::new(AtomicUsize::new(0));
         // Zero-permit semaphore: every spawned shard parks until we release.
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
 
         let work_fn = {
-            let constructed = constructed.clone();
+            let started = started.clone();
             let in_flight = in_flight.clone();
             let max_seen = max_seen.clone();
             let gate = gate.clone();
             move |_path: PathBuf| {
-                // Synchronous: counts at construction time, BEFORE any await.
-                constructed.fetch_add(1, Ordering::SeqCst);
+                let started = started.clone();
                 let in_flight = in_flight.clone();
                 let max_seen = max_seen.clone();
                 let gate = gate.clone();
                 async move {
+                    // Increment runs on the spawned task's first poll, BEFORE
+                    // the gate await — so it counts shards that the pump
+                    // actually spawned, even with the deferred-invocation
+                    // shape (`spawn(async move { work_fn(path).await })`).
+                    started.fetch_add(1, Ordering::SeqCst);
                     let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                     max_seen.fetch_max(now, Ordering::SeqCst);
                     let permit = gate.acquire_owned().await.expect("gate not closed");
@@ -109,26 +123,27 @@ mod tests {
         let scan_handle =
             tokio::spawn(async move { bounded_parallel_scan(paths, N, work_fn, |_| ()).await });
 
-        // Yield until the pump has constructed exactly N shard futures.
-        // Constructed is incremented synchronously inside work_fn, so we never
-        // need a sleep — the scheduler progressing the pump task is enough.
+        // Yield until exactly N shard futures have started. With the gate
+        // closed, no shard can finish, so the pump cannot top the set back
+        // up beyond its initial seed of N.
         for _ in 0..10_000 {
-            if constructed.load(Ordering::SeqCst) >= N {
+            if started.load(Ordering::SeqCst) >= N {
                 break;
             }
             tokio::task::yield_now().await;
         }
 
-        // Quiesce: a few more yields to give a buggy implementation a chance
-        // to over-spawn before we assert the bound.
-        for _ in 0..32 {
+        // Quiesce: extra yields so a buggy implementation has a chance to
+        // over-spawn (and have those over-spawned tasks poll past the
+        // increment) before we assert the bound.
+        for _ in 0..256 {
             tokio::task::yield_now().await;
         }
 
         assert_eq!(
-            constructed.load(Ordering::SeqCst),
+            started.load(Ordering::SeqCst),
             N,
-            "exactly N shard futures should be constructed before any permit is released",
+            "exactly N shard futures should have started before any permit is released",
         );
 
         // Release everything; the pump should now drain all paths.
@@ -136,7 +151,7 @@ mod tests {
 
         let results = scan_handle.await.expect("scan task").expect("scan ok");
         assert_eq!(results.len(), TOTAL);
-        assert_eq!(constructed.load(Ordering::SeqCst), TOTAL);
+        assert_eq!(started.load(Ordering::SeqCst), TOTAL);
         assert!(
             max_seen.load(Ordering::SeqCst) <= N,
             "max in-flight {} exceeded cap {}",
@@ -144,5 +159,38 @@ mod tests {
             N,
         );
         assert_eq!(in_flight.load(Ordering::SeqCst), 0);
+    }
+
+    /// Locks in the deferred-invocation contract for `work_fn`: a
+    /// synchronous panic from `work_fn` (before its returned future is
+    /// produced) must surface as `Err(map_join_error(JoinError))` rather
+    /// than unwinding the caller's task.
+    ///
+    /// Under the deferred shape (`spawn(async move { work_fn(path).await })`)
+    /// the `work_fn` call happens inside the spawned task, so `JoinSet`
+    /// catches the panic and reports it as a `JoinError`. Under the
+    /// pre-fix shape (`spawn(work_fn(path))`) the call happens in the
+    /// pump's task, so the panic unwinds out of `bounded_parallel_scan`
+    /// itself and never reaches `map_join_error`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn synchronous_panic_in_work_fn_surfaces_as_mapped_error() {
+        fn panicking_work(_path: PathBuf) -> std::future::Ready<Result<(), &'static str>> {
+            panic!("synchronous panic inside work_fn body");
+        }
+
+        let paths: Vec<PathBuf> = (0..4).map(|i| PathBuf::from(format!("p{i}"))).collect();
+
+        let scan_handle = tokio::spawn(async move {
+            bounded_parallel_scan(paths, 2, panicking_work, |_join_err| "mapped-join-error").await
+        });
+
+        let outcome = scan_handle
+            .await
+            .expect("pump must not unwind into the caller; the panic belongs in JoinError");
+        assert_eq!(
+            outcome,
+            Err("mapped-join-error"),
+            "synchronous panic should surface through map_join_error",
+        );
     }
 }
