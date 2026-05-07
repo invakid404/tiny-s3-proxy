@@ -386,7 +386,11 @@ impl Backend for S3Backend {
         &self,
         req: GetObjectInput<'_>,
     ) -> Result<(GetObjectMeta, BoxByteStream), ProxyError> {
-        let GetObjectInput { bucket, key, options } = req;
+        let GetObjectInput {
+            bucket,
+            key,
+            options,
+        } = req;
         let bucket = bucket.to_string();
         let key = key.to_string();
 
@@ -431,11 +435,12 @@ impl Backend for S3Backend {
         Ok((meta, Box::pin(stream)))
     }
 
-    async fn head_object(
-        &self,
-        req: HeadObjectInput<'_>,
-    ) -> Result<HeadObjectOutput, ProxyError> {
-        let HeadObjectInput { bucket, key, options } = req;
+    async fn head_object(&self, req: HeadObjectInput<'_>) -> Result<HeadObjectOutput, ProxyError> {
+        let HeadObjectInput {
+            bucket,
+            key,
+            options,
+        } = req;
         let bucket = bucket.to_string();
         let key = key.to_string();
 
@@ -610,7 +615,13 @@ impl Backend for S3Backend {
         &self,
         req: CreateMultipartUploadInput<'_>,
     ) -> Result<CreateMultipartOutput, ProxyError> {
-        let CreateMultipartUploadInput { bucket, key, content_type, metadata, content_headers } = req;
+        let CreateMultipartUploadInput {
+            bucket,
+            key,
+            content_type,
+            metadata,
+            content_headers,
+        } = req;
         let mut builder = self
             .client
             .create_multipart_upload()
@@ -778,7 +789,11 @@ impl Backend for S3Backend {
         &self,
         req: AbortMultipartUploadInput<'_>,
     ) -> Result<(), ProxyError> {
-        let AbortMultipartUploadInput { bucket, key, upload_id } = req;
+        let AbortMultipartUploadInput {
+            bucket,
+            key,
+            upload_id,
+        } = req;
         let bucket = bucket.to_string();
         let key = key.to_string();
         let upload_id = upload_id.to_string();
@@ -1138,7 +1153,11 @@ mod tests {
 
     #[test]
     fn test_scheme_extraction_is_case_insensitive() {
-        for url in &["http://example.com", "HTTP://example.com", "Http://example.com"] {
+        for url in &[
+            "http://example.com",
+            "HTTP://example.com",
+            "Http://example.com",
+        ] {
             let scheme = url.split_once("://").map(|(s, _)| s).unwrap_or_default();
             assert!(
                 scheme.eq_ignore_ascii_case("http"),

@@ -179,7 +179,11 @@ async fn try_refresh_cached_get_metadata<B: Backend + 'static, C: CacheStore + '
 
     let head_output = match state
         .backend
-        .head_object(HeadObjectInput { bucket: &state.backend_bucket, key, options: read_options })
+        .head_object(HeadObjectInput {
+            bucket: &state.backend_bucket,
+            key,
+            options: read_options,
+        })
         .await
     {
         Ok(output) => output,
@@ -491,7 +495,11 @@ async fn handle_passthrough<B: Backend, C: CacheStore>(
     let read_options = parsed.read_options();
     match state
         .backend
-        .get_object(GetObjectInput { bucket: &state.backend_bucket, key, options: read_options })
+        .get_object(GetObjectInput {
+            bucket: &state.backend_bucket,
+            key,
+            options: read_options,
+        })
         .await
     {
         Ok((meta, body_stream)) => {
@@ -501,11 +509,11 @@ async fn handle_passthrough<B: Backend, C: CacheStore>(
             build_streaming_response(
                 &meta,
                 body_stream,
-            &parsed.request_id,
-            cache_status,
-            read_options.wants_checksum_headers(),
-        )
-        },
+                &parsed.request_id,
+                cache_status,
+                read_options.wants_checksum_headers(),
+            )
+        }
         Err(e) => {
             if cache_status == "MISS" {
                 let _ = state.cache.note_miss().await;
@@ -578,7 +586,7 @@ fn spawn_cache_tee<C: CacheStore + 'static>(
                 let mut stream = body_stream;
                 while let Some(chunk) = stream.next().await {
                     match tokio::time::timeout(drain_send_timeout, tx.send(chunk)).await {
-                        Ok(Ok(())) => {} // sent successfully
+                        Ok(Ok(())) => {}     // sent successfully
                         Ok(Err(_)) => break, // receiver dropped
                         Err(_) => {
                             tracing::warn!(
@@ -809,9 +817,7 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                 )
                 .await
                 {
-                    if let Err(e) =
-                        state.cache.note_hit(cache_key, &meta_for_hit).await
-                    {
+                    if let Err(e) = state.cache.note_hit(cache_key, &meta_for_hit).await {
                         tracing::warn!(
                             request_id = %parsed.request_id,
                             error = %e,
@@ -845,7 +851,11 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
 
     let result = state
         .backend
-        .get_object(GetObjectInput { bucket: &state.backend_bucket, key, options: read_options })
+        .get_object(GetObjectInput {
+            bucket: &state.backend_bucket,
+            key,
+            options: read_options,
+        })
         .await;
 
     match result {
@@ -890,9 +900,10 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                     head_extra_headers: Default::default(),
                     head_checksum_headers: Default::default(),
                     checksum_mode_checked: read_options.wants_checksum_headers()
-                        || meta.extra_headers.keys().any(|k| {
-                            crate::s3::headers::is_checksum_response_header(k)
-                        }),
+                        || meta
+                            .extra_headers
+                            .keys()
+                            .any(|k| crate::s3::headers::is_checksum_response_header(k)),
                     head_metadata_checked: false,
                     head_checksum_checked: false,
                 };
@@ -995,39 +1006,38 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                     Ok(Some(stale_entry))
                         if !cache_entry_satisfies_read_options(&stale_entry, read_options) => {}
                     Ok(Some(stale_entry)) => {
-                let stale_meta = stale_entry.meta.clone();
-                if let Some(resp) = build_cache_response(
-                    stale_entry,
-                    &parsed.request_id,
-                    "STALE",
-                    read_options.wants_checksum_headers(),
-                )
-                .await
-                {
-                    // Record miss (backend GET was attempted) + hit (body
-                    // served from stale cache) for accurate stats.
-                    let _ = state.cache.note_miss().await;
-                    tracing::warn!(
-                        request_id = %parsed.request_id,
-                        operation = "GetObject",
-                        key = key,
-                        cache_status = "STALE",
-                        error = %e,
-                        "serving stale cache entry on backend error"
-                    );
-                    if let Err(hit_err) =
-                        state.cache.note_hit(cache_key, &stale_meta).await
-                    {
-                        tracing::warn!(
-                            request_id = %parsed.request_id,
-                            error = %hit_err,
-                            "failed to record stale cache hit"
-                        );
-                    }
-                    waiter.complete().await;
-                    return resp;
-                }
-                    // Stale body disappeared — fall through to error
+                        let stale_meta = stale_entry.meta.clone();
+                        if let Some(resp) = build_cache_response(
+                            stale_entry,
+                            &parsed.request_id,
+                            "STALE",
+                            read_options.wants_checksum_headers(),
+                        )
+                        .await
+                        {
+                            // Record miss (backend GET was attempted) + hit (body
+                            // served from stale cache) for accurate stats.
+                            let _ = state.cache.note_miss().await;
+                            tracing::warn!(
+                                request_id = %parsed.request_id,
+                                operation = "GetObject",
+                                key = key,
+                                cache_status = "STALE",
+                                error = %e,
+                                "serving stale cache entry on backend error"
+                            );
+                            if let Err(hit_err) = state.cache.note_hit(cache_key, &stale_meta).await
+                            {
+                                tracing::warn!(
+                                    request_id = %parsed.request_id,
+                                    error = %hit_err,
+                                    "failed to record stale cache hit"
+                                );
+                            }
+                            waiter.complete().await;
+                            return resp;
+                        }
+                        // Stale body disappeared — fall through to error
                     }
                 }
             }
@@ -1329,11 +1339,15 @@ mod tests {
         assert_eq!(resp.headers().get("x-cache").unwrap(), "MISS");
 
         // Verify the fill inferred checksum_mode_checked from extra_headers.
-        let cached = wait_for_cached_entry(&state, &cache_key, |e| e.meta.checksum_mode_checked)
-            .await;
+        let cached =
+            wait_for_cached_entry(&state, &cache_key, |e| e.meta.checksum_mode_checked).await;
         assert!(cached.meta.checksum_mode_checked);
         assert_eq!(
-            cached.meta.extra_headers.get("x-amz-checksum-sha256").unwrap(),
+            cached
+                .meta
+                .extra_headers
+                .get("x-amz-checksum-sha256")
+                .unwrap(),
             "abc123"
         );
 
@@ -1342,7 +1356,10 @@ mod tests {
         assert_eq!(checksum_resp.status(), 200);
         assert_eq!(checksum_resp.headers().get("x-cache").unwrap(), "HIT");
         assert_eq!(
-            checksum_resp.headers().get("x-amz-checksum-sha256").unwrap(),
+            checksum_resp
+                .headers()
+                .get("x-amz-checksum-sha256")
+                .unwrap(),
             "abc123"
         );
         // Only the original fill GET was called — no additional backend calls.
@@ -1438,12 +1455,7 @@ mod tests {
         let state = build_app_state(backend, cache, MockAuth::allow_all());
 
         // Plain HEAD triggers refresh (head_metadata_checked = false).
-        let head_resp = crate::handlers::head::handle_head(
-            &state,
-            &make_parsed(key),
-            key,
-        )
-        .await;
+        let head_resp = crate::handlers::head::handle_head(&state, &make_parsed(key), key).await;
         assert_eq!(head_resp.status(), 200);
 
         // Now a checksum GET should serve from cache with original GET checksum.
@@ -1459,7 +1471,11 @@ mod tests {
         // Verify metadata: GET checksums preserved, HEAD checksums separate.
         let cached = state.cache.peek(&cache_key).await.unwrap().unwrap();
         assert_eq!(
-            cached.meta.extra_headers.get("x-amz-checksum-sha256").unwrap(),
+            cached
+                .meta
+                .extra_headers
+                .get("x-amz-checksum-sha256")
+                .unwrap(),
             "getsum"
         );
     }
@@ -1603,7 +1619,10 @@ mod tests {
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.headers().get("x-cache").unwrap(), "MISS");
 
-        let cached = wait_for_cached_entry(&state, &cache_key, |e| e.meta.etag.as_deref() == Some(&new_etag)).await;
+        let cached = wait_for_cached_entry(&state, &cache_key, |e| {
+            e.meta.etag.as_deref() == Some(&new_etag)
+        })
+        .await;
         assert!(!cached.meta.head_metadata_checked);
         assert!(!cached.meta.head_checksum_checked);
         assert!(cached.meta.head_extra_headers.is_empty());
@@ -1770,11 +1789,13 @@ mod tests {
             "x-amz-checksum-sha256".to_string(),
             "headsum-latest".to_string(),
         );
-        assert!(state
-            .cache
-            .update_metadata_if_unchanged(&cache_key, current.meta.fill_id, refreshed_meta)
-            .await
-            .unwrap());
+        assert!(
+            state
+                .cache
+                .update_metadata_if_unchanged(&cache_key, current.meta.fill_id, refreshed_meta)
+                .await
+                .unwrap()
+        );
 
         release_commit.notify_one();
 
@@ -1807,13 +1828,12 @@ mod tests {
         let cache_key = CacheKey::new("test-backend", key);
         let stale_meta = test_cache_meta("test-backend", key, &stale_body);
 
-        let backend = MockBackend::new()
-            .with_head(Err(crate::error::ProxyError::UpstreamS3 {
-                status_code: 404,
-                s3_code: "NoSuchKey".into(),
-                message: "deleted upstream".into(),
-                operation: "head_object".into(),
-            }));
+        let backend = MockBackend::new().with_head(Err(crate::error::ProxyError::UpstreamS3 {
+            status_code: 404,
+            s3_code: "NoSuchKey".into(),
+            message: "deleted upstream".into(),
+            operation: "head_object".into(),
+        }));
         let cache = MockCache::new().with_entry(&cache_key, &stale_body, stale_meta);
         let state = build_app_state(backend, cache, MockAuth::allow_all());
 
@@ -1826,7 +1846,10 @@ mod tests {
         assert!(state.cache.poison_calls.lock().unwrap().is_empty());
         assert!(state.backend.get_read_calls.lock().unwrap().is_empty());
         assert_eq!(
-            state.cache.note_miss_count.load(std::sync::atomic::Ordering::SeqCst),
+            state
+                .cache
+                .note_miss_count
+                .load(std::sync::atomic::Ordering::SeqCst),
             1,
             "HEAD 404 invalidation path must record a cache miss"
         );
@@ -1856,13 +1879,12 @@ mod tests {
         let old_meta = test_cache_meta("test-backend", key, &old_body);
 
         // Backend HEAD returns 404.
-        let backend = MockBackend::new()
-            .with_head(Err(crate::error::ProxyError::UpstreamS3 {
-                status_code: 404,
-                s3_code: "NoSuchKey".into(),
-                message: "deleted upstream".into(),
-                operation: "head_object".into(),
-            }));
+        let backend = MockBackend::new().with_head(Err(crate::error::ProxyError::UpstreamS3 {
+            status_code: 404,
+            s3_code: "NoSuchKey".into(),
+            message: "deleted upstream".into(),
+            operation: "head_object".into(),
+        }));
 
         let cache = MockCache::new().with_entry(&cache_key, &old_body, old_meta);
 

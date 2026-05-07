@@ -2,6 +2,7 @@ pub mod disk;
 pub mod entry;
 pub mod eviction;
 pub mod key;
+mod layout;
 pub mod metadata;
 pub mod policy;
 pub mod singleflight;

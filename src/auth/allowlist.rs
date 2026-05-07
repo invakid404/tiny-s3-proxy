@@ -243,8 +243,7 @@ mod tests {
     #[test]
     fn test_full_sigv4_format_parsing() {
         let auth = AccessKeyAllowlistAuth::new(vec!["AKID1234567890AB".to_string()]);
-        let header =
-            "AWS4-HMAC-SHA256 Credential=AKID1234567890AB/20240101/us-east-1/s3/aws4_request, \
+        let header = "AWS4-HMAC-SHA256 Credential=AKID1234567890AB/20240101/us-east-1/s3/aws4_request, \
                        SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
                        Signature=abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
         let req = make_request(Some(header));

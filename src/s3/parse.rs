@@ -629,9 +629,11 @@ mod tests {
             "REDUCED_REDUNDANCY"
         );
         assert!(!parsed.extra_amz_headers.contains_key("x-amz-date"));
-        assert!(!parsed
-            .extra_amz_headers
-            .contains_key("x-amz-content-sha256"));
+        assert!(
+            !parsed
+                .extra_amz_headers
+                .contains_key("x-amz-content-sha256")
+        );
     }
 
     #[test]

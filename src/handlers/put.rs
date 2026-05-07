@@ -3,10 +3,10 @@ use std::sync::Arc;
 use axum::body::Body;
 use http::Response;
 
-use crate::backend::models::PutObjectInput;
 use crate::backend::Backend;
-use crate::cache::key::CacheKey;
+use crate::backend::models::PutObjectInput;
 use crate::cache::CacheStore;
+use crate::cache::key::CacheKey;
 use crate::handlers::AppState;
 use crate::s3::errors::S3Error;
 use crate::s3::headers::put_object_headers;
@@ -27,20 +27,21 @@ pub async fn handle_put<B: Backend, C: CacheStore>(
     // larger than the limit, clients should use multipart upload.
 
     // Read body bytes
-    let body_bytes = match axum::body::to_bytes(body, state.config.max_request_body_bytes as usize).await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            tracing::error!(
-                request_id = %parsed.request_id,
-                error = %e,
-                operation = "PutObject",
-                key = key,
-                "failed to read request body"
-            );
-            let s3err = S3Error::from_body_error(&e, &parsed.request_id);
-            return s3err.to_response();
-        }
-    };
+    let body_bytes =
+        match axum::body::to_bytes(body, state.config.max_request_body_bytes as usize).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::error!(
+                    request_id = %parsed.request_id,
+                    error = %e,
+                    operation = "PutObject",
+                    key = key,
+                    "failed to read request body"
+                );
+                let s3err = S3Error::from_body_error(&e, &parsed.request_id);
+                return s3err.to_response();
+            }
+        };
 
     let input = PutObjectInput {
         bucket: state.backend_bucket.to_string(),
@@ -67,7 +68,8 @@ pub async fn handle_put<B: Backend, C: CacheStore>(
                 "PutObject",
                 key,
                 &parsed.request_id,
-            ).await;
+            )
+            .await;
 
             tracing::info!(
                 request_id = %parsed.request_id,
@@ -115,11 +117,11 @@ pub async fn handle_put<B: Backend, C: CacheStore>(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use super::*;
     use crate::cache::key::CacheKey;
     use crate::handlers::test_utils::*;
     use crate::s3::ops::{ParsedRequest, S3Operation};
+    use std::collections::HashMap;
 
     fn make_parsed(key: &str) -> ParsedRequest {
         ParsedRequest {

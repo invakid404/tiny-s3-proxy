@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{Mutex, broadcast};
 
 use crate::cache::key::CacheKey;
 
@@ -113,8 +113,16 @@ impl SingleFlight {
             }
         } else {
             let (sender, _) = broadcast::channel(1);
-            let generation = self.next_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            registry.insert(key.clone(), FlightEntry { sender: sender.clone(), generation });
+            let generation = self
+                .next_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            registry.insert(
+                key.clone(),
+                FlightEntry {
+                    sender: sender.clone(),
+                    generation,
+                },
+            );
             FlightResult::Leader {
                 waiter: FlightWaiter {
                     key: key.clone(),

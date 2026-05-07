@@ -4,10 +4,12 @@ use axum::body::Body;
 use bytes::Bytes;
 use http::Response;
 
-use crate::backend::models::{AbortMultipartUploadInput, CompleteMultipartInput, CreateMultipartUploadInput, UploadPartInput};
 use crate::backend::Backend;
-use crate::cache::key::CacheKey;
+use crate::backend::models::{
+    AbortMultipartUploadInput, CompleteMultipartInput, CreateMultipartUploadInput, UploadPartInput,
+};
 use crate::cache::CacheStore;
+use crate::cache::key::CacheKey;
 use crate::handlers::AppState;
 use crate::s3::errors::S3Error;
 use crate::s3::headers::common_headers;
@@ -43,8 +45,7 @@ pub async fn handle_create_multipart<B: Backend, C: CacheStore>(
                 "multipart upload initiated"
             );
 
-            let xml =
-                serialize_initiate_multipart(&state.frontend_bucket, key, &output.upload_id);
+            let xml = serialize_initiate_multipart(&state.frontend_bucket, key, &output.upload_id);
 
             let headers = common_headers(&parsed.request_id);
             let mut response = Response::builder().status(200);
@@ -94,27 +95,31 @@ pub async fn handle_upload_part<B: Backend, C: CacheStore>(
     // Validate partNumber: S3 requires 1..=10000
     if !(1..=10000).contains(&part_number) {
         let s3err = S3Error::invalid_argument(
-            &format!("Part number must be between 1 and 10000, got {}", part_number),
+            &format!(
+                "Part number must be between 1 and 10000, got {}",
+                part_number
+            ),
             &parsed.request_id,
         );
         return s3err.to_response();
     }
 
     // Read body bytes
-    let body_bytes = match axum::body::to_bytes(body, state.config.max_request_body_bytes as usize).await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            tracing::error!(
-                request_id = %parsed.request_id,
-                error = %e,
-                operation = "UploadPart",
-                key = key,
-                "failed to read request body"
-            );
-            let s3err = S3Error::from_body_error(&e, &parsed.request_id);
-            return s3err.to_response();
-        }
-    };
+    let body_bytes =
+        match axum::body::to_bytes(body, state.config.max_request_body_bytes as usize).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::error!(
+                    request_id = %parsed.request_id,
+                    error = %e,
+                    operation = "UploadPart",
+                    key = key,
+                    "failed to read request body"
+                );
+                let s3err = S3Error::from_body_error(&e, &parsed.request_id);
+                return s3err.to_response();
+            }
+        };
 
     let input = UploadPartInput {
         bucket: state.backend_bucket.to_string(),
@@ -223,7 +228,8 @@ pub async fn handle_complete_multipart<B: Backend, C: CacheStore>(
                 "CompleteMultipartUpload",
                 key,
                 &parsed.request_id,
-            ).await;
+            )
+            .await;
 
             tracing::info!(
                 request_id = %parsed.request_id,
@@ -292,7 +298,11 @@ pub async fn handle_abort_multipart<B: Backend, C: CacheStore>(
 ) -> Response<Body> {
     let result = state
         .backend
-        .abort_multipart_upload(AbortMultipartUploadInput { bucket: &state.backend_bucket, key, upload_id })
+        .abort_multipart_upload(AbortMultipartUploadInput {
+            bucket: &state.backend_bucket,
+            key,
+            upload_id,
+        })
         .await;
 
     match result {
@@ -334,7 +344,9 @@ pub async fn handle_abort_multipart<B: Backend, C: CacheStore>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::models::{CompleteMultipartOutput, CreateMultipartOutput, UploadPartOutput};
+    use crate::backend::models::{
+        CompleteMultipartOutput, CreateMultipartOutput, UploadPartOutput,
+    };
     use crate::handlers::test_utils::*;
     use crate::s3::ops::{ParsedRequest, S3Operation};
 
@@ -425,11 +437,10 @@ mod tests {
     #[tokio::test]
     async fn test_create_multipart_success() {
         let key = "uploads/file.bin";
-        let backend =
-            MockBackend::new().with_create_multipart(Ok(CreateMultipartOutput {
-                upload_id: "new-upload-id".to_string(),
-                extra_headers: std::collections::HashMap::new(),
-            }));
+        let backend = MockBackend::new().with_create_multipart(Ok(CreateMultipartOutput {
+            upload_id: "new-upload-id".to_string(),
+            extra_headers: std::collections::HashMap::new(),
+        }));
 
         let state = build_app_state(backend, MockCache::new(), MockAuth::allow_all());
         let parsed = make_parsed_create(key);
@@ -437,9 +448,7 @@ mod tests {
         let resp = handle_create_multipart(&state, &parsed, key).await;
 
         assert_eq!(resp.status(), 200);
-        let body = axum::body::to_bytes(resp.into_body(), 4096)
-            .await
-            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let body_str = String::from_utf8_lossy(&body);
         assert!(body_str.contains("<UploadId>new-upload-id</UploadId>"));
         assert!(body_str.contains("<Bucket>test-frontend</Bucket>"));
@@ -469,13 +478,12 @@ mod tests {
     #[tokio::test]
     async fn test_complete_multipart_success_purges_cache() {
         let key = "script_bundle/assembled.js";
-        let backend =
-            MockBackend::new().with_complete_multipart(Ok(CompleteMultipartOutput {
-                etag: Some("\"final-etag\"".to_string()),
-                location: None,
-                version_id: None,
-                extra_headers: std::collections::HashMap::new(),
-            }));
+        let backend = MockBackend::new().with_complete_multipart(Ok(CompleteMultipartOutput {
+            etag: Some("\"final-etag\"".to_string()),
+            location: None,
+            version_id: None,
+            extra_headers: std::collections::HashMap::new(),
+        }));
 
         let cache_key = crate::cache::key::CacheKey::new("test-backend", key);
         let meta = test_cache_meta("test-backend", key, b"old");
@@ -489,13 +497,10 @@ mod tests {
         </CompleteMultipartUpload>"#;
         let body = Bytes::from(xml_body.to_vec());
 
-        let resp =
-            handle_complete_multipart(&state, &parsed, key, "upload-123", body).await;
+        let resp = handle_complete_multipart(&state, &parsed, key, "upload-123", body).await;
 
         assert_eq!(resp.status(), 200);
-        let resp_body = axum::body::to_bytes(resp.into_body(), 4096)
-            .await
-            .unwrap();
+        let resp_body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let body_str = String::from_utf8_lossy(&resp_body);
         assert!(body_str.contains("<ETag>\"final-etag\"</ETag>"));
 
@@ -507,13 +512,12 @@ mod tests {
     #[tokio::test]
     async fn test_complete_multipart_calls_poison_on_purge_failure() {
         let key = "script_bundle/assembled.js";
-        let backend =
-            MockBackend::new().with_complete_multipart(Ok(CompleteMultipartOutput {
-                etag: Some("\"final-etag\"".to_string()),
-                location: None,
-                version_id: None,
-                extra_headers: std::collections::HashMap::new(),
-            }));
+        let backend = MockBackend::new().with_complete_multipart(Ok(CompleteMultipartOutput {
+            etag: Some("\"final-etag\"".to_string()),
+            location: None,
+            version_id: None,
+            extra_headers: std::collections::HashMap::new(),
+        }));
 
         let cache = MockCache::new().with_purge_failing();
         let state = build_app_state(backend, cache, MockAuth::allow_all());
@@ -524,8 +528,7 @@ mod tests {
         </CompleteMultipartUpload>"#;
         let body = Bytes::from(xml_body.to_vec());
 
-        let resp =
-            handle_complete_multipart(&state, &parsed, key, "upload-123", body).await;
+        let resp = handle_complete_multipart(&state, &parsed, key, "upload-123", body).await;
 
         // Complete should succeed even though purge failed
         assert_eq!(resp.status(), 200);
@@ -553,12 +556,11 @@ mod tests {
     #[tokio::test]
     async fn test_create_multipart_backend_error() {
         let key = "uploads/file.bin";
-        let backend = MockBackend::new().with_create_multipart(Err(
-            crate::error::ProxyError::Backend {
+        let backend =
+            MockBackend::new().with_create_multipart(Err(crate::error::ProxyError::Backend {
                 source: "create failed".into(),
                 operation: "create_multipart_upload".into(),
-            },
-        ));
+            }));
 
         let state = build_app_state(backend, MockCache::new(), MockAuth::allow_all());
         let parsed = make_parsed_create(key);
