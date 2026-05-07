@@ -438,18 +438,49 @@ async fn process_deferred_cleanups(
                     }
                     Ok(true) => {} // meta appeared (concurrent fill), not an orphan
                     Err(e) => {
-                        // Can't confirm orphan status — conservatively count body bytes
-                        // so stats don't undercount.
-                        let size = tokio::fs::metadata(&body_path)
-                            .await
-                            .map(|m| m.len())
-                            .unwrap_or(0);
-                        *scan_total_bytes += size;
-                        tracing::warn!(
-                            path = %meta_path.display(),
-                            error = %e,
-                            "failed to recheck orphan body status under lock, counting bytes conservatively"
-                        );
+                        // Can't confirm orphan status. Try to count the body
+                        // bytes conservatively so stats don't undercount, but
+                        // do NOT silently treat a stat failure as 0 — that
+                        // would let on-disk bytes drop out of the budget.
+                        match tokio::fs::metadata(&body_path).await {
+                            Ok(m) => {
+                                *scan_total_bytes += m.len();
+                                tracing::warn!(
+                                    path = %meta_path.display(),
+                                    try_exists_error = %e,
+                                    size = m.len(),
+                                    "failed to recheck orphan body status under lock, counting body bytes conservatively"
+                                );
+                            }
+                            Err(e2) if e2.kind() == std::io::ErrorKind::NotFound => {
+                                // Body vanished between scan and locked
+                                // recheck — genuinely gone, no bytes to count.
+                                tracing::debug!(
+                                    path = %body_path.display(),
+                                    "orphan body vanished before locked recheck"
+                                );
+                            }
+                            Err(e2) => {
+                                // Both probes failed with non-NotFound errors:
+                                // remaining bytes are unknown. Abort the pass
+                                // rather than silently zero — the next eviction
+                                // tick will retry, and a persistent failure
+                                // (e.g., permanently inaccessible directory)
+                                // surfaces as a logged eviction error instead
+                                // of accumulating undercounted disk usage.
+                                tracing::warn!(
+                                    path = %body_path.display(),
+                                    try_exists_error = %e,
+                                    stat_error_kind = ?e2.kind(),
+                                    "failed to recheck orphan body status AND stat the body — aborting eviction pass"
+                                );
+                                return Err(boxed_io_error(
+                                    "stat orphan body during locked eviction cleanup",
+                                    &body_path,
+                                    e2,
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -1518,6 +1549,66 @@ mod tests {
         assert_eq!(
             result, 1500,
             "stat failure must fall back to pre_known size, not silently zero"
+        );
+    }
+
+    /// Locks in the regression behind this commit: when the OrphanBody
+    /// recheck `try_exists(meta_path)` fails AND the conservative-count
+    /// `metadata(body_path)` fallback also fails (here forced via parent dir
+    /// mode 0o000: no read, no exec, no write — both probes hit EACCES),
+    /// `process_deferred_cleanups` must abort with an error rather than
+    /// silently treating the unreclaimed bytes as zero.
+    ///
+    /// Under the old `unwrap_or(0)` implementation the function returned Ok
+    /// with `scan_total_bytes` left unchanged (zero added for an unknown
+    /// body), which let on-disk bytes silently drop out of the eviction
+    /// budget. The new code returns Err on a non-NotFound stat failure;
+    /// `collect_candidates` propagates the Err and `run_eviction_loop` logs
+    /// "eviction pass failed", leaving stats at their pre-pass values so
+    /// the next pass can retry without corrupted reconciliation.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_orphan_body_stat_failure_aborts_reconciliation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("objects").join("aa").join("bb");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let body_path = dir.join("hh.body");
+        tokio::fs::write(&body_path, vec![0u8; 1500]).await.unwrap();
+
+        // Block traversal so both try_exists(meta_path) and
+        // metadata(body_path) fail with EACCES.
+        let _restore = ChmodOnDrop::new(&dir);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let cleanup = DeferredCleanup::OrphanBody {
+            body_path: body_path.clone(),
+            hash: "hh".into(),
+        };
+
+        let mut candidates = Vec::new();
+        let mut total_bytes = 0u64;
+        let mut entry_count = 0u64;
+        let result = process_deferred_cleanups(
+            vec![cleanup],
+            None,
+            &mut candidates,
+            &mut total_bytes,
+            &mut entry_count,
+        )
+        .await;
+
+        // Bug behavior: result.is_ok() && total_bytes == 0 — silent zero.
+        // Fix behavior: result.is_err() — abort and let next pass retry.
+        assert!(
+            result.is_err(),
+            "stat failure must abort cleanup, not silently zero unreclaimed bytes"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("stat orphan body"),
+            "error should identify the failing operation, got: {err_msg}"
         );
     }
 }
