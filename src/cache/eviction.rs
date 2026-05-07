@@ -139,9 +139,26 @@ async fn scan_hash_dir_for_eviction(
             Err(e) => return Err(Box::new(e)),
         };
         let file_path = file_entry.path();
+        // The cache writer only emits UTF-8 hex-hash filenames + ASCII
+        // suffixes (.body / .meta.json / .poisoned). A non-UTF-8 name
+        // inside a hash shard is foreign content we don't own — skipping
+        // it could undercount orphan/cleanup detection, and synthesizing
+        // a fallback identifier would risk wrong locking semantics on
+        // something that's almost certainly external junk. Abort the
+        // scan and surface the offending path so an operator can
+        // investigate.
         let file_name = match file_path.file_name().and_then(|n| n.to_str()) {
             Some(n) => n.to_string(),
-            None => continue,
+            None => {
+                return Err(boxed_io_error(
+                    "non-UTF-8 filename inside cache hash shard",
+                    &file_path,
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "filename is not valid UTF-8",
+                    ),
+                ));
+            }
         };
 
         if !file_name.ends_with(".meta.json") {
@@ -1729,6 +1746,44 @@ mod tests {
         assert_eq!(
             snap.total_bytes, 7777,
             "global total_bytes must be untouched"
+        );
+    }
+
+    /// Locks in the regression behind this commit: when scan_hash_dir_for_eviction
+    /// encounters a file whose name is not valid UTF-8, the function must
+    /// abort with an error including the offending path rather than silently
+    /// skipping the entry. Silent skipping would undercount orphan/cleanup
+    /// detection; synthesizing a lossy fallback identifier would risk wrong
+    /// locking semantics on what is almost certainly external junk (the
+    /// cache writer only emits UTF-8 hex-hash filenames + ASCII suffixes).
+    ///
+    /// Linux-only: macOS APFS / HFS+ reject non-UTF-8 filenames at the
+    /// filesystem layer with "Illegal byte sequence", so the test setup
+    /// can't even create the offending file there. CI runs on Linux
+    /// (ubuntu-latest in .github/workflows/ci.yml), where this works.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_scan_aborts_on_non_utf8_filename() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("objects").join("aa").join("bb");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // Bytes that are NOT valid UTF-8: 0xff is never a valid continuation
+        // byte and never a valid leading byte either.
+        let bad_name = std::ffi::OsString::from_vec(vec![0xff, 0xfe, 0xfd]);
+        let bad_path = dir.join(&bad_name);
+        std::fs::write(&bad_path, b"junk").unwrap();
+
+        let err = match scan_hash_dir_for_eviction(dir.clone()).await {
+            Ok(_) => panic!("non-UTF-8 filename inside hash shard must abort the scan"),
+            Err(e) => e,
+        };
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("non-UTF-8") || err_msg.contains("not valid UTF-8"),
+            "error should identify the cause, got: {err_msg}"
         );
     }
 }
