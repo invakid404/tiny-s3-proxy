@@ -25,6 +25,11 @@ struct DirScanStats {
     /// (already counted into `total_bytes`; tracked separately for
     /// observability).
     unreclaimed_bytes: u64,
+    /// Count of orphan bodies whose removal failed AND whose size could not
+    /// be measured (no pre-stat baseline and post-stat also failed). Their
+    /// bytes are NOT counted into `total_bytes` because they're unknown;
+    /// the count itself surfaces the gap to operators.
+    orphan_body_size_unknown_count: u64,
 }
 
 /// Aggregated results from the full startup scan.
@@ -36,6 +41,9 @@ struct StartupScanResult {
     hash_dirs: usize,
     layout_incomplete: bool,
     unreclaimed_bytes: u64,
+    /// Aggregate of `DirScanStats::orphan_body_size_unknown_count` across
+    /// all per-shard results (saturating add).
+    orphan_body_size_unknown_count: u64,
 }
 
 /// Map a startup-scan `ProxyError` to one of the finite `reason` label values
@@ -56,31 +64,46 @@ fn classify_startup_scan_error(err: &ProxyError) -> &'static str {
 
 /// Compute how many on-disk bytes a failed orphan-body removal left behind.
 /// Used by the startup scan's orphan-cleanup branch when `remove_file` returns
-/// a non-NotFound error: a follow-up stat is the primary signal, but if that
-/// also fails we fall back to `pre_size` rather than `0`. Without the fallback
-/// a parent-dir EACCES would make `metadata(...).unwrap_or(0)` silently
-/// undercount startup totals — eviction reconciliation would then run with an
-/// under-reported budget until a later scan happened to succeed.
+/// a non-NotFound error: a follow-up stat is the primary signal, the pre-stat
+/// `pre_size` is a fallback, and if neither is available the size is reported
+/// unknown (`Err`) so the caller can bump the unknown-count and the
+/// `s3proxy_cache_scan_incomplete_total{phase="startup"}` observability
+/// counter rather than silently treating it as zero. Without the unknown
+/// signal a triple-failure (remove + post-stat + no pre-stat) would let
+/// eviction reconciliation run with an under-reported budget until a later
+/// scan happened to succeed.
 async fn measure_unreclaimed_orphan_bytes(
     file_path: &std::path::Path,
     pre_size: Option<u64>,
     remove_err: &std::io::Error,
-) -> u64 {
+) -> Result<u64, std::io::Error> {
     match tokio::fs::metadata(file_path).await {
-        Ok(m) => m.len(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(stat_err) => {
-            let counted = pre_size.unwrap_or(0);
-            tracing::warn!(
-                path = %file_path.display(),
-                remove_error = %remove_err,
-                stat_error_kind = ?stat_err.kind(),
-                pre_size = ?pre_size,
-                counted,
-                "orphan body remove and post-stat both failed during startup; using pre-stat fallback",
-            );
-            counted
-        }
+        Ok(m) => Ok(m.len()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(stat_err) => match pre_size {
+            Some(pre) => {
+                tracing::warn!(
+                    path = %file_path.display(),
+                    remove_error = %remove_err,
+                    stat_error = %stat_err,
+                    stat_error_kind = ?stat_err.kind(),
+                    pre_size = pre,
+                    "orphan body remove and post-stat both failed during startup; using pre-stat fallback",
+                );
+                Ok(pre)
+            }
+            None => {
+                tracing::warn!(
+                    path = %file_path.display(),
+                    remove_error = %remove_err,
+                    remove_error_kind = ?remove_err.kind(),
+                    stat_error = %stat_err,
+                    stat_error_kind = ?stat_err.kind(),
+                    "orphan body remove failed and no pre-stat baseline is available; size unknown",
+                );
+                Err(stat_err)
+            }
+        },
     }
 }
 
@@ -363,7 +386,8 @@ impl DiskCache {
     ///   - `s3proxy_cache_scan_duration_seconds{phase="startup"}` on success
     ///   - `s3proxy_cache_scan_failed_total{phase="startup",reason=...}` on Err
     ///   - `s3proxy_cache_scan_incomplete_total{phase="startup"}` when the
-    ///     layout walk or the per-shard scan flagged any incompleteness
+    ///     layout walk or the per-shard scan flagged any incompleteness, or
+    ///     when any orphan body's size could not be measured
     async fn scan_existing_stats(
         cache_dir: &std::path::Path,
     ) -> Result<StartupScanResult, ProxyError> {
@@ -378,7 +402,10 @@ impl DiskCache {
                     "phase" => "startup",
                 )
                 .record(duration);
-                if scan.layout_incomplete || scan.fill_id_incomplete {
+                if scan.layout_incomplete
+                    || scan.fill_id_incomplete
+                    || scan.orphan_body_size_unknown_count > 0
+                {
                     metrics::counter!(
                         "s3proxy_cache_scan_incomplete_total",
                         "phase" => "startup",
@@ -395,6 +422,7 @@ impl DiskCache {
                     layout_incomplete = scan.layout_incomplete,
                     fill_id_incomplete = scan.fill_id_incomplete,
                     unreclaimed_bytes = scan.unreclaimed_bytes,
+                    orphan_body_size_unknown_count = scan.orphan_body_size_unknown_count,
                     "cache startup scan complete",
                 );
             }
@@ -439,6 +467,7 @@ impl DiskCache {
                 hash_dirs: 0,
                 layout_incomplete,
                 unreclaimed_bytes: 0,
+                orphan_body_size_unknown_count: 0,
             });
         }
 
@@ -465,6 +494,7 @@ impl DiskCache {
             hash_dirs: hash_dir_count,
             layout_incomplete,
             unreclaimed_bytes: 0,
+            orphan_body_size_unknown_count: 0,
         };
 
         for dir in dir_results {
@@ -478,6 +508,9 @@ impl DiskCache {
             agg.saw_cache_files = agg.saw_cache_files || dir.saw_cache_files;
             agg.fill_id_incomplete = agg.fill_id_incomplete || dir.fill_id_incomplete;
             agg.unreclaimed_bytes = agg.unreclaimed_bytes.saturating_add(dir.unreclaimed_bytes);
+            agg.orphan_body_size_unknown_count = agg
+                .orphan_body_size_unknown_count
+                .saturating_add(dir.orphan_body_size_unknown_count);
         }
 
         Ok(agg)
@@ -492,6 +525,7 @@ impl DiskCache {
             saw_cache_files: false,
             fill_id_incomplete: false,
             unreclaimed_bytes: 0,
+            orphan_body_size_unknown_count: 0,
         };
 
         let mut file_entries = match tokio::fs::read_dir(&d2_path).await {
@@ -628,20 +662,34 @@ impl DiskCache {
                             Ok(()) => {}
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                             Err(remove_err) => {
-                                let counted = measure_unreclaimed_orphan_bytes(
+                                match measure_unreclaimed_orphan_bytes(
                                     &file_path,
                                     pre_size,
                                     &remove_err,
                                 )
-                                .await;
-                                result.total_bytes += counted;
-                                result.unreclaimed_bytes += counted;
-                                tracing::warn!(
-                                    path = %file_path.display(),
-                                    error = %remove_err,
-                                    counted,
-                                    "failed to remove orphan body during startup, counting bytes"
-                                );
+                                .await
+                                {
+                                    Ok(counted) => {
+                                        result.total_bytes += counted;
+                                        result.unreclaimed_bytes += counted;
+                                        tracing::warn!(
+                                            path = %file_path.display(),
+                                            error = %remove_err,
+                                            counted,
+                                            "failed to remove orphan body during startup, counting bytes"
+                                        );
+                                    }
+                                    Err(stat_err) => {
+                                        result.orphan_body_size_unknown_count += 1;
+                                        tracing::warn!(
+                                            path = %file_path.display(),
+                                            remove_error = %remove_err,
+                                            stat_error = %stat_err,
+                                            stat_error_kind = ?stat_err.kind(),
+                                            "orphan body size unknown during startup; continuing without counting bytes"
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -2730,6 +2778,7 @@ mod tests {
             hash_dirs: 0,
             layout_incomplete: false,
             unreclaimed_bytes: 0,
+            orphan_body_size_unknown_count: 0,
         };
 
         let err = DiskCache::load_next_fill_id(tmp.path(), &scan)
@@ -3337,7 +3386,9 @@ mod tests {
 
         let remove_err =
             std::io::Error::new(std::io::ErrorKind::PermissionDenied, "synthetic test error");
-        let counted = measure_unreclaimed_orphan_bytes(&path, Some(99_999), &remove_err).await;
+        let counted = measure_unreclaimed_orphan_bytes(&path, Some(99_999), &remove_err)
+            .await
+            .expect("post-stat success should yield Ok");
         assert_eq!(
             counted, 1500,
             "post-stat measurement should win over pre_size when it succeeds"
@@ -3354,18 +3405,21 @@ mod tests {
 
         let remove_err =
             std::io::Error::new(std::io::ErrorKind::PermissionDenied, "synthetic test error");
-        let counted = measure_unreclaimed_orphan_bytes(&path, Some(99_999), &remove_err).await;
+        let counted = measure_unreclaimed_orphan_bytes(&path, Some(99_999), &remove_err)
+            .await
+            .expect("post-stat NotFound should yield Ok(0)");
         assert_eq!(
             counted, 0,
             "post-stat NotFound means the bytes are genuinely gone"
         );
     }
 
-    /// Locks in the regression behind this commit: when both `remove_file`
-    /// AND the follow-up `metadata` fail with non-NotFound errors (here
-    /// forced via parent dir mode 0o000: no read, no exec, no write — path
-    /// traversal fails), `measure_unreclaimed_orphan_bytes` must fall back
-    /// to `pre_size` rather than silently returning 0.
+    /// Locks in the regression behind PR #30: when both `remove_file` AND
+    /// the follow-up `metadata` fail with non-NotFound errors (here forced
+    /// via parent dir mode 0o000: no read, no exec, no write — path
+    /// traversal fails) and a `pre_size` baseline IS available,
+    /// `measure_unreclaimed_orphan_bytes` must fall back to `pre_size`
+    /// rather than silently returning 0.
     ///
     /// Under the old `metadata(&file_path).await.map(|m| m.len()).unwrap_or(0)`
     /// shape the call would have produced 0 for the still-on-disk orphan,
@@ -3389,11 +3443,54 @@ mod tests {
         let remove_err =
             std::io::Error::new(std::io::ErrorKind::PermissionDenied, "synthetic test error");
         // Pre-stat baseline captured before chmod made traversal impossible.
-        let counted = measure_unreclaimed_orphan_bytes(&path, Some(1500), &remove_err).await;
+        let counted = measure_unreclaimed_orphan_bytes(&path, Some(1500), &remove_err)
+            .await
+            .expect("Some(pre_size) must yield Ok fallback when stat fails");
 
         assert_eq!(
             counted, 1500,
             "stat failure must fall back to pre_size, not silently zero"
+        );
+    }
+
+    /// Locks in the residual silent-zero hole that PR #30's helper still
+    /// had: when `pre_size` is `None` (pre-stat also failed) AND post-stat
+    /// fails with non-NotFound, the helper must return `Err(stat_err)` so
+    /// the caller can record an unknown-size orphan and bump the
+    /// observability counter — NOT `Ok(0)`, which would silently undercount
+    /// disk usage.
+    ///
+    /// Forced via parent dir mode 0o000 (no read/exec/write — path
+    /// traversal of any child fails). Under the old `pre_size.unwrap_or(0)`
+    /// shape this call returned `0` and the bug-revert sanity check below
+    /// confirms that direction.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_measure_unreclaimed_errors_when_pre_and_post_stat_unknown() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("locked");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("orphan.body");
+        tokio::fs::write(&path, vec![0u8; 1500]).await.unwrap();
+
+        let _restore = ChmodOnDrop::new(&dir);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let remove_err =
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "synthetic test error");
+        let result = measure_unreclaimed_orphan_bytes(&path, None, &remove_err).await;
+
+        let stat_err = result.expect_err(
+            "stat failure with no pre_size baseline must surface as Err so the caller \
+             can bump orphan_body_size_unknown_count instead of silently treating the \
+             still-on-disk bytes as zero",
+        );
+        assert_eq!(
+            stat_err.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "the original post-stat ErrorKind must be preserved through the Err",
         );
     }
 
@@ -3434,6 +3531,84 @@ mod tests {
             body_path.exists(),
             "orphan body should still be on disk after failed removal"
         );
+    }
+
+    /// Wires the full triple-failure path through the public startup-scan
+    /// entry point and asserts the observability surface: the orphan whose
+    /// size cannot be measured does NOT abort startup, contributes zero
+    /// bytes (since its size is unknown — not silently zeroed), bumps
+    /// `orphan_body_size_unknown_count`, and trips
+    /// `s3proxy_cache_scan_incomplete_total{phase="startup"}`.
+    ///
+    /// Setup:
+    ///   - `objects/aa/bb/hh.body` is a self-symlink. `tokio::fs::metadata`
+    ///     follows symlinks and therefore fails with ELOOP, so both the
+    ///     pre-stat and the post-stat return `Err` and `pre_size = None`.
+    ///   - `objects/aa/bb/` is chmod 0o500, leaving traversal (`x`) and
+    ///     enumeration (`r`) intact while making `remove_file` fail with
+    ///     EACCES (no `w`).
+    ///
+    /// Use `symlink_metadata` (NOT `exists()` / `metadata()`) for any
+    /// existence check on the symlink itself — `exists()` follows the
+    /// symlink and inherits the same ELOOP that drives the test.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_startup_scan_marks_unknown_orphan_size_and_bumps_incomplete_metric() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+        let dir = cache_dir.join("objects").join("aa").join("bb");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let body_path = dir.join("hh.body");
+        std::os::unix::fs::symlink(&body_path, &body_path).unwrap();
+
+        // 0o500: read_dir + traversal still work, but remove_file (unlink)
+        // fails with EACCES because the parent dir has no write bit.
+        let _restore = ChmodOnDrop::new(&dir);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let scan = DiskCache::scan_existing_stats(&cache_dir)
+            .await
+            .expect("startup scan must not abort when an orphan body's size is unknown");
+
+        assert_eq!(
+            scan.stats.entry_count.load(Ordering::Relaxed),
+            0,
+            "an orphan body with no metadata is not a valid cache entry",
+        );
+        assert_eq!(
+            scan.stats.total_bytes.load(Ordering::Relaxed),
+            0,
+            "unknown-size orphans must NOT contribute bytes — that's the whole \
+             point of the unknown branch",
+        );
+        assert!(
+            !scan.fill_id_incomplete,
+            "an unknown-size orphan body has no metadata and contributes no \
+             fill_id, so fill_id_incomplete must remain false",
+        );
+        assert_eq!(
+            scan.orphan_body_size_unknown_count, 1,
+            "the triple-failure orphan must bump orphan_body_size_unknown_count",
+        );
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("s3proxy_cache_scan_incomplete_total{phase=\"startup\"} 1"),
+            "expected scan_incomplete_total to be bumped exactly once for the \
+             unknown-size orphan, got:\n{rendered}",
+        );
+
+        // The symlink must still be on disk: the test relies on
+        // remove_file having failed. Use symlink_metadata so we don't follow
+        // the loop ourselves.
+        std::fs::symlink_metadata(&body_path)
+            .expect("self-symlink must still be on disk after failed removal");
     }
 
     /// A successful startup scan must record the duration histogram with
