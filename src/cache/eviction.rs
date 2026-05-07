@@ -796,22 +796,49 @@ async fn try_evict_candidate(
         && (meta.fill_id != candidate.fill_id
             || meta.last_accessed_at != candidate.last_accessed_at)
     {
-        // Entry changed since scan — skip eviction but adjust
-        // current_size to reflect the actual on-disk size (the
-        // entry still exists, possibly at a different size).
-        let actual_body = tokio::fs::metadata(&candidate.body_path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let actual_meta = tokio::fs::metadata(&candidate.meta_path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let actual_size = actual_body + actual_meta;
-        // Replace the scanned size with the measured size.
-        *current_size = current_size
-            .saturating_sub(candidate.size)
-            .saturating_add(actual_size);
+        // Entry changed since scan — skip eviction but try to adjust
+        // current_size to reflect the actual on-disk size. Classify each
+        // stat: Some(len) on Ok, Some(0) on NotFound (file genuinely gone),
+        // None on any other I/O error (size unknown). Replace candidate.size
+        // ONLY when both stats are known. If either is unknown, leave
+        // current_size unchanged for this candidate — silently treating an
+        // unknown size as 0 would undercount the budget for the rest of the
+        // pass and could stop eviction early.
+        //
+        // This is local-budget hygiene only; reconciled global stats
+        // (`stats.total_bytes`, `stats.entry_count`) are not touched here.
+        let body_size: Option<u64> = match tokio::fs::metadata(&candidate.body_path).await {
+            Ok(m) => Some(m.len()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(0),
+            Err(e) => {
+                tracing::warn!(
+                    path = %candidate.body_path.display(),
+                    error_kind = ?e.kind(),
+                    "eviction: changed-entry remeasure of body stat failed, treating size as unknown"
+                );
+                None
+            }
+        };
+        let meta_size: Option<u64> = match tokio::fs::metadata(&candidate.meta_path).await {
+            Ok(m) => Some(m.len()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(0),
+            Err(e) => {
+                tracing::warn!(
+                    path = %candidate.meta_path.display(),
+                    error_kind = ?e.kind(),
+                    "eviction: changed-entry remeasure of meta stat failed, treating size as unknown"
+                );
+                None
+            }
+        };
+        if let (Some(b), Some(m)) = (body_size, meta_size) {
+            let actual_size = b + m;
+            *current_size = current_size
+                .saturating_sub(candidate.size)
+                .saturating_add(actual_size);
+        }
+        // else: leave current_size unchanged so candidate.size stays
+        // counted toward the budget — conservative on uncertainty.
         return;
     }
 
@@ -1609,6 +1636,99 @@ mod tests {
         assert!(
             err_msg.contains("stat orphan body"),
             "error should identify the failing operation, got: {err_msg}"
+        );
+    }
+
+    /// Locks in the regression behind this commit: when the changed-entry
+    /// remeasure branch in `try_evict_candidate` cannot stat one of the
+    /// candidate's files (here forced via a self-symlink at `body_path`,
+    /// which makes `metadata` follow the symlink and fail with ELOOP),
+    /// `current_size` must be left unchanged for this candidate.
+    ///
+    /// Under the old `unwrap_or(0)` implementation the body stat would
+    /// have collapsed to 0 and `current_size` would have been
+    /// `current_size - candidate.size + meta_size` — an undercount of the
+    /// budget that could stop the eviction loop early. The fix classifies
+    /// each stat as `Some(len) | Some(0) | None` and only adjusts when
+    /// both are `Some`.
+    ///
+    /// Reconciled global stats (`stats.total_bytes`, `stats.entry_count`)
+    /// must also be untouched on this branch — this is local-budget
+    /// hygiene only.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_changed_entry_remeasure_keeps_budget_when_stat_fails() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("objects").join("aa").join("bb");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // Write a meta whose fill_id differs from the candidate's, so the
+        // "entry changed since scan" branch is entered.
+        let now = Utc::now();
+        let on_disk_meta = CacheMeta {
+            bucket: "bucket".into(),
+            key: "k".into(),
+            etag: None,
+            last_modified: None,
+            content_type: None,
+            content_length: 0,
+            cache_written_at: now,
+            // Different from candidate.fill_id below — triggers the
+            // changed-entry branch.
+            fill_id: 99,
+            metadata_version: 0,
+            last_accessed_at: now,
+            hit_count: 0,
+            source_status: 200,
+            metadata: std::collections::HashMap::new(),
+            extra_headers: std::collections::HashMap::new(),
+            head_extra_headers: std::collections::HashMap::new(),
+            head_checksum_headers: std::collections::HashMap::new(),
+            checksum_mode_checked: false,
+            head_metadata_checked: false,
+            head_checksum_checked: false,
+        };
+        let meta_path = dir.join("hh.meta.json");
+        let body_path = dir.join("hh.body");
+        tokio::fs::write(&meta_path, serde_json::to_vec(&on_disk_meta).unwrap())
+            .await
+            .unwrap();
+        // Self-symlink: tokio::fs::metadata follows symlinks, so this
+        // returns ELOOP — a non-NotFound stat error.
+        std::os::unix::fs::symlink(&body_path, &body_path).unwrap();
+
+        let candidate = EvictionCandidate {
+            body_path: body_path.clone(),
+            meta_path: meta_path.clone(),
+            hash: "hh".into(),
+            // fill_id mismatch with on-disk meta triggers the changed branch.
+            fill_id: 0,
+            last_accessed_at: now,
+            size: 1500,
+        };
+
+        let stats = Arc::new(CacheStats::default());
+        stats.entry_count.store(7, Ordering::Relaxed);
+        stats.total_bytes.store(7777, Ordering::Relaxed);
+
+        let mut current_size: u64 = 1500;
+        let mut evicted: u64 = 0;
+        try_evict_candidate(&candidate, &mut current_size, &mut evicted, &stats, None).await;
+
+        // The regression: under unwrap_or(0) this would be
+        // 1500 - 1500 + meta_size ≈ a few hundred bytes. Under the fix it
+        // stays at 1500 because the body stat is unknown.
+        assert_eq!(
+            current_size, 1500,
+            "stat-failure path must not undercount current_size"
+        );
+        assert_eq!(evicted, 0, "changed-entry branch must not bump evicted");
+        // Reconciled global stats must be untouched on this branch.
+        let snap = stats.snapshot();
+        assert_eq!(snap.entry_count, 7, "global entry_count must be untouched");
+        assert_eq!(
+            snap.total_bytes, 7777,
+            "global total_bytes must be untouched"
         );
     }
 }
