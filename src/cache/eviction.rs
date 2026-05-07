@@ -635,9 +635,9 @@ async fn process_deferred_cleanups(
 /// clean up orphans, and **reconcile stats** to match filesystem reality.
 ///
 /// Hash directories (`objects/XX/YY/`) are processed in parallel using a
-/// `JoinSet` with a semaphore-based concurrency limit. Deferred cleanups
-/// that require per-key locks are processed sequentially after the parallel
-/// scan completes.
+/// streaming `JoinSet` pump that caps in-flight shard scans at
+/// `CACHE_HASH_DIR_SCAN_CONCURRENCY`. Deferred cleanups that require per-key
+/// locks are processed sequentially after the parallel scan completes.
 ///
 /// After this function returns, `stats.total_bytes` and `stats.entry_count`
 /// reflect the actual on-disk state (minus any concurrent mutations that raced

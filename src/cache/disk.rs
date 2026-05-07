@@ -336,8 +336,9 @@ impl DiskCache {
     /// `max_fill_id` safety net for older caches and consistency checks.
     ///
     /// Hash directories (`objects/XX/YY/`) are processed in parallel using a
-    /// `JoinSet` with a semaphore-based concurrency limit to avoid overwhelming
-    /// the filesystem on large caches.
+    /// streaming `JoinSet` pump that caps in-flight shard scans at
+    /// `CACHE_HASH_DIR_SCAN_CONCURRENCY` to avoid overwhelming the filesystem
+    /// (and the runtime task queue) on large caches.
     async fn scan_existing_stats(
         cache_dir: &std::path::Path,
     ) -> Result<StartupScanResult, ProxyError> {
