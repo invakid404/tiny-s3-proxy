@@ -272,25 +272,77 @@ async fn scan_hash_dir_for_eviction(
     Ok(result)
 }
 
-/// Try to remove a file. If removal fails with a non-NotFound error, return
-/// the file's size so the caller can add it back to the scan totals and keep
-/// accounting accurate.
+/// Try to remove a file. Returns the bytes the caller should attribute as
+/// "still on disk" for this path:
+///   - 0 when the remove succeeded or returned NotFound (file is gone).
+///   - measured size when remove failed but the post-remove stat succeeded.
+///   - pre-stat baseline when remove failed AND post-remove stat also failed
+///     (the bytes are still on disk; their size is unknown right now but was
+///     known just before the remove attempt).
+///
+/// Captures a pre-stat baseline before issuing the remove so a transient
+/// stat failure during cleanup cannot silently collapse the unreclaimed
+/// bytes to 0 — that would undercount `scan_total_bytes` and let the cache
+/// stay over `max_bytes` until the next pass that doesn't hit the stat
+/// failure.
 async fn remove_file_or_reclaim_size(path: &std::path::Path) -> u64 {
+    let pre_size = pre_stat_size(path).await;
+
     match tokio::fs::remove_file(path).await {
         Ok(()) => 0,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(e) => {
-            let size = tokio::fs::metadata(path)
-                .await
-                .map(|m| m.len())
-                .unwrap_or(0);
+        Err(e) => measure_unreclaimed_after_failed_remove(path, pre_size, &e).await,
+    }
+}
+
+/// Stat a path and return its size, distinguishing NotFound (file is gone:
+/// `Some(0)`) from real I/O errors (size unknown: `None`). Used to capture a
+/// pre-attempt baseline so callers don't silently treat a later stat failure
+/// as "0 bytes remaining".
+async fn pre_stat_size(path: &std::path::Path) -> Option<u64> {
+    match tokio::fs::metadata(path).await {
+        Ok(m) => Some(m.len()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(0),
+        Err(_) => None,
+    }
+}
+
+/// After a remove_file call has failed with a non-NotFound error, measure
+/// how many bytes still occupy disk for this path.
+///
+/// Tries a post-remove stat first; on stat failure falls back to `pre_known`
+/// (typically a pre-remove stat result captured right before the remove).
+/// Returns 0 only when the post-remove stat is NotFound (file vanished
+/// between the remove and the stat) or when both the post-stat AND
+/// `pre_known` are unavailable. Never silently treats an uncertain state as
+/// "fully reclaimed".
+async fn measure_unreclaimed_after_failed_remove(
+    path: &std::path::Path,
+    pre_known: Option<u64>,
+    remove_err: &std::io::Error,
+) -> u64 {
+    match tokio::fs::metadata(path).await {
+        Ok(m) => {
             tracing::warn!(
                 path = %path.display(),
-                error = %e,
-                size,
+                error = %remove_err,
+                size = m.len(),
                 "failed to remove cache file, counting bytes as unreclaimed"
             );
-            size
+            m.len()
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => {
+            let fallback = pre_known.unwrap_or(0);
+            tracing::warn!(
+                path = %path.display(),
+                remove_error = %remove_err,
+                stat_error_kind = ?e.kind(),
+                ?pre_known,
+                fallback,
+                "failed to remove cache file and post-stat unavailable, falling back to pre-stat baseline"
+            );
+            fallback
         }
     }
 }
@@ -1391,6 +1443,81 @@ mod tests {
         assert_eq!(
             snap.total_bytes, 1500,
             "stat-failure path must not decrement total_bytes"
+        );
+    }
+
+    /// Common-case coverage for `measure_unreclaimed_after_failed_remove`:
+    /// when the post-remove stat succeeds, the measured size wins over any
+    /// `pre_known` baseline.
+    #[tokio::test]
+    async fn test_measure_unreclaimed_uses_post_stat_when_available() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("file");
+        tokio::fs::write(&path, vec![0u8; 1500]).await.unwrap();
+
+        let remove_err =
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "synthetic test error");
+        let result =
+            measure_unreclaimed_after_failed_remove(&path, Some(99_999), &remove_err).await;
+        assert_eq!(
+            result, 1500,
+            "post-stat measurement should win over pre_known when it succeeds"
+        );
+    }
+
+    /// Common-case coverage: when the post-remove stat returns NotFound
+    /// (the file vanished between the remove and the stat), return 0
+    /// regardless of `pre_known` — the bytes are genuinely off disk.
+    #[tokio::test]
+    async fn test_measure_unreclaimed_returns_zero_on_post_stat_not_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("never-existed");
+
+        let remove_err =
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "synthetic test error");
+        let result =
+            measure_unreclaimed_after_failed_remove(&path, Some(99_999), &remove_err).await;
+        assert_eq!(
+            result, 0,
+            "NotFound post-stat means the file is genuinely gone"
+        );
+    }
+
+    /// Locks in the regression behind this commit: when both `remove_file`
+    /// AND the follow-up `metadata` fail with non-NotFound errors (here
+    /// forced via parent dir mode 0o000: no read, no exec, no write — path
+    /// traversal fails), `measure_unreclaimed_after_failed_remove` must fall
+    /// back to the pre-known baseline rather than silently returning 0.
+    ///
+    /// Under the old `unwrap_or(0)` implementation the function would have
+    /// returned 0, the caller's `*scan_total_bytes += 0` would have left
+    /// orphan/corrupt bytes uncounted, and the eviction loop's budget would
+    /// have undercounted disk usage indefinitely (until a future scan didn't
+    /// hit the stat failure). The new code uses `pre_known.unwrap_or(0)` so
+    /// the caller-supplied baseline survives the stat failure.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_measure_unreclaimed_falls_back_to_pre_known_when_stat_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("locked");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("orphan.body");
+        tokio::fs::write(&path, vec![0u8; 1500]).await.unwrap();
+
+        // Block traversal so the post-remove stat fails with EACCES.
+        let _restore = ChmodOnDrop::new(&dir);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let remove_err =
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "synthetic test error");
+        // Caller knows the size from a prior observation (e.g. pre-stat).
+        let result = measure_unreclaimed_after_failed_remove(&path, Some(1500), &remove_err).await;
+
+        assert_eq!(
+            result, 1500,
+            "stat failure must fall back to pre_known size, not silently zero"
         );
     }
 }
