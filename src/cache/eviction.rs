@@ -291,23 +291,29 @@ async fn scan_hash_dir_for_eviction(
 
 /// Try to remove a file. Returns the bytes the caller should attribute as
 /// "still on disk" for this path:
-///   - 0 when the remove succeeded or returned NotFound (file is gone).
-///   - measured size when remove failed but the post-remove stat succeeded.
-///   - pre-stat baseline when remove failed AND post-remove stat also failed
-///     (the bytes are still on disk; their size is unknown right now but was
-///     known just before the remove attempt).
+///   - `Ok(0)` when the remove succeeded or returned NotFound (file is gone).
+///   - `Ok(measured)` when remove failed but the post-remove stat succeeded.
+///   - `Ok(pre)` when remove failed, post-remove stat failed, and a pre-stat
+///     baseline was captured (bytes are still on disk; size known from just
+///     before the remove attempt).
+///   - `Err` when remove failed AND both pre- and post-remove stats failed
+///     with hard I/O errors — the remaining size is genuinely unknown and
+///     silently zeroing it would undercount `scan_total_bytes`. The caller
+///     aborts the pass; the next eviction tick retries.
 ///
 /// Captures a pre-stat baseline before issuing the remove so a transient
 /// stat failure during cleanup cannot silently collapse the unreclaimed
 /// bytes to 0 — that would undercount `scan_total_bytes` and let the cache
 /// stay over `max_bytes` until the next pass that doesn't hit the stat
 /// failure.
-async fn remove_file_or_reclaim_size(path: &std::path::Path) -> u64 {
+async fn remove_file_or_reclaim_size(
+    path: &std::path::Path,
+) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
     let pre_size = pre_stat_size(path).await;
 
     match tokio::fs::remove_file(path).await {
-        Ok(()) => 0,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Ok(()) => Ok(0),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
         Err(e) => measure_unreclaimed_after_failed_remove(path, pre_size, &e).await,
     }
 }
@@ -329,15 +335,17 @@ async fn pre_stat_size(path: &std::path::Path) -> Option<u64> {
 ///
 /// Tries a post-remove stat first; on stat failure falls back to `pre_known`
 /// (typically a pre-remove stat result captured right before the remove).
-/// Returns 0 only when the post-remove stat is NotFound (file vanished
-/// between the remove and the stat) or when both the post-stat AND
-/// `pre_known` are unavailable. Never silently treats an uncertain state as
+/// Returns `Ok(0)` only when the post-remove stat is NotFound (the file
+/// vanished between the remove and the stat). Returns `Err` when the
+/// post-remove stat fails with a non-NotFound error AND no pre-stat baseline
+/// is available — silently zeroing that case would let unreclaimed bytes drop
+/// out of `scan_total_bytes`. Never silently treats an uncertain state as
 /// "fully reclaimed".
 async fn measure_unreclaimed_after_failed_remove(
     path: &std::path::Path,
     pre_known: Option<u64>,
     remove_err: &std::io::Error,
-) -> u64 {
+) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
     match tokio::fs::metadata(path).await {
         Ok(m) => {
             tracing::warn!(
@@ -346,32 +354,48 @@ async fn measure_unreclaimed_after_failed_remove(
                 size = m.len(),
                 "failed to remove cache file, counting bytes as unreclaimed"
             );
-            m.len()
+            Ok(m.len())
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(e) => {
-            let fallback = pre_known.unwrap_or(0);
-            tracing::warn!(
-                path = %path.display(),
-                remove_error = %remove_err,
-                stat_error_kind = ?e.kind(),
-                ?pre_known,
-                fallback,
-                "failed to remove cache file and post-stat unavailable, falling back to pre-stat baseline"
-            );
-            fallback
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => match pre_known {
+            Some(pre) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    remove_error = %remove_err,
+                    stat_error_kind = ?e.kind(),
+                    pre,
+                    "failed to remove cache file and post-stat unavailable, falling back to pre-stat baseline"
+                );
+                Ok(pre)
+            }
+            None => {
+                tracing::warn!(
+                    path = %path.display(),
+                    remove_error = %remove_err,
+                    stat_error_kind = ?e.kind(),
+                    "failed to remove cache file with no pre-stat baseline AND post-stat failed — aborting eviction pass"
+                );
+                Err(boxed_io_error(
+                    "stat after failed remove during eviction cleanup",
+                    path,
+                    e,
+                ))
+            }
+        },
     }
 }
 
 /// Remove all three entry files, returning the total bytes that could not be
-/// reclaimed (so the caller can keep accounting accurate).
-async fn remove_entry_files(paths: &EntryPaths) -> u64 {
+/// reclaimed (so the caller can keep accounting accurate). Propagates the
+/// `Err` from `remove_file_or_reclaim_size` when remaining bytes are unknown.
+async fn remove_entry_files(
+    paths: &EntryPaths,
+) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
     let mut unreclaimed = 0u64;
-    unreclaimed += remove_file_or_reclaim_size(&paths.meta_path).await;
-    unreclaimed += remove_file_or_reclaim_size(&paths.body_path).await;
-    unreclaimed += remove_file_or_reclaim_size(&paths.poison_path).await;
-    unreclaimed
+    unreclaimed += remove_file_or_reclaim_size(&paths.meta_path).await?;
+    unreclaimed += remove_file_or_reclaim_size(&paths.body_path).await?;
+    unreclaimed += remove_file_or_reclaim_size(&paths.poison_path).await?;
+    Ok(unreclaimed)
 }
 
 /// Outcome of attempting to recover a cache entry under lock.
@@ -450,7 +474,7 @@ async fn process_deferred_cleanups(
                     .join(format!("{}.meta.json", hash));
                 match tokio::fs::try_exists(&meta_path).await {
                     Ok(false) => {
-                        *scan_total_bytes += remove_file_or_reclaim_size(&body_path).await;
+                        *scan_total_bytes += remove_file_or_reclaim_size(&body_path).await?;
                         tracing::debug!(path = %body_path.display(), "removed orphan body file");
                     }
                     Ok(true) => {} // meta appeared (concurrent fill), not an orphan
@@ -509,7 +533,7 @@ async fn process_deferred_cleanups(
                     .join(format!("{}.meta.json", hash));
                 match tokio::fs::try_exists(&meta_path).await {
                     Ok(false) => {
-                        *scan_total_bytes += remove_file_or_reclaim_size(&poison_path).await;
+                        *scan_total_bytes += remove_file_or_reclaim_size(&poison_path).await?;
                         tracing::debug!(path = %poison_path.display(), "removed orphan poison marker");
                     }
                     Ok(true) => {} // meta appeared, poison is valid
@@ -535,8 +559,9 @@ async fn process_deferred_cleanups(
                     RecoverOutcome::MissingBody => {
                         // Body gone and meta was already proven corrupt —
                         // clean up the leftover meta and poison.
-                        *scan_total_bytes += remove_file_or_reclaim_size(&paths.meta_path).await;
-                        *scan_total_bytes += remove_file_or_reclaim_size(&paths.poison_path).await;
+                        *scan_total_bytes += remove_file_or_reclaim_size(&paths.meta_path).await?;
+                        *scan_total_bytes +=
+                            remove_file_or_reclaim_size(&paths.poison_path).await?;
                         tracing::debug!(path = %paths.meta_path.display(), "removed corrupt entry with missing body");
                     }
                     RecoverOutcome::BodyStatError(e) => {
@@ -555,13 +580,13 @@ async fn process_deferred_cleanups(
                     }
                     RecoverOutcome::MetaParseError(e) => {
                         tracing::warn!(path = %paths.meta_path.display(), error = %e, "corrupt entry meta still unparseable under lock, removing");
-                        *scan_total_bytes += remove_entry_files(&paths).await;
+                        *scan_total_bytes += remove_entry_files(&paths).await?;
                     }
                 }
             }
             DeferredCleanup::MalformedHash(paths) => {
                 let _guard = acquire_meta_lock(disk_cache, &paths.hash).await;
-                *scan_total_bytes += remove_entry_files(&paths).await;
+                *scan_total_bytes += remove_entry_files(&paths).await?;
                 tracing::warn!(
                     path = %paths.meta_path.display(),
                     "removed cache entry with malformed filename stem"
@@ -578,8 +603,9 @@ async fn process_deferred_cleanups(
                     }
                     RecoverOutcome::MissingBody => {
                         // Still missing — clean up the leftover meta and poison.
-                        *scan_total_bytes += remove_file_or_reclaim_size(&paths.meta_path).await;
-                        *scan_total_bytes += remove_file_or_reclaim_size(&paths.poison_path).await;
+                        *scan_total_bytes += remove_file_or_reclaim_size(&paths.meta_path).await?;
+                        *scan_total_bytes +=
+                            remove_file_or_reclaim_size(&paths.poison_path).await?;
                     }
                     RecoverOutcome::BodyStatError(e) => {
                         return Err(boxed_io_error(
@@ -597,7 +623,7 @@ async fn process_deferred_cleanups(
                     }
                     RecoverOutcome::MetaParseError(_) => {
                         // Body missing and meta is broken — clean up everything.
-                        *scan_total_bytes += remove_entry_files(&paths).await;
+                        *scan_total_bytes += remove_entry_files(&paths).await?;
                     }
                 }
             }
@@ -1580,8 +1606,9 @@ mod tests {
 
         let remove_err =
             std::io::Error::new(std::io::ErrorKind::PermissionDenied, "synthetic test error");
-        let result =
-            measure_unreclaimed_after_failed_remove(&path, Some(99_999), &remove_err).await;
+        let result = measure_unreclaimed_after_failed_remove(&path, Some(99_999), &remove_err)
+            .await
+            .unwrap();
         assert_eq!(
             result, 1500,
             "post-stat measurement should win over pre_known when it succeeds"
@@ -1598,8 +1625,9 @@ mod tests {
 
         let remove_err =
             std::io::Error::new(std::io::ErrorKind::PermissionDenied, "synthetic test error");
-        let result =
-            measure_unreclaimed_after_failed_remove(&path, Some(99_999), &remove_err).await;
+        let result = measure_unreclaimed_after_failed_remove(&path, Some(99_999), &remove_err)
+            .await
+            .unwrap();
         assert_eq!(
             result, 0,
             "NotFound post-stat means the file is genuinely gone"
@@ -1616,8 +1644,10 @@ mod tests {
     /// returned 0, the caller's `*scan_total_bytes += 0` would have left
     /// orphan/corrupt bytes uncounted, and the eviction loop's budget would
     /// have undercounted disk usage indefinitely (until a future scan didn't
-    /// hit the stat failure). The new code uses `pre_known.unwrap_or(0)` so
-    /// the caller-supplied baseline survives the stat failure.
+    /// hit the stat failure). The helper now matches on `pre_known`:
+    /// `Some(pre) => Ok(pre)` so the caller-supplied baseline survives the
+    /// stat failure, and `None => Err(...)` so the residual silent-zero
+    /// case aborts the pass instead of undercounting.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_measure_unreclaimed_falls_back_to_pre_known_when_stat_fails() {
@@ -1636,7 +1666,9 @@ mod tests {
         let remove_err =
             std::io::Error::new(std::io::ErrorKind::PermissionDenied, "synthetic test error");
         // Caller knows the size from a prior observation (e.g. pre-stat).
-        let result = measure_unreclaimed_after_failed_remove(&path, Some(1500), &remove_err).await;
+        let result = measure_unreclaimed_after_failed_remove(&path, Some(1500), &remove_err)
+            .await
+            .unwrap();
 
         assert_eq!(
             result, 1500,
@@ -1981,6 +2013,107 @@ mod tests {
         assert_eq!(
             evicted, 1,
             "eviction should be counted on parse-error cleanup"
+        );
+    }
+
+    /// Closes the residual silent-zero hole in `remove_file_or_reclaim_size`:
+    /// when the internal pre-stat fails, the remove fails, AND the post-stat
+    /// also fails (here forced via parent dir mode 0o000 — every probe hits
+    /// EACCES), the helper must return `Err` so callers abort the pass
+    /// rather than silently treating the unreclaimed bytes as zero.
+    ///
+    /// Under the prior `(path) -> u64` shape this case fell through to
+    /// `pre_known.unwrap_or(0) = 0`, undercounting `scan_total_bytes` until
+    /// a future pass that didn't hit the stat failure.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_remove_file_or_reclaim_size_errs_when_remove_and_both_stats_fail() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("locked");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("body");
+        tokio::fs::write(&path, vec![0u8; 1500]).await.unwrap();
+
+        // Block traversal so pre-stat, remove, and post-stat all fail with
+        // EACCES — the residual silent-zero case.
+        let _restore = ChmodOnDrop::new(&dir);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = remove_file_or_reclaim_size(&path).await;
+
+        let err = result.expect_err(
+            "remove_file_or_reclaim_size must Err when remove fails AND no size is knowable",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("stat after failed remove"),
+            "error should identify the failing operation, got: {msg}"
+        );
+    }
+
+    /// Closes the residual silent-zero hole at the call-site level:
+    /// `process_deferred_cleanups` must propagate the `Err` from
+    /// `remove_entry_files` when the parent directory is locked down so all
+    /// child file ops fail. `MalformedHash` is the cleanest variant for
+    /// this — it goes through `remove_entry_files` directly, with no
+    /// `try_exists` short-circuit ahead of it.
+    ///
+    /// Under the prior `(path) -> u64` shape this returned `Ok(())` with
+    /// `scan_total_bytes` left at 0 — silent zero, reconciliation overwrote
+    /// stats with an undercounted total, and the cache could stay over
+    /// `max_bytes` indefinitely. With the fix, the `Err` aborts the pass
+    /// before stats are touched and the next tick retries.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_malformed_hash_cleanup_propagates_unknown_remaining_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("objects").join("aa").join("bb");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let meta_path = dir.join("hh.meta.json");
+        let body_path = dir.join("hh.body");
+        let poison_path = dir.join("hh.poisoned");
+        tokio::fs::write(&meta_path, b"{}").await.unwrap();
+        tokio::fs::write(&body_path, vec![0u8; 1500]).await.unwrap();
+        tokio::fs::write(&poison_path, b"").await.unwrap();
+
+        // Block traversal: pre-stat, remove, and post-stat all fail with
+        // EACCES for every child path.
+        let _restore = ChmodOnDrop::new(&dir);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let cleanup = DeferredCleanup::MalformedHash(EntryPaths {
+            meta_path,
+            body_path,
+            poison_path,
+            hash: "hh".into(),
+        });
+
+        let mut candidates = Vec::new();
+        let mut total_bytes = 0u64;
+        let mut entry_count = 0u64;
+        let result = process_deferred_cleanups(
+            vec![cleanup],
+            None,
+            &mut candidates,
+            &mut total_bytes,
+            &mut entry_count,
+        )
+        .await;
+
+        // Bug behavior: result.is_ok() && total_bytes == 0 — silent zero
+        // would propagate to reconciliation and undercount the budget.
+        // Fix behavior: result.is_err() — abort and let the next pass retry.
+        let err = result.expect_err(
+            "MalformedHash cleanup must Err when remaining bytes are unknown, not silently zero",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("stat after failed remove"),
+            "error should identify the failing operation, got: {msg}"
         );
     }
 }
