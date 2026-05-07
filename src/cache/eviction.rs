@@ -8,6 +8,117 @@ use super::CacheStats;
 use super::layout::collect_hash_dirs_strict;
 use super::scan::{CACHE_HASH_DIR_SCAN_CONCURRENCY, bounded_parallel_scan};
 
+/// Per-pass observability fields shared between the success summary log and
+/// the `cache_unreclaimed_bytes` gauge. Populated incrementally as the pass
+/// progresses; consumed at the end of `run_eviction_pass_inner`.
+struct EvictionPassSummary {
+    hash_dirs: usize,
+    candidate_count: u64,
+    candidate_bytes: u64,
+    deferred_cleanup_count: u64,
+    deferred_cleanup_failed: u64,
+    scan_total_bytes: u64,
+    max_bytes: u64,
+    over_budget_bytes_before: u64,
+    evicted: u64,
+    final_size_bytes: u64,
+    over_budget_bytes_after: u64,
+}
+
+/// Finite failure-classification enum used as the `reason` label for
+/// `s3proxy_cache_scan_failed_total{phase="eviction"}`. Each error-returning
+/// site in the eviction scan path constructs an [`EvictionScanError`] with
+/// the matching variant; the label is recorded directly via
+/// [`ScanFailureReason::as_label`] without any string parsing. Keeping the
+/// classification typed means a renamed error message in an unrelated PR
+/// cannot silently degrade the metric to `reason="other"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScanFailureReason {
+    /// `tokio::fs::try_exists(objects_dir)` failed before any walk began.
+    ObjectsDirProbe,
+    /// Strict layout walk over `objects/XX/YY/` returned an I/O error.
+    HashDirWalk,
+    /// Per-shard scan inside `scan_hash_dir_for_eviction` failed (read_dir,
+    /// next_entry, metadata, or non-UTF-8 filename).
+    HashDirScan,
+    /// `bounded_parallel_scan` reported a `JoinError` (a shard task panicked).
+    Join,
+    /// `process_deferred_cleanups` skipped, partially failed, or aborted.
+    DeferredCleanup,
+    /// Reserved for unforeseen error paths. Should stay empty in practice
+    /// because every existing return site maps explicitly above.
+    #[allow(dead_code)]
+    Other,
+}
+
+impl ScanFailureReason {
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::ObjectsDirProbe => "objects_dir_probe",
+            Self::HashDirWalk => "hash_dir_walk",
+            Self::HashDirScan => "hash_dir_scan",
+            Self::Join => "join",
+            Self::DeferredCleanup => "deferred_cleanup",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Tagged eviction-scan error: the reason variant carries the metric label
+/// directly so the failure-path metric can be emitted without inspecting the
+/// inner error's display string.
+#[derive(Debug)]
+struct EvictionScanError {
+    reason: ScanFailureReason,
+    source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+impl EvictionScanError {
+    fn new(
+        reason: ScanFailureReason,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Self {
+        Self {
+            reason,
+            source: source.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for EvictionScanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "eviction scan failure ({}): {}",
+            self.reason.as_label(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for EvictionScanError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.source)
+    }
+}
+
+/// Construct an [`EvictionScanError`] from an `io::Error` while preserving
+/// the operation/path context that the existing log lines and tests expect.
+fn eviction_io_error(
+    reason: ScanFailureReason,
+    operation: &'static str,
+    path: &std::path::Path,
+    error: std::io::Error,
+) -> EvictionScanError {
+    EvictionScanError::new(
+        reason,
+        std::io::Error::new(
+            error.kind(),
+            format!("{operation} {}: {error}", path.display()),
+        ),
+    )
+}
+
 /// Entry info for eviction sorting.
 #[derive(Debug)]
 struct EvictionCandidate {
@@ -114,9 +225,11 @@ fn boxed_io_error(
 /// Scan a single hash directory and return candidates, stats, and deferred
 /// cleanups that require per-key locks (which cannot be acquired inside a
 /// spawned task because `DiskCache` is not `Send`-safe across spawn boundaries).
-async fn scan_hash_dir_for_eviction(
-    d2_path: PathBuf,
-) -> Result<DirScanResult, Box<dyn std::error::Error + Send + Sync>> {
+///
+/// All error returns are tagged with [`ScanFailureReason::HashDirScan`] so
+/// the call-site at `run_eviction_pass_inner` can record the correct metric
+/// label without parsing the error display string.
+async fn scan_hash_dir_for_eviction(d2_path: PathBuf) -> Result<DirScanResult, EvictionScanError> {
     let mut result = DirScanResult {
         candidates: Vec::new(),
         total_bytes: 0,
@@ -127,14 +240,28 @@ async fn scan_hash_dir_for_eviction(
     let mut file_entries = match tokio::fs::read_dir(&d2_path).await {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(result),
-        Err(e) => return Err(Box::new(e)),
+        Err(e) => {
+            return Err(eviction_io_error(
+                ScanFailureReason::HashDirScan,
+                "read hash shard dir",
+                &d2_path,
+                e,
+            ));
+        }
     };
 
     loop {
         let file_entry = match file_entries.next_entry().await {
             Ok(Some(entry)) => entry,
             Ok(None) => break,
-            Err(e) => return Err(Box::new(e)),
+            Err(e) => {
+                return Err(eviction_io_error(
+                    ScanFailureReason::HashDirScan,
+                    "iterate hash shard dir",
+                    &d2_path,
+                    e,
+                ));
+            }
         };
         let file_path = file_entry.path();
         // The cache writer only emits UTF-8 hex-hash filenames + ASCII
@@ -148,7 +275,8 @@ async fn scan_hash_dir_for_eviction(
         let file_name = match file_path.file_name().and_then(|n| n.to_str()) {
             Some(n) => n.to_string(),
             None => {
-                return Err(boxed_io_error(
+                return Err(eviction_io_error(
+                    ScanFailureReason::HashDirScan,
                     "non-UTF-8 filename inside cache hash shard",
                     &file_path,
                     std::io::Error::new(
@@ -174,7 +302,14 @@ async fn scan_hash_dir_for_eviction(
                     }
                     Ok(true) => {} // meta exists, not an orphan
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // race: dir vanished
-                    Err(e) => return Err(boxed_io_error("probe orphan metadata", &meta_path, e)),
+                    Err(e) => {
+                        return Err(eviction_io_error(
+                            ScanFailureReason::HashDirScan,
+                            "probe orphan metadata",
+                            &meta_path,
+                            e,
+                        ));
+                    }
                 }
             } else if file_name.ends_with(".poisoned") {
                 let hash = file_name.trim_end_matches(".poisoned").to_string();
@@ -190,7 +325,14 @@ async fn scan_hash_dir_for_eviction(
                     }
                     Ok(true) => {} // meta exists, not an orphan
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // race
-                    Err(e) => return Err(boxed_io_error("probe orphan metadata", &meta_path, e)),
+                    Err(e) => {
+                        return Err(eviction_io_error(
+                            ScanFailureReason::HashDirScan,
+                            "probe orphan metadata",
+                            &meta_path,
+                            e,
+                        ));
+                    }
                 }
             }
             continue;
@@ -202,7 +344,8 @@ async fn scan_hash_dir_for_eviction(
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue, // race: entry removed
             Err(e) => {
-                return Err(boxed_io_error(
+                return Err(eviction_io_error(
+                    ScanFailureReason::HashDirScan,
                     "read metadata during eviction scan",
                     &file_path,
                     e,
@@ -260,7 +403,8 @@ async fn scan_hash_dir_for_eviction(
                 continue;
             }
             Err(e) => {
-                return Err(boxed_io_error(
+                return Err(eviction_io_error(
+                    ScanFailureReason::HashDirScan,
                     "stat body during eviction scan",
                     &body_path,
                     e,
@@ -454,14 +598,57 @@ async fn acquire_meta_lock(
     }
 }
 
+/// Bump the kind-labeled `s3proxy_cache_deferred_cleanup_failed_total` counter
+/// and increment the per-pass failure count. Used for skip / partial-failure /
+/// abort branches inside `process_deferred_cleanups`.
+fn record_deferred_cleanup_failure(failed: &mut u64, kind: &'static str) {
+    *failed += 1;
+    metrics::counter!(
+        "s3proxy_cache_deferred_cleanup_failed_total",
+        "kind" => kind,
+    )
+    .increment(1);
+}
+
+/// Wrap a `Box<dyn Error>` returned by a per-file helper as an
+/// [`EvictionScanError`] tagged with [`ScanFailureReason::DeferredCleanup`]
+/// after bumping the kind-labeled counter for the originating cleanup.
+fn deferred_cleanup_err(
+    failed: &mut u64,
+    kind: &'static str,
+    source: Box<dyn std::error::Error + Send + Sync>,
+) -> EvictionScanError {
+    record_deferred_cleanup_failure(failed, kind);
+    EvictionScanError::new(ScanFailureReason::DeferredCleanup, source)
+}
+
+/// Record an unreclaimed-byte tally from a per-file removal helper. Adds the
+/// bytes to `scan_total_bytes` and flips `partial` to true when the helper
+/// signaled a partial failure (`Ok(>0)` per the `remove_file_or_reclaim_size`
+/// /`remove_entry_files` contract: zero means gone, nonzero means still on
+/// disk). Each cleanup branch records the kind-labeled counter at most once
+/// after all of its removals, regardless of how many of them returned bytes.
+fn account_unreclaimed(scan_total_bytes: &mut u64, partial: &mut bool, unreclaimed: u64) {
+    *scan_total_bytes += unreclaimed;
+    if unreclaimed > 0 {
+        *partial = true;
+    }
+}
+
 /// Process deferred cleanups that require per-key lock coordination.
+///
+/// `deferred_cleanup_failed` is incremented (and the corresponding
+/// kind-labeled counter is bumped) on every branch that skips, partially
+/// fails, or aborts a cleanup. Successful cleanups do not bump it. Every
+/// `Err` return is tagged with [`ScanFailureReason::DeferredCleanup`].
 async fn process_deferred_cleanups(
     cleanups: Vec<DeferredCleanup>,
     disk_cache: Option<&super::DiskCache>,
     candidates: &mut Vec<EvictionCandidate>,
     scan_total_bytes: &mut u64,
     scan_entry_count: &mut u64,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    deferred_cleanup_failed: &mut u64,
+) -> Result<(), EvictionScanError> {
     for cleanup in cleanups {
         match cleanup {
             DeferredCleanup::OrphanBody { body_path, hash } => {
@@ -472,7 +659,15 @@ async fn process_deferred_cleanups(
                     .join(format!("{}.meta.json", hash));
                 match tokio::fs::try_exists(&meta_path).await {
                     Ok(false) => {
-                        *scan_total_bytes += remove_file_or_reclaim_size(&body_path).await?;
+                        let unreclaimed =
+                            remove_file_or_reclaim_size(&body_path).await.map_err(|e| {
+                                deferred_cleanup_err(deferred_cleanup_failed, "orphan_body", e)
+                            })?;
+                        let mut partial = false;
+                        account_unreclaimed(scan_total_bytes, &mut partial, unreclaimed);
+                        if partial {
+                            record_deferred_cleanup_failure(deferred_cleanup_failed, "orphan_body");
+                        }
                         tracing::debug!(path = %body_path.display(), "removed orphan body file");
                     }
                     Ok(true) => {} // meta appeared (concurrent fill), not an orphan
@@ -484,6 +679,10 @@ async fn process_deferred_cleanups(
                         match tokio::fs::metadata(&body_path).await {
                             Ok(m) => {
                                 *scan_total_bytes += m.len();
+                                record_deferred_cleanup_failure(
+                                    deferred_cleanup_failed,
+                                    "orphan_body",
+                                );
                                 tracing::warn!(
                                     path = %meta_path.display(),
                                     try_exists_error = %e,
@@ -507,13 +706,18 @@ async fn process_deferred_cleanups(
                                 // (e.g., permanently inaccessible directory)
                                 // surfaces as a logged eviction error instead
                                 // of accumulating undercounted disk usage.
+                                record_deferred_cleanup_failure(
+                                    deferred_cleanup_failed,
+                                    "orphan_body",
+                                );
                                 tracing::warn!(
                                     path = %body_path.display(),
                                     try_exists_error = %e,
                                     stat_error_kind = ?e2.kind(),
                                     "failed to recheck orphan body status AND stat the body — aborting eviction pass"
                                 );
-                                return Err(boxed_io_error(
+                                return Err(eviction_io_error(
+                                    ScanFailureReason::DeferredCleanup,
                                     "stat orphan body during locked eviction cleanup",
                                     &body_path,
                                     e2,
@@ -531,11 +735,29 @@ async fn process_deferred_cleanups(
                     .join(format!("{}.meta.json", hash));
                 match tokio::fs::try_exists(&meta_path).await {
                     Ok(false) => {
-                        *scan_total_bytes += remove_file_or_reclaim_size(&poison_path).await?;
+                        let unreclaimed =
+                            remove_file_or_reclaim_size(&poison_path)
+                                .await
+                                .map_err(|e| {
+                                    deferred_cleanup_err(
+                                        deferred_cleanup_failed,
+                                        "orphan_poison",
+                                        e,
+                                    )
+                                })?;
+                        let mut partial = false;
+                        account_unreclaimed(scan_total_bytes, &mut partial, unreclaimed);
+                        if partial {
+                            record_deferred_cleanup_failure(
+                                deferred_cleanup_failed,
+                                "orphan_poison",
+                            );
+                        }
                         tracing::debug!(path = %poison_path.display(), "removed orphan poison marker");
                     }
                     Ok(true) => {} // meta appeared, poison is valid
                     Err(e) => {
+                        record_deferred_cleanup_failure(deferred_cleanup_failed, "orphan_poison");
                         tracing::warn!(
                             path = %meta_path.display(),
                             error = %e,
@@ -556,21 +778,43 @@ async fn process_deferred_cleanups(
                     }
                     RecoverOutcome::MissingBody => {
                         // Body gone and meta was already proven corrupt —
-                        // clean up the leftover meta and poison.
-                        *scan_total_bytes += remove_file_or_reclaim_size(&paths.meta_path).await?;
-                        *scan_total_bytes +=
-                            remove_file_or_reclaim_size(&paths.poison_path).await?;
+                        // clean up the leftover meta and poison. The kind
+                        // counter is bumped at most once for this cleanup
+                        // even if both removals leave bytes on disk.
+                        let mut partial = false;
+                        let meta_unreclaimed = remove_file_or_reclaim_size(&paths.meta_path)
+                            .await
+                            .map_err(|e| {
+                                deferred_cleanup_err(deferred_cleanup_failed, "corrupt_entry", e)
+                            })?;
+                        account_unreclaimed(scan_total_bytes, &mut partial, meta_unreclaimed);
+                        let poison_unreclaimed = remove_file_or_reclaim_size(&paths.poison_path)
+                            .await
+                            .map_err(|e| {
+                                deferred_cleanup_err(deferred_cleanup_failed, "corrupt_entry", e)
+                            })?;
+                        account_unreclaimed(scan_total_bytes, &mut partial, poison_unreclaimed);
+                        if partial {
+                            record_deferred_cleanup_failure(
+                                deferred_cleanup_failed,
+                                "corrupt_entry",
+                            );
+                        }
                         tracing::debug!(path = %paths.meta_path.display(), "removed corrupt entry with missing body");
                     }
                     RecoverOutcome::BodyStatError(e) => {
-                        return Err(boxed_io_error(
+                        record_deferred_cleanup_failure(deferred_cleanup_failed, "corrupt_entry");
+                        return Err(eviction_io_error(
+                            ScanFailureReason::DeferredCleanup,
                             "stat body during locked eviction cleanup",
                             &paths.body_path,
                             e,
                         ));
                     }
                     RecoverOutcome::MetaReadError(e) => {
-                        return Err(boxed_io_error(
+                        record_deferred_cleanup_failure(deferred_cleanup_failed, "corrupt_entry");
+                        return Err(eviction_io_error(
+                            ScanFailureReason::DeferredCleanup,
                             "read metadata during locked eviction cleanup",
                             &paths.meta_path,
                             e,
@@ -578,13 +822,30 @@ async fn process_deferred_cleanups(
                     }
                     RecoverOutcome::MetaParseError(e) => {
                         tracing::warn!(path = %paths.meta_path.display(), error = %e, "corrupt entry meta still unparseable under lock, removing");
-                        *scan_total_bytes += remove_entry_files(&paths).await?;
+                        let unreclaimed = remove_entry_files(&paths).await.map_err(|e| {
+                            deferred_cleanup_err(deferred_cleanup_failed, "corrupt_entry", e)
+                        })?;
+                        let mut partial = false;
+                        account_unreclaimed(scan_total_bytes, &mut partial, unreclaimed);
+                        if partial {
+                            record_deferred_cleanup_failure(
+                                deferred_cleanup_failed,
+                                "corrupt_entry",
+                            );
+                        }
                     }
                 }
             }
             DeferredCleanup::MalformedHash(paths) => {
                 let _guard = acquire_meta_lock(disk_cache, &paths.hash).await;
-                *scan_total_bytes += remove_entry_files(&paths).await?;
+                let unreclaimed = remove_entry_files(&paths).await.map_err(|e| {
+                    deferred_cleanup_err(deferred_cleanup_failed, "malformed_hash", e)
+                })?;
+                let mut partial = false;
+                account_unreclaimed(scan_total_bytes, &mut partial, unreclaimed);
+                if partial {
+                    record_deferred_cleanup_failure(deferred_cleanup_failed, "malformed_hash");
+                }
                 tracing::warn!(
                     path = %paths.meta_path.display(),
                     "removed cache entry with malformed filename stem"
@@ -600,20 +861,43 @@ async fn process_deferred_cleanups(
                         candidates.push(candidate);
                     }
                     RecoverOutcome::MissingBody => {
-                        // Still missing — clean up the leftover meta and poison.
-                        *scan_total_bytes += remove_file_or_reclaim_size(&paths.meta_path).await?;
-                        *scan_total_bytes +=
-                            remove_file_or_reclaim_size(&paths.poison_path).await?;
+                        // Still missing — clean up the leftover meta and
+                        // poison. The kind counter is bumped at most once
+                        // for this cleanup even if both removals leave
+                        // bytes on disk.
+                        let mut partial = false;
+                        let meta_unreclaimed = remove_file_or_reclaim_size(&paths.meta_path)
+                            .await
+                            .map_err(|e| {
+                                deferred_cleanup_err(deferred_cleanup_failed, "missing_body", e)
+                            })?;
+                        account_unreclaimed(scan_total_bytes, &mut partial, meta_unreclaimed);
+                        let poison_unreclaimed = remove_file_or_reclaim_size(&paths.poison_path)
+                            .await
+                            .map_err(|e| {
+                                deferred_cleanup_err(deferred_cleanup_failed, "missing_body", e)
+                            })?;
+                        account_unreclaimed(scan_total_bytes, &mut partial, poison_unreclaimed);
+                        if partial {
+                            record_deferred_cleanup_failure(
+                                deferred_cleanup_failed,
+                                "missing_body",
+                            );
+                        }
                     }
                     RecoverOutcome::BodyStatError(e) => {
-                        return Err(boxed_io_error(
+                        record_deferred_cleanup_failure(deferred_cleanup_failed, "missing_body");
+                        return Err(eviction_io_error(
+                            ScanFailureReason::DeferredCleanup,
                             "stat body during locked missing-body cleanup",
                             &paths.body_path,
                             e,
                         ));
                     }
                     RecoverOutcome::MetaReadError(e) => {
-                        return Err(boxed_io_error(
+                        record_deferred_cleanup_failure(deferred_cleanup_failed, "missing_body");
+                        return Err(eviction_io_error(
+                            ScanFailureReason::DeferredCleanup,
                             "read metadata during locked missing-body cleanup",
                             &paths.meta_path,
                             e,
@@ -621,7 +905,17 @@ async fn process_deferred_cleanups(
                     }
                     RecoverOutcome::MetaParseError(_) => {
                         // Body missing and meta is broken — clean up everything.
-                        *scan_total_bytes += remove_entry_files(&paths).await?;
+                        let unreclaimed = remove_entry_files(&paths).await.map_err(|e| {
+                            deferred_cleanup_err(deferred_cleanup_failed, "missing_body", e)
+                        })?;
+                        let mut partial = false;
+                        account_unreclaimed(scan_total_bytes, &mut partial, unreclaimed);
+                        if partial {
+                            record_deferred_cleanup_failure(
+                                deferred_cleanup_failed,
+                                "missing_body",
+                            );
+                        }
                     }
                 }
             }
@@ -650,25 +944,36 @@ struct ScanResult {
     /// Authoritative on-disk byte total, including unreclaimed bytes from
     /// failed orphan/corrupt cleanup deletions.
     total_bytes: u64,
+    /// Number of `objects/XX/YY/` shards walked during this scan.
+    hash_dirs: usize,
+    /// Number of deferred cleanups produced by the parallel shard scan.
+    deferred_cleanup_count: u64,
+    /// Number of deferred cleanups that skipped, partially failed, or aborted.
+    /// Mirrors `s3proxy_cache_deferred_cleanup_failed_total` for this pass.
+    deferred_cleanup_failed: u64,
 }
 
 async fn collect_candidates(
     objects_dir: &std::path::Path,
     stats: &Arc<CacheStats>,
     disk_cache: Option<&super::DiskCache>,
-) -> Result<ScanResult, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<ScanResult, EvictionScanError> {
     // Phase 1: Collect all hash directory paths.
     let hash_dirs = collect_hash_dirs_strict(objects_dir)
         .await
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        .map_err(|e| EvictionScanError::new(ScanFailureReason::HashDirWalk, e))?;
     if hash_dirs.is_empty() {
         stats.total_bytes.store(0, Ordering::Relaxed);
         stats.entry_count.store(0, Ordering::Relaxed);
         return Ok(ScanResult {
             candidates: Vec::new(),
             total_bytes: 0,
+            hash_dirs: 0,
+            deferred_cleanup_count: 0,
+            deferred_cleanup_failed: 0,
         });
     }
+    let hash_dir_count = hash_dirs.len();
 
     // Phase 2: Process each hash directory in parallel with a bounded
     // streaming JoinSet pump (at most CACHE_HASH_DIR_SCAN_CONCURRENCY tasks
@@ -678,9 +983,10 @@ async fn collect_candidates(
         CACHE_HASH_DIR_SCAN_CONCURRENCY,
         scan_hash_dir_for_eviction,
         |e| {
-            Box::new(std::io::Error::other(format!(
-                "eviction hash-dir scan task failed: {e}"
-            ))) as Box<dyn std::error::Error + Send + Sync>
+            EvictionScanError::new(
+                ScanFailureReason::Join,
+                std::io::Error::other(format!("eviction hash-dir scan task failed: {e}")),
+            )
         },
     )
     .await?;
@@ -697,14 +1003,17 @@ async fn collect_candidates(
         scan_entry_count += dir_result.entry_count;
         all_cleanups.extend(dir_result.deferred_cleanups);
     }
+    let deferred_cleanup_count = all_cleanups.len() as u64;
 
     // Phase 4: Process deferred cleanups under per-key locks.
+    let mut deferred_cleanup_failed: u64 = 0;
     process_deferred_cleanups(
         all_cleanups,
         disk_cache,
         &mut candidates,
         &mut scan_total_bytes,
         &mut scan_entry_count,
+        &mut deferred_cleanup_failed,
     )
     .await?;
 
@@ -717,6 +1026,9 @@ async fn collect_candidates(
     Ok(ScanResult {
         candidates,
         total_bytes: scan_total_bytes,
+        hash_dirs: hash_dir_count,
+        deferred_cleanup_count,
+        deferred_cleanup_failed,
     })
 }
 
@@ -735,22 +1047,70 @@ pub async fn run_eviction_pass(
 }
 
 /// Inner implementation that accepts an optional DiskCache for testability.
+///
+/// Wraps the actual pass body with start/end timing and emits these
+/// observability signals at the end of every pass:
+///   - `s3proxy_cache_scan_duration_seconds{phase="eviction"}` on success
+///   - `s3proxy_cache_scan_failed_total{phase="eviction",reason=...}` on Err
+///     and on the `objects_dir` probe-skip branch
+///   - `s3proxy_cache_unreclaimed_bytes` on success (set from this pass's
+///     `scan_total_bytes - candidate_bytes`)
+///   - One info-level summary log line on every successful pass
 async fn run_eviction_pass_inner(
     cache_dir: &std::path::Path,
     max_bytes: u64,
     stats: &Arc<CacheStats>,
     disk_cache: Option<&super::DiskCache>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let start = std::time::Instant::now();
     let objects_dir = cache_dir.join("objects");
-    match tokio::fs::try_exists(&objects_dir).await {
-        Ok(true) => {} // proceed
+    let scan = match tokio::fs::try_exists(&objects_dir).await {
+        Ok(true) => {
+            // collect_candidates walks the filesystem and reconciles stats.
+            // The reason label is taken directly from the typed
+            // `ScanFailureReason` variant carried by the error, so renaming
+            // the inner error message can never silently degrade
+            // observability to `reason="other"`.
+            match collect_candidates(&objects_dir, stats, disk_cache).await {
+                Ok(s) => s,
+                Err(e) => {
+                    metrics::counter!(
+                        "s3proxy_cache_scan_failed_total",
+                        "phase" => "eviction",
+                        "reason" => e.reason.as_label(),
+                    )
+                    .increment(1);
+                    return Err(Box::new(e));
+                }
+            }
+        }
         Ok(false) => {
-            // No objects directory — reconcile stats to zero.
+            // No objects directory — reconcile stats to zero and fall
+            // through to the same success emission the populated path
+            // takes. Returning early here would skip the duration
+            // histogram, leave `s3proxy_cache_unreclaimed_bytes` stale
+            // from the previous pass, and drop the per-pass summary log.
             stats.entry_count.store(0, Ordering::Relaxed);
             stats.total_bytes.store(0, Ordering::Relaxed);
-            return Ok(());
+            ScanResult {
+                candidates: Vec::new(),
+                total_bytes: 0,
+                hash_dirs: 0,
+                deferred_cleanup_count: 0,
+                deferred_cleanup_failed: 0,
+            }
         }
         Err(e) => {
+            // Probe failure is per-spec counted under `objects_dir_probe`
+            // even though the pass returns Ok (existing skip-on-probe-error
+            // semantics are preserved so a transient stat error does not
+            // crash the eviction loop).
+            metrics::counter!(
+                "s3proxy_cache_scan_failed_total",
+                "phase" => "eviction",
+                "reason" => ScanFailureReason::ObjectsDirProbe.as_label(),
+            )
+            .increment(1);
             tracing::warn!(
                 path = %objects_dir.display(),
                 error = %e,
@@ -758,10 +1118,13 @@ async fn run_eviction_pass_inner(
             );
             return Ok(());
         }
-    }
-
-    // collect_candidates walks the filesystem and reconciles stats.
-    let scan = collect_candidates(&objects_dir, stats, disk_cache).await?;
+    };
+    let candidate_count = scan.candidates.len() as u64;
+    let candidate_bytes: u64 = scan.candidates.iter().map(|c| c.size).sum();
+    let scan_total_bytes = scan.total_bytes;
+    let hash_dirs = scan.hash_dirs;
+    let deferred_cleanup_count = scan.deferred_cleanup_count;
+    let deferred_cleanup_failed = scan.deferred_cleanup_failed;
     let mut candidates = scan.candidates;
 
     // Sort by last_accessed_at ascending (oldest first = evicted first)
@@ -771,34 +1134,67 @@ async fn run_eviction_pass_inner(
     // the candidate sum. This ensures unreclaimed bytes (from failed cleanup
     // deletions) count toward the limit — otherwise the cache could stay
     // over budget indefinitely when some files can't be removed.
-    if scan.total_bytes <= max_bytes {
-        return Ok(());
-    }
-
-    // Evict oldest entries until under limit. Stat adjustments here are
-    // best-effort for between-scan responsiveness; the next scan reconciles
-    // any drift from concurrent operations.
-    let mut current_size = scan.total_bytes;
+    let over_budget_bytes_before = scan_total_bytes.saturating_sub(max_bytes);
+    let mut current_size = scan_total_bytes;
     let mut evicted = 0u64;
-    for candidate in &candidates {
-        if current_size <= max_bytes {
-            break;
+    if scan_total_bytes > max_bytes {
+        // Evict oldest entries until under limit. Stat adjustments here are
+        // best-effort for between-scan responsiveness; the next scan
+        // reconciles any drift from concurrent operations.
+        for candidate in &candidates {
+            if current_size <= max_bytes {
+                break;
+            }
+            try_evict_candidate(
+                candidate,
+                &mut current_size,
+                &mut evicted,
+                stats,
+                disk_cache,
+            )
+            .await;
         }
-        try_evict_candidate(
-            candidate,
-            &mut current_size,
-            &mut evicted,
-            stats,
-            disk_cache,
-        )
-        .await;
+        stats.eviction_count.fetch_add(evicted, Ordering::Relaxed);
     }
 
-    stats.eviction_count.fetch_add(evicted, Ordering::Relaxed);
+    let summary = EvictionPassSummary {
+        hash_dirs,
+        candidate_count,
+        candidate_bytes,
+        deferred_cleanup_count,
+        deferred_cleanup_failed,
+        scan_total_bytes,
+        max_bytes,
+        over_budget_bytes_before,
+        evicted,
+        final_size_bytes: current_size,
+        over_budget_bytes_after: current_size.saturating_sub(max_bytes),
+    };
 
-    if evicted > 0 {
-        tracing::info!(evicted, current_size, max_bytes, "eviction pass complete");
-    }
+    let duration = start.elapsed().as_secs_f64();
+    metrics::histogram!(
+        "s3proxy_cache_scan_duration_seconds",
+        "phase" => "eviction",
+    )
+    .record(duration);
+    let unreclaimed_bytes = scan_total_bytes.saturating_sub(candidate_bytes);
+    metrics::gauge!("s3proxy_cache_unreclaimed_bytes").set(unreclaimed_bytes as f64);
+    tracing::info!(
+        duration_seconds = duration,
+        hash_dirs = summary.hash_dirs,
+        candidate_count = summary.candidate_count,
+        candidate_bytes = summary.candidate_bytes,
+        deferred_cleanup_count = summary.deferred_cleanup_count,
+        deferred_cleanup_failed = summary.deferred_cleanup_failed,
+        unreclaimed_bytes = unreclaimed_bytes,
+        scan_total_bytes = summary.scan_total_bytes,
+        max_bytes = summary.max_bytes,
+        over_budget_bytes_before = summary.over_budget_bytes_before,
+        evicted = summary.evicted,
+        final_size_bytes = summary.final_size_bytes,
+        over_budget_bytes_after = summary.over_budget_bytes_after,
+        "cache eviction pass complete",
+    );
 
     Ok(())
 }
@@ -1705,12 +2101,14 @@ mod tests {
         let mut candidates = Vec::new();
         let mut total_bytes = 0u64;
         let mut entry_count = 0u64;
+        let mut deferred_cleanup_failed = 0u64;
         let result = process_deferred_cleanups(
             vec![cleanup],
             None,
             &mut candidates,
             &mut total_bytes,
             &mut entry_count,
+            &mut deferred_cleanup_failed,
         )
         .await;
 
@@ -2086,12 +2484,14 @@ mod tests {
         let mut candidates = Vec::new();
         let mut total_bytes = 0u64;
         let mut entry_count = 0u64;
+        let mut deferred_cleanup_failed = 0u64;
         let result = process_deferred_cleanups(
             vec![cleanup],
             None,
             &mut candidates,
             &mut total_bytes,
             &mut entry_count,
+            &mut deferred_cleanup_failed,
         )
         .await;
 
@@ -2105,6 +2505,495 @@ mod tests {
         assert!(
             msg.contains("stat after failed remove"),
             "error should identify the failing operation, got: {msg}"
+        );
+        assert_eq!(
+            deferred_cleanup_failed, 1,
+            "MalformedHash abort must bump deferred_cleanup_failed",
+        );
+    }
+
+    /// A successful eviction pass must record the duration histogram with
+    /// the `phase="eviction"` label and publish the unreclaimed-bytes gauge.
+    /// Uses the metrics-exporter-prometheus local recorder so the assertions
+    /// can read back the exact rendered output without touching the global
+    /// recorder (which would conflict with parallel tests).
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_eviction_pass_emits_observability_metrics() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+        tokio::fs::create_dir_all(cache_dir.join("objects"))
+            .await
+            .unwrap();
+        let key = CacheKey::new("bucket", "script_bundle/observed.js");
+        setup_cache_entry(&cache_dir, &key, b"observed body", Utc::now()).await;
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let stats = Arc::new(CacheStats::default());
+        run_eviction_pass_inner(&cache_dir, 1_000_000, &stats, None)
+            .await
+            .unwrap();
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("s3proxy_cache_scan_duration_seconds"),
+            "expected scan duration metric to be present, got:\n{rendered}",
+        );
+        assert!(
+            rendered.contains("phase=\"eviction\""),
+            "expected phase=\"eviction\" label on the duration metric, got:\n{rendered}",
+        );
+        // Single completed entry → candidate_bytes == scan_total_bytes,
+        // unreclaimed_bytes is exactly 0.
+        assert!(
+            rendered.contains("s3proxy_cache_unreclaimed_bytes 0"),
+            "expected unreclaimed_bytes gauge to be 0 for a clean pass, got:\n{rendered}",
+        );
+    }
+
+    /// A failed eviction pass — here triggered by a self-symlink at the
+    /// body path that makes `tokio::fs::metadata` follow the loop and fail
+    /// with ELOOP — must increment `s3proxy_cache_scan_failed_total` with
+    /// `reason="hash_dir_scan"` (the failing site is inside
+    /// `scan_hash_dir_for_eviction`, not the deferred-cleanup phase).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_eviction_pass_failure_emits_failed_counter() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+        let key = CacheKey::new("bucket", "script_bundle/symlink.js");
+        let hash = key.hash_hex();
+        let (d1, d2) = key.dir_prefix();
+        let dir = cache_dir.join("objects").join(d1).join(d2);
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let now = Utc::now();
+        let meta = CacheMeta {
+            bucket: "bucket".into(),
+            key: "script_bundle/symlink.js".into(),
+            etag: None,
+            last_modified: None,
+            content_type: Some("application/octet-stream".into()),
+            content_length: 5,
+            cache_written_at: now,
+            fill_id: 0,
+            metadata_version: 0,
+            last_accessed_at: now,
+            hit_count: 0,
+            source_status: 200,
+            metadata: std::collections::HashMap::new(),
+            extra_headers: std::collections::HashMap::new(),
+            head_extra_headers: std::collections::HashMap::new(),
+            head_checksum_headers: std::collections::HashMap::new(),
+            checksum_mode_checked: false,
+            head_metadata_checked: false,
+            head_checksum_checked: false,
+        };
+        let meta_path = dir.join(format!("{hash}.meta.json"));
+        let body_path = dir.join(format!("{hash}.body"));
+        tokio::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap())
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(&body_path, &body_path).unwrap();
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let stats = Arc::new(CacheStats::default());
+        let err = run_eviction_pass_inner(&cache_dir, 1_000_000, &stats, None)
+            .await
+            .expect_err("self-symlink ELOOP should propagate as scan error");
+        assert!(
+            err.to_string().contains("stat body during eviction scan"),
+            "unexpected error: {err}",
+        );
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(
+                "s3proxy_cache_scan_failed_total{phase=\"eviction\",reason=\"hash_dir_scan\"} 1",
+            ),
+            "expected scan_failed_total{{phase=eviction,reason=hash_dir_scan}}, got:\n{rendered}",
+        );
+    }
+
+    /// `process_deferred_cleanups` must increment
+    /// `s3proxy_cache_deferred_cleanup_failed_total{kind="malformed_hash"}`
+    /// when a `MalformedHash` cleanup aborts — exercises the kind-labeled
+    /// counter directly without needing the full scan path.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_process_deferred_cleanups_failure_emits_kind_counter() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("objects").join("aa").join("bb");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let meta_path = dir.join("hh.meta.json");
+        let body_path = dir.join("hh.body");
+        let poison_path = dir.join("hh.poisoned");
+        tokio::fs::write(&meta_path, b"{}").await.unwrap();
+        tokio::fs::write(&body_path, vec![0u8; 1500]).await.unwrap();
+        tokio::fs::write(&poison_path, b"").await.unwrap();
+
+        let _restore = ChmodOnDrop::new(&dir);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let cleanup = DeferredCleanup::MalformedHash(EntryPaths {
+            meta_path,
+            body_path,
+            poison_path,
+            hash: "hh".into(),
+        });
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let mut candidates = Vec::new();
+        let mut total_bytes = 0u64;
+        let mut entry_count = 0u64;
+        let mut deferred_cleanup_failed = 0u64;
+        let result = process_deferred_cleanups(
+            vec![cleanup],
+            None,
+            &mut candidates,
+            &mut total_bytes,
+            &mut entry_count,
+            &mut deferred_cleanup_failed,
+        )
+        .await;
+        assert!(result.is_err(), "MalformedHash cleanup must Err");
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(
+                "s3proxy_cache_deferred_cleanup_failed_total{kind=\"malformed_hash\"} 1",
+            ),
+            "expected deferred_cleanup_failed_total{{kind=malformed_hash}}, got:\n{rendered}",
+        );
+    }
+
+    /// Regression test: when `read_dir(d2_path)` inside
+    /// `scan_hash_dir_for_eviction` fails (here forced by chmod 0o000 on the
+    /// leaf shard dir while leaving the layout walk intact), the failure
+    /// must be classified as `reason="hash_dir_scan"` — not `reason="other"`.
+    ///
+    /// Under the prior substring-matching `eviction_failure_reason` helper,
+    /// this leaf path returned a raw `Box<io::Error>` with no operation tag
+    /// in its display string and was misclassified as `other`. The typed
+    /// `ScanFailureReason::HashDirScan` carried in `EvictionScanError`
+    /// removes that ambiguity.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_eviction_pass_classifies_hash_dir_read_dir_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+        let shard = cache_dir.join("objects").join("aa").join("bb");
+        tokio::fs::create_dir_all(&shard).await.unwrap();
+
+        // Block read_dir(shard) without breaking the d1 layout walk above
+        // it. file_type() on the shard entry uses DT_TYPE from getdents and
+        // does not require traversal, so the strict layout walk succeeds.
+        let _restore = ChmodOnDrop::new(&shard);
+        std::fs::set_permissions(&shard, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let stats = Arc::new(CacheStats::default());
+        let err = run_eviction_pass_inner(&cache_dir, 1_000_000, &stats, None)
+            .await
+            .expect_err("read_dir on locked shard should propagate as scan error");
+        assert!(
+            err.to_string().contains("read hash shard dir"),
+            "unexpected error: {err}",
+        );
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(
+                "s3proxy_cache_scan_failed_total{phase=\"eviction\",reason=\"hash_dir_scan\"} 1",
+            ),
+            "expected scan_failed_total{{reason=hash_dir_scan}}, got:\n{rendered}",
+        );
+    }
+
+    /// Regression test: when the strict layout walk in
+    /// `collect_hash_dirs_strict` fails (here forced by chmod 0o000 on a
+    /// `objects/<d1>/` hash-prefix dir so `read_dir(d1)` returns EACCES),
+    /// the failure must be classified as `reason="hash_dir_walk"` — not
+    /// `reason="other"`.
+    ///
+    /// The previous substring matcher only recognized `"read objects dir"`
+    /// and `"iterate objects dir"`; the actual layout-walk operations are
+    /// `"read hash prefix dir"` / `"iterate hash prefix dir"` (and their
+    /// `check ... type` siblings). Routing through
+    /// `ScanFailureReason::HashDirWalk` removes the dependency on the
+    /// operation name.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_eviction_pass_classifies_layout_walk_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+        let d1 = cache_dir.join("objects").join("aa");
+        tokio::fs::create_dir_all(d1.join("bb")).await.unwrap();
+
+        // Block read_dir(d1) without affecting the objects_dir probe above.
+        // The probe's try_exists only stats objects_dir itself and succeeds.
+        // file_type() on d1 (from objects_dir's getdents) does not need
+        // traversal, so the walk reaches the read_dir(d1) call before
+        // failing.
+        let _restore = ChmodOnDrop::new(&d1);
+        std::fs::set_permissions(&d1, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let stats = Arc::new(CacheStats::default());
+        let err = run_eviction_pass_inner(&cache_dir, 1_000_000, &stats, None)
+            .await
+            .expect_err("strict layout walk on locked prefix dir should propagate");
+        assert!(
+            err.to_string().contains("read hash prefix dir")
+                || err.to_string().contains("iterate hash prefix dir"),
+            "unexpected error: {err}",
+        );
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(
+                "s3proxy_cache_scan_failed_total{phase=\"eviction\",reason=\"hash_dir_walk\"} 1",
+            ),
+            "expected scan_failed_total{{reason=hash_dir_walk}}, got:\n{rendered}",
+        );
+    }
+
+    /// Regression test for the partial-cleanup recording fix:
+    /// `remove_file_or_reclaim_size` returning `Ok(>0)` means the unlink
+    /// failed but the bytes are still measurable on disk — that's a partial
+    /// cleanup failure per the helper contract. Forced here via parent dir
+    /// mode 0o500 (read+exec, no write): unlink fails with EACCES while the
+    /// post-stat still succeeds, so the helper returns the file's size as
+    /// `Ok(>0)`.
+    ///
+    /// Before the fix the bytes were folded into `scan_total_bytes` but
+    /// neither the per-pass `deferred_cleanup_failed` count nor the
+    /// kind-labeled counter were bumped, so partial failures were
+    /// invisible to operators. After the fix both must rise by exactly 1.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_partial_orphan_body_cleanup_records_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("objects").join("aa").join("bb");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let body_path = dir.join("hh.body");
+        tokio::fs::write(&body_path, vec![0u8; 1500]).await.unwrap();
+
+        // 0o500: stat traverses, unlink fails with EACCES, so
+        // remove_file_or_reclaim_size returns Ok(1500).
+        let _restore = ChmodOnDrop::new(&dir);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let cleanup = DeferredCleanup::OrphanBody {
+            body_path: body_path.clone(),
+            hash: "hh".into(),
+        };
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let mut candidates = Vec::new();
+        let mut total_bytes = 0u64;
+        let mut entry_count = 0u64;
+        let mut deferred_cleanup_failed = 0u64;
+        process_deferred_cleanups(
+            vec![cleanup],
+            None,
+            &mut candidates,
+            &mut total_bytes,
+            &mut entry_count,
+            &mut deferred_cleanup_failed,
+        )
+        .await
+        .expect("partial cleanup is a successful (lossy) outcome, not an Err return");
+
+        assert_eq!(
+            total_bytes, 1500,
+            "unreclaimed bytes from the failed unlink must still be counted"
+        );
+        assert_eq!(
+            deferred_cleanup_failed, 1,
+            "partial cleanup must bump the per-pass failure count"
+        );
+        let rendered = handle.render();
+        assert!(
+            rendered
+                .contains("s3proxy_cache_deferred_cleanup_failed_total{kind=\"orphan_body\"} 1"),
+            "expected deferred_cleanup_failed_total{{kind=orphan_body}} = 1, got:\n{rendered}",
+        );
+    }
+
+    /// Regression test: the `MissingBody::MissingBody` cleanup variant
+    /// invokes `remove_file_or_reclaim_size` twice (meta + poison). When
+    /// both removals partially fail, the kind-labeled counter must rise
+    /// by exactly 1 — not 2. The per-pass `deferred_cleanup_failed`
+    /// counter is a cleanup-count, not a per-file count.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_partial_two_remove_cleanup_counts_once() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("objects").join("aa").join("bb");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let meta_path = dir.join("hh.meta.json");
+        let poison_path = dir.join("hh.poisoned");
+        let body_path = dir.join("hh.body"); // intentionally absent
+        // Write a meta whose JSON is broken so try_recover_entry returns
+        // MetaParseError... actually we want MissingBody outcome from
+        // try_recover_entry: body absent, meta valid. Easier: write valid
+        // meta JSON.
+        let now = Utc::now();
+        let meta = CacheMeta {
+            bucket: "bucket".into(),
+            key: "k".into(),
+            etag: None,
+            last_modified: None,
+            content_type: None,
+            content_length: 0,
+            cache_written_at: now,
+            fill_id: 0,
+            metadata_version: 0,
+            last_accessed_at: now,
+            hit_count: 0,
+            source_status: 200,
+            metadata: std::collections::HashMap::new(),
+            extra_headers: std::collections::HashMap::new(),
+            head_extra_headers: std::collections::HashMap::new(),
+            head_checksum_headers: std::collections::HashMap::new(),
+            checksum_mode_checked: false,
+            head_metadata_checked: false,
+            head_checksum_checked: false,
+        };
+        tokio::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap())
+            .await
+            .unwrap();
+        // Non-empty poison so its unreclaimed-bytes value is > 0; with an
+        // empty file the partial-failure path silently returns Ok(0) and
+        // a buggy per-file recorder would dodge the double-count check.
+        tokio::fs::write(&poison_path, b"poisoned").await.unwrap();
+
+        // 0o500: unlink fails (no write), stat still works (read+exec).
+        let _restore = ChmodOnDrop::new(&dir);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let cleanup = DeferredCleanup::MissingBody(EntryPaths {
+            meta_path: meta_path.clone(),
+            body_path,
+            poison_path: poison_path.clone(),
+            hash: "hh".into(),
+        });
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let mut candidates = Vec::new();
+        let mut total_bytes = 0u64;
+        let mut entry_count = 0u64;
+        let mut deferred_cleanup_failed = 0u64;
+        process_deferred_cleanups(
+            vec![cleanup],
+            None,
+            &mut candidates,
+            &mut total_bytes,
+            &mut entry_count,
+            &mut deferred_cleanup_failed,
+        )
+        .await
+        .expect("partial cleanup must not abort the pass");
+
+        // Both files still on disk → total_bytes = meta_size + poison_size.
+        assert!(
+            total_bytes > 0,
+            "two failed unlinks must still count their bytes"
+        );
+        assert_eq!(
+            deferred_cleanup_failed, 1,
+            "two partial removals in one cleanup must count as one failure"
+        );
+        let rendered = handle.render();
+        assert!(
+            rendered
+                .contains("s3proxy_cache_deferred_cleanup_failed_total{kind=\"missing_body\"} 1"),
+            "expected exactly one missing_body increment, got:\n{rendered}",
+        );
+        assert!(
+            !rendered
+                .contains("s3proxy_cache_deferred_cleanup_failed_total{kind=\"missing_body\"} 2"),
+            "two-remove cleanup must not double-count, got:\n{rendered}",
+        );
+    }
+
+    /// Regression test for the no-objects-dir fast path: a pass that finds
+    /// the cache directory missing must still emit the duration histogram,
+    /// publish a fresh `s3proxy_cache_unreclaimed_bytes 0`, and reconcile
+    /// stats to zero. Returning early skipped all three signals and left
+    /// the gauge stale at the previous pass's value — invisible to
+    /// operators that the cache is empty now.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_eviction_pass_no_objects_dir_emits_success_signals() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+        // Don't create cache_dir/objects.
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let stats = Arc::new(CacheStats::default());
+        // Seed with stale values so the test exercises the reconciliation
+        // side too — the empty-cache pass must zero them.
+        stats.entry_count.store(7, Ordering::Relaxed);
+        stats.total_bytes.store(7777, Ordering::Relaxed);
+
+        run_eviction_pass_inner(&cache_dir, 1_000_000, &stats, None)
+            .await
+            .expect("missing objects dir must not be a failure case");
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.entry_count, 0, "stats must be reconciled to zero");
+        assert_eq!(snap.total_bytes, 0, "stats must be reconciled to zero");
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("s3proxy_cache_scan_duration_seconds"),
+            "duration histogram must be emitted on empty pass, got:\n{rendered}",
+        );
+        assert!(
+            rendered.contains("phase=\"eviction\""),
+            "duration histogram must carry phase=eviction label, got:\n{rendered}",
+        );
+        assert!(
+            rendered.contains("s3proxy_cache_unreclaimed_bytes 0"),
+            "empty pass must publish unreclaimed_bytes=0 (fresh, not stale), got:\n{rendered}",
+        );
+        assert!(
+            !rendered.contains("s3proxy_cache_scan_failed_total"),
+            "empty pass is a success, not a failure, got:\n{rendered}",
         );
     }
 }

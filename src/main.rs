@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use metrics_exporter_prometheus::PrometheusHandle;
+use metrics_exporter_prometheus::{Matcher, PrometheusHandle};
 
 use tiny_s3_proxy::admin;
 use tiny_s3_proxy::auth;
@@ -48,6 +48,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let config = Arc::new(config);
+
+    // Install the Prometheus recorder before any cache or eviction code runs
+    // so the startup scan and the first eviction tick are captured. The
+    // returned handle is plumbed into the admin router below.
+    let prometheus_handle = setup_metrics();
 
     // 3. Create auth
     let auth = Arc::from(auth::create_request_gate(&config));
@@ -125,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 9. Build admin router
     let admin_state = admin::AdminState {
-        prometheus_handle: setup_metrics(),
+        prometheus_handle,
         cache_dir: PathBuf::from(&config.cache_dir),
     };
     let admin_app = admin::build_admin_router(admin_state);
@@ -221,7 +226,19 @@ where
 /// Install the Prometheus metrics recorder globally and return a handle
 /// for rendering collected metrics.
 fn setup_metrics() -> PrometheusHandle {
-    let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
+    // Override buckets only for the cache scan duration histogram so the
+    // existing request-duration histograms keep their default-builder
+    // (summary-shaped) rendering. The default builder emits histograms
+    // without bucket series, so the new metric needs an explicit override
+    // to be rendered as a Prometheus histogram with bucket lines.
+    let builder = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            Matcher::Full("s3proxy_cache_scan_duration_seconds".to_string()),
+            &[
+                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0,
+            ],
+        )
+        .expect("failed to configure cache scan duration buckets");
     builder
         .install_recorder()
         .expect("failed to install metrics recorder")

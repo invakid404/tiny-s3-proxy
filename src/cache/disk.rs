@@ -21,6 +21,10 @@ struct DirScanStats {
     /// Set when any metadata file was corrupt, meaning `max_fill_id` may
     /// not reflect the true maximum.
     fill_id_incomplete: bool,
+    /// Bytes from orphan bodies that the cleanup attempt could not remove
+    /// (already counted into `total_bytes`; tracked separately for
+    /// observability).
+    unreclaimed_bytes: u64,
 }
 
 /// Aggregated results from the full startup scan.
@@ -29,6 +33,25 @@ struct StartupScanResult {
     max_fill_id: u64,
     saw_cache_files: bool,
     fill_id_incomplete: bool,
+    hash_dirs: usize,
+    layout_incomplete: bool,
+    unreclaimed_bytes: u64,
+}
+
+/// Map a startup-scan `ProxyError` to one of the finite `reason` label values
+/// used by `s3proxy_cache_scan_failed_total{phase="startup"}`. The label set
+/// is intentionally finite to keep cardinality bounded — full error strings
+/// would explode the label space and bypass the careful error-context fields
+/// already emitted via tracing.
+fn classify_startup_scan_error(err: &ProxyError) -> &'static str {
+    let ProxyError::Cache { operation, .. } = err else {
+        return "other";
+    };
+    if operation.contains("startup scan task panicked") {
+        "join"
+    } else {
+        "other"
+    }
 }
 
 /// Compute how many on-disk bytes a failed orphan-body removal left behind.
@@ -335,11 +358,68 @@ impl DiskCache {
     /// allocatable `fill_id`; the metadata scan only contributes a fallback
     /// `max_fill_id` safety net for older caches and consistency checks.
     ///
+    /// Wraps the inner scan with timing, observability metrics, and a
+    /// single end-of-scan summary log. Emits:
+    ///   - `s3proxy_cache_scan_duration_seconds{phase="startup"}` on success
+    ///   - `s3proxy_cache_scan_failed_total{phase="startup",reason=...}` on Err
+    ///   - `s3proxy_cache_scan_incomplete_total{phase="startup"}` when the
+    ///     layout walk or the per-shard scan flagged any incompleteness
+    async fn scan_existing_stats(
+        cache_dir: &std::path::Path,
+    ) -> Result<StartupScanResult, ProxyError> {
+        let start = std::time::Instant::now();
+        let result = Self::scan_existing_stats_inner(cache_dir).await;
+        let duration = start.elapsed().as_secs_f64();
+
+        match &result {
+            Ok(scan) => {
+                metrics::histogram!(
+                    "s3proxy_cache_scan_duration_seconds",
+                    "phase" => "startup",
+                )
+                .record(duration);
+                if scan.layout_incomplete || scan.fill_id_incomplete {
+                    metrics::counter!(
+                        "s3proxy_cache_scan_incomplete_total",
+                        "phase" => "startup",
+                    )
+                    .increment(1);
+                }
+                tracing::info!(
+                    duration_seconds = duration,
+                    hash_dirs = scan.hash_dirs,
+                    entry_count = scan.stats.entry_count.load(Ordering::Relaxed),
+                    total_bytes = scan.stats.total_bytes.load(Ordering::Relaxed),
+                    max_fill_id = scan.max_fill_id,
+                    saw_cache_files = scan.saw_cache_files,
+                    layout_incomplete = scan.layout_incomplete,
+                    fill_id_incomplete = scan.fill_id_incomplete,
+                    unreclaimed_bytes = scan.unreclaimed_bytes,
+                    "cache startup scan complete",
+                );
+            }
+            Err(e) => {
+                metrics::counter!(
+                    "s3proxy_cache_scan_failed_total",
+                    "phase" => "startup",
+                    "reason" => classify_startup_scan_error(e),
+                )
+                .increment(1);
+            }
+        }
+
+        result
+    }
+
+    /// Inner implementation of the startup scan. The public wrapper above
+    /// adds timing, metrics, and the summary log so this function can stay
+    /// focused on the actual scan work.
+    ///
     /// Hash directories (`objects/XX/YY/`) are processed in parallel using a
     /// streaming `JoinSet` pump that caps in-flight shard scans at
     /// `CACHE_HASH_DIR_SCAN_CONCURRENCY` to avoid overwhelming the filesystem
     /// (and the runtime task queue) on large caches.
-    async fn scan_existing_stats(
+    async fn scan_existing_stats_inner(
         cache_dir: &std::path::Path,
     ) -> Result<StartupScanResult, ProxyError> {
         let objects_dir = cache_dir.join("objects");
@@ -347,14 +427,18 @@ impl DiskCache {
 
         // Phase 1: Collect all hash directory paths (objects/XX/YY/).
         let collection = collect_hash_dirs_best_effort(&objects_dir).await;
-        let dirs_fill_id_incomplete = collection.incomplete;
+        let layout_incomplete = collection.incomplete;
         let hash_dirs = collection.dirs;
+        let hash_dir_count = hash_dirs.len();
         if hash_dirs.is_empty() {
             return Ok(StartupScanResult {
                 stats,
                 max_fill_id: 0,
                 saw_cache_files: false,
-                fill_id_incomplete: dirs_fill_id_incomplete,
+                fill_id_incomplete: layout_incomplete,
+                hash_dirs: 0,
+                layout_incomplete,
+                unreclaimed_bytes: 0,
             });
         }
 
@@ -377,7 +461,10 @@ impl DiskCache {
             stats,
             max_fill_id: 0,
             saw_cache_files: false,
-            fill_id_incomplete: dirs_fill_id_incomplete,
+            fill_id_incomplete: layout_incomplete,
+            hash_dirs: hash_dir_count,
+            layout_incomplete,
+            unreclaimed_bytes: 0,
         };
 
         for dir in dir_results {
@@ -390,6 +477,7 @@ impl DiskCache {
             agg.max_fill_id = agg.max_fill_id.max(dir.max_fill_id);
             agg.saw_cache_files = agg.saw_cache_files || dir.saw_cache_files;
             agg.fill_id_incomplete = agg.fill_id_incomplete || dir.fill_id_incomplete;
+            agg.unreclaimed_bytes = agg.unreclaimed_bytes.saturating_add(dir.unreclaimed_bytes);
         }
 
         Ok(agg)
@@ -403,6 +491,7 @@ impl DiskCache {
             max_fill_id: 0,
             saw_cache_files: false,
             fill_id_incomplete: false,
+            unreclaimed_bytes: 0,
         };
 
         let mut file_entries = match tokio::fs::read_dir(&d2_path).await {
@@ -546,6 +635,7 @@ impl DiskCache {
                                 )
                                 .await;
                                 result.total_bytes += counted;
+                                result.unreclaimed_bytes += counted;
                                 tracing::warn!(
                                     path = %file_path.display(),
                                     error = %remove_err,
@@ -2637,6 +2727,9 @@ mod tests {
             max_fill_id: 0,
             saw_cache_files: false,
             fill_id_incomplete: true,
+            hash_dirs: 0,
+            layout_incomplete: false,
+            unreclaimed_bytes: 0,
         };
 
         let err = DiskCache::load_next_fill_id(tmp.path(), &scan)
@@ -3340,6 +3433,37 @@ mod tests {
         assert!(
             body_path.exists(),
             "orphan body should still be on disk after failed removal"
+        );
+    }
+
+    /// A successful startup scan must record the duration histogram with
+    /// `phase="startup"`. Uses the metrics-exporter-prometheus local
+    /// recorder so the assertions can read back the rendered output
+    /// without touching the global recorder.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_startup_scan_emits_duration_metric() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+        tokio::fs::create_dir_all(cache_dir.join("objects"))
+            .await
+            .unwrap();
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let scan = DiskCache::scan_existing_stats(&cache_dir).await.unwrap();
+        assert_eq!(scan.hash_dirs, 0);
+        assert!(!scan.layout_incomplete);
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("s3proxy_cache_scan_duration_seconds"),
+            "expected scan duration metric to be present, got:\n{rendered}",
+        );
+        assert!(
+            rendered.contains("phase=\"startup\""),
+            "expected phase=\"startup\" label on the duration metric, got:\n{rendered}",
         );
     }
 }
