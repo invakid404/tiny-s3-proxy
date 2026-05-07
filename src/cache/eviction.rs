@@ -703,15 +703,29 @@ async fn run_eviction_pass_inner(
             continue;
         }
 
-        let body_removed = tokio::fs::remove_file(&candidate.body_path).await.is_ok();
-        let meta_removed = tokio::fs::remove_file(&candidate.meta_path).await.is_ok();
-        if body_removed || meta_removed {
-            // Clear poison marker whenever either file is removed — the stale
+        let body_res = tokio::fs::remove_file(&candidate.body_path).await;
+        let meta_res = tokio::fs::remove_file(&candidate.meta_path).await;
+
+        // "Gone" means the file is no longer on disk: either we removed it
+        // (Ok) or it was already missing (NotFound). Other errors (permission
+        // denied, EIO, etc.) indicate the bytes are likely still occupying
+        // disk space and must NOT be treated as reclaimed.
+        let is_gone = |res: &std::io::Result<()>| match res {
+            Ok(()) => true,
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        };
+        let body_gone = is_gone(&body_res);
+        let meta_gone = is_gone(&meta_res);
+
+        if body_gone || meta_gone {
+            // Clear poison marker whenever either file is gone — the stale
             // content is (at least partially) gone.
             let poison_path = candidate.body_path.with_extension("poisoned");
             let _ = tokio::fs::remove_file(&poison_path).await;
         }
-        if body_removed && meta_removed {
+
+        if body_gone && meta_gone {
+            // Both files are off disk (removed by us or already missing).
             // Best-effort: use the scan-measured size. If commit_fill replaced
             // the files between scan and delete, this may be stale — the next
             // scan reconciles.
@@ -733,14 +747,32 @@ async fn run_eviction_pass_inner(
                 "evicted cache entry"
             );
         } else {
-            // Partial or already-gone — subtract scanned size so the loop
-            // doesn't over-evict. Stats reconcile on the next scan.
-            current_size = current_size.saturating_sub(candidate.size);
+            // At least one removal failed with a non-NotFound error — bytes
+            // are still (at least partially) on disk. Adjust current_size to
+            // reflect what's actually still there: replace the scanned size
+            // with the measured remaining body+meta size. Do NOT decrement
+            // entry_count / total_bytes — counting this as a full eviction
+            // would falsely lower the budget and could stop the loop early,
+            // leaving the cache over max_bytes indefinitely. The next scan
+            // reconciles.
+            let actual_body = tokio::fs::metadata(&candidate.body_path)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let actual_meta = tokio::fs::metadata(&candidate.meta_path)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let actual_remaining = actual_body + actual_meta;
+            current_size = current_size
+                .saturating_sub(candidate.size)
+                .saturating_add(actual_remaining);
             tracing::warn!(
                 path = %candidate.body_path.display(),
-                body_removed,
-                meta_removed,
-                "eviction: partial removal, stats reconcile on next scan"
+                body_error = ?body_res.as_ref().err().map(|e| e.kind()),
+                meta_error = ?meta_res.as_ref().err().map(|e| e.kind()),
+                actual_remaining,
+                "eviction: removal failed with I/O error, leaving bytes counted toward budget"
             );
         }
     }
