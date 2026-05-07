@@ -677,7 +677,11 @@ async fn collect_candidates(
         hash_dirs,
         CACHE_HASH_DIR_SCAN_CONCURRENCY,
         scan_hash_dir_for_eviction,
-        |e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
+        |e| {
+            Box::new(std::io::Error::other(format!(
+                "eviction hash-dir scan task failed: {e}"
+            ))) as Box<dyn std::error::Error + Send + Sync>
+        },
     )
     .await?;
 
