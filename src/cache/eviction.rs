@@ -6,9 +6,7 @@ use crate::cache::metadata::CacheMeta;
 
 use super::CacheStats;
 use super::layout::collect_hash_dirs_strict;
-
-/// Concurrency limit for parallel hash-directory scans during eviction.
-const EVICTION_SCAN_CONCURRENCY: usize = 64;
+use super::scan::{CACHE_HASH_DIR_SCAN_CONCURRENCY, bounded_parallel_scan};
 
 /// Entry info for eviction sorting.
 #[derive(Debug)]
@@ -672,17 +670,16 @@ async fn collect_candidates(
         });
     }
 
-    // Phase 2: Process each hash directory in parallel.
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(EVICTION_SCAN_CONCURRENCY));
-    let mut join_set = tokio::task::JoinSet::new();
-
-    for dir_path in hash_dirs {
-        let sem = semaphore.clone();
-        join_set.spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
-            scan_hash_dir_for_eviction(dir_path).await
-        });
-    }
+    // Phase 2: Process each hash directory in parallel with a bounded
+    // streaming JoinSet pump (at most CACHE_HASH_DIR_SCAN_CONCURRENCY tasks
+    // alive at once).
+    let dir_results = bounded_parallel_scan(
+        hash_dirs,
+        CACHE_HASH_DIR_SCAN_CONCURRENCY,
+        scan_hash_dir_for_eviction,
+        |e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
+    )
+    .await?;
 
     // Phase 3: Aggregate results from all parallel tasks.
     let mut candidates = Vec::new();
@@ -690,21 +687,11 @@ async fn collect_candidates(
     let mut scan_entry_count: u64 = 0;
     let mut all_cleanups = Vec::new();
 
-    while let Some(result) = join_set.join_next().await {
-        match result {
-            Ok(Ok(dir_result)) => {
-                candidates.extend(dir_result.candidates);
-                scan_total_bytes += dir_result.total_bytes;
-                scan_entry_count += dir_result.entry_count;
-                all_cleanups.extend(dir_result.deferred_cleanups);
-            }
-            Ok(Err(e)) => {
-                return Err(e);
-            }
-            Err(e) => {
-                return Err(Box::new(e));
-            }
-        }
+    for dir_result in dir_results {
+        candidates.extend(dir_result.candidates);
+        scan_total_bytes += dir_result.total_bytes;
+        scan_entry_count += dir_result.entry_count;
+        all_cleanups.extend(dir_result.deferred_cleanups);
     }
 
     // Phase 4: Process deferred cleanups under per-key locks.

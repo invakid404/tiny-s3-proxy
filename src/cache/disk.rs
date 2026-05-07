@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use super::layout::collect_hash_dirs_best_effort;
+use super::scan::{CACHE_HASH_DIR_SCAN_CONCURRENCY, bounded_parallel_scan};
 use crate::cache::entry::CacheEntry;
 use crate::cache::key::CacheKey;
 use crate::cache::metadata::CacheMeta;
@@ -356,18 +357,19 @@ impl DiskCache {
             });
         }
 
-        // Phase 2: Process each hash directory in parallel.
-        const SCAN_CONCURRENCY: usize = 64;
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(SCAN_CONCURRENCY));
-        let mut join_set = tokio::task::JoinSet::new();
-
-        for dir_path in hash_dirs {
-            let sem = semaphore.clone();
-            join_set.spawn(async move {
-                let _permit = sem.acquire().await.unwrap();
-                Self::scan_hash_dir(dir_path).await
-            });
-        }
+        // Phase 2: Process each hash directory in parallel with a bounded
+        // streaming JoinSet pump (at most CACHE_HASH_DIR_SCAN_CONCURRENCY
+        // tasks alive at once).
+        let dir_results = bounded_parallel_scan(
+            hash_dirs,
+            CACHE_HASH_DIR_SCAN_CONCURRENCY,
+            Self::scan_hash_dir,
+            |e| ProxyError::Cache {
+                source: Box::new(e),
+                operation: "startup scan task panicked".into(),
+            },
+        )
+        .await?;
 
         // Phase 3: Aggregate results from all tasks.
         let mut agg = StartupScanResult {
@@ -377,29 +379,16 @@ impl DiskCache {
             fill_id_incomplete: dirs_fill_id_incomplete,
         };
 
-        while let Some(join_result) = join_set.join_next().await {
-            match join_result {
-                Ok(Ok(dir)) => {
-                    agg.stats
-                        .total_bytes
-                        .fetch_add(dir.total_bytes, Ordering::Relaxed);
-                    agg.stats
-                        .entry_count
-                        .fetch_add(dir.entry_count, Ordering::Relaxed);
-                    agg.max_fill_id = agg.max_fill_id.max(dir.max_fill_id);
-                    agg.saw_cache_files = agg.saw_cache_files || dir.saw_cache_files;
-                    agg.fill_id_incomplete = agg.fill_id_incomplete || dir.fill_id_incomplete;
-                }
-                Ok(Err(e)) => {
-                    return Err(e);
-                }
-                Err(e) => {
-                    return Err(ProxyError::Cache {
-                        source: Box::new(e),
-                        operation: "startup scan task panicked".into(),
-                    });
-                }
-            }
+        for dir in dir_results {
+            agg.stats
+                .total_bytes
+                .fetch_add(dir.total_bytes, Ordering::Relaxed);
+            agg.stats
+                .entry_count
+                .fetch_add(dir.entry_count, Ordering::Relaxed);
+            agg.max_fill_id = agg.max_fill_id.max(dir.max_fill_id);
+            agg.saw_cache_files = agg.saw_cache_files || dir.saw_cache_files;
+            agg.fill_id_incomplete = agg.fill_id_incomplete || dir.fill_id_incomplete;
         }
 
         Ok(agg)

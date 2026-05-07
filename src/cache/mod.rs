@@ -5,6 +5,7 @@ pub mod key;
 mod layout;
 pub mod metadata;
 pub mod policy;
+mod scan;
 pub mod singleflight;
 
 use std::path::PathBuf;
