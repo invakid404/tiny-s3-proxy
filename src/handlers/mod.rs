@@ -304,8 +304,9 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
             } else {
                 // Read the body eagerly so we can check for per-part checksum
                 // XML elements (ChecksumCRC32, ChecksumCRC32C, ChecksumSHA1,
-                // ChecksumSHA256). The typed path drops these — route through
-                // passthrough to preserve integrity validation.
+                // ChecksumSHA256, ChecksumCRC64NVME). The typed path drops
+                // these — route through passthrough to preserve integrity
+                // validation.
                 match axum::body::to_bytes(body, state.config.max_request_body_bytes as usize).await
                 {
                     Err(e) => {
