@@ -73,16 +73,11 @@ fn build_object_headers_common(
 
     headers.extend(metadata_headers(metadata));
 
-    for (k, v) in extra_headers {
-        if !include_checksum_headers && is_checksum_response_header(k) {
-            continue;
-        }
-        if let (Ok(name), Ok(val)) = (
-            HeaderName::from_bytes(k.as_bytes()),
-            HeaderValue::from_str(v),
-        ) {
-            headers.insert(name, val);
-        }
+    let filtered = extra_headers
+        .iter()
+        .filter(|(k, _)| include_checksum_headers || !is_checksum_response_header(k.as_str()));
+    for (name, val) in parse_valid_extra_headers(filtered) {
+        headers.insert(name, val);
     }
 
     headers
