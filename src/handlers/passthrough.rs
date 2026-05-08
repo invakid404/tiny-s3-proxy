@@ -218,9 +218,7 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
         };
 
         // Build a fresh http::Request from the base headers for signing.
-        let mut sign_req_builder = http::Request::builder()
-            .method(method)
-            .uri(&upstream_url);
+        let mut sign_req_builder = http::Request::builder().method(method).uri(&upstream_url);
         for (name, value) in &base_headers {
             sign_req_builder = sign_req_builder.header(name, value);
         }
@@ -879,7 +877,11 @@ mod tests {
         .await;
 
         assert_eq!(resp.status(), 200);
-        assert_eq!(call_count.load(Ordering::SeqCst), 2, "should have made 2 attempts");
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            2,
+            "should have made 2 attempts"
+        );
 
         let reqs = requests_for_handler.lock().await;
         assert_eq!(reqs.len(), 2, "mock should have recorded 2 requests");
@@ -888,7 +890,9 @@ mod tests {
         for (i, (_method, _uri, hdrs)) in reqs.iter().enumerate() {
             let auth = hdrs
                 .get("authorization")
-                .unwrap_or_else(|| panic!("attempt {}: authorization header must be present", i + 1))
+                .unwrap_or_else(|| {
+                    panic!("attempt {}: authorization header must be present", i + 1)
+                })
                 .to_str()
                 .unwrap();
             assert!(
@@ -908,17 +912,32 @@ mod tests {
         let date2 = reqs[1].2.get("x-amz-date").unwrap().to_str().unwrap();
         assert_eq!(date1.len(), 16, "x-amz-date should be 16 chars: {date1}");
         assert_eq!(date2.len(), 16, "x-amz-date should be 16 chars: {date2}");
-        assert!(date1.ends_with('Z'), "x-amz-date should end with Z: {date1}");
-        assert!(date2.ends_with('Z'), "x-amz-date should end with Z: {date2}");
+        assert!(
+            date1.ends_with('Z'),
+            "x-amz-date should end with Z: {date1}"
+        );
+        assert!(
+            date2.ends_with('Z'),
+            "x-amz-date should end with Z: {date2}"
+        );
 
         // The authorization headers should both be valid SigV4 signatures
         // (they will differ if the timestamps differ, or be the same if
         // the retry was fast enough that the second landed in the same second).
         let auth1 = reqs[0].2.get("authorization").unwrap().to_str().unwrap();
         let auth2 = reqs[1].2.get("authorization").unwrap().to_str().unwrap();
-        assert!(auth1.contains("Credential="), "first auth missing Credential");
-        assert!(auth2.contains("Credential="), "second auth missing Credential");
+        assert!(
+            auth1.contains("Credential="),
+            "first auth missing Credential"
+        );
+        assert!(
+            auth2.contains("Credential="),
+            "second auth missing Credential"
+        );
         assert!(auth1.contains("Signature="), "first auth missing Signature");
-        assert!(auth2.contains("Signature="), "second auth missing Signature");
+        assert!(
+            auth2.contains("Signature="),
+            "second auth missing Signature"
+        );
     }
 }
