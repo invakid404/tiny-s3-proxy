@@ -283,15 +283,13 @@ where
                 Ok(params) => params,
                 Err(e) => {
                     tracing::error!(error = %e, "passthrough: failed to build signing params");
-                    let s3err =
-                        S3Error::internal_error("An internal error occurred.", request_id);
+                    let s3err = S3Error::internal_error("An internal error occurred.", request_id);
                     return s3err.to_response();
                 }
             };
 
             // Build a fresh http::Request from the base headers for signing.
-            let mut sign_req_builder =
-                http::Request::builder().method(method).uri(&upstream_url);
+            let mut sign_req_builder = http::Request::builder().method(method).uri(&upstream_url);
             for (name, value) in &base_headers {
                 sign_req_builder = sign_req_builder.header(name, value);
             }
@@ -299,8 +297,7 @@ where
                 Ok(req) => req,
                 Err(e) => {
                     tracing::error!(error = %e, "passthrough: failed to build signable request");
-                    let s3err =
-                        S3Error::internal_error("An internal error occurred.", request_id);
+                    let s3err = S3Error::internal_error("An internal error occurred.", request_id);
                     return s3err.to_response();
                 }
             };
@@ -327,22 +324,19 @@ where
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!(error = %e, "passthrough: failed to create signable request");
-                    let s3err =
-                        S3Error::internal_error("An internal error occurred.", request_id);
+                    let s3err = S3Error::internal_error("An internal error occurred.", request_id);
                     return s3err.to_response();
                 }
             };
 
-            let (signing_instructions, _signature) =
-                match sign(signable, &signing_params.into()) {
-                    Ok(output) => output.into_parts(),
-                    Err(e) => {
-                        tracing::error!(error = %e, "passthrough: failed to sign request");
-                        let s3err =
-                            S3Error::internal_error("An internal error occurred.", request_id);
-                        return s3err.to_response();
-                    }
-                };
+            let (signing_instructions, _signature) = match sign(signable, &signing_params.into()) {
+                Ok(output) => output.into_parts(),
+                Err(e) => {
+                    tracing::error!(error = %e, "passthrough: failed to sign request");
+                    let s3err = S3Error::internal_error("An internal error occurred.", request_id);
+                    return s3err.to_response();
+                }
+            };
 
             // Apply signing instructions (adds Authorization, x-amz-date, etc.).
             signing_instructions.apply_to_request_http1x(&mut signable_request);
@@ -424,8 +418,7 @@ where
         }
     } else {
         // -- Streaming path (unsigned payload, non-retryable) --
-        let stream_body =
-            stream_body.expect("stream_body must be Some when body_bytes is None");
+        let stream_body = stream_body.expect("stream_body must be Some when body_bytes is None");
 
         let signing_params = match SigningParams::builder()
             .identity(&identity)
@@ -616,7 +609,11 @@ mod tests {
         let body_bytes = axum::body::to_bytes(req.into_body(), 64 * 1024 * 1024)
             .await
             .unwrap_or_default();
-        state.requests.lock().await.push((method, uri, headers, body_bytes));
+        state
+            .requests
+            .lock()
+            .await
+            .push((method, uri, headers, body_bytes));
         let count = state.call_count.fetch_add(1, Ordering::SeqCst);
 
         let status = state.response_status.load(Ordering::SeqCst);
