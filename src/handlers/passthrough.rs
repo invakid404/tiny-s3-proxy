@@ -78,6 +78,35 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
     body: Body,
     request_id: &str,
 ) -> Response<Body> {
+    handle_passthrough_with_clock(
+        state,
+        method,
+        path,
+        query,
+        original_headers,
+        body,
+        request_id,
+        SystemTime::now,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_passthrough_with_clock<B, C, Now>(
+    state: &Arc<AppState<B, C>>,
+    method: &str,
+    path: &str,
+    query: Option<&str>,
+    original_headers: &http::HeaderMap,
+    body: Body,
+    request_id: &str,
+    now: Now,
+) -> Response<Body>
+where
+    B: Backend,
+    C: CacheStore,
+    Now: Fn() -> SystemTime + Send + Sync,
+{
     // 1. Build the upstream URL.
     // When backend_use_path_style is false, rewrite to virtual-hosted-style:
     //   https://bucket.endpoint/key  instead of  https://endpoint/bucket/key
@@ -205,7 +234,7 @@ pub async fn handle_passthrough<B: Backend, C: CacheStore>(
             .identity(&identity)
             .region(&state.config.backend_region)
             .name("s3")
-            .time(SystemTime::now())
+            .time(now())
             .settings(signing_settings.clone())
             .build()
         {
@@ -391,6 +420,7 @@ mod tests {
     use http::HeaderMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
 
     /// State shared with the mock upstream server.
     struct MockUpstream {
@@ -865,7 +895,25 @@ mod tests {
         let state = build_passthrough_state(config);
         let headers = HeaderMap::new();
 
-        let resp = handle_passthrough(
+        // Inject a deterministic clock that advances by 2 seconds between
+        // calls, guaranteeing each retry's signing timestamp lands in a
+        // different SigV4 second. Without this, both attempts could share a
+        // wall-clock second and produce identical Authorization/x-amz-date,
+        // letting the test pass even if production reverted to one-time
+        // pre-loop signing.
+        let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let clock_calls = Arc::new(std::sync::Mutex::new(0u32));
+        let clock = {
+            let clock_calls = clock_calls.clone();
+            move || {
+                let mut n = clock_calls.lock().unwrap();
+                let t = base_time + Duration::from_secs(u64::from(*n) * 2);
+                *n += 1;
+                t
+            }
+        };
+
+        let resp = handle_passthrough_with_clock(
             &state,
             "GET",
             "/test-backend/key",
@@ -873,6 +921,7 @@ mod tests {
             &headers,
             Body::empty(),
             "req-resign",
+            clock,
         )
         .await;
 
@@ -921,9 +970,6 @@ mod tests {
             "x-amz-date should end with Z: {date2}"
         );
 
-        // The authorization headers should both be valid SigV4 signatures
-        // (they will differ if the timestamps differ, or be the same if
-        // the retry was fast enough that the second landed in the same second).
         let auth1 = reqs[0].2.get("authorization").unwrap().to_str().unwrap();
         let auth2 = reqs[1].2.get("authorization").unwrap().to_str().unwrap();
         assert!(
@@ -938,6 +984,16 @@ mod tests {
         assert!(
             auth2.contains("Signature="),
             "second auth missing Signature"
+        );
+
+        // The injected clock advances by 2s per call, so the two attempts
+        // must produce distinct timestamps. If signing were lifted out of
+        // the retry loop (the bug), both attempts would carry the SAME
+        // x-amz-date and Signature.
+        assert_ne!(date1, date2, "retry must be signed with a fresh x-amz-date");
+        assert_ne!(
+            auth1, auth2,
+            "retry must be signed with a fresh Authorization signature"
         );
     }
 }
