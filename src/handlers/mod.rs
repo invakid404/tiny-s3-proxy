@@ -222,20 +222,7 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
             "unsupported operation, attempting passthrough to backend"
         );
 
-        // Rewrite path: replace frontend bucket with backend bucket.
-        let rewritten_path =
-            rewrite_bucket_in_path(path, &state.frontend_bucket, &state.backend_bucket);
-        let query = parts.uri.query();
-        let response = passthrough::handle_passthrough(
-            &state,
-            method,
-            &rewritten_path,
-            query,
-            &parts.headers,
-            body,
-            &parsed.request_id,
-        )
-        .await;
+        let response = route_to_passthrough(&state, &parts, body, &parsed.request_id).await;
         record_metrics(op_name, &response, start);
         return response;
     }
@@ -244,35 +231,35 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
     let response = match &parsed.operation {
         S3Operation::GetObject { key, .. } => {
             if has_unsupported_get_modifiers(&parts.headers) {
-                route_to_passthrough(&state, "GET", &parts, body, &parsed.request_id).await
+                route_to_passthrough(&state, &parts, body, &parsed.request_id).await
             } else {
                 get::handle_get(&state, &parsed, key).await
             }
         }
         S3Operation::HeadObject { key, .. } => {
             if has_unsupported_get_modifiers(&parts.headers) {
-                route_to_passthrough(&state, "HEAD", &parts, body, &parsed.request_id).await
+                route_to_passthrough(&state, &parts, body, &parsed.request_id).await
             } else {
                 head::handle_head(&state, &parsed, key).await
             }
         }
         S3Operation::PutObject { key, .. } => {
             if has_unsupported_write_modifiers(&parsed.extra_amz_headers, &parts.headers) {
-                route_to_passthrough(&state, "PUT", &parts, body, &parsed.request_id).await
+                route_to_passthrough(&state, &parts, body, &parsed.request_id).await
             } else {
                 put::handle_put(&state, &parsed, key, body).await
             }
         }
         S3Operation::DeleteObject { key, .. } => {
             if has_unsupported_write_modifiers(&parsed.extra_amz_headers, &parts.headers) {
-                route_to_passthrough(&state, "DELETE", &parts, body, &parsed.request_id).await
+                route_to_passthrough(&state, &parts, body, &parsed.request_id).await
             } else {
                 delete::handle_delete(&state, &parsed, key).await
             }
         }
         S3Operation::ListObjectsV1 { params, .. } | S3Operation::ListObjectsV2 { params, .. } => {
             if has_unsupported_list_modifiers(parts.uri.query(), &parts.headers) {
-                route_to_passthrough(&state, "GET", &parts, body, &parsed.request_id).await
+                route_to_passthrough(&state, &parts, body, &parsed.request_id).await
             } else {
                 let is_v2 = matches!(&parsed.operation, S3Operation::ListObjectsV2 { .. });
                 list::handle_list(&state, &parsed, params, is_v2).await
@@ -280,7 +267,7 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
         }
         S3Operation::CreateMultipartUpload { key, .. } => {
             if has_unsupported_multipart_modifiers(&parsed.extra_amz_headers, &parts.headers) {
-                route_to_passthrough(&state, "POST", &parts, body, &parsed.request_id).await
+                route_to_passthrough(&state, &parts, body, &parsed.request_id).await
             } else {
                 multipart::handle_create_multipart(&state, &parsed, key).await
             }
@@ -292,7 +279,7 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
             ..
         } => {
             if has_unsupported_multipart_modifiers(&parsed.extra_amz_headers, &parts.headers) {
-                route_to_passthrough(&state, "PUT", &parts, body, &parsed.request_id).await
+                route_to_passthrough(&state, &parts, body, &parsed.request_id).await
             } else {
                 multipart::handle_upload_part(&state, &parsed, key, *part_number, upload_id, body)
                     .await
@@ -300,7 +287,7 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
         }
         S3Operation::CompleteMultipartUpload { key, upload_id, .. } => {
             if has_unsupported_multipart_modifiers(&parsed.extra_amz_headers, &parts.headers) {
-                route_to_passthrough(&state, "POST", &parts, body, &parsed.request_id).await
+                route_to_passthrough(&state, &parts, body, &parsed.request_id).await
             } else {
                 // Read the body eagerly so we can check for per-part checksum
                 // XML elements (ChecksumCRC32, ChecksumCRC32C, ChecksumSHA1,
@@ -316,7 +303,6 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
                     Ok(body_bytes) if crate::s3::xml::body_has_checksum_elements(&body_bytes) => {
                         route_to_passthrough(
                             &state,
-                            "POST",
                             &parts,
                             Body::from(body_bytes),
                             &parsed.request_id,
@@ -334,7 +320,7 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
         }
         S3Operation::AbortMultipartUpload { key, upload_id, .. } => {
             if has_unsupported_multipart_modifiers(&parsed.extra_amz_headers, &parts.headers) {
-                route_to_passthrough(&state, "DELETE", &parts, body, &parsed.request_id).await
+                route_to_passthrough(&state, &parts, body, &parsed.request_id).await
             } else {
                 multipart::handle_abort_multipart(&state, &parsed, key, upload_id).await
             }
@@ -352,7 +338,6 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
 /// Route through raw passthrough, rewriting the bucket in the path.
 async fn route_to_passthrough<B: Backend, C: CacheStore>(
     state: &Arc<AppState<B, C>>,
-    method: &str,
     parts: &http::request::Parts,
     body: Body,
     request_id: &str,
@@ -362,7 +347,7 @@ async fn route_to_passthrough<B: Backend, C: CacheStore>(
     let query = parts.uri.query();
     passthrough::handle_passthrough(
         state,
-        method,
+        parts.method.as_str(),
         &rewritten,
         query,
         &parts.headers,
