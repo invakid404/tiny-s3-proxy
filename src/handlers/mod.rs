@@ -359,7 +359,16 @@ async fn route_to_passthrough<B: Backend, C: CacheStore>(
     let raw_path = parts.uri.path();
     let rewritten = rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
     let query = parts.uri.query();
-    passthrough::handle_passthrough(state, method, &rewritten, query, &parts.headers, body, request_id).await
+    passthrough::handle_passthrough(
+        state,
+        method,
+        &rewritten,
+        query,
+        &parts.headers,
+        body,
+        request_id,
+    )
+    .await
 }
 
 /// Rewrite the bucket portion of a path-style S3 URL.
@@ -474,8 +483,6 @@ pub(crate) async fn invalidate_cache_key<C: CacheStore>(
     }
     singleflight.cancel(cache_key).await;
 }
-
-
 
 #[cfg(test)]
 pub mod test_utils {
