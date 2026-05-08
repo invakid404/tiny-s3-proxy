@@ -6,7 +6,8 @@ use http::header::{HeaderName, HeaderValue};
 use crate::backend::models::{GetObjectMeta, HeadObjectOutput};
 
 pub(crate) fn is_checksum_response_header(name: &str) -> bool {
-    name.starts_with("x-amz-checksum-")
+    const PREFIX: &str = "x-amz-checksum-";
+    name.len() >= PREFIX.len() && name[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
 }
 
 /// Format a DateTime to RFC 7231 (HTTP-date) format.
@@ -351,6 +352,37 @@ mod tests {
 
         let headers = get_object_headers(&meta, true);
         assert_eq!(headers.get("x-amz-checksum-sha256").unwrap(), "abc");
+    }
+
+    #[test]
+    fn test_is_checksum_response_header_case_insensitive() {
+        assert!(is_checksum_response_header("x-amz-checksum-sha256"));
+        assert!(is_checksum_response_header("X-Amz-Checksum-SHA256"));
+        assert!(is_checksum_response_header("X-AMZ-CHECKSUM-CRC32"));
+        assert!(is_checksum_response_header("x-AmZ-cHeCkSuM-crc32c"));
+        assert!(!is_checksum_response_header("x-amz-meta-checksum"));
+        assert!(!is_checksum_response_header("x-amz-checksum"));
+        assert!(!is_checksum_response_header(""));
+    }
+
+    #[test]
+    fn test_get_object_headers_filters_mixed_case_checksum_headers() {
+        let mut extra_headers = HashMap::new();
+        extra_headers.insert("X-Amz-Checksum-CRC32".to_string(), "abc".to_string());
+        extra_headers.insert("Cache-Control".to_string(), "max-age=60".to_string());
+
+        let meta = GetObjectMeta {
+            content_type: None,
+            content_length: None,
+            etag: None,
+            last_modified: None,
+            metadata: HashMap::new(),
+            extra_headers,
+        };
+
+        let headers = get_object_headers(&meta, false);
+        assert!(headers.get("x-amz-checksum-crc32").is_none());
+        assert_eq!(headers.get("cache-control").unwrap(), "max-age=60");
     }
 
     #[test]

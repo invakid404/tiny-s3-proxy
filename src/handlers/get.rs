@@ -1284,6 +1284,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cache_hit_filters_mixed_case_checksum_headers_when_not_requested() {
+        let key = "script_bundle/checksum-filter-mixed-case.js";
+        let body = b"cached checksum body".to_vec();
+        let cache_key = CacheKey::new("test-backend", key);
+        let mut meta = test_cache_meta("test-backend", key, &body);
+        meta.extra_headers
+            .insert("X-Amz-Checksum-CRC32".to_string(), "abc123".to_string());
+        meta.checksum_mode_checked = true;
+
+        let cache = MockCache::new().with_entry(&cache_key, &body, meta);
+        let state = build_app_state(MockBackend::new(), cache, MockAuth::allow_all());
+
+        let resp = handle_get(&state, &make_parsed(key), key).await;
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("x-cache").unwrap(), "HIT");
+        assert!(resp.headers().get("x-amz-checksum-crc32").is_none());
+    }
+
+    #[tokio::test]
     async fn test_checksum_mode_cache_hit_preserves_checksum_headers() {
         let key = "script_bundle/checksum-hit.js";
         let body = b"cached checksum body".to_vec();
@@ -1359,6 +1379,37 @@ mod tests {
         );
         // Only the original fill GET was called — no additional backend calls.
         assert_eq!(state.backend.get_read_calls.lock().unwrap().len(), 1);
+    }
+
+    /// `checksum_mode_checked` inference must detect mixed-case backend
+    /// checksum keys, not just lowercase ones. Otherwise a fill from a
+    /// backend that produces `X-Amz-Checksum-*` would silently fail to
+    /// satisfy a follow-up checksum GET.
+    #[tokio::test]
+    async fn test_plain_get_with_mixed_case_checksum_headers_sets_checksum_mode_checked() {
+        let key = "script_bundle/plain-get-mixed-case-checksums.js";
+        let body = b"body with mixed-case checksums".to_vec();
+        let cache_key = CacheKey::new("test-backend", key);
+
+        let mut get_extra = HashMap::new();
+        get_extra.insert("X-Amz-Checksum-CRC32".to_string(), "abc123".to_string());
+
+        let backend = MockBackend::new().with_get(Ok(MockGetResponse {
+            body: body.clone(),
+            content_type: Some("text/plain".to_string()),
+            etag: Some("\"etag-mixed\"".to_string()),
+            extra_headers: get_extra,
+        }));
+        let cache = MockCache::new();
+        let state = build_app_state(backend, cache, MockAuth::allow_all());
+
+        let resp = handle_get(&state, &make_parsed(key), key).await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("x-cache").unwrap(), "MISS");
+
+        let cached =
+            wait_for_cached_entry(&state, &cache_key, |e| e.meta.checksum_mode_checked).await;
+        assert!(cached.meta.checksum_mode_checked);
     }
 
     /// HEAD refresh enriches HEAD-specific state but cannot make checksum

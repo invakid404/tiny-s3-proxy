@@ -1280,6 +1280,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_head_cache_filters_mixed_case_checksum_headers_when_not_requested() {
+        let key = "script_bundle/head-checksum-filter-mixed-case.js";
+        let cache_key = crate::cache::key::CacheKey::new("test-backend", key);
+        let mut meta = test_cache_meta("test-backend", key, b"cached body");
+        meta.extra_headers
+            .insert("X-Amz-Checksum-CRC32".to_string(), "crc32".to_string());
+        meta.checksum_mode_checked = true;
+        meta.head_metadata_checked = true;
+
+        let cache = MockCache::new().with_entry(&cache_key, b"cached body", meta);
+        let state = build_app_state(MockBackend::new(), cache, MockAuth::allow_all());
+
+        let resp = handle_head(&state, &make_parsed(key), key).await;
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("x-cache").unwrap(), "HIT");
+        assert!(resp.headers().get("x-amz-checksum-crc32").is_none());
+    }
+
+    #[tokio::test]
     async fn test_head_checksum_mode_uses_checked_cache_entry() {
         let key = "script_bundle/head-checksum-cached.js";
         let cache_key = crate::cache::key::CacheKey::new("test-backend", key);
