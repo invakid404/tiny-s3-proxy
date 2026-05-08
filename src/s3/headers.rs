@@ -6,8 +6,10 @@ use http::header::{HeaderName, HeaderValue};
 use crate::backend::models::{GetObjectMeta, HeadObjectOutput};
 
 pub(crate) fn is_checksum_response_header(name: &str) -> bool {
-    const PREFIX: &str = "x-amz-checksum-";
-    name.len() >= PREFIX.len() && name[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
+    const PREFIX: &[u8] = b"x-amz-checksum-";
+    name.as_bytes()
+        .get(..PREFIX.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(PREFIX))
 }
 
 /// Format a DateTime to RFC 7231 (HTTP-date) format.
@@ -363,6 +365,21 @@ mod tests {
         assert!(!is_checksum_response_header("x-amz-meta-checksum"));
         assert!(!is_checksum_response_header("x-amz-checksum"));
         assert!(!is_checksum_response_header(""));
+    }
+
+    #[test]
+    fn test_is_checksum_response_header_non_ascii_does_not_panic() {
+        // 14 ASCII bytes ("x-amz-checksum") followed by 'é' (2 UTF-8 bytes:
+        // 0xC3 0xA9). The prefix length is 15, so a naive `name[..15]` slice
+        // would land mid-multibyte-char and panic on string indexing.
+        let input = format!("x-amz-checksum{}", '\u{00E9}');
+        assert!(!is_checksum_response_header(&input));
+
+        // Bytewise the prefix matches "x-amz-checksum" + 0xC3, which is not
+        // '-' (0x2D), so the answer is false — but the important assertion
+        // is that the call returns instead of panicking.
+        let prefixed = format!("x-amz-checksum-{}", '\u{00E9}');
+        assert!(is_checksum_response_header(&prefixed));
     }
 
     #[test]
