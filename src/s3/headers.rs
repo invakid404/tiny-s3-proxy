@@ -141,6 +141,39 @@ pub fn put_object_headers(etag: Option<&str>, request_id: &str) -> HeaderMap {
     headers
 }
 
+/// Parse a `(String, String)` extra-headers iterable into validated
+/// `(HeaderName, HeaderValue)` pairs, silently dropping entries with invalid
+/// names or values. Used by callers that need to forward backend-supplied
+/// extra headers onto a response.
+pub fn parse_valid_extra_headers<'a, I>(
+    extra: I,
+) -> impl Iterator<Item = (HeaderName, HeaderValue)> + 'a
+where
+    I: IntoIterator<Item = (&'a String, &'a String)> + 'a,
+{
+    extra.into_iter().filter_map(|(k, v)| {
+        match (
+            HeaderName::from_bytes(k.as_bytes()),
+            HeaderValue::from_str(v),
+        ) {
+            (Ok(name), Ok(val)) => Some((name, val)),
+            _ => None,
+        }
+    })
+}
+
+/// Append extra headers from a HashMap to a response builder, silently
+/// skipping entries with invalid header names or values.
+pub fn append_extra_headers(
+    mut builder: http::response::Builder,
+    headers: &HashMap<String, String>,
+) -> http::response::Builder {
+    for (name, val) in parse_valid_extra_headers(headers) {
+        builder = builder.header(name, val);
+    }
+    builder
+}
+
 /// Add a cache diagnostic header.
 pub fn with_cache_status(headers: &mut HeaderMap, status: &str) {
     if let Ok(val) = HeaderValue::from_str(status) {

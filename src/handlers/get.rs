@@ -16,7 +16,7 @@ use crate::handlers::AppState;
 use crate::s3::errors::S3Error;
 use crate::s3::headers::{
     common_headers, get_object_headers, is_checksum_response_header, metadata_headers,
-    with_cache_status,
+    parse_valid_extra_headers, with_cache_status,
 };
 use crate::s3::ops::ParsedRequest;
 
@@ -115,16 +115,11 @@ async fn build_cache_response(
                 }
             }
             headers.extend(metadata_headers(&m.metadata));
-            for (k, v) in &m.extra_headers {
-                if !include_checksum_headers && is_checksum_response_header(k.as_str()) {
-                    continue;
-                }
-                if let (Ok(name), Ok(val)) = (
-                    http::header::HeaderName::from_bytes(k.as_bytes()),
-                    http::header::HeaderValue::from_str(v),
-                ) {
-                    headers.insert(name, val);
-                }
+            let filtered = m.extra_headers.iter().filter(|(k, _)| {
+                include_checksum_headers || !is_checksum_response_header(k.as_str())
+            });
+            for (name, val) in parse_valid_extra_headers(filtered) {
+                headers.insert(name, val);
             }
 
             headers.extend(common_headers(request_id));

@@ -2,9 +2,12 @@ pub mod delete;
 pub mod get;
 pub mod head;
 pub mod list;
+mod modifiers;
 pub mod multipart;
 pub mod passthrough;
 pub mod put;
+
+use modifiers::*;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -219,20 +222,7 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
             "unsupported operation, attempting passthrough to backend"
         );
 
-        // Rewrite path: replace frontend bucket with backend bucket.
-        let rewritten_path =
-            rewrite_bucket_in_path(path, &state.frontend_bucket, &state.backend_bucket);
-        let query = parts.uri.query();
-        let response = passthrough::handle_passthrough(
-            &state,
-            method,
-            &rewritten_path,
-            query,
-            &parts.headers,
-            body,
-            &parsed.request_id,
-        )
-        .await;
+        let response = route_to_passthrough(&state, &parts, body, &parsed.request_id).await;
         record_metrics(op_name, &response, start);
         return response;
     }
@@ -241,104 +231,35 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
     let response = match &parsed.operation {
         S3Operation::GetObject { key, .. } => {
             if has_unsupported_get_modifiers(&parts.headers) {
-                // Route through raw passthrough to preserve headers like Range,
-                // If-Match, If-None-Match, SSE-C, etc. that the typed backend
-                // API cannot carry. Use the original raw URI path to preserve
-                // percent-encoding (the parsed `key` is already decoded).
-                let raw_path = parts.uri.path();
-                let rewritten =
-                    rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
-                let query = parts.uri.query();
-                passthrough::handle_passthrough(
-                    &state,
-                    "GET",
-                    &rewritten,
-                    query,
-                    &parts.headers,
-                    body,
-                    &parsed.request_id,
-                )
-                .await
+                route_to_passthrough(&state, &parts, body, &parsed.request_id).await
             } else {
                 get::handle_get(&state, &parsed, key).await
             }
         }
         S3Operation::HeadObject { key, .. } => {
             if has_unsupported_get_modifiers(&parts.headers) {
-                let raw_path = parts.uri.path();
-                let rewritten =
-                    rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
-                let query = parts.uri.query();
-                passthrough::handle_passthrough(
-                    &state,
-                    "HEAD",
-                    &rewritten,
-                    query,
-                    &parts.headers,
-                    body,
-                    &parsed.request_id,
-                )
-                .await
+                route_to_passthrough(&state, &parts, body, &parsed.request_id).await
             } else {
                 head::handle_head(&state, &parsed, key).await
             }
         }
         S3Operation::PutObject { key, .. } => {
             if has_unsupported_write_modifiers(&parsed.extra_amz_headers, &parts.headers) {
-                let raw_path = parts.uri.path();
-                let rewritten =
-                    rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
-                let query = parts.uri.query();
-                passthrough::handle_passthrough(
-                    &state,
-                    "PUT",
-                    &rewritten,
-                    query,
-                    &parts.headers,
-                    body,
-                    &parsed.request_id,
-                )
-                .await
+                route_to_passthrough(&state, &parts, body, &parsed.request_id).await
             } else {
                 put::handle_put(&state, &parsed, key, body).await
             }
         }
         S3Operation::DeleteObject { key, .. } => {
             if has_unsupported_write_modifiers(&parsed.extra_amz_headers, &parts.headers) {
-                let raw_path = parts.uri.path();
-                let rewritten =
-                    rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
-                let query = parts.uri.query();
-                passthrough::handle_passthrough(
-                    &state,
-                    "DELETE",
-                    &rewritten,
-                    query,
-                    &parts.headers,
-                    body,
-                    &parsed.request_id,
-                )
-                .await
+                route_to_passthrough(&state, &parts, body, &parsed.request_id).await
             } else {
                 delete::handle_delete(&state, &parsed, key).await
             }
         }
         S3Operation::ListObjectsV1 { params, .. } | S3Operation::ListObjectsV2 { params, .. } => {
             if has_unsupported_list_modifiers(parts.uri.query(), &parts.headers) {
-                let raw_path = parts.uri.path();
-                let rewritten =
-                    rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
-                let query = parts.uri.query();
-                passthrough::handle_passthrough(
-                    &state,
-                    "GET",
-                    &rewritten,
-                    query,
-                    &parts.headers,
-                    body,
-                    &parsed.request_id,
-                )
-                .await
+                route_to_passthrough(&state, &parts, body, &parsed.request_id).await
             } else {
                 let is_v2 = matches!(&parsed.operation, S3Operation::ListObjectsV2 { .. });
                 list::handle_list(&state, &parsed, params, is_v2).await
@@ -346,20 +267,7 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
         }
         S3Operation::CreateMultipartUpload { key, .. } => {
             if has_unsupported_multipart_modifiers(&parsed.extra_amz_headers, &parts.headers) {
-                let raw_path = parts.uri.path();
-                let rewritten =
-                    rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
-                let query = parts.uri.query();
-                passthrough::handle_passthrough(
-                    &state,
-                    "POST",
-                    &rewritten,
-                    query,
-                    &parts.headers,
-                    body,
-                    &parsed.request_id,
-                )
-                .await
+                route_to_passthrough(&state, &parts, body, &parsed.request_id).await
             } else {
                 multipart::handle_create_multipart(&state, &parsed, key).await
             }
@@ -371,20 +279,7 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
             ..
         } => {
             if has_unsupported_multipart_modifiers(&parsed.extra_amz_headers, &parts.headers) {
-                let raw_path = parts.uri.path();
-                let rewritten =
-                    rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
-                let query = parts.uri.query();
-                passthrough::handle_passthrough(
-                    &state,
-                    "PUT",
-                    &rewritten,
-                    query,
-                    &parts.headers,
-                    body,
-                    &parsed.request_id,
-                )
-                .await
+                route_to_passthrough(&state, &parts, body, &parsed.request_id).await
             } else {
                 multipart::handle_upload_part(&state, &parsed, key, *part_number, upload_id, body)
                     .await
@@ -392,25 +287,12 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
         }
         S3Operation::CompleteMultipartUpload { key, upload_id, .. } => {
             if has_unsupported_multipart_modifiers(&parsed.extra_amz_headers, &parts.headers) {
-                let raw_path = parts.uri.path();
-                let rewritten =
-                    rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
-                let query = parts.uri.query();
-                passthrough::handle_passthrough(
-                    &state,
-                    "POST",
-                    &rewritten,
-                    query,
-                    &parts.headers,
-                    body,
-                    &parsed.request_id,
-                )
-                .await
+                route_to_passthrough(&state, &parts, body, &parsed.request_id).await
             } else {
                 // Read the body eagerly so we can check for per-part checksum
-                // XML elements (ChecksumCRC32, ChecksumCRC32C, ChecksumSHA1,
-                // ChecksumSHA256). The typed path drops these — route through
-                // passthrough to preserve integrity validation.
+                // XML elements (ChecksumCRC32, ChecksumCRC32C, ChecksumCRC64NVME,
+                // ChecksumSHA1, ChecksumSHA256). The typed path drops these —
+                // route through passthrough to preserve integrity validation.
                 match axum::body::to_bytes(body, state.config.max_request_body_bytes as usize).await
                 {
                     Err(e) => {
@@ -418,19 +300,9 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
                         s3err.to_response()
                     }
                     Ok(body_bytes) if crate::s3::xml::body_has_checksum_elements(&body_bytes) => {
-                        let raw_path = parts.uri.path();
-                        let rewritten = rewrite_bucket_in_path(
-                            raw_path,
-                            &state.frontend_bucket,
-                            &state.backend_bucket,
-                        );
-                        let query = parts.uri.query();
-                        passthrough::handle_passthrough(
+                        route_to_passthrough(
                             &state,
-                            "POST",
-                            &rewritten,
-                            query,
-                            &parts.headers,
+                            &parts,
                             Body::from(body_bytes),
                             &parsed.request_id,
                         )
@@ -447,20 +319,7 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
         }
         S3Operation::AbortMultipartUpload { key, upload_id, .. } => {
             if has_unsupported_multipart_modifiers(&parsed.extra_amz_headers, &parts.headers) {
-                let raw_path = parts.uri.path();
-                let rewritten =
-                    rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
-                let query = parts.uri.query();
-                passthrough::handle_passthrough(
-                    &state,
-                    "DELETE",
-                    &rewritten,
-                    query,
-                    &parts.headers,
-                    body,
-                    &parsed.request_id,
-                )
-                .await
+                route_to_passthrough(&state, &parts, body, &parsed.request_id).await
             } else {
                 multipart::handle_abort_multipart(&state, &parsed, key, upload_id).await
             }
@@ -473,6 +332,28 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
 
     record_metrics(op_name, &response, start);
     response
+}
+
+/// Route through raw passthrough, rewriting the bucket in the path.
+async fn route_to_passthrough<B: Backend, C: CacheStore>(
+    state: &Arc<AppState<B, C>>,
+    parts: &http::request::Parts,
+    body: Body,
+    request_id: &str,
+) -> Response<Body> {
+    let raw_path = parts.uri.path();
+    let rewritten = rewrite_bucket_in_path(raw_path, &state.frontend_bucket, &state.backend_bucket);
+    let query = parts.uri.query();
+    passthrough::handle_passthrough(
+        state,
+        parts.method.as_str(),
+        &rewritten,
+        query,
+        &parts.headers,
+        body,
+        request_id,
+    )
+    .await
 }
 
 /// Rewrite the bucket portion of a path-style S3 URL.
@@ -586,147 +467,6 @@ pub(crate) async fn invalidate_cache_key<C: CacheStore>(
         }
     }
     singleflight.cancel(cache_key).await;
-}
-
-/// Check if the request contains headers that the typed GET/HEAD backend
-/// API cannot forward. When present, the request must go through the raw
-/// HTTP passthrough to preserve semantics.
-fn checksum_mode_requires_passthrough(headers: &http::HeaderMap) -> bool {
-    let mut values = headers.get_all("x-amz-checksum-mode").iter();
-    let Some(value) = values.next() else {
-        return false;
-    };
-    if values.next().is_some() {
-        return true;
-    }
-    value
-        .to_str()
-        .ok()
-        .and_then(crate::backend::models::ChecksumMode::from_header_value)
-        .is_none()
-}
-
-fn has_unsupported_get_modifiers(headers: &http::HeaderMap) -> bool {
-    headers.contains_key("range")
-        || headers.contains_key("if-match")
-        || headers.contains_key("if-none-match")
-        || headers.contains_key("if-modified-since")
-        || headers.contains_key("if-unmodified-since")
-        || headers.contains_key("x-amz-request-payer")
-        || headers.contains_key("x-amz-expected-bucket-owner")
-        || checksum_mode_requires_passthrough(headers)
-        || headers.keys().any(|k| {
-            k.as_str()
-                .starts_with("x-amz-server-side-encryption-customer-")
-        })
-}
-
-/// Check if the request contains write-side headers that the typed path
-/// does not forward. Inspects both the parsed `extra_amz_headers` and the
-/// raw HTTP header map (for standard headers like If-Match/If-None-Match
-/// that are not stored in extra_amz_headers).
-/// Headers that modify write semantics and cannot be preserved by any typed
-/// path. Shared base for both PutObject and multipart gates.
-const WRITE_MODIFYING_BASE: &[&str] = &[
-    "x-amz-storage-class",
-    "x-amz-server-side-encryption",
-    "x-amz-server-side-encryption-aws-kms-key-id",
-    "x-amz-server-side-encryption-context",
-    "x-amz-server-side-encryption-bucket-key-enabled",
-    "x-amz-server-side-encryption-customer-algorithm",
-    "x-amz-server-side-encryption-customer-key",
-    "x-amz-server-side-encryption-customer-key-md5",
-    "x-amz-request-payer",
-    "x-amz-expected-bucket-owner",
-    "x-amz-bypass-governance-retention",
-    "x-amz-mfa",
-    "x-amz-tagging",
-    "x-amz-object-lock-mode",
-    "x-amz-object-lock-retain-until-date",
-    "x-amz-object-lock-legal-hold",
-    "x-amz-website-redirect-location",
-    "x-amz-mp-object-size",
-    "x-amz-if-match-last-modified-time",
-    "x-amz-if-match-size",
-    "x-amz-if-match-initiated-time",
-    "x-amz-acl",
-    "x-amz-grant-full-control",
-    "x-amz-grant-read",
-    "x-amz-grant-read-acp",
-    "x-amz-grant-write-acp",
-    // Append-mode PUTs have different semantics (conditional offset writes,
-    // x-amz-object-size in the response) that the typed path wasn't designed for.
-    "x-amz-write-offset-bytes",
-];
-
-/// Additional checksum headers that the typed multipart paths don't forward.
-/// The typed PutObject path handles these end-to-end (request forwarded via
-/// extra_amz_headers + customize().mutate_request(), response captured via
-/// extract_write_extra_headers!), but CreateMultipartUpload, UploadPart, and
-/// CompleteMultipartUpload do NOT forward checksum request headers, so they
-/// must route to passthrough when these are present.
-const MULTIPART_CHECKSUM_HEADERS: &[&str] = &[
-    "x-amz-checksum-algorithm",
-    "x-amz-checksum-crc32",
-    "x-amz-checksum-crc32c",
-    "x-amz-checksum-crc64nvme",
-    "x-amz-checksum-sha1",
-    "x-amz-checksum-sha256",
-    "x-amz-checksum-type",
-    "x-amz-sdk-checksum-algorithm",
-];
-
-/// Check for standard HTTP conditionals that typed write paths don't forward.
-fn has_unsupported_http_conditionals(raw_headers: &http::HeaderMap) -> bool {
-    raw_headers.contains_key("if-match") || raw_headers.contains_key("if-none-match")
-}
-
-/// Gate for PutObject and DeleteObject. Checksum headers are NOT gated here
-/// because the typed PutObject path forwards them end-to-end.
-fn has_unsupported_write_modifiers(
-    extra_amz: &std::collections::HashMap<String, String>,
-    raw_headers: &http::HeaderMap,
-) -> bool {
-    if has_unsupported_http_conditionals(raw_headers) {
-        return true;
-    }
-    extra_amz
-        .keys()
-        .any(|k| WRITE_MODIFYING_BASE.contains(&k.as_str()))
-}
-
-/// Gate for multipart operations. Includes checksum headers because the typed
-/// multipart paths (CreateMultipartUpload, UploadPart, CompleteMultipartUpload)
-/// don't forward checksum request headers or XML checksum elements.
-fn has_unsupported_multipart_modifiers(
-    extra_amz: &std::collections::HashMap<String, String>,
-    raw_headers: &http::HeaderMap,
-) -> bool {
-    if has_unsupported_http_conditionals(raw_headers) {
-        return true;
-    }
-    extra_amz.keys().any(|k| {
-        WRITE_MODIFYING_BASE.contains(&k.as_str())
-            || MULTIPART_CHECKSUM_HEADERS.contains(&k.as_str())
-    })
-}
-
-/// Check if the LIST request contains query params or headers that the typed
-/// list path doesn't model. When present, the request must go through raw
-/// passthrough so the backend can handle them.
-fn has_unsupported_list_modifiers(query: Option<&str>, headers: &http::HeaderMap) -> bool {
-    // Query parameters the typed LIST path doesn't forward.
-    if let Some(q) = query {
-        for pair in q.split('&') {
-            let key = pair.split('=').next().unwrap_or("");
-            if key == "fetch-owner" || key == "optional-object-attributes" {
-                return true;
-            }
-        }
-    }
-    // Headers the typed LIST path doesn't forward.
-    headers.contains_key("x-amz-request-payer")
-        || headers.contains_key("x-amz-expected-bucket-owner")
 }
 
 #[cfg(test)]
