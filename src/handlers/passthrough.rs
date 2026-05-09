@@ -501,6 +501,19 @@ where
                 req_builder = req_builder.header(name.as_str(), v);
             }
         }
+        // Forward Content-Length from the inbound request when present and
+        // parseable. SKIP_REQUEST_HEADERS strips content-length from the
+        // signed headers, and the buffered path lets reqwest compute the
+        // header from the Bytes body — but on the streaming path,
+        // `wrap_stream` produces a body of unknown length, so without an
+        // explicit header reqwest would fall back to chunked transfer-
+        // encoding. Some S3-compatible backends reject chunked PUTs.
+        if let Some(cl) = original_headers.get("content-length")
+            && let Ok(s) = cl.to_str()
+            && let Ok(n) = s.trim().parse::<u64>()
+        {
+            req_builder = req_builder.header("content-length", n);
+        }
         // Enforce max_request_body_bytes on the streaming path. The buffered
         // path gets this for free via `axum::body::to_bytes(.., max)`; here we
         // wrap the body so polling errors out once the limit is exceeded. The
@@ -1262,6 +1275,57 @@ mod tests {
         assert_eq!(
             sha_header, "UNSIGNED-PAYLOAD",
             "expected UNSIGNED-PAYLOAD, got: {sha_header}"
+        );
+    }
+
+    // ---- Streaming branch preserves Content-Length ----
+    #[tokio::test]
+    async fn test_unsigned_payload_streaming_preserves_content_length() {
+        let mock = MockUpstream::new(200);
+        let addr = start_mock_upstream(mock.clone()).await;
+
+        let mut config = test_config_for_passthrough(&addr);
+        config.passthrough_unsigned_payload = true;
+        let state = build_passthrough_state(config);
+
+        let payload = b"streaming-with-known-length";
+        let len = payload.len();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-length",
+            http::HeaderValue::from_str(&len.to_string()).unwrap(),
+        );
+
+        let resp = handle_passthrough(
+            &state,
+            "PUT",
+            "/test-backend/known-length-key",
+            None,
+            &headers,
+            Body::from(&payload[..]),
+            "req-cl-streaming",
+        )
+        .await;
+
+        assert_eq!(resp.status(), 200);
+
+        let reqs = mock.requests.lock().await;
+        assert_eq!(reqs.len(), 1);
+        let upstream_headers = &reqs[0].2;
+        let upstream_cl = upstream_headers
+            .get("content-length")
+            .expect("upstream should receive content-length when set on inbound request")
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            upstream_cl,
+            len.to_string(),
+            "upstream content-length should match inbound"
+        );
+        // And no chunked transfer-encoding when content-length is honored.
+        assert!(
+            upstream_headers.get("transfer-encoding").is_none(),
+            "transfer-encoding should not be set when content-length is forwarded"
         );
     }
 
