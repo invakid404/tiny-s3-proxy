@@ -221,6 +221,31 @@ pub fn endpoint_scheme(endpoint: &str) -> &str {
     endpoint.split_once("://").map(|(s, _)| s).unwrap_or("")
 }
 
+/// Best-effort strip of the `userinfo` (`user:pass@`) portion from a URL-shaped
+/// endpoint string before it is logged. Returns the input unchanged if no
+/// scheme/authority structure is detected, so callers can pass arbitrary
+/// strings without losing them. The original endpoint must still be used for
+/// SDK / request construction — only log output should consume the redacted
+/// form.
+pub fn redact_url_userinfo(endpoint: &str) -> String {
+    let Some((scheme, rest)) = endpoint.split_once("://") else {
+        return endpoint.to_string();
+    };
+
+    if scheme.is_empty() {
+        return endpoint.to_string();
+    }
+
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, suffix) = rest.split_at(authority_end);
+
+    let Some((_, host_and_port)) = authority.rsplit_once('@') else {
+        return endpoint.to_string();
+    };
+
+    format!("{scheme}://{host_and_port}{suffix}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,6 +525,66 @@ mod tests {
             let config = Config::from_env().expect("https + unsigned should parse");
             assert!(config.passthrough_unsigned_payload);
         });
+    }
+
+    // ── redact_url_userinfo tests ───────────────────────────────────
+    //
+    // The helper is deliberately best-effort: it does not parse the URL,
+    // it just lops off everything between the scheme separator and the last
+    // `@` in the authority. These cases pin the behaviors we rely on for
+    // log redaction.
+
+    #[test]
+    fn test_redact_url_userinfo_strips_credentials() {
+        assert_eq!(
+            redact_url_userinfo("https://user:pass@example.com:9000/root"),
+            "https://example.com:9000/root"
+        );
+    }
+
+    #[test]
+    fn test_redact_url_userinfo_handles_ipv6_authority() {
+        assert_eq!(
+            redact_url_userinfo("http://user:pass@[::1]:443/root"),
+            "http://[::1]:443/root"
+        );
+    }
+
+    #[test]
+    fn test_redact_url_userinfo_handles_empty_userinfo() {
+        assert_eq!(redact_url_userinfo("http://@host/root"), "http://host/root");
+    }
+
+    #[test]
+    fn test_redact_url_userinfo_ignores_at_in_query() {
+        assert_eq!(
+            redact_url_userinfo("https://host/root?x=a@b"),
+            "https://host/root?x=a@b"
+        );
+    }
+
+    #[test]
+    fn test_redact_url_userinfo_ignores_when_no_scheme() {
+        assert_eq!(redact_url_userinfo("host/root@x"), "host/root@x");
+    }
+
+    #[test]
+    fn test_redact_url_userinfo_passthrough_when_no_userinfo() {
+        assert_eq!(
+            redact_url_userinfo("https://host/root"),
+            "https://host/root"
+        );
+    }
+
+    #[test]
+    fn test_redact_url_userinfo_handles_multiple_at_in_authority() {
+        // rsplit_once redacts through the LAST `@` in the authority, so
+        // even a userinfo segment that itself contains a literal `@` is
+        // fully removed.
+        assert_eq!(
+            redact_url_userinfo("https://a@b:c@example.com/root"),
+            "https://example.com/root"
+        );
     }
 
     #[test]
