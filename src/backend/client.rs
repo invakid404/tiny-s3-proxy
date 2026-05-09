@@ -11,7 +11,7 @@ use tokio_util::io::ReaderStream;
 use crate::backend::models::*;
 use crate::backend::retry::{RetryPolicy, with_retry};
 use crate::backend::{Backend, BoxByteStream};
-use crate::config::Config;
+use crate::config::{Config, endpoint_scheme};
 use crate::error::ProxyError;
 
 /// S3 backend client that uses the aws-sdk-s3 crate to talk to an S3-compatible backend.
@@ -30,11 +30,7 @@ impl S3Backend {
     /// Build an S3Backend from the application configuration.
     pub async fn from_config(config: &Config) -> Result<Self, ProxyError> {
         // Enforce BACKEND_ALLOW_HTTP: reject http:// endpoints unless explicitly allowed.
-        let scheme = config
-            .backend_endpoint
-            .split_once("://")
-            .map(|(s, _)| s)
-            .unwrap_or_default();
+        let scheme = endpoint_scheme(&config.backend_endpoint);
         if !config.backend_allow_http && scheme.eq_ignore_ascii_case("http") {
             return Err(ProxyError::InvalidRequest {
                 message: format!(

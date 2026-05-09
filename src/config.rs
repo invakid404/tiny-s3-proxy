@@ -119,6 +119,28 @@ impl Config {
             });
         }
 
+        // UNSIGNED-PAYLOAD relies entirely on transport security (TLS) for
+        // body integrity. With an HTTP backend, request bodies would be sent
+        // both unsigned and unencrypted, so a network attacker could tamper
+        // with them without detection. Reject this combination at startup
+        // rather than allow a silent-downgrade misconfiguration. Note that
+        // we inspect the actual scheme of BACKEND_ENDPOINT, not BACKEND_ALLOW_HTTP
+        // (which only grants permission to use HTTP, regardless of whether
+        // the configured endpoint actually does).
+        if config.passthrough_unsigned_payload
+            && endpoint_scheme(&config.backend_endpoint).eq_ignore_ascii_case("http")
+        {
+            return Err(ConfigError::ValidationError {
+                reason: format!(
+                    "PASSTHROUGH_UNSIGNED_PAYLOAD=true requires an HTTPS BACKEND_ENDPOINT \
+                     for body integrity; got HTTP endpoint '{}'. UNSIGNED-PAYLOAD relies on \
+                     transport security to protect request bodies — over plaintext, an \
+                     attacker on the network path could tamper with bodies undetected.",
+                    config.backend_endpoint,
+                ),
+            });
+        }
+
         Ok(config)
     }
 }
@@ -190,6 +212,13 @@ fn parse_u32_env(name: &str, default: u32) -> Result<u32, ConfigError> {
         }),
         Err(_) => Ok(default),
     }
+}
+
+/// Extract the URL scheme from an endpoint string (the part before "://"),
+/// or an empty string if no scheme is present. Used by both config validation
+/// and backend client construction so they agree on what counts as HTTP.
+pub fn endpoint_scheme(endpoint: &str) -> &str {
+    endpoint.split_once("://").map(|(s, _)| s).unwrap_or("")
 }
 
 #[cfg(test)]
@@ -411,6 +440,58 @@ mod tests {
             let config = Config::from_env().expect("should parse");
             assert!(!config.backend_use_path_style);
             assert!(config.backend_allow_http);
+        });
+    }
+
+    #[test]
+    fn test_unsigned_payload_with_http_backend_rejected() {
+        let mut vars = required_env_vars();
+        // Override the default https endpoint with an http one.
+        vars.retain(|(k, _)| *k != "BACKEND_ENDPOINT");
+        vars.push(("BACKEND_ENDPOINT", "http://insecure.example"));
+        vars.push(("BACKEND_ALLOW_HTTP", "true"));
+        vars.push(("PASSTHROUGH_UNSIGNED_PAYLOAD", "true"));
+        with_env_vars(&vars, || {
+            let result = Config::from_env();
+            match result {
+                Err(ConfigError::ValidationError { reason }) => {
+                    assert!(
+                        reason.contains("PASSTHROUGH_UNSIGNED_PAYLOAD"),
+                        "reason should cite the env var: {reason}"
+                    );
+                    assert!(
+                        reason.contains("BACKEND_ENDPOINT")
+                            || reason.contains("http://insecure.example"),
+                        "reason should cite the endpoint or its env var: {reason}"
+                    );
+                }
+                other => panic!("expected ValidationError, got: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn test_unsigned_payload_with_https_backend_accepted() {
+        let mut vars = required_env_vars();
+        // required_env_vars already uses https; just opt into unsigned payload.
+        vars.push(("PASSTHROUGH_UNSIGNED_PAYLOAD", "true"));
+        with_env_vars(&vars, || {
+            let config = Config::from_env().expect("https + unsigned should parse");
+            assert!(config.passthrough_unsigned_payload);
+        });
+    }
+
+    #[test]
+    fn test_unsigned_payload_off_with_http_backend_accepted() {
+        // Plain HTTP is allowed when not using UNSIGNED-PAYLOAD; the validation
+        // is specifically the unsigned-over-plaintext combo.
+        let mut vars = required_env_vars();
+        vars.retain(|(k, _)| *k != "BACKEND_ENDPOINT");
+        vars.push(("BACKEND_ENDPOINT", "http://insecure.example"));
+        vars.push(("BACKEND_ALLOW_HTTP", "true"));
+        with_env_vars(&vars, || {
+            let config = Config::from_env().expect("http + signed should parse");
+            assert!(!config.passthrough_unsigned_payload);
         });
     }
 }
