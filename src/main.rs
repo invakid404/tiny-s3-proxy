@@ -22,16 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Load config
     let config = config::Config::from_env().expect("Failed to load configuration");
-    tracing::info!(
-        s3_addr = %config.s3_listen_addr,
-        admin_addr = %config.admin_listen_addr,
-        backend_endpoint = %config.backend_endpoint,
-        backend_bucket = %config.backend_bucket,
-        frontend_bucket = %config.frontend_bucket,
-        cache_dir = %config.cache_dir,
-        auth_mode = ?config.auth_mode,
-        "starting tiny-s3-proxy"
-    );
+    log_startup_config(&config);
 
     if config.auth_mode == config::AuthMode::TrustedInternal {
         tracing::warn!(
@@ -212,6 +203,25 @@ async fn shutdown_signal() {
     tracing::info!("shutdown signal received, draining connections...");
 }
 
+/// Emit the structured "starting" event for the loaded config. Extracted so
+/// the redaction of `backend_endpoint` (which may carry `user:pass@` userinfo)
+/// can be exercised by a unit test — `config.backend_endpoint` itself is left
+/// untouched so the SDK still gets the raw URL.
+fn log_startup_config(config: &config::Config) {
+    let redacted_backend_endpoint = config::redact_url_userinfo(&config.backend_endpoint);
+
+    tracing::info!(
+        s3_addr = %config.s3_listen_addr,
+        admin_addr = %config.admin_listen_addr,
+        backend_endpoint = %redacted_backend_endpoint,
+        backend_bucket = %config.backend_bucket,
+        frontend_bucket = %config.frontend_bucket,
+        cache_dir = %config.cache_dir,
+        auth_mode = ?config.auth_mode,
+        "starting tiny-s3-proxy"
+    );
+}
+
 /// Build the S3 router. All requests are routed through the S3 handler via fallback.
 fn build_s3_router<B, C>(state: Arc<handlers::AppState<B, C>>) -> axum::Router
 where
@@ -242,4 +252,73 @@ fn setup_metrics() -> PrometheusHandle {
     builder
         .install_recorder()
         .expect("failed to install metrics recorder")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tiny_s3_proxy::config::{AuthMode, Config};
+
+    fn config_with_backend_endpoint(endpoint: &str) -> Config {
+        Config {
+            s3_listen_addr: "0.0.0.0:8080".to_string(),
+            admin_listen_addr: "0.0.0.0:9090".to_string(),
+            frontend_bucket: "test-frontend".to_string(),
+            auth_mode: AuthMode::TrustedInternal,
+            allowed_frontend_keys: vec![],
+            backend_endpoint: endpoint.to_string(),
+            backend_region: "auto".to_string(),
+            backend_bucket: "test-backend".to_string(),
+            backend_access_key_id: "AKID".to_string(),
+            backend_secret_access_key: "secret".to_string(),
+            backend_use_path_style: true,
+            backend_allow_http: false,
+            cache_dir: "/tmp/test-cache".to_string(),
+            cache_max_bytes: 1024 * 1024,
+            cache_max_object_bytes: 512 * 1024,
+            cacheable_prefixes: vec![],
+            cache_serve_stale_on_error: true,
+            cache_eviction_interval_secs: 300,
+            get_max_attempts: 1,
+            head_max_attempts: 1,
+            list_max_attempts: 1,
+            put_max_attempts: 1,
+            delete_max_attempts: 1,
+            retry_base_backoff_ms: 10,
+            upstream_connect_timeout_ms: 5000,
+            upstream_request_timeout_ms: 30000,
+            max_request_body_bytes: 268_435_456,
+            passthrough_unsigned_payload: false,
+        }
+    }
+
+    /// The startup log must show the host/port/path of `BACKEND_ENDPOINT`
+    /// (operators need it to debug connectivity) but never the userinfo —
+    /// users sometimes embed credentials there, and process logs may flow
+    /// to less-trusted log sinks. Pin the contract: redacted form present,
+    /// raw user/pass tokens absent.
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_log_startup_config_redacts_backend_endpoint_userinfo() {
+        let config =
+            config_with_backend_endpoint("https://alice:supersecret@s3.example.com:9443/root");
+        log_startup_config(&config);
+
+        assert!(
+            logs_contain("starting tiny-s3-proxy"),
+            "expected the structured 'starting' event in captured logs"
+        );
+        assert!(
+            logs_contain("https://s3.example.com:9443/root"),
+            "expected redacted backend endpoint to appear in logs"
+        );
+        assert!(
+            !logs_contain("alice"),
+            "userinfo username must not appear in startup logs"
+        );
+        assert!(
+            !logs_contain("supersecret"),
+            "userinfo password must not appear in startup logs"
+        );
+    }
 }
