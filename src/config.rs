@@ -132,11 +132,11 @@ impl Config {
         {
             return Err(ConfigError::ValidationError {
                 reason: format!(
-                    "PASSTHROUGH_UNSIGNED_PAYLOAD=true requires an HTTPS BACKEND_ENDPOINT \
-                     for body integrity; got HTTP endpoint '{}'. UNSIGNED-PAYLOAD relies on \
-                     transport security to protect request bodies — over plaintext, an \
-                     attacker on the network path could tamper with bodies undetected.",
-                    config.backend_endpoint,
+                    "PASSTHROUGH_UNSIGNED_PAYLOAD=true requires BACKEND_ENDPOINT to use https \
+                     for body integrity; got scheme \"{}\". UNSIGNED-PAYLOAD relies on transport \
+                     security to protect request bodies — over plaintext, an attacker on the \
+                     network path could tamper with bodies undetected.",
+                    endpoint_scheme(&config.backend_endpoint),
                 ),
             });
         }
@@ -446,9 +446,13 @@ mod tests {
     #[test]
     fn test_unsigned_payload_with_http_backend_rejected() {
         let mut vars = required_env_vars();
-        // Override the default https endpoint with an http one.
+        // Override the default https endpoint with an http one carrying
+        // userinfo. The validation message must NOT echo the raw endpoint
+        // (URLs can legally embed credentials in userinfo); it should cite
+        // the scheme only. Config::from_env errors are surfaced via .expect()
+        // in main.rs, so any echoed credentials would land in process logs.
         vars.retain(|(k, _)| *k != "BACKEND_ENDPOINT");
-        vars.push(("BACKEND_ENDPOINT", "http://insecure.example"));
+        vars.push(("BACKEND_ENDPOINT", "http://user:pass@insecure.example"));
         vars.push(("BACKEND_ALLOW_HTTP", "true"));
         vars.push(("PASSTHROUGH_UNSIGNED_PAYLOAD", "true"));
         with_env_vars(&vars, || {
@@ -460,9 +464,26 @@ mod tests {
                         "reason should cite the env var: {reason}"
                     );
                     assert!(
-                        reason.contains("BACKEND_ENDPOINT")
-                            || reason.contains("http://insecure.example"),
-                        "reason should cite the endpoint or its env var: {reason}"
+                        reason.contains("BACKEND_ENDPOINT"),
+                        "reason should cite BACKEND_ENDPOINT: {reason}"
+                    );
+                    // Credential leak: the userinfo from the endpoint must
+                    // not appear anywhere in the rendered message.
+                    assert!(
+                        !reason.contains("user"),
+                        "reason must not leak userinfo: {reason}"
+                    );
+                    assert!(
+                        !reason.contains("pass"),
+                        "reason must not leak userinfo: {reason}"
+                    );
+                    assert!(
+                        !reason.contains("http://user:pass@insecure.example"),
+                        "reason must not echo the raw endpoint: {reason}"
+                    );
+                    assert!(
+                        !reason.contains("insecure.example"),
+                        "reason must not echo the host portion of the endpoint: {reason}"
                     );
                 }
                 other => panic!("expected ValidationError, got: {other:?}"),
