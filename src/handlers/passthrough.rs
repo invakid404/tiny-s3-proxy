@@ -49,6 +49,24 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex
 }
 
+/// Walk the error source chain looking for a `LengthLimitError`, indicating
+/// the streaming body wrapper aborted because the configured byte cap was
+/// exceeded. Mirrors the lookup in `S3Error::from_body_error` but operates
+/// on any `std::error::Error` (we receive a `reqwest::Error` here, not an
+/// `axum::Error`).
+fn has_length_limit_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = source {
+        if e.downcast_ref::<http_body_util::LengthLimitError>()
+            .is_some()
+        {
+            return true;
+        }
+        source = e.source();
+    }
+    false
+}
+
 /// Collect header names nominated as hop-by-hop by `Connection` headers.
 /// Per RFC 9110 Section 7.6.1, each token in `Connection` names a header
 /// that the sender considers hop-by-hop and that MUST be removed by the
@@ -483,12 +501,28 @@ where
                 req_builder = req_builder.header(name.as_str(), v);
             }
         }
-        req_builder = req_builder.body(reqwest::Body::wrap_stream(stream_body.into_data_stream()));
+        // Enforce max_request_body_bytes on the streaming path. The buffered
+        // path gets this for free via `axum::body::to_bytes(.., max)`; here we
+        // wrap the body so polling errors out once the limit is exceeded. The
+        // resulting LengthLimitError surfaces through reqwest's Err chain and
+        // is mapped to the same EntityTooLarge response below.
+        let limited_body =
+            http_body_util::Limited::new(stream_body, state.config.max_request_body_bytes as usize);
+        req_builder = req_builder.body(reqwest::Body::wrap_stream(
+            http_body_util::BodyExt::into_data_stream(limited_body),
+        ));
 
         match req_builder.send().await {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!(error = %e, "passthrough: streaming upstream request failed");
+                if has_length_limit_error(&e) {
+                    let s3err = S3Error::entity_too_large(
+                        "request body exceeded the configured size limit",
+                        request_id,
+                    );
+                    return s3err.to_response();
+                }
                 let proxy_err = if e.is_timeout() {
                     crate::error::ProxyError::Timeout {
                         operation: "passthrough".into(),
@@ -1228,6 +1262,45 @@ mod tests {
         assert_eq!(
             sha_header, "UNSIGNED-PAYLOAD",
             "expected UNSIGNED-PAYLOAD, got: {sha_header}"
+        );
+    }
+
+    // ---- Streaming branch enforces max_request_body_bytes ----
+    #[tokio::test]
+    async fn test_unsigned_payload_streaming_rejects_oversized_body() {
+        let mock = MockUpstream::new(200);
+        let addr = start_mock_upstream(mock.clone()).await;
+
+        let mut config = test_config_for_passthrough(&addr);
+        config.passthrough_unsigned_payload = true;
+        // 16 byte cap; the payload below is 1024 bytes.
+        config.max_request_body_bytes = 16;
+        let state = build_passthrough_state(config);
+
+        let payload = vec![b'A'; 1024];
+        let headers = HeaderMap::new();
+        let resp = handle_passthrough(
+            &state,
+            "PUT",
+            "/test-backend/oversized-key",
+            None,
+            &headers,
+            Body::from(payload),
+            "req-oversized",
+        )
+        .await;
+
+        // EntityTooLarge is mapped to HTTP 400 in S3Error::entity_too_large
+        // (see src/s3/errors.rs); assert the status and that the response
+        // body carries the EntityTooLarge code.
+        assert_eq!(resp.status(), 400);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("response body should read");
+        let body_str = std::str::from_utf8(&body_bytes).unwrap();
+        assert!(
+            body_str.contains("<Code>EntityTooLarge</Code>"),
+            "expected EntityTooLarge in body, got: {body_str}"
         );
     }
 }
