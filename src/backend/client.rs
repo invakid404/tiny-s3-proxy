@@ -34,9 +34,9 @@ impl S3Backend {
         if !config.backend_allow_http && scheme.eq_ignore_ascii_case("http") {
             return Err(ProxyError::InvalidRequest {
                 message: format!(
-                    "backend endpoint uses HTTP ({}) but BACKEND_ALLOW_HTTP is not enabled; \
+                    "backend endpoint uses HTTP (scheme \"{}\") but BACKEND_ALLOW_HTTP is not enabled; \
                      set BACKEND_ALLOW_HTTP=true to allow plaintext connections",
-                    config.backend_endpoint,
+                    scheme,
                 ),
             });
         }
@@ -1118,7 +1118,12 @@ mod tests {
     #[tokio::test]
     async fn test_from_config_rejects_http_without_allow() {
         let mut config = test_config();
-        config.backend_endpoint = "http://example.com".to_string();
+        // Use an endpoint with userinfo so we can pin that the rejection
+        // message never echoes credentials, host, or path. This rejection
+        // path bubbles out through `?` in main.rs and lands in process
+        // logs, so leaking the raw endpoint here is the same exposure as
+        // the startup-log leak fixed alongside this.
+        config.backend_endpoint = "http://alice:supersecret@insecure.example/root".to_string();
         config.backend_allow_http = false;
 
         let result = S3Backend::from_config(&config).await;
@@ -1127,6 +1132,26 @@ mod tests {
                 assert!(
                     message.contains("BACKEND_ALLOW_HTTP"),
                     "error should mention BACKEND_ALLOW_HTTP, got: {message}"
+                );
+                assert!(
+                    message.contains("scheme \"http\""),
+                    "error should cite the scheme so operators know what tripped the check, got: {message}"
+                );
+                assert!(
+                    !message.contains("alice"),
+                    "error must not echo userinfo username, got: {message}"
+                );
+                assert!(
+                    !message.contains("supersecret"),
+                    "error must not echo userinfo password, got: {message}"
+                );
+                assert!(
+                    !message.contains("insecure.example"),
+                    "error must not echo the host portion, got: {message}"
+                );
+                assert!(
+                    !message.contains("http://alice:supersecret@insecure.example/root"),
+                    "error must not echo the raw endpoint, got: {message}"
                 );
             }
             Err(other) => panic!("expected InvalidRequest, got: {other:?}"),
