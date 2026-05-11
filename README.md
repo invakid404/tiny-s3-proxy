@@ -99,7 +99,7 @@ All configuration is via environment variables.
 
 | Variable | Default | Description |
 |---|---|---|
-| `BACKEND_ENDPOINT` | *required* | S3-compatible endpoint URL |
+| `BACKEND_ENDPOINT` | *required* | S3-compatible endpoint URL. Must not embed credentials as URL userinfo — use `BACKEND_ACCESS_KEY_ID` and `BACKEND_SECRET_ACCESS_KEY` instead. Rejected at startup if userinfo is present |
 | `BACKEND_REGION` | `auto` | AWS region |
 | `BACKEND_BUCKET` | *required* | Actual backend bucket name |
 | `BACKEND_ACCESS_KEY_ID` | *required* | Backend credentials |

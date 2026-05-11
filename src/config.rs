@@ -120,6 +120,21 @@ impl Config {
             });
         }
 
+        // Reject URL-embedded credentials in BACKEND_ENDPOINT at config load.
+        // Credentials belong in BACKEND_ACCESS_KEY_ID / BACKEND_SECRET_ACCESS_KEY;
+        // if userinfo reaches the SDK, request errors can format the endpoint
+        // into log strings and leak `user:pass@host` at runtime. Source-side
+        // rejection closes that class of leak at the boundary. The error
+        // intentionally does not echo the endpoint, host, or userinfo.
+        if endpoint_has_userinfo(&config.backend_endpoint) {
+            return Err(ConfigError::ValidationError {
+                reason: "BACKEND_ENDPOINT must not include URL userinfo; configure \
+                         backend credentials with BACKEND_ACCESS_KEY_ID and \
+                         BACKEND_SECRET_ACCESS_KEY instead"
+                    .to_string(),
+            });
+        }
+
         // UNSIGNED-PAYLOAD relies entirely on transport security (TLS) for
         // body integrity. With an HTTP backend, request bodies would be sent
         // both unsigned and unencrypted, so a network attacker could tamper
@@ -220,6 +235,23 @@ fn parse_u32_env(name: &str, default: u32) -> Result<u32, ConfigError> {
 /// and backend client construction so they agree on what counts as HTTP.
 pub fn endpoint_scheme(endpoint: &str) -> &str {
     endpoint.split_once("://").map(|(s, _)| s).unwrap_or("")
+}
+
+/// Detect whether a URL-shaped endpoint carries non-empty userinfo
+/// (`user`, `user:pass`, etc. before an `@` in the authority). Mirrors the
+/// authority-scanning shape of `redact_url_userinfo` so the two stay aligned
+/// on what they consider userinfo. Empty userinfo (`http://@host`) is
+/// degenerate and not flagged.
+fn endpoint_has_userinfo(endpoint: &str) -> bool {
+    let Some((_, rest)) = endpoint.split_once("://") else {
+        return false;
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    match authority.rsplit_once('@') {
+        Some((userinfo, _)) => !userinfo.is_empty(),
+        None => false,
+    }
 }
 
 /// Best-effort strip of the `userinfo` (`user:pass@`) portion from a URL-shaped
@@ -472,13 +504,12 @@ mod tests {
     #[test]
     fn test_unsigned_payload_with_http_backend_rejected() {
         let mut vars = required_env_vars();
-        // Override the default https endpoint with an http one carrying
-        // userinfo. The validation message must NOT echo the raw endpoint
-        // (URLs can legally embed credentials in userinfo); it should cite
-        // the scheme only. Config::from_env errors are surfaced via .expect()
-        // in main.rs, so any echoed credentials would land in process logs.
+        // Override the default https endpoint with a plain http one. The
+        // validation message must NOT echo the raw endpoint or its host —
+        // Config::from_env errors are surfaced via .expect() in main.rs,
+        // so anything in the message lands in process logs.
         vars.retain(|(k, _)| *k != "BACKEND_ENDPOINT");
-        vars.push(("BACKEND_ENDPOINT", "http://user:pass@insecure.example"));
+        vars.push(("BACKEND_ENDPOINT", "http://insecure.example"));
         vars.push(("BACKEND_ALLOW_HTTP", "true"));
         vars.push(("PASSTHROUGH_UNSIGNED_PAYLOAD", "true"));
         with_env_vars(&vars, || {
@@ -493,18 +524,8 @@ mod tests {
                         reason.contains("BACKEND_ENDPOINT"),
                         "reason should cite BACKEND_ENDPOINT: {reason}"
                     );
-                    // Credential leak: the userinfo from the endpoint must
-                    // not appear anywhere in the rendered message.
                     assert!(
-                        !reason.contains("user"),
-                        "reason must not leak userinfo: {reason}"
-                    );
-                    assert!(
-                        !reason.contains("pass"),
-                        "reason must not leak userinfo: {reason}"
-                    );
-                    assert!(
-                        !reason.contains("http://user:pass@insecure.example"),
+                        !reason.contains("http://insecure.example"),
                         "reason must not echo the raw endpoint: {reason}"
                     );
                     assert!(
@@ -514,6 +535,36 @@ mod tests {
                 }
                 other => panic!("expected ValidationError, got: {other:?}"),
             }
+        });
+    }
+
+    #[test]
+    fn test_backend_endpoint_with_userinfo_rejected() {
+        let mut vars = required_env_vars();
+        vars.retain(|(k, _)| *k != "BACKEND_ENDPOINT");
+        vars.push((
+            "BACKEND_ENDPOINT",
+            "https://alice:supersecret@s3.example.com:9443/root",
+        ));
+        with_env_vars(&vars, || {
+            let err =
+                Config::from_env().expect_err("expected ValidationError for endpoint userinfo");
+            let reason = match err {
+                ConfigError::ValidationError { reason } => reason,
+                other => panic!("expected ValidationError, got {other:?}"),
+            };
+
+            // Positive: error message references the relevant env vars.
+            assert!(reason.contains("BACKEND_ENDPOINT"));
+            assert!(reason.contains("BACKEND_ACCESS_KEY_ID"));
+            assert!(reason.contains("BACKEND_SECRET_ACCESS_KEY"));
+
+            // Negative: error does NOT leak userinfo or the raw URL.
+            assert!(!reason.contains("alice"));
+            assert!(!reason.contains("supersecret"));
+            assert!(!reason.contains("https://alice"));
+            // Also catches partial redaction that strips userinfo but leaks host.
+            assert!(!reason.contains("s3.example.com"));
         });
     }
 
