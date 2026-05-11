@@ -111,15 +111,18 @@ pub(super) fn has_s3_streaming_upload_indicators(raw_headers: &http::HeaderMap) 
     }
 
     // 2. x-amz-content-sha256 set to a STREAMING-* sentinel. Match the
-    //    canonical values defensively via case-insensitive prefix.
-    if let Some(value) = raw_headers.get("x-amz-content-sha256")
-        && let Ok(s) = value.to_str()
-    {
-        let trimmed = s.trim();
-        if trimmed.len() >= "STREAMING-".len()
-            && trimmed[.."STREAMING-".len()].eq_ignore_ascii_case("STREAMING-")
-        {
-            return true;
+    //    canonical values defensively via case-insensitive prefix. Iterate
+    //    every header value: a client could send multiple x-amz-content-sha256
+    //    headers (e.g. `UNSIGNED-PAYLOAD` followed by `STREAMING-...`) to slip
+    //    a streaming sentinel past a single-value check.
+    for value in raw_headers.get_all("x-amz-content-sha256") {
+        if let Ok(s) = value.to_str() {
+            let trimmed = s.trim();
+            if trimmed.len() >= "STREAMING-".len()
+                && trimmed[.."STREAMING-".len()].eq_ignore_ascii_case("STREAMING-")
+            {
+                return true;
+            }
         }
     }
 

@@ -1911,6 +1911,35 @@ mod tests {
     }
 
     #[test]
+    fn test_streaming_indicator_amz_content_sha256_duplicate_values() {
+        // A client could send two x-amz-content-sha256 headers — first
+        // UNSIGNED-PAYLOAD, then a STREAMING-* sentinel — to slip past a
+        // single-value check. The gate must inspect every value.
+        let extra_amz = std::collections::HashMap::new();
+        let mut headers = http::HeaderMap::new();
+        headers.append(
+            http::header::HeaderName::from_static("x-amz-content-sha256"),
+            http::header::HeaderValue::from_static("UNSIGNED-PAYLOAD"),
+        );
+        headers.append(
+            http::header::HeaderName::from_static("x-amz-content-sha256"),
+            http::header::HeaderValue::from_static("STREAMING-AWS4-HMAC-SHA256-PAYLOAD"),
+        );
+        assert!(
+            has_s3_streaming_upload_indicators(&headers),
+            "streaming sentinel in second x-amz-content-sha256 value must trip the helper"
+        );
+        assert!(
+            has_unsupported_write_modifiers(&extra_amz, &headers),
+            "write gate must trip when a later x-amz-content-sha256 value is STREAMING-*"
+        );
+        assert!(
+            has_unsupported_multipart_modifiers(&extra_amz, &headers),
+            "multipart gate must trip when a later x-amz-content-sha256 value is STREAMING-*"
+        );
+    }
+
+    #[test]
     fn test_streaming_indicator_decoded_content_length() {
         let extra_amz = std::collections::HashMap::new();
         let mut headers = http::HeaderMap::new();
