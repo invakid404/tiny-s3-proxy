@@ -159,12 +159,21 @@ impl CacheDirLock {
                 source: Box::new(e),
                 operation: format!("open cache_dir lock file {}", lock_path.display()),
             })?;
-        // Fully-qualified call: std::fs::File gained an inherent
-        // `try_lock_exclusive` in Rust 1.89 with a different signature, which
-        // would otherwise shadow the trait method via method resolution.
+        // Call through the fs2 trait explicitly: std stabilized `File::try_lock`
+        // (not `try_lock_exclusive`) and `File::unlock` in Rust 1.89 with
+        // different signatures (`try_lock` returns `Result<(), TryLockError>`).
+        // Going through the trait keeps the call site unambiguous and makes a
+        // future swap to std obvious.
+        //
+        // `fs2::lock_contended_error()` is the portable discriminator for the
+        // contention case: on POSIX it carries `EWOULDBLOCK` (kind
+        // `WouldBlock`), on Windows it carries `ERROR_LOCK_VIOLATION`. Anything
+        // else (e.g. `ENOLCK`, `EBADF`) is a real syscall failure that should
+        // not be presented to the operator as "already in use".
+        let contended_kind = fs2::lock_contended_error().kind();
         match fs2::FileExt::try_lock_exclusive(&file) {
             Ok(()) => Ok(CacheDirLock { file }),
-            Err(_) => Err(ProxyError::Cache {
+            Err(e) if e.kind() == contended_kind => Err(ProxyError::Cache {
                 source: format!(
                     "cache directory {} is already in use by another process \
                      (could not acquire exclusive lock on {}); CACHE_DIR must \
@@ -176,14 +185,24 @@ impl CacheDirLock {
                 .into(),
                 operation: "acquire cache_dir exclusive lock".into(),
             }),
+            Err(e) => Err(ProxyError::Cache {
+                source: Box::new(e),
+                operation: format!(
+                    "acquire cache_dir exclusive lock on {}",
+                    lock_path.display(),
+                ),
+            }),
         }
     }
 }
 
 impl Drop for CacheDirLock {
     fn drop(&mut self) {
-        // Fully-qualified for the same reason as `try_lock_exclusive`: std
-        // gained an inherent `File::unlock` in Rust 1.89.
+        // Call through the fs2 trait explicitly: `std::fs::File` gained an
+        // inherent `File::unlock` in Rust 1.89 (alongside `lock`, `lock_shared`,
+        // `try_lock`, `try_lock_shared`). The std and fs2 signatures happen to
+        // match today, but going through the trait keeps acquire and release
+        // symmetric and makes a future swap to std obvious.
         if let Err(e) = fs2::FileExt::unlock(&self.file) {
             tracing::warn!(
                 error = %e,
