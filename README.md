@@ -41,7 +41,7 @@ Requests are also routed through raw passthrough when they carry headers or quer
 - **PUT/DELETE/multipart** with operation-modifying `x-amz-*` headers not handled by the typed path (storage class, SSE, governance bypass, MFA, etc.)
 - **GET** `?uploadId` (ListParts), **GET** `?uploads` (ListMultipartUploads), and incomplete multipart query combinations
 
-GET responses for cacheable prefixes (default: `script_bundle/`, `bun_bundle/`, `tar/`) are streamed to disk and to the client simultaneously. Cache hits stream directly from disk — the proxy never buffers a full object in memory for reads.
+GET responses for prefixes listed in `CACHEABLE_PREFIXES` are streamed to disk and to the client simultaneously. The default prefix list is empty, so GETs bypass the cache until `CACHEABLE_PREFIXES` is set. Cache hits stream directly from disk — the proxy never buffers a full object in memory for reads.
 
 Writes (PUT, DELETE, multipart completion) purge the cache for the affected key immediately. If the on-disk purge fails, a durable poison marker is written so subsequent reads bypass the stale entry until it is cleaned up.
 
@@ -57,6 +57,10 @@ export BACKEND_BUCKET=my-bucket
 export BACKEND_ACCESS_KEY_ID=your-key
 export BACKEND_SECRET_ACCESS_KEY=your-secret
 
+# Cache opt-in: choose prefixes that are safe for your workload.
+# Example for immutable artifact keys:
+export CACHEABLE_PREFIXES=script_bundle/,bun_bundle/,tar/
+
 # Run
 cargo run --release
 ```
@@ -71,6 +75,7 @@ docker run -p 8080:8080 -p 9090:9090 \
   -e BACKEND_BUCKET=my-bucket \
   -e BACKEND_ACCESS_KEY_ID=your-key \
   -e BACKEND_SECRET_ACCESS_KEY=your-secret \
+  -e CACHEABLE_PREFIXES=script_bundle/,bun_bundle/,tar/ \
   ghcr.io/invakid404/tiny-s3-proxy:latest
 ```
 
@@ -109,7 +114,7 @@ All configuration is via environment variables.
 | `CACHE_DIR` | `/cache` | Disk cache directory |
 | `CACHE_MAX_BYTES` | `10737418240` (10 GB) | Maximum cache size on disk |
 | `CACHE_MAX_OBJECT_BYTES` | `536870912` (512 MB) | Maximum single object size to cache. Objects with unknown `Content-Length` are not cached |
-| `CACHEABLE_PREFIXES` | `script_bundle/,bun_bundle/,tar/` | Object key prefixes to cache |
+| `CACHEABLE_PREFIXES` | *(empty)* | Comma-separated object key prefixes to cache. Empty/unset means all GETs bypass the cache. Example: `script_bundle/,bun_bundle/,tar/` |
 | `CACHE_SERVE_STALE_ON_ERROR` | `true` | Serve stale cache entries on transient backend errors (5xx, timeouts). Semantic errors like 404/403 are never masked |
 | `CACHE_EVICTION_INTERVAL_SECS` | `300` | Seconds between LRU eviction passes |
 
