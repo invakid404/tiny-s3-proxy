@@ -1874,6 +1874,10 @@ impl DiskCache {
                     now,
                 )
                 .await;
+                // Load-bearing: this final use forces `cache_dir_lock` to be captured by
+                // the `tokio::spawn` future and held until `Self::rewrite_last_accessed`
+                // completes, keeping the OS advisory lock alive past `DiskCache::drop`.
+                // Do not remove unless the spawned task otherwise owns the lock Arc.
                 drop(cache_dir_lock);
             });
         }
