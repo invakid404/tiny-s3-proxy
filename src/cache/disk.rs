@@ -219,8 +219,13 @@ impl Drop for CacheDirLock {
 pub struct DiskCache {
     cache_dir: PathBuf,
     /// Exclusive advisory lock on `<cache_dir>/.lock` enforcing single-owner
-    /// access. Held purely for its `Drop` side effect; never read.
-    _lock: CacheDirLock,
+    /// access. `Arc` so detached cache-touching tasks (e.g. the
+    /// `note_hit_inner` background rewrite of `.meta.json`) can clone the
+    /// handle and keep the OS-level lock alive past `DiskCache::drop`. The
+    /// lock releases only when the last `Arc` is dropped, which guarantees
+    /// no foreign owner can claim `cache_dir` while one of our writers is
+    /// still in flight.
+    _lock: Arc<CacheDirLock>,
     stats: Arc<CacheStats>,
     /// Per-key fill tracking: refcount + generation counter + commit lock.
     /// purge() takes a read lock to bump the generation atomically without
@@ -265,7 +270,10 @@ impl DiskCache {
 
         // Acquire the single-owner lock before any other initialization.
         // `lock` is a stack temporary; if any later step in `new` returns
-        // Err, drop releases the OS-level lock automatically.
+        // Err, drop releases the OS-level lock automatically. On the
+        // success path it is wrapped in an `Arc` and moved into `Self` so
+        // detached cache-touching tasks can clone it and extend the
+        // lock's lifetime past `DiskCache::drop`.
         let lock = CacheDirLock::acquire(&cache_dir)?;
 
         // Create directory structure
@@ -288,7 +296,7 @@ impl DiskCache {
 
         Ok(Self {
             cache_dir,
-            _lock: lock,
+            _lock: Arc::new(lock),
             stats: Arc::new(scan.stats),
             active_fills: tokio::sync::RwLock::new(HashMap::new()),
             meta_locks: std::sync::Mutex::new(HashMap::new()),
@@ -1848,6 +1856,13 @@ impl DiskCache {
             let hash = key.hash_hex().to_string();
             let meta_lock = self.meta_lock_for(key);
             let stats = Arc::clone(&self.stats);
+            // Clone the cache_dir advisory lock into the spawn so the
+            // OS-level lock outlives `DiskCache::drop`. Without this, the
+            // spawn captures only detached pieces — `DiskCache` (and its
+            // `_lock`) could drop while we are still renaming the meta
+            // file, letting another process claim `cache_dir` mid-rewrite.
+            // Released when the last `Arc` clone falls out of scope.
+            let cache_dir_lock = Arc::clone(&self._lock);
             tokio::spawn(async move {
                 Self::rewrite_last_accessed(
                     stats,
@@ -1859,6 +1874,7 @@ impl DiskCache {
                     now,
                 )
                 .await;
+                drop(cache_dir_lock);
             });
         }
     }
@@ -3837,5 +3853,101 @@ mod tests {
         let _second = DiskCache::new(cache_dir, 1_000_000, test_policy())
             .await
             .expect("second DiskCache::new should succeed once lock has been released on failure");
+    }
+
+    /// Regression test for the bug CodeRabbit flagged on PR #53:
+    /// `note_hit_inner` spawns a detached task that rewrites a `.meta.json`
+    /// under `cache_dir`. Without holding an `Arc<CacheDirLock>`, dropping
+    /// the `DiskCache` while that task is in flight would release the
+    /// single-owner lock and let a foreign process claim the directory
+    /// mid-rewrite.
+    ///
+    /// We arrange the race deterministically:
+    ///   1. Fill a cache entry, then back-date its on-disk `last_accessed_at`
+    ///      so `note_hit_inner` takes the rewrite path.
+    ///   2. Acquire the per-key `meta_lock` from the test task so the
+    ///      spawned `rewrite_last_accessed` parks immediately on its first
+    ///      `meta_lock.lock().await`.
+    ///   3. Call `note_hit_inner` directly to spawn the task (its async
+    ///      block captures the `Arc<CacheDirLock>` at spawn time).
+    ///   4. Drop the `DiskCache`. The lock must STILL be held — by the
+    ///      `Arc` clone living inside the parked spawn's future state.
+    ///   5. Assert a second `DiskCache::new` on the same dir fails with the
+    ///      contention error.
+    ///   6. Release `meta_lock` so the spawn finishes, drop its `Arc`, and
+    ///      assert that a subsequent `DiskCache::new` then succeeds.
+    #[tokio::test]
+    async fn test_note_hit_spawn_keeps_lock_alive_past_drop() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+        let cache = DiskCache::new(cache_dir.clone(), 1_000_000, test_policy())
+            .await
+            .expect("first DiskCache::new");
+
+        let key = test_key();
+        let body = b"keep-lock-alive".to_vec();
+        let temp_path = write_temp_body(&cache_dir, &body).await;
+        let guard = cache.begin_fill(&key).await.unwrap();
+        cache
+            .commit_fill(guard, temp_path, test_meta(body.len()))
+            .await
+            .unwrap();
+
+        // Back-date the persisted `last_accessed_at` so the rewrite path is
+        // chosen in `note_hit_inner` AND `rewrite_last_accessed` doesn't
+        // short-circuit on `current_meta.last_accessed_at >= now`.
+        let meta_path = cache.paths_for_key(&key).1;
+        let bytes = tokio::fs::read(&meta_path).await.unwrap();
+        let mut stamped: CacheMeta = serde_json::from_slice(&bytes).unwrap();
+        stamped.last_accessed_at -= chrono::Duration::hours(2);
+        let new_bytes = serde_json::to_vec(&stamped).unwrap();
+        tokio::fs::write(&meta_path, &new_bytes).await.unwrap();
+
+        // Hold the per-key meta_lock so the spawn parks before it touches
+        // anything on disk.
+        let meta_lock = cache.meta_lock_for(&key);
+        let meta_guard = meta_lock.lock().await;
+
+        // Spawn the rewrite. Its captured Arc<CacheDirLock> now owns a
+        // reference that outlives the `cache` variable.
+        cache.note_hit_inner(&key, &stamped);
+
+        // Let the runtime poll the spawn so it actually parks on meta_lock
+        // (and the Arc capture takes effect before we drop the cache).
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+
+        drop(cache);
+
+        // The spawn still holds an Arc<CacheDirLock>, so the OS-level lock
+        // must still be held. A second open MUST fail with the contention
+        // error.
+        let blocked = DiskCache::new(cache_dir.clone(), 1_000_000, test_policy()).await;
+        let blocked_err = blocked
+            .err()
+            .expect("second open must fail while spawn holds the cache_dir lock");
+        let msg = blocked_err.to_string();
+        assert!(
+            msg.contains("already in use"),
+            "expected contention error while spawn is in flight, got: {msg}",
+        );
+
+        // Releasing the meta_lock lets the spawn finish, drop its Arc, and
+        // free the OS-level lock.
+        drop(meta_guard);
+
+        // Poll until the lock is observable as released. Bounded retry so
+        // a regression hangs the test instead of waiting forever.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match DiskCache::new(cache_dir.clone(), 1_000_000, test_policy()).await {
+                Ok(_second) => break,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                Err(e) => panic!("lock never released after meta_lock drop; last error: {e}",),
+            }
+        }
     }
 }
