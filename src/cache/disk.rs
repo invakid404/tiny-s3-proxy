@@ -132,12 +132,100 @@ struct FillEntry {
     commit_lock: tokio::sync::Mutex<()>,
 }
 
+/// RAII guard holding an exclusive advisory lock on `<cache_dir>/.lock`.
+///
+/// Acquired in `DiskCache::new` and held for the lifetime of the
+/// `DiskCache`. `Drop` calls `fs2::FileExt::unlock` best-effort. The lock
+/// file is intentionally not removed on drop — removing it would race with
+/// the next-start process between unlink and re-open.
+struct CacheDirLock {
+    file: std::fs::File,
+}
+
+impl CacheDirLock {
+    /// Open `<cache_dir>/.lock` and acquire an exclusive advisory lock via
+    /// `try_lock_exclusive` so a second owner fails fast with a clear error
+    /// rather than blocking. The caller must ensure `cache_dir` already
+    /// exists.
+    fn acquire(cache_dir: &std::path::Path) -> Result<Self, ProxyError> {
+        let lock_path = cache_dir.join(".lock");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| ProxyError::Cache {
+                source: Box::new(e),
+                operation: format!("open cache_dir lock file {}", lock_path.display()),
+            })?;
+        // Call through the fs2 trait explicitly: std stabilized `File::try_lock`
+        // (not `try_lock_exclusive`) and `File::unlock` in Rust 1.89 with
+        // different signatures (`try_lock` returns `Result<(), TryLockError>`).
+        // Going through the trait keeps the call site unambiguous and makes a
+        // future swap to std obvious.
+        //
+        // `fs2::lock_contended_error()` is the portable discriminator for the
+        // contention case: on POSIX it carries `EWOULDBLOCK` (kind
+        // `WouldBlock`), on Windows it carries `ERROR_LOCK_VIOLATION`. Anything
+        // else (e.g. `ENOLCK`, `EBADF`) is a real syscall failure that should
+        // not be presented to the operator as "already in use".
+        let contended_kind = fs2::lock_contended_error().kind();
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => Ok(CacheDirLock { file }),
+            Err(e) if e.kind() == contended_kind => Err(ProxyError::Cache {
+                source: format!(
+                    "cache directory {} is already in use by another process \
+                     (could not acquire exclusive lock on {}); CACHE_DIR must \
+                     not be shared across processes — confirm no other \
+                     tiny-s3-proxy instance is running against this path and retry",
+                    cache_dir.display(),
+                    lock_path.display(),
+                )
+                .into(),
+                operation: "acquire cache_dir exclusive lock".into(),
+            }),
+            Err(e) => Err(ProxyError::Cache {
+                source: Box::new(e),
+                operation: format!(
+                    "acquire cache_dir exclusive lock on {}",
+                    lock_path.display(),
+                ),
+            }),
+        }
+    }
+}
+
+impl Drop for CacheDirLock {
+    fn drop(&mut self) {
+        // Call through the fs2 trait explicitly: `std::fs::File` gained an
+        // inherent `File::unlock` in Rust 1.89 (alongside `lock`, `lock_shared`,
+        // `try_lock`, `try_lock_shared`). The std and fs2 signatures happen to
+        // match today, but going through the trait keeps acquire and release
+        // symmetric and makes a future swap to std obvious.
+        if let Err(e) = fs2::FileExt::unlock(&self.file) {
+            tracing::warn!(
+                error = %e,
+                "failed to release cache_dir advisory lock on drop",
+            );
+        }
+    }
+}
+
 /// Disk-backed implementation of `CacheStore`.
 ///
 /// Stores cached objects on the filesystem using a two-level directory hash
 /// scheme for even distribution. Writes are atomic (write to tmp, fsync, rename).
 pub struct DiskCache {
     cache_dir: PathBuf,
+    /// Exclusive advisory lock on `<cache_dir>/.lock` enforcing single-owner
+    /// access. `Arc` so detached cache-touching tasks (e.g. the
+    /// `note_hit_inner` background rewrite of `.meta.json`) can clone the
+    /// handle and keep the OS-level lock alive past `DiskCache::drop`. The
+    /// lock releases only when the last `Arc` is dropped, which guarantees
+    /// no foreign owner can claim `cache_dir` while one of our writers is
+    /// still in flight.
+    _lock: Arc<CacheDirLock>,
     stats: Arc<CacheStats>,
     /// Per-key fill tracking: refcount + generation counter + commit lock.
     /// purge() takes a read lock to bump the generation atomically without
@@ -171,6 +259,23 @@ impl DiskCache {
         _max_bytes: u64,
         _policy: CachePolicy,
     ) -> Result<Self, ProxyError> {
+        // Ensure the cache root dir exists so we can place the lock file
+        // inside it before any other state touches the directory.
+        tokio::fs::create_dir_all(&cache_dir)
+            .await
+            .map_err(|e| ProxyError::Cache {
+                source: Box::new(e),
+                operation: "create cache root dir".into(),
+            })?;
+
+        // Acquire the single-owner lock before any other initialization.
+        // `lock` is a stack temporary; if any later step in `new` returns
+        // Err, drop releases the OS-level lock automatically. On the
+        // success path it is wrapped in an `Arc` and moved into `Self` so
+        // detached cache-touching tasks can clone it and extend the
+        // lock's lifetime past `DiskCache::drop`.
+        let lock = CacheDirLock::acquire(&cache_dir)?;
+
         // Create directory structure
         tokio::fs::create_dir_all(cache_dir.join("objects"))
             .await
@@ -191,6 +296,7 @@ impl DiskCache {
 
         Ok(Self {
             cache_dir,
+            _lock: Arc::new(lock),
             stats: Arc::new(scan.stats),
             active_fills: tokio::sync::RwLock::new(HashMap::new()),
             meta_locks: std::sync::Mutex::new(HashMap::new()),
@@ -357,9 +463,10 @@ impl DiskCache {
     /// publish failures may leak gaps, which is acceptable, but ID reuse is not
     /// because `fill_id` is the CAS fence for cache invalidation.
     ///
-    /// This assumes a single cache-owning process/instance per `cache_dir`.
-    /// Supporting multiple concurrent owners would require file locking around
-    /// both the in-memory counter and `.fill_id_counter` updates.
+    /// Single-owner access to `cache_dir` is enforced at startup by the
+    /// exclusive advisory lock on `<cache_dir>/.lock` (see `CacheDirLock`),
+    /// so this code can rely on no concurrent writer racing it on
+    /// `.fill_id_counter` from another process.
     async fn reserve_fill_id(&self) -> Result<FillId, ProxyError> {
         let _guard = self.fill_id_persist_lock.lock().await;
         let fill_id = self
@@ -1749,6 +1856,13 @@ impl DiskCache {
             let hash = key.hash_hex().to_string();
             let meta_lock = self.meta_lock_for(key);
             let stats = Arc::clone(&self.stats);
+            // Clone the cache_dir advisory lock into the spawn so the
+            // OS-level lock outlives `DiskCache::drop`. Without this, the
+            // spawn captures only detached pieces — `DiskCache` (and its
+            // `_lock`) could drop while we are still renaming the meta
+            // file, letting another process claim `cache_dir` mid-rewrite.
+            // Released when the last `Arc` clone falls out of scope.
+            let cache_dir_lock = Arc::clone(&self._lock);
             tokio::spawn(async move {
                 Self::rewrite_last_accessed(
                     stats,
@@ -1760,6 +1874,11 @@ impl DiskCache {
                     now,
                 )
                 .await;
+                // Load-bearing: this final use forces `cache_dir_lock` to be captured by
+                // the `tokio::spawn` future and held until `Self::rewrite_last_accessed`
+                // completes, keeping the OS advisory lock alive past `DiskCache::drop`.
+                // Do not remove unless the spawned task otherwise owns the lock Arc.
+                drop(cache_dir_lock);
             });
         }
     }
@@ -3649,5 +3768,190 @@ mod tests {
             rendered.contains("phase=\"startup\""),
             "expected phase=\"startup\" label on the duration metric, got:\n{rendered}",
         );
+    }
+
+    #[tokio::test]
+    async fn test_disk_cache_rejects_second_owner() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+
+        // First owner holds the lock for the duration of this test.
+        let _first = DiskCache::new(cache_dir.clone(), 1_000_000, test_policy())
+            .await
+            .expect("first DiskCache::new should succeed");
+
+        let err = DiskCache::new(cache_dir.clone(), 1_000_000, test_policy())
+            .await
+            .err()
+            .expect("second DiskCache::new must fail while first owner holds the lock");
+
+        assert!(
+            matches!(err, ProxyError::Cache { .. }),
+            "expected ProxyError::Cache, got: {err:?}",
+        );
+
+        let msg = err.to_string();
+        let path_str = cache_dir.display().to_string();
+        assert!(
+            msg.contains("CACHE_DIR"),
+            "error message should name the CACHE_DIR env var, got: {msg}",
+        );
+        assert!(
+            msg.contains("already in use"),
+            "error message should mention the ownership conflict, got: {msg}",
+        );
+        assert!(
+            msg.contains(&path_str),
+            "error message should include the cache path {path_str}, got: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_disk_cache_lock_released_on_drop() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+
+        {
+            let first = DiskCache::new(cache_dir.clone(), 1_000_000, test_policy())
+                .await
+                .expect("first DiskCache::new should succeed");
+            drop(first);
+        }
+
+        // After the first owner is dropped, the lock must be released and a
+        // second owner must be able to claim the same directory.
+        let _second = DiskCache::new(cache_dir, 1_000_000, test_policy())
+            .await
+            .expect("second DiskCache::new should succeed after first is dropped");
+    }
+
+    #[tokio::test]
+    async fn test_disk_cache_lock_released_when_construction_fails_after_acquire() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+
+        // Force `load_next_fill_id` to fail by planting an unparseable
+        // `.fill_id_counter` file. Construction will fail AFTER the lock
+        // has been acquired, exercising the drop-on-Err path.
+        tokio::fs::create_dir_all(&cache_dir).await.unwrap();
+        tokio::fs::write(cache_dir.join(".fill_id_counter"), b"not-a-number")
+            .await
+            .unwrap();
+
+        let err = DiskCache::new(cache_dir.clone(), 1_000_000, test_policy())
+            .await
+            .err()
+            .expect("first DiskCache::new should fail on the corrupt counter");
+        assert!(
+            matches!(err, ProxyError::Cache { .. }),
+            "expected ProxyError::Cache from corrupt counter, got: {err:?}",
+        );
+
+        // Fix the counter so the second open's `load_next_fill_id` succeeds;
+        // the lock must already have been released by the first failure's
+        // unwinding for this to work.
+        tokio::fs::write(cache_dir.join(".fill_id_counter"), b"1")
+            .await
+            .unwrap();
+
+        let _second = DiskCache::new(cache_dir, 1_000_000, test_policy())
+            .await
+            .expect("second DiskCache::new should succeed once lock has been released on failure");
+    }
+
+    /// Regression test for the bug CodeRabbit flagged on PR #53:
+    /// `note_hit_inner` spawns a detached task that rewrites a `.meta.json`
+    /// under `cache_dir`. Without holding an `Arc<CacheDirLock>`, dropping
+    /// the `DiskCache` while that task is in flight would release the
+    /// single-owner lock and let a foreign process claim the directory
+    /// mid-rewrite.
+    ///
+    /// We arrange the race deterministically:
+    ///   1. Fill a cache entry, then back-date its on-disk `last_accessed_at`
+    ///      so `note_hit_inner` takes the rewrite path.
+    ///   2. Acquire the per-key `meta_lock` from the test task so the
+    ///      spawned `rewrite_last_accessed` parks immediately on its first
+    ///      `meta_lock.lock().await`.
+    ///   3. Call `note_hit_inner` directly to spawn the task (its async
+    ///      block captures the `Arc<CacheDirLock>` at spawn time).
+    ///   4. Drop the `DiskCache`. The lock must STILL be held — by the
+    ///      `Arc` clone living inside the parked spawn's future state.
+    ///   5. Assert a second `DiskCache::new` on the same dir fails with the
+    ///      contention error.
+    ///   6. Release `meta_lock` so the spawn finishes, drop its `Arc`, and
+    ///      assert that a subsequent `DiskCache::new` then succeeds.
+    #[tokio::test]
+    async fn test_note_hit_spawn_keeps_lock_alive_past_drop() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+        let cache = DiskCache::new(cache_dir.clone(), 1_000_000, test_policy())
+            .await
+            .expect("first DiskCache::new");
+
+        let key = test_key();
+        let body = b"keep-lock-alive".to_vec();
+        let temp_path = write_temp_body(&cache_dir, &body).await;
+        let guard = cache.begin_fill(&key).await.unwrap();
+        cache
+            .commit_fill(guard, temp_path, test_meta(body.len()))
+            .await
+            .unwrap();
+
+        // Back-date the persisted `last_accessed_at` so the rewrite path is
+        // chosen in `note_hit_inner` AND `rewrite_last_accessed` doesn't
+        // short-circuit on `current_meta.last_accessed_at >= now`.
+        let meta_path = cache.paths_for_key(&key).1;
+        let bytes = tokio::fs::read(&meta_path).await.unwrap();
+        let mut stamped: CacheMeta = serde_json::from_slice(&bytes).unwrap();
+        stamped.last_accessed_at -= chrono::Duration::hours(2);
+        let new_bytes = serde_json::to_vec(&stamped).unwrap();
+        tokio::fs::write(&meta_path, &new_bytes).await.unwrap();
+
+        // Hold the per-key meta_lock so the spawn parks before it touches
+        // anything on disk.
+        let meta_lock = cache.meta_lock_for(&key);
+        let meta_guard = meta_lock.lock().await;
+
+        // Spawn the rewrite. Its captured Arc<CacheDirLock> now owns a
+        // reference that outlives the `cache` variable.
+        cache.note_hit_inner(&key, &stamped);
+
+        // Let the runtime poll the spawn so it actually parks on meta_lock
+        // (and the Arc capture takes effect before we drop the cache).
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+
+        drop(cache);
+
+        // The spawn still holds an Arc<CacheDirLock>, so the OS-level lock
+        // must still be held. A second open MUST fail with the contention
+        // error.
+        let blocked = DiskCache::new(cache_dir.clone(), 1_000_000, test_policy()).await;
+        let blocked_err = blocked
+            .err()
+            .expect("second open must fail while spawn holds the cache_dir lock");
+        let msg = blocked_err.to_string();
+        assert!(
+            msg.contains("already in use"),
+            "expected contention error while spawn is in flight, got: {msg}",
+        );
+
+        // Releasing the meta_lock lets the spawn finish, drop its Arc, and
+        // free the OS-level lock.
+        drop(meta_guard);
+
+        // Poll until the lock is observable as released. Bounded retry so
+        // a regression hangs the test instead of waiting forever.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match DiskCache::new(cache_dir.clone(), 1_000_000, test_policy()).await {
+                Ok(_second) => break,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                Err(e) => panic!("lock never released after meta_lock drop; last error: {e}",),
+            }
+        }
     }
 }
