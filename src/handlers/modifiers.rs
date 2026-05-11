@@ -87,6 +87,51 @@ pub(super) fn has_unsupported_http_conditionals(raw_headers: &http::HeaderMap) -
     raw_headers.contains_key("if-match") || raw_headers.contains_key("if-none-match")
 }
 
+/// Detect SigV4 streaming (aws-chunked) upload indicators on the inbound
+/// request. The typed PUT/UploadPart paths buffer the raw body and forward it
+/// verbatim — they do not decode aws-chunked framing — so chunk-signature
+/// frames would end up stored as object body bytes. Route these through
+/// passthrough instead.
+///
+/// IMPORTANT: this inspects the raw inbound `HeaderMap` rather than the
+/// `extra_amz_headers` map produced by `parse_s3_request`, because the parser
+/// strips `x-amz-content-sha256` and `x-amz-decoded-content-length` before
+/// they reach `extra_amz_headers`.
+pub(super) fn has_s3_streaming_upload_indicators(raw_headers: &http::HeaderMap) -> bool {
+    // 1. Content-Encoding may carry aws-chunked as one token in a comma list
+    //    (e.g. `gzip, aws-chunked`), possibly via multiple header values.
+    for value in raw_headers.get_all("content-encoding") {
+        if let Ok(s) = value.to_str() {
+            for tok in s.split(',') {
+                if tok.trim().eq_ignore_ascii_case("aws-chunked") {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // 2. x-amz-content-sha256 set to a STREAMING-* sentinel. Match the
+    //    canonical values defensively via case-insensitive prefix. Iterate
+    //    every header value: a client could send multiple x-amz-content-sha256
+    //    headers (e.g. `UNSIGNED-PAYLOAD` followed by `STREAMING-...`) to slip
+    //    a streaming sentinel past a single-value check.
+    for value in raw_headers.get_all("x-amz-content-sha256") {
+        if let Ok(s) = value.to_str() {
+            let trimmed = s.trim();
+            if trimmed.len() >= "STREAMING-".len()
+                && trimmed[.."STREAMING-".len()].eq_ignore_ascii_case("STREAMING-")
+            {
+                return true;
+            }
+        }
+    }
+
+    // 3/4. Decoded length and trailer headers only appear on aws-chunked
+    //      uploads; presence alone is sufficient signal.
+    raw_headers.contains_key("x-amz-decoded-content-length")
+        || raw_headers.contains_key("x-amz-trailer")
+}
+
 /// Gate for PutObject and DeleteObject. Checksum headers are NOT gated here
 /// because the typed PutObject path forwards them end-to-end.
 pub(super) fn has_unsupported_write_modifiers(
@@ -94,6 +139,9 @@ pub(super) fn has_unsupported_write_modifiers(
     raw_headers: &http::HeaderMap,
 ) -> bool {
     if has_unsupported_http_conditionals(raw_headers) {
+        return true;
+    }
+    if has_s3_streaming_upload_indicators(raw_headers) {
         return true;
     }
     extra_amz
@@ -109,6 +157,9 @@ pub(super) fn has_unsupported_multipart_modifiers(
     raw_headers: &http::HeaderMap,
 ) -> bool {
     if has_unsupported_http_conditionals(raw_headers) {
+        return true;
+    }
+    if has_s3_streaming_upload_indicators(raw_headers) {
         return true;
     }
     extra_amz.keys().any(|k| {

@@ -1557,6 +1557,149 @@ mod tests {
         assert!(body_str.contains("AccessDenied"));
     }
 
+    /// PUT with aws-chunked / SigV4 streaming indicators must bypass the typed
+    /// PUT path (which buffers the raw body verbatim, storing chunk-signature
+    /// frames as object body bytes) and instead route to passthrough.
+    #[tokio::test]
+    async fn test_aws_chunked_put_routes_to_passthrough() {
+        use axum::routing::any;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        // Minimal aws-chunked-style framed body wrapping the literal payload
+        // "hello". The proxy doesn't parse this — it forwards the bytes
+        // verbatim to the upstream, which is exactly what we want to verify.
+        let framed_body: &[u8] =
+            b"5;chunk-signature=deadbeef\r\nhello\r\n0;chunk-signature=cafef00d\r\n\r\n";
+
+        // Mock upstream that captures (method, uri, headers, body) per request.
+        let call_count = std::sync::Arc::new(AtomicU32::new(0));
+        type CapturedRequest = (String, String, http::HeaderMap, bytes::Bytes);
+        let captured: std::sync::Arc<tokio::sync::Mutex<Vec<CapturedRequest>>> =
+            std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let call_count_for_handler = call_count.clone();
+        let captured_for_handler = captured.clone();
+
+        let app = axum::Router::new().route(
+            "/{*path}",
+            any(move |req: http::Request<Body>| {
+                let cc = call_count_for_handler.clone();
+                let cap = captured_for_handler.clone();
+                async move {
+                    let method = req.method().to_string();
+                    let uri = req.uri().to_string();
+                    let headers = req.headers().clone();
+                    let body_bytes = axum::body::to_bytes(req.into_body(), 64 * 1024)
+                        .await
+                        .unwrap_or_default();
+                    cap.lock().await.push((method, uri, headers, body_bytes));
+                    cc.fetch_add(1, Ordering::SeqCst);
+                    http::Response::builder()
+                        .status(200)
+                        .body(Body::from("ok"))
+                        .unwrap()
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // Build state pointing at the mock upstream. MockBackend has zero
+        // expectations: if dispatch hits the typed PUT path it will return
+        // an error from put_object() and `total_calls` will be non-zero.
+        let cache = MockCache::new();
+        let mut config = test_config();
+        config.backend_endpoint = format!("http://{addr}");
+        config.cache_dir = cache.temp_dir.path().to_path_buf();
+        let _ = std::fs::create_dir_all(cache.temp_dir.path().join("tmp"));
+        let backend = std::sync::Arc::new(MockBackend::new());
+        let state = std::sync::Arc::new(AppState {
+            backend: backend.clone(),
+            cache: std::sync::Arc::new(cache),
+            singleflight: std::sync::Arc::new(crate::cache::SingleFlight::new()),
+            auth: std::sync::Arc::new(MockAuth::allow_all()),
+            policy: crate::cache::policy::CachePolicy::new(
+                config.cacheable_prefixes.clone(),
+                config.cache_max_object_bytes,
+            ),
+            frontend_bucket: std::sync::Arc::from(config.frontend_bucket.as_str()),
+            backend_bucket: std::sync::Arc::from(config.backend_bucket.as_str()),
+            http_client: reqwest::Client::new(),
+            config: std::sync::Arc::new(config),
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/test-frontend/key")
+            .header("content-encoding", "aws-chunked")
+            .header(
+                "x-amz-content-sha256",
+                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+            )
+            .header("x-amz-decoded-content-length", "5")
+            .header("x-amz-trailer", "x-amz-checksum-crc32")
+            .body(Body::from(framed_body.to_vec()))
+            .unwrap();
+
+        let resp = handle_s3_request(State(state), req).await;
+        assert_eq!(resp.status(), 200, "passthrough should return upstream 200");
+
+        // Typed PUT path must NOT have been invoked.
+        let typed_calls = backend.total_calls.load(Ordering::Relaxed);
+        assert_eq!(
+            typed_calls, 0,
+            "typed Backend path must not be invoked for aws-chunked PUT (got {typed_calls} calls)"
+        );
+
+        // Upstream must have received the framed wire body verbatim and the
+        // streaming-indicator headers preserved.
+        let calls = captured.lock().await;
+        assert_eq!(calls.len(), 1, "upstream should receive exactly 1 request");
+        let (method, uri, hdrs, body) = &calls[0];
+        assert_eq!(method, "PUT");
+        assert!(
+            uri.starts_with("/test-backend/key"),
+            "upstream URI should target rewritten backend bucket, got {uri}"
+        );
+        assert_eq!(
+            body.as_ref(),
+            framed_body,
+            "upstream must receive the original framed body bytes verbatim"
+        );
+        let ce = hdrs
+            .get("content-encoding")
+            .expect("content-encoding forwarded")
+            .to_str()
+            .unwrap();
+        assert!(
+            ce.split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("aws-chunked")),
+            "content-encoding must preserve aws-chunked token, got {ce}"
+        );
+        assert_eq!(
+            hdrs.get("x-amz-decoded-content-length")
+                .expect("x-amz-decoded-content-length forwarded")
+                .to_str()
+                .unwrap(),
+            "5"
+        );
+        assert_eq!(
+            hdrs.get("x-amz-trailer")
+                .expect("x-amz-trailer forwarded")
+                .to_str()
+                .unwrap(),
+            "x-amz-checksum-crc32"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "upstream handler should be invoked exactly once"
+        );
+    }
+
     #[tokio::test]
     async fn test_mock_cache_purge_if_unchanged_only_consumes_matching_staged_replacement() {
         let key_a = crate::cache::key::CacheKey::new("test-backend", "script_bundle/a.js");
@@ -1720,6 +1863,109 @@ mod tests {
     fn test_has_unsupported_multipart_modifiers_clean() {
         let extra_amz = std::collections::HashMap::new();
         let headers = http::HeaderMap::new();
+        assert!(!has_unsupported_multipart_modifiers(&extra_amz, &headers));
+    }
+
+    // ---- aws-chunked / SigV4 streaming upload indicators ----
+
+    #[test]
+    fn test_streaming_indicator_content_encoding_aws_chunked() {
+        let extra_amz = std::collections::HashMap::new();
+        let mut headers = http::HeaderMap::new();
+        headers.insert("content-encoding", "aws-chunked".parse().unwrap());
+        assert!(has_unsupported_write_modifiers(&extra_amz, &headers));
+        assert!(has_unsupported_multipart_modifiers(&extra_amz, &headers));
+    }
+
+    #[test]
+    fn test_streaming_indicator_content_encoding_comma_list() {
+        let extra_amz = std::collections::HashMap::new();
+        let mut headers = http::HeaderMap::new();
+        // Comma list with leading whitespace before the aws-chunked token.
+        headers.insert("content-encoding", "gzip,  aws-chunked".parse().unwrap());
+        assert!(has_unsupported_write_modifiers(&extra_amz, &headers));
+        assert!(has_unsupported_multipart_modifiers(&extra_amz, &headers));
+    }
+
+    #[test]
+    fn test_streaming_indicator_amz_content_sha256_canonical_values() {
+        let extra_amz = std::collections::HashMap::new();
+        for sentinel in [
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+            "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD",
+            "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER",
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+        ] {
+            let mut headers = http::HeaderMap::new();
+            headers.insert("x-amz-content-sha256", sentinel.parse().unwrap());
+            assert!(
+                has_unsupported_write_modifiers(&extra_amz, &headers),
+                "write gate should match {sentinel}",
+            );
+            assert!(
+                has_unsupported_multipart_modifiers(&extra_amz, &headers),
+                "multipart gate should match {sentinel}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_streaming_indicator_amz_content_sha256_duplicate_values() {
+        // A client could send two x-amz-content-sha256 headers — first
+        // UNSIGNED-PAYLOAD, then a STREAMING-* sentinel — to slip past a
+        // single-value check. The gate must inspect every value.
+        let extra_amz = std::collections::HashMap::new();
+        let mut headers = http::HeaderMap::new();
+        headers.append(
+            http::header::HeaderName::from_static("x-amz-content-sha256"),
+            http::header::HeaderValue::from_static("UNSIGNED-PAYLOAD"),
+        );
+        headers.append(
+            http::header::HeaderName::from_static("x-amz-content-sha256"),
+            http::header::HeaderValue::from_static("STREAMING-AWS4-HMAC-SHA256-PAYLOAD"),
+        );
+        assert!(
+            has_s3_streaming_upload_indicators(&headers),
+            "streaming sentinel in second x-amz-content-sha256 value must trip the helper"
+        );
+        assert!(
+            has_unsupported_write_modifiers(&extra_amz, &headers),
+            "write gate must trip when a later x-amz-content-sha256 value is STREAMING-*"
+        );
+        assert!(
+            has_unsupported_multipart_modifiers(&extra_amz, &headers),
+            "multipart gate must trip when a later x-amz-content-sha256 value is STREAMING-*"
+        );
+    }
+
+    #[test]
+    fn test_streaming_indicator_decoded_content_length() {
+        let extra_amz = std::collections::HashMap::new();
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-amz-decoded-content-length", "5".parse().unwrap());
+        assert!(has_unsupported_write_modifiers(&extra_amz, &headers));
+        assert!(has_unsupported_multipart_modifiers(&extra_amz, &headers));
+    }
+
+    #[test]
+    fn test_streaming_indicator_amz_trailer() {
+        let extra_amz = std::collections::HashMap::new();
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-amz-trailer", "x-amz-checksum-crc32".parse().unwrap());
+        assert!(has_unsupported_write_modifiers(&extra_amz, &headers));
+        assert!(has_unsupported_multipart_modifiers(&extra_amz, &headers));
+    }
+
+    #[test]
+    fn test_streaming_indicator_negative_unsigned_payload_gzip() {
+        // gzip + UNSIGNED-PAYLOAD is a perfectly normal compressed upload —
+        // it must not be flagged as an aws-chunked streaming upload.
+        let extra_amz = std::collections::HashMap::new();
+        let mut headers = http::HeaderMap::new();
+        headers.insert("content-encoding", "gzip".parse().unwrap());
+        headers.insert("x-amz-content-sha256", "UNSIGNED-PAYLOAD".parse().unwrap());
+        assert!(!has_unsupported_write_modifiers(&extra_amz, &headers));
         assert!(!has_unsupported_multipart_modifiers(&extra_amz, &headers));
     }
 
