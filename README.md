@@ -111,7 +111,7 @@ All configuration is via environment variables.
 
 | Variable | Default | Description |
 |---|---|---|
-| `CACHE_DIR` | `/cache` | Disk cache directory |
+| `CACHE_DIR` | `/cache` | Disk cache directory. Must not be shared across processes — startup acquires an exclusive advisory lock on `<CACHE_DIR>/.lock` and a second instance against the same path fails fast |
 | `CACHE_MAX_BYTES` | `10737418240` (10 GB) | Maximum cache size on disk |
 | `CACHE_MAX_OBJECT_BYTES` | `536870912` (512 MB) | Maximum single object size to cache. Objects with unknown `Content-Length` are not cached |
 | `CACHEABLE_PREFIXES` | *(empty)* | Comma-separated object key prefixes to cache. Empty/unset means all GETs bypass the cache. Example: `script_bundle/,bun_bundle/,tar/` |

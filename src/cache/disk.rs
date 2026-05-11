@@ -132,12 +132,76 @@ struct FillEntry {
     commit_lock: tokio::sync::Mutex<()>,
 }
 
+/// RAII guard holding an exclusive advisory lock on `<cache_dir>/.lock`.
+///
+/// Acquired in `DiskCache::new` and held for the lifetime of the
+/// `DiskCache`. `Drop` calls `fs2::FileExt::unlock` best-effort. The lock
+/// file is intentionally not removed on drop — removing it would race with
+/// the next-start process between unlink and re-open.
+struct CacheDirLock {
+    file: std::fs::File,
+}
+
+impl CacheDirLock {
+    /// Open `<cache_dir>/.lock` and acquire an exclusive advisory lock via
+    /// `try_lock_exclusive` so a second owner fails fast with a clear error
+    /// rather than blocking. The caller must ensure `cache_dir` already
+    /// exists.
+    fn acquire(cache_dir: &std::path::Path) -> Result<Self, ProxyError> {
+        let lock_path = cache_dir.join(".lock");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| ProxyError::Cache {
+                source: Box::new(e),
+                operation: format!("open cache_dir lock file {}", lock_path.display()),
+            })?;
+        // Fully-qualified call: std::fs::File gained an inherent
+        // `try_lock_exclusive` in Rust 1.89 with a different signature, which
+        // would otherwise shadow the trait method via method resolution.
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => Ok(CacheDirLock { file }),
+            Err(_) => Err(ProxyError::Cache {
+                source: format!(
+                    "cache directory {} is already in use by another process \
+                     (could not acquire exclusive lock on {}); CACHE_DIR must \
+                     not be shared across processes — confirm no other \
+                     tiny-s3-proxy instance is running against this path and retry",
+                    cache_dir.display(),
+                    lock_path.display(),
+                )
+                .into(),
+                operation: "acquire cache_dir exclusive lock".into(),
+            }),
+        }
+    }
+}
+
+impl Drop for CacheDirLock {
+    fn drop(&mut self) {
+        // Fully-qualified for the same reason as `try_lock_exclusive`: std
+        // gained an inherent `File::unlock` in Rust 1.89.
+        if let Err(e) = fs2::FileExt::unlock(&self.file) {
+            tracing::warn!(
+                error = %e,
+                "failed to release cache_dir advisory lock on drop",
+            );
+        }
+    }
+}
+
 /// Disk-backed implementation of `CacheStore`.
 ///
 /// Stores cached objects on the filesystem using a two-level directory hash
 /// scheme for even distribution. Writes are atomic (write to tmp, fsync, rename).
 pub struct DiskCache {
     cache_dir: PathBuf,
+    /// Exclusive advisory lock on `<cache_dir>/.lock` enforcing single-owner
+    /// access. Held purely for its `Drop` side effect; never read.
+    _lock: CacheDirLock,
     stats: Arc<CacheStats>,
     /// Per-key fill tracking: refcount + generation counter + commit lock.
     /// purge() takes a read lock to bump the generation atomically without
@@ -171,6 +235,20 @@ impl DiskCache {
         _max_bytes: u64,
         _policy: CachePolicy,
     ) -> Result<Self, ProxyError> {
+        // Ensure the cache root dir exists so we can place the lock file
+        // inside it before any other state touches the directory.
+        tokio::fs::create_dir_all(&cache_dir)
+            .await
+            .map_err(|e| ProxyError::Cache {
+                source: Box::new(e),
+                operation: "create cache root dir".into(),
+            })?;
+
+        // Acquire the single-owner lock before any other initialization.
+        // `lock` is a stack temporary; if any later step in `new` returns
+        // Err, drop releases the OS-level lock automatically.
+        let lock = CacheDirLock::acquire(&cache_dir)?;
+
         // Create directory structure
         tokio::fs::create_dir_all(cache_dir.join("objects"))
             .await
@@ -191,6 +269,7 @@ impl DiskCache {
 
         Ok(Self {
             cache_dir,
+            _lock: lock,
             stats: Arc::new(scan.stats),
             active_fills: tokio::sync::RwLock::new(HashMap::new()),
             meta_locks: std::sync::Mutex::new(HashMap::new()),
@@ -357,9 +436,10 @@ impl DiskCache {
     /// publish failures may leak gaps, which is acceptable, but ID reuse is not
     /// because `fill_id` is the CAS fence for cache invalidation.
     ///
-    /// This assumes a single cache-owning process/instance per `cache_dir`.
-    /// Supporting multiple concurrent owners would require file locking around
-    /// both the in-memory counter and `.fill_id_counter` updates.
+    /// Single-owner access to `cache_dir` is enforced at startup by the
+    /// exclusive advisory lock on `<cache_dir>/.lock` (see `CacheDirLock`),
+    /// so this code can rely on no concurrent writer racing it on
+    /// `.fill_id_counter` from another process.
     async fn reserve_fill_id(&self) -> Result<FillId, ProxyError> {
         let _guard = self.fill_id_persist_lock.lock().await;
         let fill_id = self
@@ -3649,5 +3729,94 @@ mod tests {
             rendered.contains("phase=\"startup\""),
             "expected phase=\"startup\" label on the duration metric, got:\n{rendered}",
         );
+    }
+
+    #[tokio::test]
+    async fn test_disk_cache_rejects_second_owner() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+
+        // First owner holds the lock for the duration of this test.
+        let _first = DiskCache::new(cache_dir.clone(), 1_000_000, test_policy())
+            .await
+            .expect("first DiskCache::new should succeed");
+
+        let err = DiskCache::new(cache_dir.clone(), 1_000_000, test_policy())
+            .await
+            .err()
+            .expect("second DiskCache::new must fail while first owner holds the lock");
+
+        assert!(
+            matches!(err, ProxyError::Cache { .. }),
+            "expected ProxyError::Cache, got: {err:?}",
+        );
+
+        let msg = err.to_string();
+        let path_str = cache_dir.display().to_string();
+        assert!(
+            msg.contains("CACHE_DIR"),
+            "error message should name the CACHE_DIR env var, got: {msg}",
+        );
+        assert!(
+            msg.contains("already in use"),
+            "error message should mention the ownership conflict, got: {msg}",
+        );
+        assert!(
+            msg.contains(&path_str),
+            "error message should include the cache path {path_str}, got: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_disk_cache_lock_released_on_drop() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+
+        {
+            let first = DiskCache::new(cache_dir.clone(), 1_000_000, test_policy())
+                .await
+                .expect("first DiskCache::new should succeed");
+            drop(first);
+        }
+
+        // After the first owner is dropped, the lock must be released and a
+        // second owner must be able to claim the same directory.
+        let _second = DiskCache::new(cache_dir, 1_000_000, test_policy())
+            .await
+            .expect("second DiskCache::new should succeed after first is dropped");
+    }
+
+    #[tokio::test]
+    async fn test_disk_cache_lock_released_when_construction_fails_after_acquire() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+
+        // Force `load_next_fill_id` to fail by planting an unparseable
+        // `.fill_id_counter` file. Construction will fail AFTER the lock
+        // has been acquired, exercising the drop-on-Err path.
+        tokio::fs::create_dir_all(&cache_dir).await.unwrap();
+        tokio::fs::write(cache_dir.join(".fill_id_counter"), b"not-a-number")
+            .await
+            .unwrap();
+
+        let err = DiskCache::new(cache_dir.clone(), 1_000_000, test_policy())
+            .await
+            .err()
+            .expect("first DiskCache::new should fail on the corrupt counter");
+        assert!(
+            matches!(err, ProxyError::Cache { .. }),
+            "expected ProxyError::Cache from corrupt counter, got: {err:?}",
+        );
+
+        // Fix the counter so the second open's `load_next_fill_id` succeeds;
+        // the lock must already have been released by the first failure's
+        // unwinding for this to work.
+        tokio::fs::write(cache_dir.join(".fill_id_counter"), b"1")
+            .await
+            .unwrap();
+
+        let _second = DiskCache::new(cache_dir, 1_000_000, test_policy())
+            .await
+            .expect("second DiskCache::new should succeed once lock has been released on failure");
     }
 }
