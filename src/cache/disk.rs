@@ -9,14 +9,14 @@ use crate::cache::entry::CacheEntry;
 use crate::cache::key::CacheKey;
 use crate::cache::metadata::CacheMeta;
 use crate::cache::policy::CachePolicy;
-use crate::cache::{CacheStats, CacheStatsSnapshot, CacheStore, FillGuard};
+use crate::cache::{CacheStats, CacheStatsSnapshot, CacheStore, FillGuard, FillId};
 use crate::error::ProxyError;
 
 /// Results from scanning a single hash directory during startup.
 struct DirScanStats {
     total_bytes: u64,
     entry_count: u64,
-    max_fill_id: u64,
+    max_fill_id: FillId,
     saw_cache_files: bool,
     /// Set when any metadata file was corrupt, meaning `max_fill_id` may
     /// not reflect the true maximum.
@@ -35,7 +35,7 @@ struct DirScanStats {
 /// Aggregated results from the full startup scan.
 struct StartupScanResult {
     stats: CacheStats,
-    max_fill_id: u64,
+    max_fill_id: FillId,
     saw_cache_files: bool,
     fill_id_incomplete: bool,
     hash_dirs: usize,
@@ -259,7 +259,7 @@ impl DiskCache {
         cache_dir: &std::path::Path,
         scan: &StartupScanResult,
     ) -> Result<u64, ProxyError> {
-        let scan_next_fill_id = scan.max_fill_id.saturating_add(1).max(1);
+        let scan_next_fill_id = scan.max_fill_id.as_u64().saturating_add(1).max(1);
         let counter_path = Self::fill_id_counter_path_for(cache_dir);
         match Self::read_persisted_fill_id_counter(&counter_path).await? {
             Some(counter_file_value) => Ok(counter_file_value.max(scan_next_fill_id)),
@@ -277,7 +277,7 @@ impl DiskCache {
             None if scan.saw_cache_files => {
                 tracing::warn!(
                     path = %counter_path.display(),
-                    scan_max_fill_id = scan.max_fill_id,
+                    scan_max_fill_id = scan.max_fill_id.as_u64(),
                     "fill_id counter file missing on non-empty cache; falling back to startup scan"
                 );
                 Ok(scan_next_fill_id)
@@ -360,7 +360,7 @@ impl DiskCache {
     /// This assumes a single cache-owning process/instance per `cache_dir`.
     /// Supporting multiple concurrent owners would require file locking around
     /// both the in-memory counter and `.fill_id_counter` updates.
-    async fn reserve_fill_id(&self) -> Result<u64, ProxyError> {
+    async fn reserve_fill_id(&self) -> Result<FillId, ProxyError> {
         let _guard = self.fill_id_persist_lock.lock().await;
         let fill_id = self
             .next_fill_id
@@ -373,7 +373,7 @@ impl DiskCache {
             })?;
         let next_fill_id = fill_id.saturating_add(1);
         self.persist_fill_id_counter(next_fill_id).await?;
-        Ok(fill_id)
+        Ok(FillId::from(fill_id))
     }
 
     /// Scan the objects directory to compute initial stats at startup. The
@@ -417,7 +417,7 @@ impl DiskCache {
                     hash_dirs = scan.hash_dirs,
                     entry_count = scan.stats.entry_count.load(Ordering::Relaxed),
                     total_bytes = scan.stats.total_bytes.load(Ordering::Relaxed),
-                    max_fill_id = scan.max_fill_id,
+                    max_fill_id = scan.max_fill_id.as_u64(),
                     saw_cache_files = scan.saw_cache_files,
                     layout_incomplete = scan.layout_incomplete,
                     fill_id_incomplete = scan.fill_id_incomplete,
@@ -461,7 +461,7 @@ impl DiskCache {
         if hash_dirs.is_empty() {
             return Ok(StartupScanResult {
                 stats,
-                max_fill_id: 0,
+                max_fill_id: FillId::ZERO,
                 saw_cache_files: false,
                 fill_id_incomplete: layout_incomplete,
                 hash_dirs: 0,
@@ -488,7 +488,7 @@ impl DiskCache {
         // Phase 3: Aggregate results from all tasks.
         let mut agg = StartupScanResult {
             stats,
-            max_fill_id: 0,
+            max_fill_id: FillId::ZERO,
             saw_cache_files: false,
             fill_id_incomplete: layout_incomplete,
             hash_dirs: hash_dir_count,
@@ -521,7 +521,7 @@ impl DiskCache {
         let mut result = DirScanStats {
             total_bytes: 0,
             entry_count: 0,
-            max_fill_id: 0,
+            max_fill_id: FillId::ZERO,
             saw_cache_files: false,
             fill_id_incomplete: false,
             unreclaimed_bytes: 0,
@@ -977,7 +977,7 @@ impl DiskCache {
         meta_path: PathBuf,
         tmp_dir: PathBuf,
         hash: String,
-        expected_fill_id: u64,
+        expected_fill_id: FillId,
         now: chrono::DateTime<chrono::Utc>,
     ) {
         static ACCESS_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1337,7 +1337,7 @@ impl DiskCache {
     async fn purge_inner(
         &self,
         key: &CacheKey,
-        expected_fill_id: Option<u64>,
+        expected_fill_id: Option<FillId>,
     ) -> Result<bool, ProxyError> {
         // Look up the per-key fill entry. If an active fill exists, acquire
         // its commit_lock so we serialize against commit_fill's publish step.
@@ -1545,7 +1545,7 @@ impl CacheStore for DiskCache {
     async fn purge_if_unchanged(
         &self,
         key: &CacheKey,
-        expected_fill_id: u64,
+        expected_fill_id: FillId,
     ) -> Result<bool, ProxyError> {
         self.purge_inner(key, Some(expected_fill_id)).await
     }
@@ -1579,7 +1579,7 @@ impl CacheStore for DiskCache {
     async fn poison_if_unchanged(
         &self,
         key: &CacheKey,
-        expected_fill_id: u64,
+        expected_fill_id: FillId,
     ) -> Result<bool, ProxyError> {
         let fill_entry = {
             let fills = self.active_fills.read().await;
@@ -1628,7 +1628,7 @@ impl CacheStore for DiskCache {
     async fn update_metadata_if_unchanged(
         &self,
         key: &CacheKey,
-        expected_fill_id: u64,
+        expected_fill_id: FillId,
         meta: CacheMeta,
     ) -> Result<bool, ProxyError> {
         static UPDATE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1980,7 +1980,7 @@ mod tests {
             content_type: Some("application/javascript".into()),
             content_length: body_len as i64,
             cache_written_at: now,
-            fill_id: 0, // stamped by commit_fill
+            fill_id: FillId::ZERO, // stamped by commit_fill
             metadata_version: 0,
             last_accessed_at: now,
             hit_count: 0,
@@ -2288,7 +2288,7 @@ mod tests {
                     content_type: None,
                     content_length: body.len() as i64,
                     cache_written_at: Utc::now(),
-                    fill_id: 0,
+                    fill_id: FillId::ZERO,
                     metadata_version: 0,
                     last_accessed_at: Utc::now(),
                     hit_count: 0,
@@ -2317,7 +2317,7 @@ mod tests {
                 content_type: None,
                 content_length: body.len() as i64,
                 cache_written_at: Utc::now(),
-                fill_id: 0,
+                fill_id: FillId::ZERO,
                 metadata_version: 0,
                 last_accessed_at: Utc::now(),
                 hit_count: 0,
@@ -2658,7 +2658,10 @@ mod tests {
         let guard = cache1.begin_fill(&key).await.unwrap();
         cache1.commit_fill(guard, temp_path, meta).await.unwrap();
         let old_fill_id = cache1.lookup(&key).await.unwrap().unwrap().meta.fill_id;
-        assert_eq!(read_fill_id_counter(tmp.path()).await, old_fill_id + 1);
+        assert_eq!(
+            read_fill_id_counter(tmp.path()).await,
+            old_fill_id.as_u64() + 1
+        );
         drop(cache1);
 
         let cache2 = DiskCache::new(cache_dir.clone(), 1_000_000, test_policy())
@@ -2675,7 +2678,10 @@ mod tests {
             new_fill_id > old_fill_id,
             "fill_id did not survive restart: old={old_fill_id}, new={new_fill_id}"
         );
-        assert_eq!(read_fill_id_counter(tmp.path()).await, new_fill_id + 1);
+        assert_eq!(
+            read_fill_id_counter(tmp.path()).await,
+            new_fill_id.as_u64() + 1
+        );
 
         assert!(!cache2.purge_if_unchanged(&key, old_fill_id).await.unwrap());
     }
@@ -2712,7 +2718,10 @@ mod tests {
 
         let new_fill_id = cache2.lookup(&key).await.unwrap().unwrap().meta.fill_id;
         assert!(new_fill_id > old_fill_id);
-        assert_eq!(read_fill_id_counter(tmp.path()).await, new_fill_id + 1);
+        assert_eq!(
+            read_fill_id_counter(tmp.path()).await,
+            new_fill_id.as_u64() + 1
+        );
     }
 
     #[tokio::test]
@@ -2742,7 +2751,7 @@ mod tests {
 
         let legacy_body = b"legacy data".to_vec();
         let mut legacy_meta = test_meta(legacy_body.len());
-        legacy_meta.fill_id = 7;
+        legacy_meta.fill_id = FillId::from(7);
         tokio::fs::write(&body_path, &legacy_body).await.unwrap();
         tokio::fs::write(&meta_path, serde_json::to_vec(&legacy_meta).unwrap())
             .await
@@ -2763,7 +2772,7 @@ mod tests {
             .unwrap();
 
         let fill_id = cache2.lookup(&key).await.unwrap().unwrap().meta.fill_id;
-        assert_eq!(fill_id, 100);
+        assert_eq!(fill_id, FillId::from(100));
         assert_eq!(read_fill_id_counter(tmp.path()).await, 101);
     }
 
@@ -2772,7 +2781,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let scan = StartupScanResult {
             stats: CacheStats::default(),
-            max_fill_id: 0,
+            max_fill_id: FillId::ZERO,
             saw_cache_files: false,
             fill_id_incomplete: true,
             hash_dirs: 0,
@@ -2798,7 +2807,7 @@ mod tests {
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
         let mut meta = test_meta(123);
-        meta.fill_id = 41;
+        meta.fill_id = FillId::from(41);
         let meta_bytes = serde_json::to_vec(&meta).unwrap();
         let meta_path = dir.join(format!("{hash}.meta.json"));
         tokio::fs::write(&meta_path, &meta_bytes).await.unwrap();
@@ -2809,7 +2818,7 @@ mod tests {
             meta_bytes.len() as u64
         );
         assert_eq!(scan.stats.entry_count.load(Ordering::Relaxed), 0);
-        assert_eq!(scan.max_fill_id, 41);
+        assert_eq!(scan.max_fill_id, FillId::from(41));
         assert!(scan.saw_cache_files);
 
         let next_fill_id = DiskCache::load_next_fill_id(&cache_dir, &scan)
@@ -2870,7 +2879,7 @@ mod tests {
         let new_temp_path = write_temp_body(tmp.path(), &new_body).await;
         let new_meta = test_meta(new_body.len());
 
-        let wrong_fill_id = u64::MAX;
+        let wrong_fill_id = FillId::from(u64::MAX);
         assert!(!cache.purge_if_unchanged(&key, wrong_fill_id).await.unwrap());
 
         cache

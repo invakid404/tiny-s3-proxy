@@ -880,7 +880,7 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                     content_type: meta.content_type.clone(),
                     content_length: meta.content_length.unwrap_or(0),
                     cache_written_at: chrono::Utc::now(),
-                    fill_id: 0, // stamped by commit_fill()
+                    fill_id: crate::cache::FillId::ZERO, // stamped by commit_fill()
                     metadata_version: 0,
                     last_accessed_at: chrono::Utc::now(),
                     hit_count: 0,
@@ -2216,7 +2216,7 @@ mod tests {
         async fn purge_if_unchanged(
             &self,
             _key: &CacheKey,
-            _expected_fill_id: u64,
+            _expected_fill_id: crate::cache::FillId,
         ) -> Result<bool, crate::error::ProxyError> {
             Ok(false)
         }
@@ -2224,7 +2224,7 @@ mod tests {
         async fn poison_if_unchanged(
             &self,
             _key: &CacheKey,
-            _expected_fill_id: u64,
+            _expected_fill_id: crate::cache::FillId,
         ) -> Result<bool, crate::error::ProxyError> {
             Ok(false)
         }
@@ -2232,7 +2232,7 @@ mod tests {
         async fn update_metadata_if_unchanged(
             &self,
             _key: &CacheKey,
-            _expected_fill_id: u64,
+            _expected_fill_id: crate::cache::FillId,
             _meta: crate::cache::metadata::CacheMeta,
         ) -> Result<bool, crate::error::ProxyError> {
             Ok(false)

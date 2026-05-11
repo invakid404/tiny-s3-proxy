@@ -19,6 +19,58 @@ use metadata::CacheMeta;
 pub use disk::DiskCache;
 pub use singleflight::{FlightResult, FlightWaiter, SingleFlight};
 
+/// Monotonic per-fill generation token. `FillId::ZERO` represents an
+/// unassigned / legacy-missing / pre-commit placeholder; real committed fill
+/// IDs start at `1`. `#[serde(transparent)]` preserves the on-disk JSON shape
+/// from when the field was a raw `u64`, so existing `.meta.json` files keep
+/// deserializing unchanged. Arithmetic stays explicit through `as_u64()` /
+/// `FillId::from(...)` at counter boundaries (no `Add` / `Deref` impls).
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(transparent)]
+pub struct FillId(u64);
+
+impl FillId {
+    pub const ZERO: Self = Self(0);
+
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for FillId {
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+impl From<FillId> for u64 {
+    fn from(value: FillId) -> Self {
+        value.0
+    }
+}
+
+impl std::fmt::Display for FillId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
 /// Trait defining the cache storage interface.
 pub trait CacheStore: Send + Sync {
     /// Look up a cached entry. Returns None on miss.
@@ -94,7 +146,7 @@ pub trait CacheStore: Send + Sync {
     fn purge_if_unchanged(
         &self,
         key: &CacheKey,
-        expected_fill_id: u64,
+        expected_fill_id: FillId,
     ) -> impl std::future::Future<Output = Result<bool, ProxyError>> + Send;
 
     /// Mark a key as poisoned so lookup returns miss until the entry is
@@ -119,7 +171,7 @@ pub trait CacheStore: Send + Sync {
     fn poison_if_unchanged(
         &self,
         key: &CacheKey,
-        expected_fill_id: u64,
+        expected_fill_id: FillId,
     ) -> impl std::future::Future<Output = Result<bool, ProxyError>> + Send;
 
     /// Update metadata for an existing cached entry when the stored entry
@@ -135,7 +187,7 @@ pub trait CacheStore: Send + Sync {
     fn update_metadata_if_unchanged(
         &self,
         key: &CacheKey,
-        expected_fill_id: u64,
+        expected_fill_id: FillId,
         meta: CacheMeta,
     ) -> impl std::future::Future<Output = Result<bool, ProxyError>> + Send;
 
