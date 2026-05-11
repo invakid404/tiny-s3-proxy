@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use crate::cache::FillId;
 use crate::cache::metadata::CacheMeta;
 
 use super::CacheStats;
@@ -125,7 +126,7 @@ struct EvictionCandidate {
     body_path: PathBuf,
     meta_path: PathBuf,
     hash: String,
-    fill_id: u64,
+    fill_id: FillId,
     last_accessed_at: chrono::DateTime<chrono::Utc>,
     size: u64,
 }
@@ -1470,7 +1471,7 @@ mod tests {
             content_type: Some("application/octet-stream".into()),
             content_length: body.len() as i64,
             cache_written_at: last_accessed_at,
-            fill_id: 0,
+            fill_id: FillId::ZERO,
             metadata_version: 0,
             last_accessed_at,
             hit_count: 0,
@@ -1626,7 +1627,7 @@ mod tests {
             content_type: None,
             content_length: 5,
             cache_written_at: now,
-            fill_id: 99,
+            fill_id: FillId::from(99),
             metadata_version: 0,
             last_accessed_at: now,
             hit_count: 0,
@@ -1747,7 +1748,7 @@ mod tests {
             content_type: Some("application/octet-stream".into()),
             content_length: 5,
             cache_written_at: now,
-            fill_id: 0,
+            fill_id: FillId::ZERO,
             metadata_version: 0,
             last_accessed_at: now,
             hit_count: 0,
@@ -1946,7 +1947,7 @@ mod tests {
             body_path: body_path.clone(),
             meta_path: meta_path.clone(),
             hash: "hh".into(),
-            fill_id: 0,
+            fill_id: FillId::ZERO,
             last_accessed_at: Utc::now(),
             size: 1500,
         };
@@ -2161,7 +2162,7 @@ mod tests {
             cache_written_at: now,
             // Different from candidate.fill_id below — triggers the
             // changed-entry branch.
-            fill_id: 99,
+            fill_id: FillId::from(99),
             metadata_version: 0,
             last_accessed_at: now,
             hit_count: 0,
@@ -2188,7 +2189,7 @@ mod tests {
             meta_path: meta_path.clone(),
             hash: "hh".into(),
             // fill_id mismatch with on-disk meta triggers the changed branch.
-            fill_id: 0,
+            fill_id: FillId::ZERO,
             last_accessed_at: now,
             size: 1500,
         };
@@ -2286,7 +2287,7 @@ mod tests {
             content_type: None,
             content_length: 1000,
             cache_written_at: now,
-            fill_id: 0,
+            fill_id: FillId::ZERO,
             metadata_version: 0,
             last_accessed_at: now,
             hit_count: 0,
@@ -2319,7 +2320,7 @@ mod tests {
             body_path: body_path.clone(),
             meta_path: meta_path.clone(),
             hash: "hh".into(),
-            fill_id: 0,
+            fill_id: FillId::ZERO,
             last_accessed_at: now,
             size: 1500,
         };
@@ -2379,7 +2380,7 @@ mod tests {
             body_path: body_path.clone(),
             meta_path: meta_path.clone(),
             hash: "hh".into(),
-            fill_id: 0,
+            fill_id: FillId::ZERO,
             last_accessed_at: Utc::now(),
             size: 1500,
         };
@@ -2578,7 +2579,7 @@ mod tests {
             content_type: Some("application/octet-stream".into()),
             content_length: 5,
             cache_written_at: now,
-            fill_id: 0,
+            fill_id: FillId::ZERO,
             metadata_version: 0,
             last_accessed_at: now,
             hit_count: 0,
@@ -2875,7 +2876,7 @@ mod tests {
             content_type: None,
             content_length: 0,
             cache_written_at: now,
-            fill_id: 0,
+            fill_id: FillId::ZERO,
             metadata_version: 0,
             last_accessed_at: now,
             hit_count: 0,

@@ -725,7 +725,7 @@ mod tests {
         cache: MockCache,
     ) -> Arc<AppState<B, MockCache>> {
         let mut config = test_config();
-        config.cache_dir = cache.temp_dir.path().to_str().unwrap().to_string();
+        config.cache_dir = cache.temp_dir.path().to_path_buf();
         let tmp_dir = cache.temp_dir.path().join("tmp");
         let _ = std::fs::create_dir_all(&tmp_dir);
 
@@ -2101,7 +2101,7 @@ mod tests {
         let cache = MockCache::new().with_entry(&cache_key, b"cached body", stale_meta);
 
         let mut config = test_config();
-        config.cache_dir = cache.temp_dir.path().to_str().unwrap().to_string();
+        config.cache_dir = cache.temp_dir.path().to_path_buf();
         config.cache_serve_stale_on_error = false;
         let tmp_dir = cache.temp_dir.path().join("tmp");
         let _ = std::fs::create_dir_all(&tmp_dir);

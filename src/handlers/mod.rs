@@ -29,7 +29,7 @@ pub(crate) struct InvalidationMessages {
 pub(crate) async fn purge_then_poison_if_unchanged<C: crate::cache::CacheStore>(
     cache: &Arc<C>,
     cache_key: &crate::cache::key::CacheKey,
-    expected_fill_id: u64,
+    expected_fill_id: crate::cache::FillId,
     request_id: &str,
     operation: &str,
     key: &str,
@@ -484,7 +484,7 @@ pub mod test_utils {
     use crate::cache::entry::CacheEntry;
     use crate::cache::key::CacheKey;
     use crate::cache::metadata::CacheMeta;
-    use crate::cache::{CacheStatsSnapshot, CacheStore, FillGuard};
+    use crate::cache::{CacheStatsSnapshot, CacheStore, FillGuard, FillId};
     use crate::error::ProxyError;
     use crate::s3::ops::ParsedRequest;
 
@@ -890,9 +890,10 @@ pub mod test_utils {
             use std::sync::atomic::{AtomicU64, Ordering};
             static MOCK_COUNTER: AtomicU64 = AtomicU64::new(100_000);
             let id = MOCK_COUNTER.fetch_add(1, Ordering::Relaxed);
-            meta.fill_id = self
-                .next_fill_id
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            meta.fill_id = FillId::from(
+                self.next_fill_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            );
             meta.metadata_version = 0;
             let body_path = self.temp_dir.path().join(format!("{}.body", id));
             std::fs::write(&body_path, body).expect("write mock body");
@@ -914,9 +915,10 @@ pub mod test_utils {
             use std::sync::atomic::{AtomicU64, Ordering};
             static MOCK_COUNTER: AtomicU64 = AtomicU64::new(200_000);
             let id = MOCK_COUNTER.fetch_add(1, Ordering::Relaxed);
-            meta.fill_id = self
-                .next_fill_id
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            meta.fill_id = FillId::from(
+                self.next_fill_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            );
             meta.metadata_version = 0;
             let body_path = self.temp_dir.path().join(format!("{}.body", id));
             std::fs::write(&body_path, body).expect("write mock body");
@@ -944,9 +946,10 @@ pub mod test_utils {
             use std::sync::atomic::{AtomicU64, Ordering};
             static MOCK_COUNTER: AtomicU64 = AtomicU64::new(0);
             let id = MOCK_COUNTER.fetch_add(1, Ordering::Relaxed);
-            meta.fill_id = self
-                .next_fill_id
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            meta.fill_id = FillId::from(
+                self.next_fill_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            );
             meta.metadata_version = 0;
             let body_path = self.temp_dir.path().join(format!("{}.body", id));
             std::fs::write(&body_path, body).expect("write mock body");
@@ -1122,9 +1125,10 @@ pub mod test_utils {
             if let Some(current) = entries.get(guard.key.hash_hex()) {
                 meta.preserve_same_etag_head_state_from(&current.meta);
             }
-            meta.fill_id = self
-                .next_fill_id
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            meta.fill_id = FillId::from(
+                self.next_fill_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            );
             meta.metadata_version = 0;
             let entry = CacheEntry {
                 meta: Arc::new(meta),
@@ -1162,7 +1166,7 @@ pub mod test_utils {
         async fn purge_if_unchanged(
             &self,
             key: &CacheKey,
-            expected_fill_id: u64,
+            expected_fill_id: FillId,
         ) -> Result<bool, ProxyError> {
             if *self.purge_should_fail.lock().unwrap() {
                 return Err(ProxyError::Cache {
@@ -1219,7 +1223,7 @@ pub mod test_utils {
         async fn poison_if_unchanged(
             &self,
             key: &CacheKey,
-            expected_fill_id: u64,
+            expected_fill_id: FillId,
         ) -> Result<bool, ProxyError> {
             let key_hash = key.hash_hex().to_string();
             let poisoned = {
@@ -1244,7 +1248,7 @@ pub mod test_utils {
         async fn update_metadata_if_unchanged(
             &self,
             key: &CacheKey,
-            expected_fill_id: u64,
+            expected_fill_id: FillId,
             meta: CacheMeta,
         ) -> Result<bool, ProxyError> {
             let mut entries = self.entries.lock().unwrap();
@@ -1327,7 +1331,7 @@ pub mod test_utils {
             backend_secret_access_key: "secret".to_string(),
             backend_use_path_style: true,
             backend_allow_http: false,
-            cache_dir: "/tmp/test-cache".to_string(),
+            cache_dir: std::path::PathBuf::from("/tmp/test-cache"),
             cache_max_bytes: 1024 * 1024,
             cache_max_object_bytes: 512 * 1024,
             cacheable_prefixes: vec!["script_bundle/".to_string(), "tar/".to_string()],
@@ -1353,7 +1357,7 @@ pub mod test_utils {
     ) -> Arc<AppState<MockBackend, MockCache>> {
         let mut config = test_config();
         // Point cache_dir to the MockCache's temp dir so tee tasks can write there
-        config.cache_dir = cache.temp_dir.path().to_str().unwrap().to_string();
+        config.cache_dir = cache.temp_dir.path().to_path_buf();
         // Create the tmp sub-directory that the tee task expects
         let tmp_dir = cache.temp_dir.path().join("tmp");
         let _ = std::fs::create_dir_all(&tmp_dir);
@@ -1404,7 +1408,7 @@ pub mod test_utils {
             content_type: Some("application/octet-stream".to_string()),
             content_length: body.len() as i64,
             cache_written_at: Utc::now(),
-            fill_id: 1, // non-zero so conditional ops match
+            fill_id: FillId::from(1), // non-zero so conditional ops match
             metadata_version: 0,
             last_accessed_at: Utc::now(),
             hit_count: 0,

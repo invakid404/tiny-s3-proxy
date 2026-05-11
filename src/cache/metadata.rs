@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::cache::FillId;
+
 /// Metadata stored alongside a cached object body.
 ///
 /// Fields added after the initial schema use `#[serde(default)]` so older
@@ -25,7 +27,7 @@ pub struct CacheMeta {
     /// can safely distinguish entries even when `cache_written_at` collides
     /// due to clock resolution.
     #[serde(default)]
-    pub fill_id: u64,
+    pub fill_id: FillId,
     #[serde(default)]
     pub metadata_version: u64,
     pub last_accessed_at: DateTime<Utc>,
@@ -86,6 +88,7 @@ impl CacheMeta {
 #[cfg(test)]
 mod tests {
     use super::CacheMeta;
+    use crate::cache::FillId;
     use chrono::Utc;
     use std::collections::HashMap;
 
@@ -98,7 +101,7 @@ mod tests {
             content_type: Some("application/javascript".into()),
             content_length: 42,
             cache_written_at: Utc::now(),
-            fill_id: 1,
+            fill_id: FillId::from(1),
             metadata_version: 0,
             last_accessed_at: Utc::now(),
             hit_count: 0,
@@ -130,7 +133,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(meta.fill_id, 0);
+        assert_eq!(meta.fill_id, FillId::ZERO);
         assert_eq!(meta.metadata_version, 0);
         assert!(meta.metadata.is_empty());
         assert!(meta.extra_headers.is_empty());
@@ -139,6 +142,39 @@ mod tests {
         assert!(!meta.checksum_mode_checked);
         assert!(!meta.head_metadata_checked);
         assert!(!meta.head_checksum_checked);
+    }
+
+    /// Pin the `#[serde(transparent)]` wire format: a `fill_id` newtype must
+    /// deserialize from and serialize to a bare JSON number, so existing
+    /// `.meta.json` files on disk (written when `fill_id` was `u64`) keep
+    /// round-tripping after the type change.
+    #[test]
+    fn fill_id_serde_is_transparent_to_u64_wire_format() {
+        let json = r#"{
+            "bucket": "bucket",
+            "key": "script_bundle/app.js",
+            "etag": null,
+            "last_modified": null,
+            "content_type": null,
+            "content_length": 42,
+            "cache_written_at": "2026-03-23T00:00:00Z",
+            "fill_id": 123,
+            "last_accessed_at": "2026-03-23T00:00:00Z",
+            "source_status": 200
+        }"#;
+
+        let meta: CacheMeta = serde_json::from_str(json).unwrap();
+        assert_eq!(meta.fill_id, FillId::from(123));
+
+        let reserialized = serde_json::to_string(&meta).unwrap();
+        assert!(
+            reserialized.contains("\"fill_id\":123"),
+            "expected raw u64 wire shape, got: {reserialized}",
+        );
+        assert!(
+            !reserialized.contains("\"fill_id\":{"),
+            "FillId must not be wrapped as an object: {reserialized}",
+        );
     }
 
     #[test]

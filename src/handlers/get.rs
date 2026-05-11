@@ -863,14 +863,11 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                 .unwrap_or(false);
 
             if is_size_cacheable && fill_guard.is_some() {
-                let temp_body_path =
-                    PathBuf::from(&state.config.cache_dir)
-                        .join("tmp")
-                        .join(format!(
-                            "{}-{}.body",
-                            std::process::id(),
-                            crate::request_id::generate()
-                        ));
+                let temp_body_path = state.config.cache_dir.join("tmp").join(format!(
+                    "{}-{}.body",
+                    std::process::id(),
+                    crate::request_id::generate()
+                ));
 
                 let cache_meta = CacheMeta {
                     bucket: state.backend_bucket.to_string(),
@@ -880,7 +877,7 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                     content_type: meta.content_type.clone(),
                     content_length: meta.content_length.unwrap_or(0),
                     cache_written_at: chrono::Utc::now(),
-                    fill_id: 0, // stamped by commit_fill()
+                    fill_id: crate::cache::FillId::ZERO, // stamped by commit_fill()
                     metadata_version: 0,
                     last_accessed_at: chrono::Utc::now(),
                     hit_count: 0,
@@ -2216,7 +2213,7 @@ mod tests {
         async fn purge_if_unchanged(
             &self,
             _key: &CacheKey,
-            _expected_fill_id: u64,
+            _expected_fill_id: crate::cache::FillId,
         ) -> Result<bool, crate::error::ProxyError> {
             Ok(false)
         }
@@ -2224,7 +2221,7 @@ mod tests {
         async fn poison_if_unchanged(
             &self,
             _key: &CacheKey,
-            _expected_fill_id: u64,
+            _expected_fill_id: crate::cache::FillId,
         ) -> Result<bool, crate::error::ProxyError> {
             Ok(false)
         }
@@ -2232,7 +2229,7 @@ mod tests {
         async fn update_metadata_if_unchanged(
             &self,
             _key: &CacheKey,
-            _expected_fill_id: u64,
+            _expected_fill_id: crate::cache::FillId,
             _meta: crate::cache::metadata::CacheMeta,
         ) -> Result<bool, crate::error::ProxyError> {
             Ok(false)
@@ -2251,7 +2248,7 @@ mod tests {
         stale_on_error: bool,
     ) -> Arc<AppState<MockBackend, StaleMockCache>> {
         let mut config = test_config();
-        config.cache_dir = cache.temp_dir.path().to_str().unwrap().to_string();
+        config.cache_dir = cache.temp_dir.path().to_path_buf();
         config.cache_serve_stale_on_error = stale_on_error;
         let tmp_dir = cache.temp_dir.path().join("tmp");
         let _ = std::fs::create_dir_all(&tmp_dir);

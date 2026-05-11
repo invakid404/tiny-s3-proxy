@@ -10,7 +10,6 @@
 //!
 //! Run with: `cargo test -- --ignored`
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use testcontainers::core::WaitFor;
@@ -104,7 +103,7 @@ async fn build_proxy_stack_inner(
         backend_secret_access_key: TEST_SECRET_KEY.to_string(),
         backend_use_path_style: true,
         backend_allow_http: true,
-        cache_dir: cache_dir.path().to_str().unwrap().to_string(),
+        cache_dir: cache_dir.path().to_path_buf(),
         cache_max_bytes: 100 * 1024 * 1024,
         cache_max_object_bytes: 10 * 1024 * 1024,
         cacheable_prefixes: vec!["script_bundle/".into(), "bun_bundle/".into(), "tar/".into()],
@@ -131,7 +130,7 @@ async fn build_proxy_stack_inner(
         config.cache_max_object_bytes,
     );
     let disk_cache = cache::DiskCache::new(
-        PathBuf::from(&config.cache_dir),
+        config.cache_dir.clone(),
         config.cache_max_bytes,
         cache_policy.clone(),
     )
