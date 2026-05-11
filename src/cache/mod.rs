@@ -269,3 +269,23 @@ pub struct CacheStatsSnapshot {
     pub fill_count: u64,
     pub eviction_count: u64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::FillId;
+
+    /// Documents that `FillId` round-trips as a bare JSON number.
+    /// Note: this does NOT specifically protect against removal of
+    /// `#[serde(transparent)]` — serde_json already serializes tuple
+    /// newtypes (`struct FillId(u64)`) as their inner value regardless.
+    /// The on-disk invariant is pinned by the `CacheMeta` test in
+    /// `metadata.rs`. This is documentation colocated with the type.
+    #[test]
+    fn fill_id_serde_round_trips_as_bare_number() {
+        let fill_id: FillId = serde_json::from_str("123").unwrap();
+        assert_eq!(fill_id, FillId::from(123));
+
+        let json = serde_json::to_string(&fill_id).unwrap();
+        assert_eq!(json, "123");
+    }
+}
