@@ -1331,7 +1331,7 @@ pub mod test_utils {
             backend_secret_access_key: "secret".to_string(),
             backend_use_path_style: true,
             backend_allow_http: false,
-            cache_dir: "/tmp/test-cache".to_string(),
+            cache_dir: std::path::PathBuf::from("/tmp/test-cache"),
             cache_max_bytes: 1024 * 1024,
             cache_max_object_bytes: 512 * 1024,
             cacheable_prefixes: vec!["script_bundle/".to_string(), "tar/".to_string()],
@@ -1357,7 +1357,7 @@ pub mod test_utils {
     ) -> Arc<AppState<MockBackend, MockCache>> {
         let mut config = test_config();
         // Point cache_dir to the MockCache's temp dir so tee tasks can write there
-        config.cache_dir = cache.temp_dir.path().to_str().unwrap().to_string();
+        config.cache_dir = cache.temp_dir.path().to_path_buf();
         // Create the tmp sub-directory that the tee task expects
         let tmp_dir = cache.temp_dir.path().join("tmp");
         let _ = std::fs::create_dir_all(&tmp_dir);

@@ -863,14 +863,11 @@ async fn handle_leader<B: Backend + 'static, C: CacheStore + 'static>(
                 .unwrap_or(false);
 
             if is_size_cacheable && fill_guard.is_some() {
-                let temp_body_path =
-                    PathBuf::from(&state.config.cache_dir)
-                        .join("tmp")
-                        .join(format!(
-                            "{}-{}.body",
-                            std::process::id(),
-                            crate::request_id::generate()
-                        ));
+                let temp_body_path = state.config.cache_dir.join("tmp").join(format!(
+                    "{}-{}.body",
+                    std::process::id(),
+                    crate::request_id::generate()
+                ));
 
                 let cache_meta = CacheMeta {
                     bucket: state.backend_bucket.to_string(),
@@ -2251,7 +2248,7 @@ mod tests {
         stale_on_error: bool,
     ) -> Arc<AppState<MockBackend, StaleMockCache>> {
         let mut config = test_config();
-        config.cache_dir = cache.temp_dir.path().to_str().unwrap().to_string();
+        config.cache_dir = cache.temp_dir.path().to_path_buf();
         config.cache_serve_stale_on_error = stale_on_error;
         let tmp_dir = cache.temp_dir.path().join("tmp");
         let _ = std::fs::create_dir_all(&tmp_dir);
