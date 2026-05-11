@@ -173,6 +173,10 @@ The admin listener (default `:9090`) exposes:
 | `s3proxy_cache_total` | counter | `status` | Cache outcomes (`HIT`, `MISS`, `BYPASS`, `STALE`) |
 | `s3proxy_request_size_bytes` | histogram | `operation` | Inbound body size |
 | `s3proxy_response_size_bytes` | histogram | `operation` | Outbound body size |
+| `s3proxy_cache_tmp_sweep_removed_files_total` | counter | `kind` | Stale tmp files removed at startup (see "Startup tmp sweep") |
+| `s3proxy_cache_tmp_sweep_removed_bytes_total` | counter | `kind` | Bytes reclaimed by the startup tmp sweep |
+| `s3proxy_cache_tmp_sweep_skipped_total` | counter | `reason` | Tmp entries preserved (symlink, non-regular, unknown_pattern, non_utf8) |
+| `s3proxy_cache_tmp_sweep_failed_total` | counter | `reason` | Per-entry sweep I/O errors (read_dir, read_entry, metadata, remove) |
 
 Cache hit rate: `rate(s3proxy_cache_total{status="HIT"}[5m]) / rate(s3proxy_cache_total[5m])`
 
@@ -197,6 +201,7 @@ Cache hit rate: `rate(s3proxy_cache_total{status="HIT"}[5m]) / rate(s3proxy_cach
 - **LRU eviction with periodic stat reconciliation**. Cache hits update `last_accessed_at` on disk at most once per hour via atomic temp-file rename. Cache stats (`total_bytes`, `entry_count`) follow a periodic reconciliation model: the eviction scan walks the filesystem and overwrites the atomics with authoritative values, while `commit_fill`/`purge` do best-effort incremental adjustments between scans for responsiveness. This eliminates stat-accounting races without locks.
 - **Generation-based cache invalidation**. Concurrent writes and cache fills are coordinated through per-key generation counters. A fill that started before a write is automatically rejected at commit time, preventing stale data from being re-cached after a PUT/DELETE.
 - **Path-style and virtual-hosted-style**. Typed SDK operations honor `BACKEND_USE_PATH_STYLE`. Passthrough requests construct virtual-hosted-style URLs (`bucket.endpoint/key`) when path-style is disabled.
+- **Startup tmp sweep**. After acquiring the single-owner `.lock`, the cache removes stale files from `<cache_dir>/tmp/` left by prior crashed runs. Only filename shapes that production writers can produce are removed; everything else (foreign files, symlinks, subdirectories) is preserved and warned about. The sweep is best-effort — I/O errors do not abort startup.
 
 ## Testing
 

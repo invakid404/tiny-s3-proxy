@@ -7,6 +7,7 @@ pub mod metadata;
 pub mod policy;
 mod scan;
 pub mod singleflight;
+mod tmp_sweep;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
