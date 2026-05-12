@@ -351,26 +351,121 @@ async fn raw_list_query(
     (status, body)
 }
 
-/// Raw HTTP `PUT /<bucket>/<key>` against the proxy with caller-supplied
-/// headers. Returns `(status, body_bytes)`. Used by tests that need to control
-/// `Content-Length` independently of the actual body length (which `reqwest`
-/// would otherwise reconcile for them).
-async fn raw_put_with_headers(
-    http_client: &reqwest::Client,
-    proxy_endpoint: &str,
-    key: &str,
-    headers: &[(&str, &str)],
-    body: Vec<u8>,
-) -> (u16, Vec<u8>) {
-    let url = format!("{}/{}/{}", proxy_endpoint, TEST_BUCKET, key);
-    let mut req = http_client.put(&url);
-    for (k, v) in headers {
-        req = req.header(*k, *v);
+/// Send a hand-rolled HTTP/1.1 request to `addr` (`host:port`) as a raw byte
+/// stream, then read the entire response off the socket and return the parsed
+/// `(status_code, full_response_bytes)`. The whole response is returned
+/// verbatim — including any `Transfer-Encoding: chunked` framing — because the
+/// tests that need this helper assert on substrings (status line, error
+/// codes) rather than a structurally-decoded body. This sidesteps the work of
+/// writing a chunked-decoder and avoids `reqwest`'s body-length reconciliation
+/// that would otherwise prevent us from sending a `Content-Length` mismatched
+/// with the actual body.
+async fn raw_tcp_request(addr: &str, request: &[u8]) -> (u16, Vec<u8>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("raw tcp: connect to proxy failed");
+    stream
+        .write_all(request)
+        .await
+        .expect("raw tcp: write request failed");
+    stream.flush().await.expect("raw tcp: flush failed");
+    let mut buf = Vec::new();
+    stream
+        .read_to_end(&mut buf)
+        .await
+        .expect("raw tcp: read response failed");
+
+    // Parse `HTTP/1.1 NNN ...` from the start of the response.
+    let header_end = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("raw tcp: response missing header/body separator");
+    let first_line_end = buf[..header_end]
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .unwrap_or(header_end);
+    let first_line = std::str::from_utf8(&buf[..first_line_end])
+        .expect("raw tcp: status line not UTF-8");
+    let mut parts = first_line.split_whitespace();
+    let _version = parts.next().expect("raw tcp: missing HTTP version");
+    let status_str = parts.next().expect("raw tcp: missing status code");
+    let status: u16 = status_str
+        .parse()
+        .expect("raw tcp: status code not numeric");
+    (status, buf)
+}
+
+/// Counting mock upstream for passthrough integration tests. `received_count`
+/// is incremented on the FIRST line of the handler (before any body read), so
+/// it catches the upstream being contacted even when the body stream errors
+/// out mid-flight. The test cases that use this helper want to prove that the
+/// proxy rejected before contacting the upstream at all.
+#[derive(Default)]
+struct CountingMockUpstream {
+    received_count: std::sync::atomic::AtomicU32,
+}
+
+impl CountingMockUpstream {
+    fn new() -> Arc<Self> {
+        Arc::new(Self::default())
     }
-    let resp = req.body(body).send().await.expect("raw PUT request failed");
-    let status = resp.status().as_u16();
-    let body = resp.bytes().await.expect("read PUT body").to_vec();
-    (status, body)
+}
+
+/// Spawn the counting mock upstream and return its `http://host:port` URL.
+/// The returned `Arc<CountingMockUpstream>` lets the caller assert on
+/// `received_count` after sending requests through the proxy.
+async fn start_counting_mock_upstream(mock: Arc<CountingMockUpstream>) -> String {
+    use axum::routing::any;
+    let app = axum::Router::new()
+        .route(
+            "/{*path}",
+            any({
+                let mock = mock.clone();
+                move |_req: http::Request<axum::body::Body>| {
+                    let mock = mock.clone();
+                    async move {
+                        mock.received_count
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        // Don't even read the body — the tests assert this
+                        // handler is never reached, so the response is
+                        // irrelevant. Returning 200 keeps the noise minimal
+                        // if the mock IS reached (then the test fails on the
+                        // received_count assertion with a clearer signal).
+                        http::Response::builder()
+                            .status(200)
+                            .body(axum::body::Body::from("mock"))
+                            .unwrap()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/",
+            any({
+                let mock = mock.clone();
+                move |_req: http::Request<axum::body::Body>| {
+                    let mock = mock.clone();
+                    async move {
+                        mock.received_count
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        http::Response::builder()
+                            .status(200)
+                            .body(axum::body::Body::from("mock"))
+                            .unwrap()
+                    }
+                }
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("mock upstream bind");
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{}", addr)
 }
 
 async fn wait_for_head_cache_status(
@@ -1380,4 +1475,189 @@ async fn test_startup_sweeps_stale_cache_tmp_fill_body_file() {
         .expect("post-sweep GET should succeed");
     let body = get_resp.body.collect().await.unwrap().into_bytes();
     assert_eq!(body.as_ref(), b"alive");
+}
+
+/// Backfills coverage for PR #58 (issue #47): the streaming passthrough path
+/// must reject an inbound request whose declared `Content-Length` exceeds
+/// `max_request_body_bytes` BEFORE contacting the upstream. The earlier
+/// `Limited` body wrapper only fires after `reqwest::send()` starts streaming
+/// the body, which (a) means the upstream sees a torn request, and (b) means
+/// the proxy can return inconsistent response framing once the upstream's
+/// reply has already started flowing. The preflight closes that window.
+///
+/// Setup intentionally points the proxy at a counting mock upstream rather
+/// than VersityGW: the assertion that the upstream was never contacted is the
+/// load-bearing one, and exposing a real S3 backend here would make a torn
+/// request indistinguishable from "the backend rejected it." The PUT is
+/// forced down the passthrough STREAMING branch via two switches:
+///
+///   * `passthrough_unsigned_payload=true` flips the buffered/streaming
+///     selection in `handle_passthrough`: with unsigned payload + a
+///     non-idempotent method (PUT), `needs_buffer` evaluates to false and
+///     the streaming branch is chosen.
+///   * `Content-Encoding: aws-chunked` makes
+///     `has_s3_streaming_upload_indicators` return true, which makes
+///     `has_unsupported_write_modifiers` return true, which routes the
+///     PutObject dispatch through `route_to_passthrough` instead of the
+///     typed `put::handle_put` path.
+///
+/// Bug-revert reasoning: if the preflight at the top of the streaming branch
+/// were removed (the regression #58 fixed), the `Limited` wrapper alone would
+/// still abort when the body actually exceeded the cap — but in THIS test the
+/// body is 8 bytes, well under the 16-byte cap. Limited would NOT fire, the
+/// request would be sent to the upstream, `received_count` would increment to
+/// 1, and the test would fail on the no-upstream-contact assertion.
+///
+/// Why raw TCP: `reqwest` reconciles a body's declared and actual length when
+/// sending. We need to send `Content-Length: 32` with only 8 bytes of body to
+/// pre-fail the preflight without arming the `Limited` backstop, and the
+/// cleanest way to send that mismatch is a hand-rolled HTTP/1.1 byte stream.
+#[tokio::test]
+#[ignore] // Spawns an in-process mock upstream; Docker not required, but kept
+          // `#[ignore]` for parity with the rest of this suite.
+async fn test_unsigned_streaming_put_oversized_content_length_rejected_before_backend_contact() {
+    let mock = CountingMockUpstream::new();
+    let mock_endpoint = start_counting_mock_upstream(mock.clone()).await;
+
+    let cache_dir = tempfile::TempDir::new().expect("cache dir");
+    // Use the with_opts path so we can flip `passthrough_unsigned_payload`
+    // (forces the streaming branch in passthrough) and pin a tiny
+    // `max_request_body_bytes` (so we can hit the cap without lifting more
+    // than a few bytes of network traffic). Building Config directly bypasses
+    // `Config::from_env`, which would reject http + unsigned-payload at boot.
+    let (_proxy_client, _http_client, proxy_endpoint, _cache_dir) =
+        build_proxy_stack_with_opts(&mock_endpoint, cache_dir, |cfg| {
+            cfg.passthrough_unsigned_payload = true;
+            cfg.max_request_body_bytes = 16;
+        })
+        .await;
+
+    let proxy_host = proxy_endpoint
+        .strip_prefix("http://")
+        .expect("proxy endpoint should be http://host:port");
+
+    // Hand-rolled HTTP/1.1 PUT:
+    //   * declared Content-Length 32 > cap 16 → preflight rejects
+    //   * actual body 8 bytes < cap 16        → Limited backstop would NOT fire
+    //   * Content-Encoding: aws-chunked       → routes to passthrough
+    let request = format!(
+        "PUT /{TEST_BUCKET}/cold-review/oversized-cl HTTP/1.1\r\n\
+         Host: {proxy_host}\r\n\
+         Content-Length: 32\r\n\
+         Content-Encoding: aws-chunked\r\n\
+         x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD\r\n\
+         x-amz-decoded-content-length: 8\r\n\
+         Connection: close\r\n\
+         \r\n\
+         AAAAAAAA"
+    );
+    let (status, raw_response) = raw_tcp_request(proxy_host, request.as_bytes()).await;
+
+    assert_eq!(
+        status, 400,
+        "oversized Content-Length must be rejected with 400 EntityTooLarge"
+    );
+    let response_text = String::from_utf8_lossy(&raw_response);
+    assert!(
+        response_text.contains("EntityTooLarge"),
+        "response body should contain EntityTooLarge error code; got: {response_text}"
+    );
+
+    // Load-bearing assertion: the preflight must reject BEFORE any
+    // `req_builder.send()` reaches the upstream. `received_count` is bumped
+    // at the very top of the mock handler — before body read — so it catches
+    // even torn-body requests where the `Limited` backstop would abort the
+    // upstream send mid-flight. If this assertion fires, the preflight has
+    // regressed.
+    assert_eq!(
+        mock.received_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "preflight must reject before contacting upstream"
+    );
+}
+
+/// Backfills coverage for PR #52 (issue #45): the binary must reject a
+/// `BACKEND_ENDPOINT` that embeds URL userinfo (e.g.
+/// `https://user:pass@host`), and the rejection message must NOT leak the
+/// embedded credentials or the host portion of the URL into stderr / process
+/// logs. Configuration errors are surfaced via `expect("Failed to load
+/// configuration")` in `main.rs`, so the panic message lands directly on
+/// stderr where logging pipelines pick it up.
+///
+/// This test spawns the actual compiled `tiny-s3-proxy` binary as a
+/// subprocess (via the Cargo-set `CARGO_BIN_EXE_*` env var) rather than
+/// invoking `Config::from_env` in-process. The reason is that the userinfo
+/// leak surface is the panic message produced by `expect`, which Rust prints
+/// through the default panic hook to the parent process's stderr — we need
+/// real fork + stderr capture to assert on what an operator would actually
+/// see.
+///
+/// Bug-revert reasoning: if the `endpoint_has_userinfo` check were removed
+/// from `Config::from_env`, the binary would attempt to bind sockets and
+/// reach the SDK construction step, at which point logs and request errors
+/// might format the endpoint into strings — leaking `alice:supersecret`
+/// and `s3.example.com:9443` into stderr. The negative assertions below
+/// would fail.
+#[tokio::test]
+#[ignore]
+async fn test_backend_endpoint_userinfo_rejected_without_leaking_endpoint_parts() {
+    use tokio::time::{Duration, timeout};
+
+    let bin_path = env!("CARGO_BIN_EXE_tiny-s3-proxy");
+
+    let mut cmd = tokio::process::Command::new(bin_path);
+    // Start from a clean environment so the parent shell's BACKEND_*/FRONTEND_*
+    // values don't accidentally satisfy or shadow what we want to test.
+    cmd.env_clear()
+        .env("FRONTEND_BUCKET", "test-frontend")
+        .env(
+            "BACKEND_ENDPOINT",
+            "https://alice:supersecret@s3.example.com:9443/root",
+        )
+        .env("BACKEND_BUCKET", "test-backend")
+        .env("BACKEND_ACCESS_KEY_ID", "AKID")
+        .env("BACKEND_SECRET_ACCESS_KEY", "shouldnotappearinerror")
+        .env("S3_LISTEN_ADDR", "127.0.0.1:0")
+        .env("ADMIN_LISTEN_ADDR", "127.0.0.1:0")
+        // RUST_LOG=off keeps tracing-subscriber's default warning about the
+        // missing env filter out of stderr so the assertions below see only
+        // the panic message (and surrounding cargo/runtime noise).
+        .env("RUST_LOG", "off")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+    let child = cmd.spawn().expect("spawn tiny-s3-proxy binary");
+    let output = timeout(Duration::from_secs(15), child.wait_with_output())
+        .await
+        .expect("tiny-s3-proxy did not exit within 15s")
+        .expect("read tiny-s3-proxy output");
+
+    assert!(
+        !output.status.success(),
+        "binary should exit non-zero when BACKEND_ENDPOINT carries userinfo; got: {:?}",
+        output.status,
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Positive: the error must name the relevant env vars so operators can
+    // act on it without guesswork.
+    for needle in ["BACKEND_ENDPOINT", "BACKEND_ACCESS_KEY_ID", "BACKEND_SECRET_ACCESS_KEY"] {
+        assert!(
+            stderr.contains(needle),
+            "stderr should reference {needle} so the operator can fix the config; got:\n{stderr}"
+        );
+    }
+
+    // Negative: under no circumstances should the userinfo or host portions
+    // of the embedded URL reach stderr. These four needles together cover the
+    // username, password, host, and port portion of the planted URL.
+    for forbidden in ["alice", "supersecret", "s3.example.com", "9443"] {
+        assert!(
+            !stderr.contains(forbidden),
+            "stderr must not leak `{forbidden}` from the rejected BACKEND_ENDPOINT; got:\n{stderr}"
+        );
+    }
 }
