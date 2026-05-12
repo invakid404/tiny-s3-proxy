@@ -75,22 +75,18 @@ async fn build_raw_s3_client(
     aws_sdk_s3::Client::from_conf(config)
 }
 
-/// Shared proxy stack builder. `build_proxy_stack` and
-/// `build_proxy_stack_allowlist` delegate here, differing only in auth mode
-/// and allowed keys.
-async fn build_proxy_stack_inner(
+/// Build the default test `Config` aimed at `backend_endpoint`, using the
+/// given auth mode / allowed keys and rooting the cache at `cache_dir`. Pulled
+/// out so tests that need a non-default Config (e.g. a small
+/// `max_request_body_bytes`, or `passthrough_unsigned_payload`) can start from
+/// this baseline and mutate via `build_proxy_stack_with_opts`.
+fn default_proxy_test_config(
     backend_endpoint: &str,
     auth_mode: AuthMode,
     allowed_keys: Vec<String>,
-) -> (
-    aws_sdk_s3::Client,
-    reqwest::Client,
-    String,
-    tempfile::TempDir,
-) {
-    let cache_dir = tempfile::TempDir::new().expect("create temp cache dir");
-
-    let config = Config {
+    cache_dir: &std::path::Path,
+) -> Config {
+    Config {
         s3_listen_addr: "127.0.0.1:0".to_string(),
         admin_listen_addr: "127.0.0.1:0".to_string(),
         frontend_bucket: TEST_BUCKET.to_string(),
@@ -103,7 +99,7 @@ async fn build_proxy_stack_inner(
         backend_secret_access_key: TEST_SECRET_KEY.to_string(),
         backend_use_path_style: true,
         backend_allow_http: true,
-        cache_dir: cache_dir.path().to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
         cache_max_bytes: 100 * 1024 * 1024,
         cache_max_object_bytes: 10 * 1024 * 1024,
         cacheable_prefixes: vec!["script_bundle/".into(), "bun_bundle/".into(), "tar/".into()],
@@ -119,7 +115,36 @@ async fn build_proxy_stack_inner(
         upstream_request_timeout_ms: 30000,
         max_request_body_bytes: 268_435_456,
         passthrough_unsigned_payload: false,
-    };
+    }
+}
+
+/// Shared proxy stack builder. `build_proxy_stack`, `build_proxy_stack_allowlist`
+/// and `build_proxy_stack_with_opts` delegate here. The caller owns the
+/// `cache_dir` `TempDir` (returned in the result tuple) and supplies a
+/// `mutate_config` closure that can patch the default `Config` before the
+/// stack is spun up. Pass an identity closure when no overrides are needed.
+async fn build_proxy_stack_inner<F>(
+    backend_endpoint: &str,
+    auth_mode: AuthMode,
+    allowed_keys: Vec<String>,
+    cache_dir: tempfile::TempDir,
+    mutate_config: F,
+) -> (
+    aws_sdk_s3::Client,
+    reqwest::Client,
+    String,
+    tempfile::TempDir,
+)
+where
+    F: FnOnce(&mut Config),
+{
+    let mut config = default_proxy_test_config(
+        backend_endpoint,
+        auth_mode,
+        allowed_keys,
+        cache_dir.path(),
+    );
+    mutate_config(&mut config);
 
     let s3_backend = backend::client::S3Backend::from_config(&config)
         .await
@@ -181,7 +206,15 @@ async fn build_proxy_stack_allowlist(
     String,
     tempfile::TempDir,
 ) {
-    build_proxy_stack_inner(backend_endpoint, AuthMode::AccessKeyAllowlist, allowed_keys).await
+    let cache_dir = tempfile::TempDir::new().expect("create temp cache dir");
+    build_proxy_stack_inner(
+        backend_endpoint,
+        AuthMode::AccessKeyAllowlist,
+        allowed_keys,
+        cache_dir,
+        |_cfg| {},
+    )
+    .await
 }
 
 async fn build_proxy_stack(
@@ -192,7 +225,44 @@ async fn build_proxy_stack(
     String,
     tempfile::TempDir,
 ) {
-    build_proxy_stack_inner(backend_endpoint, AuthMode::TrustedInternal, vec![]).await
+    let cache_dir = tempfile::TempDir::new().expect("create temp cache dir");
+    build_proxy_stack_inner(
+        backend_endpoint,
+        AuthMode::TrustedInternal,
+        vec![],
+        cache_dir,
+        |_cfg| {},
+    )
+    .await
+}
+
+/// Spin up a proxy stack with a pre-existing `cache_dir` (preplanted files
+/// survive into startup) and an arbitrary `Config` override applied to the
+/// default test config. Required for the startup-sweep test (preplant
+/// `<cache_dir>/tmp/*.body` before `DiskCache::new`) and for tests that need
+/// a tweaked `Config` (e.g. small `max_request_body_bytes`,
+/// `passthrough_unsigned_payload`).
+async fn build_proxy_stack_with_opts<F>(
+    backend_endpoint: &str,
+    cache_dir: tempfile::TempDir,
+    mutate_config: F,
+) -> (
+    aws_sdk_s3::Client,
+    reqwest::Client,
+    String,
+    tempfile::TempDir,
+)
+where
+    F: FnOnce(&mut Config),
+{
+    build_proxy_stack_inner(
+        backend_endpoint,
+        AuthMode::TrustedInternal,
+        vec![],
+        cache_dir,
+        mutate_config,
+    )
+    .await
 }
 
 /// Helper: PUT an object through the given S3 client.
@@ -256,6 +326,51 @@ async fn raw_head(
         .get("x-cache")
         .map(|v| v.to_str().unwrap().to_string());
     (status, x_cache)
+}
+
+/// Raw HTTP `GET /<bucket>?<raw_query>` against the proxy. The raw query is
+/// inserted into the URL verbatim — unlike `reqwest::Client::get(...).query()`,
+/// which would percent-encode/normalize the query — so percent-encoded keys
+/// (e.g. `fetch%2Downer`) reach the proxy with their exact wire form. Returns
+/// `(status, body_bytes)`.
+async fn raw_list_query(
+    http_client: &reqwest::Client,
+    proxy_endpoint: &str,
+    bucket: &str,
+    raw_query: &str,
+) -> (u16, Vec<u8>) {
+    let url = format!("{}/{}?{}", proxy_endpoint, bucket, raw_query);
+    let parsed = reqwest::Url::parse(&url).expect("parse raw LIST URL");
+    let resp = http_client
+        .get(parsed)
+        .send()
+        .await
+        .expect("raw LIST request failed");
+    let status = resp.status().as_u16();
+    let body = resp.bytes().await.expect("read LIST body").to_vec();
+    (status, body)
+}
+
+/// Raw HTTP `PUT /<bucket>/<key>` against the proxy with caller-supplied
+/// headers. Returns `(status, body_bytes)`. Used by tests that need to control
+/// `Content-Length` independently of the actual body length (which `reqwest`
+/// would otherwise reconcile for them).
+async fn raw_put_with_headers(
+    http_client: &reqwest::Client,
+    proxy_endpoint: &str,
+    key: &str,
+    headers: &[(&str, &str)],
+    body: Vec<u8>,
+) -> (u16, Vec<u8>) {
+    let url = format!("{}/{}/{}", proxy_endpoint, TEST_BUCKET, key);
+    let mut req = http_client.put(&url);
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let resp = req.body(body).send().await.expect("raw PUT request failed");
+    let status = resp.status().as_u16();
+    let body = resp.bytes().await.expect("read PUT body").to_vec();
+    (status, body)
 }
 
 async fn wait_for_head_cache_status(
@@ -1075,4 +1190,194 @@ async fn test_allowlist_mode_rejects_unknown_key() {
         "response should contain AccessDenied, got: {}",
         body
     );
+}
+
+// ---------------------------------------------------------------------------
+// Cold-review regression coverage (issue #48) — backfills end-to-end coverage
+// for the production fixes shipped in PRs #43, #44, #45, #46, #47, and #49.
+// ---------------------------------------------------------------------------
+
+/// Backfills coverage for PR #57 (issue #46): the LIST modifier gate must
+/// percent-decode query-string keys before deciding whether a request needs to
+/// route to passthrough. A client sending `fetch%2Downer=true` (an encoded
+/// `-`) intends `fetch-owner=true`. The typed LIST path does not model the
+/// owner field — its XML serializer emits no `<Owner>` element at all — so
+/// hitting the typed path silently drops the response data the client asked
+/// for.
+///
+/// Bug-revert reasoning: if the decode in `has_unsupported_list_modifiers`
+/// were removed, the gate would compare the raw `fetch%2Downer` key against
+/// the literal `"fetch-owner"`, miss, and fall through to the typed LIST. The
+/// typed serializer (`serialize_list_objects_v2` in `src/s3/xml.rs`) writes no
+/// `<Owner>` element, so the assertion below would fail.
+#[tokio::test]
+#[ignore] // Requires Docker with versity/versitygw image
+async fn test_list_v2_encoded_fetch_owner_routes_to_passthrough_and_preserves_owner() {
+    let (_container, backend_endpoint) = start_versitygw().await;
+
+    let backend_client =
+        build_raw_s3_client(&backend_endpoint, TEST_ACCESS_KEY, TEST_SECRET_KEY).await;
+    backend_client
+        .create_bucket()
+        .bucket(TEST_BUCKET)
+        .send()
+        .await
+        .expect("create bucket");
+
+    let (proxy_client, http_client, proxy_endpoint, _cache_dir) =
+        build_proxy_stack(&backend_endpoint).await;
+
+    // Put one object so the LIST has something to enumerate.
+    put_object(
+        &proxy_client,
+        "cold-review/fetch-owner-encoded.txt",
+        b"owner-probe",
+    )
+    .await;
+
+    // `fetch%2Downer` is the URL-encoded form of `fetch-owner`. Send it raw,
+    // not decoded, so the proxy receives the exact wire bytes a misbehaving
+    // (or strict) client would send.
+    let (status, body) = raw_list_query(
+        &http_client,
+        &proxy_endpoint,
+        TEST_BUCKET,
+        "list-type=2&fetch%2Downer=true",
+    )
+    .await;
+    assert_eq!(status, 200, "encoded fetch-owner LIST should succeed");
+    let body_str = String::from_utf8_lossy(&body);
+    // Passthrough mode forwards the upstream LIST response, which includes the
+    // <Owner> block when fetch-owner=true. The typed LIST path would emit none.
+    assert!(
+        body_str.contains("<Owner>"),
+        "passthrough LIST must include <Owner> when fetch-owner=true; got: {body_str}"
+    );
+    assert!(
+        body_str.contains(&format!("<ID>{TEST_ACCESS_KEY}</ID>")),
+        "Owner block must carry the upstream owner ID; got: {body_str}"
+    );
+}
+
+/// Backfills coverage for PR #60 (issue #40, follow-up #49 area): the typed
+/// LIST response must preserve `ChecksumAlgorithm` and `ChecksumType` metadata
+/// that the upstream reports for each object. Without this, SDK clients
+/// (notably anything verifying object integrity on the listing side) see a
+/// LIST output whose checksum fields are silently dropped.
+///
+/// Setup intentionally PUTs directly to the backend with `Crc32` checksum so
+/// the LIST path is exercised in isolation — the proxy's typed PUT/passthrough
+/// paths have their own checksum handling and would entangle this test.
+///
+/// Bug-revert reasoning: if `map_sdk_object` (`src/backend/client.rs`) stopped
+/// copying `checksum_algorithm` / `checksum_type`, those fields would be empty
+/// in `ObjectInfo`, and `serialize_list_objects_v2` would skip the
+/// `<ChecksumAlgorithm>` / `<ChecksumType>` elements. The assertions below
+/// would fail.
+#[tokio::test]
+#[ignore] // Requires Docker with versity/versitygw image
+async fn test_list_v2_preserves_checksum_algorithm_and_type_xml() {
+    let (_container, backend_endpoint) = start_versitygw().await;
+
+    let backend_client =
+        build_raw_s3_client(&backend_endpoint, TEST_ACCESS_KEY, TEST_SECRET_KEY).await;
+    backend_client
+        .create_bucket()
+        .bucket(TEST_BUCKET)
+        .send()
+        .await
+        .expect("create bucket");
+
+    // PUT through the backend with a checksum algorithm so VersityGW records
+    // ChecksumAlgorithm + ChecksumType on the stored object. Bypasses the
+    // proxy on PUT so the LIST behavior is isolated.
+    let key = "cold-review/checksum-list.txt";
+    backend_client
+        .put_object()
+        .bucket(TEST_BUCKET)
+        .key(key)
+        .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Crc32)
+        .body(aws_sdk_s3::primitives::ByteStream::from(b"crc32-probe".to_vec()))
+        .send()
+        .await
+        .expect("checksum PUT direct to backend");
+
+    let (_proxy_client, http_client, proxy_endpoint, _cache_dir) =
+        build_proxy_stack(&backend_endpoint).await;
+
+    // Plain LIST (no modifiers) — typed path; the typed path is the one PR #60 fixed.
+    let (status, body) =
+        raw_list_query(&http_client, &proxy_endpoint, TEST_BUCKET, "list-type=2").await;
+    assert_eq!(status, 200, "plain typed LIST should succeed");
+    let body_str = String::from_utf8_lossy(&body);
+
+    assert!(
+        body_str.contains("<ChecksumAlgorithm>CRC32</ChecksumAlgorithm>"),
+        "typed LIST XML must preserve the per-object ChecksumAlgorithm; got: {body_str}"
+    );
+    assert!(
+        body_str.contains("<ChecksumType>FULL_OBJECT</ChecksumType>"),
+        "typed LIST XML must preserve the per-object ChecksumType; got: {body_str}"
+    );
+}
+
+/// Backfills coverage for PR #54 (issue #43): on startup, `DiskCache::new`
+/// must sweep the `<cache_dir>/tmp/` directory of stale temp files left by a
+/// previous crashed run. The allowlist includes the `{pid}-{pid}-{counter}.body`
+/// fill-body temp shape used by `handlers/get.rs`; the sweep should remove it
+/// even though we know nothing about the dead process that wrote it.
+///
+/// Bug-revert reasoning: if `super::tmp_sweep::sweep_tmp_dir(...)` were
+/// removed from `DiskCache::new`, the preplanted `1-1-1.body` file would
+/// survive the proxy startup, leaving an accumulating leak across crashes.
+/// The post-startup `assert!(!planted.exists(), ...)` would then fail.
+#[tokio::test]
+#[ignore] // Requires Docker with versity/versitygw image
+async fn test_startup_sweeps_stale_cache_tmp_fill_body_file() {
+    let (_container, backend_endpoint) = start_versitygw().await;
+
+    let backend_client =
+        build_raw_s3_client(&backend_endpoint, TEST_ACCESS_KEY, TEST_SECRET_KEY).await;
+    backend_client
+        .create_bucket()
+        .bucket(TEST_BUCKET)
+        .send()
+        .await
+        .expect("create bucket");
+
+    // Build the cache_dir layout and plant a stale fill_body before the proxy
+    // starts. The sweep runs synchronously inside `DiskCache::new`, so by the
+    // time `build_proxy_stack_with_opts` returns the file should be gone.
+    let cache_dir = tempfile::TempDir::new().expect("create cache dir");
+    let tmp_dir = cache_dir.path().join("tmp");
+    let objects_dir = cache_dir.path().join("objects");
+    tokio::fs::create_dir_all(&tmp_dir).await.unwrap();
+    tokio::fs::create_dir_all(&objects_dir).await.unwrap();
+    let planted = tmp_dir.join("1-1-1.body");
+    tokio::fs::write(&planted, b"stale fill body from a dead proxy")
+        .await
+        .expect("plant stale fill_body");
+    assert!(planted.exists(), "precondition: planted file must exist");
+
+    let (proxy_client, _http_client, _proxy_endpoint, _cache_dir) =
+        build_proxy_stack_with_opts(&backend_endpoint, cache_dir, |_cfg| {}).await;
+
+    assert!(
+        !planted.exists(),
+        "DiskCache::new must sweep allowlisted fill_body temp files at startup; \
+         expected {} to be removed",
+        planted.display()
+    );
+
+    // Sanity: the proxy is still healthy after sweep (startup didn't abort).
+    put_object(&proxy_client, "cold-review/post-sweep.txt", b"alive").await;
+    let get_resp = proxy_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key("cold-review/post-sweep.txt")
+        .send()
+        .await
+        .expect("post-sweep GET should succeed");
+    let body = get_resp.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), b"alive");
 }
