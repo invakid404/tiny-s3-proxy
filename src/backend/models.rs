@@ -184,6 +184,8 @@ pub struct ObjectInfo {
     pub etag: Option<String>,
     pub size: Option<i64>,
     pub storage_class: Option<String>,
+    pub checksum_algorithm: Vec<String>,
+    pub checksum_type: Option<String>,
 }
 
 #[derive(Debug)]

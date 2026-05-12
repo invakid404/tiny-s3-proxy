@@ -130,6 +130,8 @@ mod tests {
                 etag: Some("\"abc\"".to_string()),
                 size: Some(100),
                 storage_class: Some("STANDARD".to_string()),
+                checksum_algorithm: Vec::new(),
+                checksum_type: None,
             }],
             common_prefixes: vec![],
             name: "test-backend".to_string(),
