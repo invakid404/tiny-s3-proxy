@@ -1415,10 +1415,13 @@ mod tests {
         // The declared Content-Length (32) exceeds the cap (16), but the
         // actual body (8 bytes) fits within the cap. If the preflight
         // regresses, the Limited backstop does NOT fire (body is under the
-        // limit), so the request would be forwarded to the mock and we'd
-        // see a 200. With the preflight active, we get 400 before any
-        // upstream contact. This separation is what makes the test diagnose
-        // the bug rather than aliasing onto the backstop's behavior.
+        // limit), so the request is forwarded to the upstream and the test
+        // fails the no-backend-contact assertion below — regardless of what
+        // status the upstream side then produces (typically a torn-body
+        // backend error since CL=32 disagrees with the 8 bytes actually
+        // sent). With the preflight active, we get 400 before any upstream
+        // contact. This separation is what makes the test diagnose the bug
+        // rather than aliasing onto the backstop's behavior.
         let payload = vec![b'A'; 8];
         let mut headers = HeaderMap::new();
         headers.insert("content-length", http::HeaderValue::from_static("32"));
