@@ -520,7 +520,7 @@ async fn start_capturing_mock_upstream(mock: Arc<CapturingMockUpstream>) -> Stri
         let headers = req.headers().clone();
         let body_bytes = axum::body::to_bytes(req.into_body(), 16 * 1024 * 1024)
             .await
-            .unwrap_or_default();
+            .expect("failed to drain request body for mock capture");
         mock.requests.lock().await.push(CapturedRequest {
             method,
             path,
@@ -1898,8 +1898,8 @@ async fn test_aws_chunked_put_routes_to_passthrough_forwards_decoded_content_len
     // header asserted above; this body-length check is just a passthrough
     // byte-preservation sanity check.
     assert_eq!(
-        captured.body.len(),
-        180,
-        "upstream should receive the full 180-byte chunked body"
+        captured.body.as_slice(),
+        body.as_slice(),
+        "upstream should receive the full 180-byte aws-chunked body byte-for-byte"
     );
 }
