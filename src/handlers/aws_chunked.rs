@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::body::Body;
 use http::Response;
-use tokio::fs::{File, OpenOptions};
+use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio_util::io::StreamReader;
 
@@ -31,6 +31,38 @@ use crate::s3::ops::ParsedRequest;
 /// uniqueness across concurrent spools without coordinating with peers.
 static UPLOAD_SPOOL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Create the spool file `O_CREAT | O_EXCL | O_WRONLY` with owner-only
+/// permissions on Unix. The decoded body contains the object payload, so
+/// group/other readability under a typical 022 umask would be a needless
+/// exposure. On non-Unix targets we fall back to `tokio`'s default
+/// `OpenOptions` (umask has no equivalent there).
+async fn open_upload_spool_file(path: &Path) -> std::io::Result<File> {
+    open_upload_spool_file_platform(path).await
+}
+
+#[cfg(unix)]
+async fn open_upload_spool_file_platform(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // Use the blocking `std::fs::OpenOptions` so we can set `mode(0o600)` —
+    // tokio's async `OpenOptions` doesn't expose Unix mode bits.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    Ok(File::from_std(file))
+}
+
+#[cfg(not(unix))]
+async fn open_upload_spool_file_platform(path: &Path) -> std::io::Result<File> {
+    tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .await
+}
+
 /// Owns the lifecycle of one decoded-body spool file. Drop is a best-effort
 /// backstop; callers should explicitly `.cleanup().await` on both the happy
 /// and error paths so failures to delete are logged.
@@ -43,7 +75,8 @@ impl UploadSpoolGuard {
     /// Create a fresh spool file under `<cache_dir>/tmp/`. Returns the guard
     /// plus an open `File` handle positioned at offset 0 with write
     /// permission. Uses `create_new` so collisions with a stale file abort
-    /// rather than silently overwrite.
+    /// rather than silently overwrite, and (on Unix) `mode(0o600)` so the
+    /// decoded body isn't readable by group/other regardless of umask.
     pub(super) async fn create(cache_dir: &Path) -> std::io::Result<(Self, File)> {
         let tmp_dir = cache_dir.join("tmp");
         tokio::fs::create_dir_all(&tmp_dir).await?;
@@ -52,11 +85,7 @@ impl UploadSpoolGuard {
         let counter = UPLOAD_SPOOL_COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = tmp_dir.join(format!("{pid}-{counter}.upload-spool.tmp"));
 
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .await?;
+        let file = open_upload_spool_file(&path).await?;
 
         Ok((Self { path, armed: true }, file))
     }
@@ -889,6 +918,38 @@ mod tests {
         let (g1, _f1) = UploadSpoolGuard::create(tmp.path()).await.unwrap();
         let (g2, _f2) = UploadSpoolGuard::create(tmp.path()).await.unwrap();
         assert_ne!(g1.path(), g2.path());
+    }
+
+    /// Spool files carry decoded request bodies (object payload), so on
+    /// Unix they must be created owner-only (0600) regardless of the
+    /// process umask. Asserts no group/other bits are set on the created
+    /// file. `OpenOptions::mode(0o600)` is still subject to umask (umask
+    /// can only REMOVE bits, never add), so checking `mode & 0o077 == 0`
+    /// is the right invariant — it catches the regression where the
+    /// helper falls back to umask-respecting defaults under 022.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_spool_create_uses_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (guard, file) = UploadSpoolGuard::create(tmp.path()).await.unwrap();
+        drop(file);
+
+        let mode = tokio::fs::metadata(guard.path())
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "spool file must not be group/other readable; got mode {:o}",
+            mode,
+        );
+
+        guard.cleanup().await.unwrap();
     }
 
     /// Pins CodeRabbit Finding 2: if the async `remove_file` inside
