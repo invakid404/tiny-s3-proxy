@@ -438,6 +438,31 @@ where
         // -- Streaming path (unsigned payload, non-retryable) --
         let stream_body = stream_body.expect("stream_body must be Some when body_bytes is None");
 
+        // Parse the inbound Content-Length once. Missing / non-UTF-8 /
+        // non-numeric values fall through to None and are handled by the
+        // Limited backstop further down.
+        let content_length_n: Option<u64> = original_headers
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok());
+
+        // Preflight: reject oversized requests BEFORE constructing the
+        // upstream request or initiating send. Without this check (see #47)
+        // the Limited wrapper would only fire once `req_builder.send()`
+        // started reading the body — by then the response headers may
+        // already be in flight, and clients see a torn / inconsistent
+        // EntityTooLarge. The Limited wrapper below still backstops the
+        // missing / invalid / lying Content-Length cases.
+        if let Some(n) = content_length_n
+            && n > state.config.max_request_body_bytes
+        {
+            let s3err = S3Error::entity_too_large(
+                "request body exceeded the configured size limit",
+                request_id,
+            );
+            return s3err.to_response();
+        }
+
         let signing_params = match SigningParams::builder()
             .identity(&identity)
             .region(&state.config.backend_region)
@@ -508,10 +533,8 @@ where
         // `wrap_stream` produces a body of unknown length, so without an
         // explicit header reqwest would fall back to chunked transfer-
         // encoding. Some S3-compatible backends reject chunked PUTs.
-        if let Some(cl) = original_headers.get("content-length")
-            && let Ok(s) = cl.to_str()
-            && let Ok(n) = s.trim().parse::<u64>()
-        {
+        // Reuses content_length_n parsed above for the oversize preflight.
+        if let Some(n) = content_length_n {
             req_builder = req_builder.header("content-length", n);
         }
         // Enforce max_request_body_bytes on the streaming path. The buffered
@@ -614,8 +637,13 @@ mod tests {
         requests: tokio::sync::Mutex<Vec<(String, String, HeaderMap, bytes::Bytes)>>,
         /// Status code the mock will return. Can be mutated between calls.
         response_status: AtomicU32,
-        /// How many times the mock has been called.
+        /// How many times the mock handler has completed body read and
+        /// finished handling. Existing tests assert on this counter.
         call_count: AtomicU32,
+        /// How many times the mock handler has been entered (before body
+        /// read). Use this to detect that the upstream was contacted even
+        /// when the body send fails partway through.
+        received_count: AtomicU32,
         /// Fixed response headers to include.
         response_headers: tokio::sync::Mutex<Vec<(String, String)>>,
     }
@@ -626,6 +654,7 @@ mod tests {
                 requests: tokio::sync::Mutex::new(Vec::new()),
                 response_status: AtomicU32::new(status as u32),
                 call_count: AtomicU32::new(0),
+                received_count: AtomicU32::new(0),
                 response_headers: tokio::sync::Mutex::new(Vec::new()),
             })
         }
@@ -650,6 +679,10 @@ mod tests {
         axum::extract::State(state): axum::extract::State<Arc<MockUpstream>>,
         req: http::Request<Body>,
     ) -> http::Response<Body> {
+        // Increment received_count BEFORE body read so callers can detect
+        // that the upstream was contacted even when the body stream errors
+        // out mid-flight (e.g. Limited wrapper hits its cap).
+        state.received_count.fetch_add(1, Ordering::SeqCst);
         let method = req.method().to_string();
         let uri = req.uri().to_string();
         let headers = req.headers().clone();
@@ -1365,6 +1398,118 @@ mod tests {
         assert!(
             body_str.contains("<Code>EntityTooLarge</Code>"),
             "expected EntityTooLarge in body, got: {body_str}"
+        );
+    }
+
+    // ---- Streaming branch preflight: oversized Content-Length rejected before send (#47) ----
+    #[tokio::test]
+    async fn test_streaming_passthrough_rejects_oversized_content_length_before_send() {
+        let mock = MockUpstream::new(200);
+        let addr = start_mock_upstream(mock.clone()).await;
+
+        let mut config = test_config_for_passthrough(&addr);
+        config.passthrough_unsigned_payload = true;
+        config.max_request_body_bytes = 16;
+        let state = build_passthrough_state(config);
+
+        // The declared Content-Length (32) exceeds the cap (16), but the
+        // actual body (8 bytes) fits within the cap. If the preflight
+        // regresses, the Limited backstop does NOT fire (body is under the
+        // limit), so the request is forwarded to the upstream and the test
+        // fails the no-backend-contact assertion below — regardless of what
+        // status the upstream side then produces (typically a torn-body
+        // backend error since CL=32 disagrees with the 8 bytes actually
+        // sent). With the preflight active, we get 400 before any upstream
+        // contact. This separation is what makes the test diagnose the bug
+        // rather than aliasing onto the backstop's behavior.
+        let payload = vec![b'A'; 8];
+        let mut headers = HeaderMap::new();
+        headers.insert("content-length", http::HeaderValue::from_static("32"));
+
+        let resp = handle_passthrough(
+            &state,
+            "PUT",
+            "/test-backend/oversized-cl-key",
+            None,
+            &headers,
+            Body::from(payload),
+            "req-cl-preflight",
+        )
+        .await;
+
+        assert_eq!(
+            resp.status(),
+            400,
+            "oversized Content-Length must be rejected with 400 EntityTooLarge"
+        );
+
+        // Crucial: the backend mock MUST NOT have been entered. The preflight
+        // must reject before any upstream send. received_count increments at
+        // the top of the mock handler (before body read), so it catches even
+        // torn requests where the Limited backstop aborts mid-body. If this
+        // assertion fires, the preflight check has regressed.
+        assert_eq!(
+            mock.received_count.load(Ordering::SeqCst),
+            0,
+            "preflight must reject before contacting upstream"
+        );
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("response body should read");
+        let body_str = std::str::from_utf8(&body_bytes).unwrap();
+        assert!(
+            body_str.contains("<Code>EntityTooLarge</Code>"),
+            "expected EntityTooLarge in body, got: {body_str}"
+        );
+    }
+
+    // ---- Streaming branch: malformed Content-Length falls through to backstop ----
+    #[tokio::test]
+    async fn test_streaming_passthrough_proceeds_with_malformed_content_length() {
+        let mock = MockUpstream::new(200);
+        let addr = start_mock_upstream(mock.clone()).await;
+
+        let mut config = test_config_for_passthrough(&addr);
+        config.passthrough_unsigned_payload = true;
+        let state = build_passthrough_state(config);
+
+        // A non-numeric Content-Length must not cause the preflight to reject
+        // with a bad-request shape — content_length_n parses to None and the
+        // request proceeds, relying on the Limited backstop for the body.
+        let payload = b"small";
+        let mut headers = HeaderMap::new();
+        headers.insert("content-length", http::HeaderValue::from_static("abc"));
+
+        let resp = handle_passthrough(
+            &state,
+            "PUT",
+            "/test-backend/malformed-cl-key",
+            None,
+            &headers,
+            Body::from(&payload[..]),
+            "req-cl-malformed",
+        )
+        .await;
+
+        assert_eq!(
+            resp.status(),
+            200,
+            "malformed Content-Length must not be treated as oversized"
+        );
+        assert_eq!(
+            mock.call_count.load(Ordering::SeqCst),
+            1,
+            "upstream should be contacted when Content-Length is unparseable"
+        );
+
+        let reqs = mock.requests.lock().await;
+        // The upstream must not receive the bogus inbound Content-Length —
+        // parsing it returned None, so the forwarding branch skips it and
+        // reqwest falls back to chunked transfer-encoding.
+        assert!(
+            reqs[0].2.get("content-length").is_none(),
+            "upstream should not receive an unparseable Content-Length"
         );
     }
 }
