@@ -290,6 +290,11 @@ impl DiskCache {
                 operation: "create tmp dir".into(),
             })?;
 
+        // Best-effort sweep of stale temp files left by prior crashed runs
+        // (issue #43). Runs after the single-owner lock is held and the tmp
+        // directory exists; never aborts startup on I/O error.
+        super::tmp_sweep::sweep_tmp_dir(&cache_dir.join("tmp")).await;
+
         // Load startup stats and derive the next fill_id to allocate.
         let scan = Self::scan_existing_stats(&cache_dir).await?;
         let next_fill_id = Self::load_next_fill_id(&cache_dir, &scan).await?;
