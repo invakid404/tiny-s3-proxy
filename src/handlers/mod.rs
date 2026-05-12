@@ -1995,4 +1995,31 @@ mod tests {
             &headers
         ));
     }
+
+    #[test]
+    fn test_has_unsupported_list_modifiers_encoded_fetch_owner() {
+        let headers = http::HeaderMap::new();
+        assert!(has_unsupported_list_modifiers(
+            Some("list-type=2&fetch%2Downer=true"),
+            &headers
+        ));
+    }
+
+    #[test]
+    fn test_has_unsupported_list_modifiers_encoded_optional_object_attributes() {
+        let headers = http::HeaderMap::new();
+        assert!(has_unsupported_list_modifiers(
+            Some("list-type=2&optional%2Dobject%2Dattributes=RestoreStatus"),
+            &headers
+        ));
+    }
+
+    #[test]
+    fn test_has_unsupported_list_modifiers_encoded_fetch_owner_no_value() {
+        let headers = http::HeaderMap::new();
+        assert!(has_unsupported_list_modifiers(
+            Some("list-type=2&fetch%2Downer"),
+            &headers
+        ));
+    }
 }
