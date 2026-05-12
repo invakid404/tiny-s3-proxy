@@ -179,7 +179,12 @@ pub(super) fn has_unsupported_list_modifiers(
     if let Some(q) = query {
         for pair in q.split('&') {
             let key = pair.split('=').next().unwrap_or("");
-            if key == "fetch-owner" || key == "optional-object-attributes" {
+            // Percent-decode before matching: encoded equivalents like
+            // `fetch%2Downer` would otherwise bypass the gate (issue #46).
+            // Match parse_query()'s lossy decoding semantics so gating and
+            // parsing agree on the same key set.
+            let decoded_key = percent_encoding::percent_decode_str(key).decode_utf8_lossy();
+            if decoded_key == "fetch-owner" || decoded_key == "optional-object-attributes" {
                 return true;
             }
         }
