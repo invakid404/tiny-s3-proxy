@@ -64,8 +64,23 @@ pub enum AwsChunkedError {
     #[error("aws-chunked chunk header exceeded {limit} bytes")]
     ChunkHeaderTooLarge { limit: usize },
 
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
+    /// I/O error reading the inbound aws-chunked body. The client is the
+    /// proximate cause (truncated socket, mid-stream reset, etc.) so this
+    /// maps to a 400 `IncompleteBody` at the handler boundary.
+    #[error("aws-chunked inbound body read I/O error: {source}")]
+    InboundIo {
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// I/O error writing the decoded body to the spool file on disk. The
+    /// proxy is the proximate cause (no space, permission, etc.) so this
+    /// maps to a 500 `InternalError` at the handler boundary.
+    #[error("aws-chunked spool write I/O error: {source}")]
+    SpoolIo {
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Streaming aws-chunked decoder. Reads frames from `inner`, validates them,
@@ -169,17 +184,21 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
         }
     }
 
-    /// Read a single chunk-header line (terminated by `\r\n`) using a bounded
-    /// buffer. Strips the trailing `\r\n` from the returned string.
+    /// Read a single chunk-header line (terminated by `\r\n`) using a
+    /// strictly bounded buffer. Returns the header bytes WITHOUT the
+    /// trailing `\r\n`. Implemented with `fill_buf` / `consume` so we can
+    /// abort with `ChunkHeaderTooLarge` BEFORE allocating past
+    /// `MAX_CHUNK_HEADER_LINE_BYTES` — a malicious client that never sends
+    /// `\n` can't drive unbounded memory growth.
     async fn read_chunk_header_line(&mut self) -> Result<String, AwsChunkedError> {
         let mut buf: Vec<u8> = Vec::with_capacity(128);
-        loop {
-            let read_n = self
+        let raw = loop {
+            let chunk = self
                 .inner
-                .read_until(b'\n', &mut buf)
+                .fill_buf()
                 .await
-                .map_err(AwsChunkedError::Io)?;
-            if read_n == 0 {
+                .map_err(|source| AwsChunkedError::InboundIo { source })?;
+            if chunk.is_empty() {
                 // EOF before we found a `\n`.
                 if buf.is_empty() {
                     return Err(AwsChunkedError::Truncated);
@@ -188,25 +207,38 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
                     message: "chunk header missing CRLF terminator".to_string(),
                 });
             }
-            if buf.len() > MAX_CHUNK_HEADER_LINE_BYTES {
+            if let Some(idx) = chunk.iter().position(|&b| b == b'\n') {
+                // Including the newline byte in the line.
+                let line_bytes_in_chunk = idx + 1;
+                if buf.len() + line_bytes_in_chunk > MAX_CHUNK_HEADER_LINE_BYTES {
+                    return Err(AwsChunkedError::ChunkHeaderTooLarge {
+                        limit: MAX_CHUNK_HEADER_LINE_BYTES,
+                    });
+                }
+                buf.extend_from_slice(&chunk[..line_bytes_in_chunk]);
+                self.inner.consume(line_bytes_in_chunk);
+                break buf;
+            }
+            // No newline in this batch — append everything we saw (subject
+            // to the cap) and loop. The cap check fires BEFORE the
+            // allocation that would exceed it.
+            if buf.len() + chunk.len() > MAX_CHUNK_HEADER_LINE_BYTES {
                 return Err(AwsChunkedError::ChunkHeaderTooLarge {
                     limit: MAX_CHUNK_HEADER_LINE_BYTES,
                 });
             }
-            // `read_until` stops *after* the delimiter; we got the `\n` if the
-            // last byte is `\n`. (Should always be the case unless EOF.)
-            if buf.last() == Some(&b'\n') {
-                break;
-            }
-        }
+            buf.extend_from_slice(chunk);
+            let consumed = chunk.len();
+            self.inner.consume(consumed);
+        };
 
         // Strip trailing \r\n; must be present and exact.
-        if buf.len() < 2 || buf[buf.len() - 2] != b'\r' || buf[buf.len() - 1] != b'\n' {
+        if raw.len() < 2 || raw[raw.len() - 2] != b'\r' || raw[raw.len() - 1] != b'\n' {
             return Err(AwsChunkedError::MalformedFrame {
                 message: "chunk header not terminated by CRLF".to_string(),
             });
         }
-        let header_bytes = &buf[..buf.len() - 2];
+        let header_bytes = &raw[..raw.len() - 2];
         std::str::from_utf8(header_bytes)
             .map(|s| s.to_string())
             .map_err(|_| AwsChunkedError::MalformedFrame {
@@ -232,7 +264,7 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
                 .inner
                 .read(&mut buf[..want])
                 .await
-                .map_err(AwsChunkedError::Io)?;
+                .map_err(|source| AwsChunkedError::InboundIo { source })?;
             if n == 0 {
                 return Err(AwsChunkedError::Truncated);
             }
@@ -240,7 +272,7 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
             writer
                 .write_all(&buf[..n])
                 .await
-                .map_err(AwsChunkedError::Io)?;
+                .map_err(|source| AwsChunkedError::SpoolIo { source })?;
             remaining -= n as u64;
         }
         Ok(())
@@ -255,7 +287,7 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 return Err(AwsChunkedError::Truncated);
             }
-            Err(e) => return Err(AwsChunkedError::Io(e)),
+            Err(source) => return Err(AwsChunkedError::InboundIo { source }),
         }
         if crlf != *b"\r\n" {
             return Err(AwsChunkedError::MalformedFrame {
@@ -272,7 +304,7 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
         match self.inner.read(&mut scratch).await {
             Ok(0) => Ok(()),
             Ok(_) => Err(AwsChunkedError::TrailingData),
-            Err(e) => Err(AwsChunkedError::Io(e)),
+            Err(source) => Err(AwsChunkedError::InboundIo { source }),
         }
     }
 }
@@ -592,6 +624,60 @@ mod tests {
             // Could also surface as Truncated if the buffer exactly hits the
             // limit at the same call that detects no `\n` — both are fine.
             AwsChunkedError::Truncated | AwsChunkedError::MalformedFrame { .. } => {}
+            other => panic!("expected ChunkHeaderTooLarge, got {other:?}"),
+        }
+    }
+
+    /// Proves `MAX_CHUNK_HEADER_LINE_BYTES` is enforced incrementally during
+    /// the header read — a malicious stream that emits bytes in small
+    /// batches WITHOUT a `\n` must abort with `ChunkHeaderTooLarge` rather
+    /// than buffer the entire stream first.
+    #[tokio::test]
+    async fn test_chunk_header_unbounded_without_newline_errors() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncRead, ReadBuf};
+
+        /// AsyncRead that yields one chunk of `chunk_bytes` `a`s per poll, up
+        /// to `chunks` polls, then EOF. Never emits `\n`. By sizing chunks to
+        /// `MAX_CHUNK_HEADER_LINE_BYTES / 4` we force the decoder to either
+        /// (a) bail out partway with `ChunkHeaderTooLarge`, or (b) keep
+        /// accumulating bytes past the limit (the bug we're guarding).
+        struct DripReader {
+            chunk_bytes: usize,
+            chunks_remaining: usize,
+        }
+        impl AsyncRead for DripReader {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                if self.chunks_remaining == 0 {
+                    return Poll::Ready(Ok(()));
+                }
+                let want = buf.remaining().min(self.chunk_bytes);
+                buf.put_slice(&vec![b'a'; want]);
+                self.chunks_remaining -= 1;
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        // Emit ~8 KiB total in 4 batches, no newline. With a working bound
+        // check, we must error out before the 5th batch could even be read.
+        let reader = DripReader {
+            chunk_bytes: MAX_CHUNK_HEADER_LINE_BYTES / 4,
+            chunks_remaining: 5,
+        };
+        let mut sink: tokio::io::BufWriter<Vec<u8>> = tokio::io::BufWriter::new(Vec::new());
+        let err = AwsChunkedDecoder::new(reader, 1)
+            .decode_to_writer(&mut sink)
+            .await
+            .expect_err("must error before exhausting the drip stream");
+        match err {
+            AwsChunkedError::ChunkHeaderTooLarge { limit } => {
+                assert_eq!(limit, MAX_CHUNK_HEADER_LINE_BYTES);
+            }
             other => panic!("expected ChunkHeaderTooLarge, got {other:?}"),
         }
     }

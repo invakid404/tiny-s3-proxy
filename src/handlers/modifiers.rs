@@ -129,8 +129,19 @@ pub(super) enum AwsChunkedUploadMode {
 pub(super) fn classify_aws_chunked_upload(
     raw_headers: &http::HeaderMap,
 ) -> Option<AwsChunkedUploadMode> {
-    // First-pass signal: `Content-Encoding: aws-chunked` (potentially in a
-    // comma list, possibly via multiple header values).
+    // `x-amz-trailer` advertises HTTP trailers after the body. The non-trailer
+    // decoder doesn't consume trailers, so we treat its presence as conclusive
+    // proof of trailer-mode framing — even if `x-amz-content-sha256` claims
+    // the non-trailer sentinel. Routing to passthrough also avoids leaking
+    // `x-amz-trailer` into `extra_amz_headers` (which parse.rs does not
+    // strip) and onward into the decoded backend request.
+    if raw_headers.contains_key("x-amz-trailer") {
+        return Some(AwsChunkedUploadMode::Trailer);
+    }
+
+    // `Content-Encoding: aws-chunked` (potentially in a comma list, possibly
+    // via multiple header values) is a fallback streaming signal when no
+    // STREAMING-* sentinel is present.
     let mut content_encoding_has_aws_chunked = false;
     for value in raw_headers.get_all("content-encoding") {
         if let Ok(s) = value.to_str() {
@@ -180,14 +191,6 @@ pub(super) fn classify_aws_chunked_upload(
         };
     }
 
-    // Trailer headers and decoded-content-length headers are aws-chunked
-    // markers — if they're present but no STREAMING-* sentinel was seen, the
-    // request is malformed but we still route it through passthrough to
-    // preserve historical behaviour. If x-amz-trailer is present we treat
-    // the request as trailer-mode regardless of the sha256 sentinel.
-    if raw_headers.contains_key("x-amz-trailer") {
-        return Some(mode.unwrap_or(AwsChunkedUploadMode::Trailer));
-    }
     if mode.is_some() {
         return mode;
     }
@@ -322,4 +325,39 @@ pub(super) fn has_unsupported_list_modifiers(
     // Headers the typed LIST path doesn't forward.
     headers.contains_key("x-amz-request-payer")
         || headers.contains_key("x-amz-expected-bucket-owner")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `x-amz-trailer` MUST force `Trailer` mode even when the sha256 sentinel
+    /// claims non-trailer streaming. Routing this combination through the
+    /// decoder would (a) drop the trailers silently and (b) leak the
+    /// `x-amz-trailer` header into the backend request (parse.rs strips
+    /// `x-amz-decoded-content-length` but not `x-amz-trailer`).
+    #[test]
+    fn test_trailer_header_forces_trailer_mode_over_non_trailer_sha256() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-amz-content-sha256",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".parse().unwrap(),
+        );
+        headers.insert("x-amz-trailer", "x-amz-checksum-crc32".parse().unwrap());
+        assert_eq!(
+            classify_aws_chunked_upload(&headers),
+            Some(AwsChunkedUploadMode::Trailer),
+        );
+        // And the routing decision must therefore be Passthrough — PR 2 of
+        // issue #50 will move trailer-mode into the in-house decoder.
+        let extra_amz = std::collections::HashMap::new();
+        assert_eq!(
+            classify_put_body_route(&extra_amz, &headers),
+            WriteBodyRoute::Passthrough,
+        );
+        assert_eq!(
+            classify_upload_part_body_route(&extra_amz, &headers),
+            WriteBodyRoute::Passthrough,
+        );
+    }
 }
