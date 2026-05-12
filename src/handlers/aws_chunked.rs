@@ -42,16 +42,16 @@ async fn open_upload_spool_file(path: &Path) -> std::io::Result<File> {
 
 #[cfg(unix)]
 async fn open_upload_spool_file_platform(path: &Path) -> std::io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    // Use the blocking `std::fs::OpenOptions` so we can set `mode(0o600)` —
-    // tokio's async `OpenOptions` doesn't expose Unix mode bits.
-    let file = std::fs::OpenOptions::new()
+    // Owner-only (0600): the spool holds the decoded object body for the
+    // lifetime of the upload, so group/other readability would be a
+    // needless exposure. `mode(0o600)` is still masked by the process
+    // umask, but umask can only REMOVE bits — group/other stays cleared.
+    tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(path)?;
-    Ok(File::from_std(file))
+        .open(path)
+        .await
 }
 
 #[cfg(not(unix))]
