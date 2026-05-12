@@ -283,11 +283,11 @@ fn parse_chunk_header(line: &str) -> Result<u64, AwsChunkedError> {
     // Split on the first `;`. Anything before is the hex size; the remainder
     // must be exactly `chunk-signature=<64 hex>` (no extra extensions; the
     // AWS aws-chunked wire format defines only the signature extension).
-    let (size_part, sig_part) = line.split_once(';').ok_or_else(|| {
-        AwsChunkedError::MalformedFrame {
-            message: format!("chunk header missing `;chunk-signature=` extension: `{line}`"),
-        }
-    })?;
+    let (size_part, sig_part) =
+        line.split_once(';')
+            .ok_or_else(|| AwsChunkedError::MalformedFrame {
+                message: format!("chunk header missing `;chunk-signature=` extension: `{line}`"),
+            })?;
 
     if size_part.is_empty() {
         return Err(AwsChunkedError::MalformedFrame {
@@ -298,11 +298,11 @@ fn parse_chunk_header(line: &str) -> Result<u64, AwsChunkedError> {
         message: format!("chunk size is not valid hex: `{size_part}`"),
     })?;
 
-    let sig_hex = sig_part
-        .strip_prefix("chunk-signature=")
-        .ok_or_else(|| AwsChunkedError::MalformedFrame {
+    let sig_hex = sig_part.strip_prefix("chunk-signature=").ok_or_else(|| {
+        AwsChunkedError::MalformedFrame {
             message: format!("chunk header extension is not `chunk-signature=...`: `{sig_part}`"),
-        })?;
+        }
+    })?;
     if sig_hex.len() != CHUNK_SIGNATURE_HEX_LEN {
         return Err(AwsChunkedError::MalformedFrame {
             message: format!(
@@ -354,7 +354,10 @@ mod tests {
         out
     }
 
-    async fn decode(frame: &[u8], declared_len: u64) -> Result<(Vec<u8>, DecodedSummary), AwsChunkedError> {
+    async fn decode(
+        frame: &[u8],
+        declared_len: u64,
+    ) -> Result<(Vec<u8>, DecodedSummary), AwsChunkedError> {
         let mut sink: BufWriter<Vec<u8>> = BufWriter::new(Vec::new());
         let summary = AwsChunkedDecoder::new(frame, declared_len)
             .decode_to_writer(&mut sink)
@@ -415,7 +418,10 @@ mod tests {
     async fn test_missing_signature_extension_errors() {
         let frame = b"8\r\nabcdefgh\r\n0\r\n\r\n".to_vec();
         let err = decode(&frame, 8).await.unwrap_err();
-        assert!(matches!(err, AwsChunkedError::MalformedFrame { .. }), "got {err:?}");
+        assert!(
+            matches!(err, AwsChunkedError::MalformedFrame { .. }),
+            "got {err:?}"
+        );
     }
 
     // Test 5: signature is the wrong length.
@@ -424,7 +430,10 @@ mod tests {
         let frame = b"8;chunk-signature=deadbeef\r\nabcdefgh\r\n0;chunk-signature=deadbeef\r\n\r\n"
             .to_vec();
         let err = decode(&frame, 8).await.unwrap_err();
-        assert!(matches!(err, AwsChunkedError::MalformedFrame { .. }), "got {err:?}");
+        assert!(
+            matches!(err, AwsChunkedError::MalformedFrame { .. }),
+            "got {err:?}"
+        );
     }
 
     // Test 6: signature contains non-hex characters.
@@ -432,9 +441,13 @@ mod tests {
     async fn test_signature_non_hex_errors() {
         // 64 chars including a non-hex 'z'.
         let sig = "z".to_string() + &"0".repeat(63);
-        let frame = format!("8;chunk-signature={sig}\r\nabcdefgh\r\n0;chunk-signature={SIG}\r\n\r\n");
+        let frame =
+            format!("8;chunk-signature={sig}\r\nabcdefgh\r\n0;chunk-signature={SIG}\r\n\r\n");
         let err = decode(frame.as_bytes(), 8).await.unwrap_err();
-        assert!(matches!(err, AwsChunkedError::MalformedFrame { .. }), "got {err:?}");
+        assert!(
+            matches!(err, AwsChunkedError::MalformedFrame { .. }),
+            "got {err:?}"
+        );
     }
 
     // Test 7: missing CRLF after header (the header reader sees EOF instead).
@@ -445,7 +458,10 @@ mod tests {
         let frame = format!("8;chunk-signature={SIG}");
         let err = decode(frame.as_bytes(), 8).await.unwrap_err();
         assert!(
-            matches!(err, AwsChunkedError::Truncated | AwsChunkedError::MalformedFrame { .. }),
+            matches!(
+                err,
+                AwsChunkedError::Truncated | AwsChunkedError::MalformedFrame { .. }
+            ),
             "got {err:?}",
         );
     }
@@ -454,10 +470,12 @@ mod tests {
     #[tokio::test]
     async fn test_missing_crlf_after_chunk_data_errors() {
         // Replace the post-payload \r\n with `xx` to invalidate the framing.
-        let frame =
-            format!("8;chunk-signature={SIG}\r\nabcdefghxx0;chunk-signature={SIG}\r\n\r\n");
+        let frame = format!("8;chunk-signature={SIG}\r\nabcdefghxx0;chunk-signature={SIG}\r\n\r\n");
         let err = decode(frame.as_bytes(), 8).await.unwrap_err();
-        assert!(matches!(err, AwsChunkedError::MalformedFrame { .. }), "got {err:?}");
+        assert!(
+            matches!(err, AwsChunkedError::MalformedFrame { .. }),
+            "got {err:?}"
+        );
     }
 
     // Test 9: truncated chunk data (payload shorter than declared size).
@@ -473,12 +491,13 @@ mod tests {
     #[tokio::test]
     async fn test_final_chunk_missing_terminator_errors() {
         // Data chunk OK, final chunk header OK, but no terminating CRLF after.
-        let frame = format!(
-            "8;chunk-signature={SIG}\r\nabcdefgh\r\n0;chunk-signature={SIG}\r\n",
-        );
+        let frame = format!("8;chunk-signature={SIG}\r\nabcdefgh\r\n0;chunk-signature={SIG}\r\n",);
         let err = decode(frame.as_bytes(), 8).await.unwrap_err();
         assert!(
-            matches!(err, AwsChunkedError::Truncated | AwsChunkedError::MalformedFrame { .. }),
+            matches!(
+                err,
+                AwsChunkedError::Truncated | AwsChunkedError::MalformedFrame { .. }
+            ),
             "got {err:?}",
         );
     }
@@ -536,7 +555,9 @@ mod tests {
         let small = vec![b'x'; 100];
         let big = vec![b'y'; 9_000];
         let frame = build_frame(&[&small, &big]);
-        let err = decode(&frame, (small.len() + big.len()) as u64).await.unwrap_err();
+        let err = decode(&frame, (small.len() + big.len()) as u64)
+            .await
+            .unwrap_err();
         match err {
             AwsChunkedError::InvalidChunkSize { size, min, .. } => {
                 assert_eq!(size, 100);
@@ -583,13 +604,19 @@ mod tests {
         let upper = "0".repeat(63) + "A";
         let line = format!("8;chunk-signature={upper}");
         let err = parse_chunk_header(&line).unwrap_err();
-        assert!(matches!(err, AwsChunkedError::MalformedFrame { .. }), "got {err:?}");
+        assert!(
+            matches!(err, AwsChunkedError::MalformedFrame { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]
     fn test_parse_header_empty_size_rejected() {
         let line = format!(";chunk-signature={SIG}");
         let err = parse_chunk_header(&line).unwrap_err();
-        assert!(matches!(err, AwsChunkedError::MalformedFrame { .. }), "got {err:?}");
+        assert!(
+            matches!(err, AwsChunkedError::MalformedFrame { .. }),
+            "got {err:?}"
+        );
     }
 }

@@ -245,10 +245,21 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
             }
         }
         S3Operation::PutObject { key, .. } => {
-            if has_unsupported_write_modifiers(&parsed.extra_amz_headers, &parts.headers) {
-                route_to_passthrough(&state, &parts, body, &parsed.request_id).await
-            } else {
-                put::handle_put(&state, &parsed, key, body).await
+            match classify_put_body_route(&parsed.extra_amz_headers, &parts.headers) {
+                WriteBodyRoute::Typed => put::handle_put(&state, &parsed, key, body).await,
+                WriteBodyRoute::DecodeAwsChunked => {
+                    aws_chunked::handle_put_decode_aws_chunked(
+                        &state,
+                        &parsed,
+                        key,
+                        &parts.headers,
+                        body,
+                    )
+                    .await
+                }
+                WriteBodyRoute::Passthrough => {
+                    route_to_passthrough(&state, &parts, body, &parsed.request_id).await
+                }
             }
         }
         S3Operation::DeleteObject { key, .. } => {
@@ -278,14 +289,27 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
             part_number,
             upload_id,
             ..
-        } => {
-            if has_unsupported_multipart_modifiers(&parsed.extra_amz_headers, &parts.headers) {
-                route_to_passthrough(&state, &parts, body, &parsed.request_id).await
-            } else {
+        } => match classify_upload_part_body_route(&parsed.extra_amz_headers, &parts.headers) {
+            WriteBodyRoute::Typed => {
                 multipart::handle_upload_part(&state, &parsed, key, *part_number, upload_id, body)
                     .await
             }
-        }
+            WriteBodyRoute::DecodeAwsChunked => {
+                aws_chunked::handle_upload_part_decode_aws_chunked(
+                    &state,
+                    &parsed,
+                    key,
+                    *part_number,
+                    upload_id,
+                    &parts.headers,
+                    body,
+                )
+                .await
+            }
+            WriteBodyRoute::Passthrough => {
+                route_to_passthrough(&state, &parts, body, &parsed.request_id).await
+            }
+        },
         S3Operation::CompleteMultipartUpload { key, upload_id, .. } => {
             if has_unsupported_multipart_modifiers(&parsed.extra_amz_headers, &parts.headers) {
                 route_to_passthrough(&state, &parts, body, &parsed.request_id).await

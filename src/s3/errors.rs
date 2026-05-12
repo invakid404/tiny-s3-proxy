@@ -183,6 +183,30 @@ impl S3Error {
         }
     }
 
+    /// Create an InvalidChunkSizeError (HTTP 400). Used by the aws-chunked
+    /// decoder when a non-final chunk is below the AWS-documented minimum.
+    pub fn invalid_chunk_size(message: &str, request_id: &str) -> Self {
+        S3Error {
+            http_status: StatusCode::BAD_REQUEST,
+            code: "InvalidChunkSizeError".to_string(),
+            message: message.to_string(),
+            resource: None,
+            request_id: request_id.to_string(),
+        }
+    }
+
+    /// Create an IncompleteBody error (HTTP 400). Used by the aws-chunked
+    /// decoder for framing errors that leave the body partial or unparsable.
+    pub fn incomplete_body(message: &str, request_id: &str) -> Self {
+        S3Error {
+            http_status: StatusCode::BAD_REQUEST,
+            code: "IncompleteBody".to_string(),
+            message: message.to_string(),
+            resource: None,
+            request_id: request_id.to_string(),
+        }
+    }
+
     /// Create a NotImplemented error.
     pub fn not_implemented(operation: &str, request_id: &str) -> Self {
         S3Error {

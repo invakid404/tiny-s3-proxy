@@ -87,49 +87,179 @@ pub(super) fn has_unsupported_http_conditionals(raw_headers: &http::HeaderMap) -
     raw_headers.contains_key("if-match") || raw_headers.contains_key("if-none-match")
 }
 
+/// What body-handling path a write request should take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WriteBodyRoute {
+    /// Normal typed PUT/UploadPart path — the body is forwarded as opaque
+    /// bytes via the SDK.
+    Typed,
+    /// aws-chunked non-trailer streaming upload — decode the framing to a
+    /// disk spool, then forward the decoded body via the SDK.
+    DecodeAwsChunked,
+    /// Pass the raw request through to the upstream byte-for-byte.
+    Passthrough,
+}
+
+/// Granular classification of an aws-chunked upload's mode, derived from the
+/// `x-amz-content-sha256` header. Used to decide between the in-house decode
+/// path (non-trailer) and passthrough (everything else).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AwsChunkedUploadMode {
+    /// `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` — handled by the decoder in PR #1.
+    NonTrailerHmacSha256,
+    /// Any trailer-mode variant (e.g.
+    /// `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`,
+    /// `STREAMING-UNSIGNED-PAYLOAD-TRAILER`). Will be handled in PR #2.
+    Trailer,
+    /// ECDSA-signed streaming. Out of scope for this PR series; goes to
+    /// passthrough.
+    Ecdsa,
+    /// Some other `STREAMING-*` sentinel we don't recognise. Conservative
+    /// fallback: route through passthrough.
+    OtherStreaming,
+}
+
+/// Inspect the inbound headers and classify the aws-chunked upload mode if
+/// one is present. Returns `None` for plain (non-streaming) requests.
+///
+/// IMPORTANT: this inspects the raw inbound `HeaderMap` rather than the
+/// `extra_amz_headers` map produced by `parse_s3_request`, because the parser
+/// strips `x-amz-content-sha256` and `x-amz-decoded-content-length` before
+/// they reach `extra_amz_headers`.
+pub(super) fn classify_aws_chunked_upload(
+    raw_headers: &http::HeaderMap,
+) -> Option<AwsChunkedUploadMode> {
+    // First-pass signal: `Content-Encoding: aws-chunked` (potentially in a
+    // comma list, possibly via multiple header values).
+    let mut content_encoding_has_aws_chunked = false;
+    for value in raw_headers.get_all("content-encoding") {
+        if let Ok(s) = value.to_str() {
+            for tok in s.split(',') {
+                if tok.trim().eq_ignore_ascii_case("aws-chunked") {
+                    content_encoding_has_aws_chunked = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Inspect every `x-amz-content-sha256` value defensively: a client could
+    // send multiple headers (e.g. UNSIGNED-PAYLOAD plus a STREAMING-* one)
+    // to try to slip a streaming sentinel past a single-value check.
+    let mut mode: Option<AwsChunkedUploadMode> = None;
+    for value in raw_headers.get_all("x-amz-content-sha256") {
+        let Ok(s) = value.to_str() else { continue };
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let upper = trimmed.to_ascii_uppercase();
+        let candidate = if upper == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" {
+            Some(AwsChunkedUploadMode::NonTrailerHmacSha256)
+        } else if upper.contains("ECDSA") && upper.starts_with("STREAMING-") {
+            Some(AwsChunkedUploadMode::Ecdsa)
+        } else if upper.ends_with("-TRAILER") && upper.starts_with("STREAMING-") {
+            Some(AwsChunkedUploadMode::Trailer)
+        } else if upper.starts_with("STREAMING-") {
+            Some(AwsChunkedUploadMode::OtherStreaming)
+        } else {
+            None
+        };
+        // Conservative escalation: prefer the most restrictive mode if the
+        // request happens to advertise more than one. Anything but the plain
+        // non-trailer mode routes to passthrough, so once we see Trailer/Ecdsa
+        // we don't downgrade back to NonTrailer.
+        mode = match (mode, candidate) {
+            (None, c) => c,
+            (Some(AwsChunkedUploadMode::NonTrailerHmacSha256), Some(c))
+                if c != AwsChunkedUploadMode::NonTrailerHmacSha256 =>
+            {
+                Some(c)
+            }
+            (existing, _) => existing,
+        };
+    }
+
+    // Trailer headers and decoded-content-length headers are aws-chunked
+    // markers — if they're present but no STREAMING-* sentinel was seen, the
+    // request is malformed but we still route it through passthrough to
+    // preserve historical behaviour. If x-amz-trailer is present we treat
+    // the request as trailer-mode regardless of the sha256 sentinel.
+    if raw_headers.contains_key("x-amz-trailer") {
+        return Some(mode.unwrap_or(AwsChunkedUploadMode::Trailer));
+    }
+    if mode.is_some() {
+        return mode;
+    }
+    if content_encoding_has_aws_chunked || raw_headers.contains_key("x-amz-decoded-content-length")
+    {
+        // No STREAMING-* sentinel observed but aws-chunked framing is
+        // advertised. Treat as something we don't model directly.
+        return Some(AwsChunkedUploadMode::OtherStreaming);
+    }
+    None
+}
+
+/// Pick the body-handling route for a PUT request.
+pub(super) fn classify_put_body_route(
+    extra_amz: &std::collections::HashMap<String, String>,
+    raw_headers: &http::HeaderMap,
+) -> WriteBodyRoute {
+    // HTTP conditional headers (If-Match / If-None-Match) can't be modeled by
+    // the typed write path; passthrough is required to preserve semantics.
+    if has_unsupported_http_conditionals(raw_headers) {
+        return WriteBodyRoute::Passthrough;
+    }
+    // Modifiers the typed path can't carry. Same precedent as the existing
+    // gate: anything here forces passthrough.
+    if extra_amz
+        .keys()
+        .any(|k| WRITE_MODIFYING_BASE.contains(&k.as_str()))
+    {
+        return WriteBodyRoute::Passthrough;
+    }
+    match classify_aws_chunked_upload(raw_headers) {
+        None => WriteBodyRoute::Typed,
+        Some(AwsChunkedUploadMode::NonTrailerHmacSha256) => WriteBodyRoute::DecodeAwsChunked,
+        Some(_) => WriteBodyRoute::Passthrough,
+    }
+}
+
+/// Pick the body-handling route for an UploadPart request. Multipart gating
+/// is stricter than PUT — checksum headers also force passthrough — but the
+/// aws-chunked routing decision is identical.
+pub(super) fn classify_upload_part_body_route(
+    extra_amz: &std::collections::HashMap<String, String>,
+    raw_headers: &http::HeaderMap,
+) -> WriteBodyRoute {
+    if has_unsupported_http_conditionals(raw_headers) {
+        return WriteBodyRoute::Passthrough;
+    }
+    if extra_amz.keys().any(|k| {
+        WRITE_MODIFYING_BASE.contains(&k.as_str())
+            || MULTIPART_CHECKSUM_HEADERS.contains(&k.as_str())
+    }) {
+        return WriteBodyRoute::Passthrough;
+    }
+    match classify_aws_chunked_upload(raw_headers) {
+        None => WriteBodyRoute::Typed,
+        Some(AwsChunkedUploadMode::NonTrailerHmacSha256) => WriteBodyRoute::DecodeAwsChunked,
+        Some(_) => WriteBodyRoute::Passthrough,
+    }
+}
+
 /// Detect SigV4 streaming (aws-chunked) upload indicators on the inbound
-/// request. The typed PUT/UploadPart paths buffer the raw body and forward it
-/// verbatim — they do not decode aws-chunked framing — so chunk-signature
-/// frames would end up stored as object body bytes. Route these through
-/// passthrough instead.
+/// request. Kept for the multipart gates that don't decode aws-chunked yet —
+/// CreateMultipartUpload, CompleteMultipartUpload, AbortMultipartUpload, and
+/// the DeleteObject path. PUT and UploadPart route through
+/// `classify_put_body_route` / `classify_upload_part_body_route` instead.
 ///
 /// IMPORTANT: this inspects the raw inbound `HeaderMap` rather than the
 /// `extra_amz_headers` map produced by `parse_s3_request`, because the parser
 /// strips `x-amz-content-sha256` and `x-amz-decoded-content-length` before
 /// they reach `extra_amz_headers`.
 pub(super) fn has_s3_streaming_upload_indicators(raw_headers: &http::HeaderMap) -> bool {
-    // 1. Content-Encoding may carry aws-chunked as one token in a comma list
-    //    (e.g. `gzip, aws-chunked`), possibly via multiple header values.
-    for value in raw_headers.get_all("content-encoding") {
-        if let Ok(s) = value.to_str() {
-            for tok in s.split(',') {
-                if tok.trim().eq_ignore_ascii_case("aws-chunked") {
-                    return true;
-                }
-            }
-        }
-    }
-
-    // 2. x-amz-content-sha256 set to a STREAMING-* sentinel. Match the
-    //    canonical values defensively via case-insensitive prefix. Iterate
-    //    every header value: a client could send multiple x-amz-content-sha256
-    //    headers (e.g. `UNSIGNED-PAYLOAD` followed by `STREAMING-...`) to slip
-    //    a streaming sentinel past a single-value check.
-    for value in raw_headers.get_all("x-amz-content-sha256") {
-        if let Ok(s) = value.to_str() {
-            let trimmed = s.trim();
-            if trimmed.len() >= "STREAMING-".len()
-                && trimmed[.."STREAMING-".len()].eq_ignore_ascii_case("STREAMING-")
-            {
-                return true;
-            }
-        }
-    }
-
-    // 3/4. Decoded length and trailer headers only appear on aws-chunked
-    //      uploads; presence alone is sufficient signal.
-    raw_headers.contains_key("x-amz-decoded-content-length")
-        || raw_headers.contains_key("x-amz-trailer")
+    classify_aws_chunked_upload(raw_headers).is_some()
 }
 
 /// Gate for PutObject and DeleteObject. Checksum headers are NOT gated here

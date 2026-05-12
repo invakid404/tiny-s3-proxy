@@ -1640,14 +1640,19 @@ async fn test_unsigned_streaming_put_oversized_content_length_rejected_before_ba
     // Hand-rolled HTTP/1.1 PUT:
     //   * declared Content-Length 32 > cap 16 → preflight rejects
     //   * actual body 8 bytes < cap 16        → Limited backstop would NOT fire
-    //   * Content-Encoding: aws-chunked       → routes to passthrough
+    //   * STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER with x-amz-trailer:
+    //     trailer-mode aws-chunked still routes through passthrough (PR #2
+    //     of issue #50 will move trailer-mode into the in-house decoder).
+    //     The non-trailer variant now goes through the decoder, so using
+    //     it here would no longer exercise the passthrough preflight.
     let request = format!(
         "PUT /{TEST_BUCKET}/cold-review/oversized-cl HTTP/1.1\r\n\
          Host: {proxy_host}\r\n\
          Content-Length: 32\r\n\
          Content-Encoding: aws-chunked\r\n\
-         x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD\r\n\
+         x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER\r\n\
          x-amz-decoded-content-length: 8\r\n\
+         x-amz-trailer: x-amz-checksum-crc32\r\n\
          Connection: close\r\n\
          \r\n\
          AAAAAAAA"
@@ -1767,31 +1772,29 @@ async fn test_backend_endpoint_userinfo_rejected_without_leaking_endpoint_parts(
     }
 }
 
-/// Pins issue #48 / PR #49 — aws-chunked PUT must route to passthrough,
-/// not typed PUT.
+/// Pins the routing decision for aws-chunked TRAILER-mode uploads — those
+/// must still go through passthrough because PR #1 of issue #50 only handles
+/// non-trailer mode. PR #2 will add trailer support.
 ///
-/// Signal: `x-amz-decoded-content-length` reaches the upstream. Passthrough
-/// forwards it verbatim; typed PUT strips it during request parsing
-/// (`src/s3/parse.rs`) and forwards only modeled headers via the SDK
-/// (`src/backend/client.rs`). If the combined streaming-upload gate in
-/// `has_s3_streaming_upload_indicators` regressed, this request would go
-/// typed and the captured upstream request would not see the header.
+/// Signal: `x-amz-decoded-content-length` + `x-amz-trailer` reach the upstream.
+/// Passthrough forwards both verbatim; typed PUT strips
+/// `x-amz-decoded-content-length` during request parsing
+/// (`src/s3/parse.rs`) and the decode path would consume the body before
+/// forwarding the framing. Seeing the trailer header at the upstream proves
+/// we routed through passthrough.
 ///
-/// Note: this test won't catch removal of a SINGLE indicator branch (we
-/// send three: Content-Encoding, x-amz-content-sha256: STREAMING-*, and
-/// x-amz-decoded-content-length — any surviving branch still triggers
-/// routing). Per-branch coverage is provided by unit tests in `modifiers.rs`.
+/// Replaces the earlier non-trailer routing test from PR #62 — non-trailer
+/// aws-chunked now goes through the in-house decoder (issue #50 PR #1), so
+/// the routing target has changed. Trailer mode remains on passthrough until
+/// PR #2 lands.
 #[tokio::test]
 #[ignore] // Spawns an in-process mock upstream; Docker not required, but kept
 // `#[ignore]` for parity with the rest of this suite.
-async fn test_aws_chunked_put_routes_to_passthrough_forwards_decoded_content_length() {
+async fn test_aws_chunked_trailer_mode_routes_to_passthrough() {
     let mock = CapturingMockUpstream::new();
     let mock_endpoint = start_capturing_mock_upstream(mock.clone()).await;
 
     let cache_dir = tempfile::TempDir::new().expect("cache dir");
-    // Default TrustedInternal auth; no Authorization header needed. We point
-    // at the capturing mock so the assertion target is what the upstream
-    // actually sees, not what VersityGW might rewrite.
     let (_proxy_client, _http_client, proxy_endpoint, _cache_dir) =
         build_proxy_stack_with_opts(&mock_endpoint, cache_dir, |_cfg| {}).await;
 
@@ -1799,15 +1802,9 @@ async fn test_aws_chunked_put_routes_to_passthrough_forwards_decoded_content_len
         .strip_prefix("http://")
         .expect("proxy endpoint should be http://host:port");
 
-    // aws-chunked body framing: one 8-byte data chunk "abcdefgh" plus the
-    // terminating zero-length chunk, both with a 64-zero chunk-signature.
-    // Each line ends in CRLF (\r\n = 2 bytes). Total length 180 bytes:
-    //   line 1 (size + signature header):  1 + 17 + 64 + 2 = 84
-    //   line 2 (data + CRLF):                       8 + 2 = 10
-    //   line 3 (final 0-size header):      1 + 17 + 64 + 2 = 84
-    //   line 4 (trailing CRLF):                          2 =  2
-    //                                                   ----
-    //                                                    180
+    // Same 180-byte aws-chunked body as the original PR #62 test. The body
+    // shape is only checked for byte-for-byte preservation; the routing
+    // signal is the trailer header below.
     let body: Vec<u8> =
         b"8;chunk-signature=0000000000000000000000000000000000000000000000000000000000000000\r\n\
         abcdefgh\r\n\
@@ -1820,19 +1817,17 @@ async fn test_aws_chunked_put_routes_to_passthrough_forwards_decoded_content_len
         "aws-chunked body must be exactly 180 bytes"
     );
 
-    // Hand-rolled HTTP/1.1 PUT with the streaming-upload indicators that
-    // route to passthrough:
-    //   * Content-Encoding: aws-chunked          → branch 1 of the gate
-    //   * x-amz-content-sha256: STREAMING-*      → branch 2 of the gate
-    //   * x-amz-decoded-content-length: 8        → branch 4 of the gate
-    // We don't include x-amz-trailer because no trailer follows the body.
+    // Trailer-mode indicators force passthrough routing:
+    //   * x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER
+    //   * x-amz-trailer: x-amz-checksum-crc32
     let headers = format!(
-        "PUT /{TEST_BUCKET}/cold-review/aws-chunked-routing HTTP/1.1\r\n\
+        "PUT /{TEST_BUCKET}/cold-review/aws-chunked-trailer-routing HTTP/1.1\r\n\
          Host: {proxy_host}\r\n\
          Content-Length: 180\r\n\
          Content-Encoding: aws-chunked\r\n\
-         x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD\r\n\
+         x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER\r\n\
          x-amz-decoded-content-length: 8\r\n\
+         x-amz-trailer: x-amz-checksum-crc32\r\n\
          Connection: close\r\n\
          \r\n"
     );
@@ -1845,61 +1840,307 @@ async fn test_aws_chunked_put_routes_to_passthrough_forwards_decoded_content_len
         "proxy should return the upstream's 200; got {status}"
     );
 
-    // Routing assertion: passthrough forwards `x-amz-decoded-content-length`
-    // to the upstream; the typed PUT path strips it before forwarding via
-    // the SDK. Seeing the header at the upstream proves we went through
-    // passthrough.
     let captured = mock
         .last_request()
         .await
         .expect("upstream must have received the request");
-    assert_eq!(
-        mock.request_count().await,
-        1,
-        "upstream should receive exactly one request"
-    );
+    assert_eq!(mock.request_count().await, 1);
     assert_eq!(captured.method, http::Method::PUT);
     assert_eq!(
         captured.path,
-        format!("/{TEST_BUCKET}/cold-review/aws-chunked-routing"),
-        "passthrough should forward the path verbatim"
+        format!("/{TEST_BUCKET}/cold-review/aws-chunked-trailer-routing"),
     );
+    // x-amz-trailer reaching the upstream proves passthrough — the typed
+    // path and the decode path both strip this.
+    let trailer = captured
+        .headers
+        .get("x-amz-trailer")
+        .expect(
+            "x-amz-trailer must reach the upstream; if missing, the request \
+             was decoded by the proxy rather than passed through",
+        )
+        .to_str()
+        .unwrap();
+    assert_eq!(trailer, "x-amz-checksum-crc32");
+    // The raw aws-chunked framing must also have reached the upstream
+    // byte-for-byte (passthrough byte preservation).
+    assert_eq!(
+        captured.body.as_slice(),
+        body.as_slice(),
+        "upstream should receive the trailer-framed body byte-for-byte",
+    );
+}
+
+/// ECDSA-signed streaming uploads (`STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD`)
+/// are out of scope for the in-house decoder — they must continue to route
+/// through passthrough. Pins the routing decision so a future change to the
+/// aws-chunked classifier doesn't accidentally swallow ECDSA frames.
+#[tokio::test]
+#[ignore]
+async fn test_aws_chunked_ecdsa_streaming_routes_to_passthrough() {
+    let mock = CapturingMockUpstream::new();
+    let mock_endpoint = start_capturing_mock_upstream(mock.clone()).await;
+    let cache_dir = tempfile::TempDir::new().expect("cache dir");
+    let (_proxy_client, _http_client, proxy_endpoint, _cache_dir) =
+        build_proxy_stack_with_opts(&mock_endpoint, cache_dir, |_cfg| {}).await;
+    let proxy_host = proxy_endpoint.strip_prefix("http://").unwrap();
+
+    // Single-chunk framed body, same shape as the trailer-mode test.
+    let body: Vec<u8> =
+        b"8;chunk-signature=0000000000000000000000000000000000000000000000000000000000000000\r\n\
+        abcdefgh\r\n\
+        0;chunk-signature=0000000000000000000000000000000000000000000000000000000000000000\r\n\
+        \r\n"
+            .to_vec();
+    let headers = format!(
+        "PUT /{TEST_BUCKET}/cold-review/aws-chunked-ecdsa-routing HTTP/1.1\r\n\
+         Host: {proxy_host}\r\n\
+         Content-Length: {body_len}\r\n\
+         Content-Encoding: aws-chunked\r\n\
+         x-amz-content-sha256: STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD\r\n\
+         x-amz-decoded-content-length: 8\r\n\
+         Connection: close\r\n\
+         \r\n",
+        body_len = body.len(),
+    );
+    let mut request_bytes = headers.into_bytes();
+    request_bytes.extend_from_slice(&body);
+    let (status, _raw_response) = raw_tcp_request(proxy_host, &request_bytes).await;
+    assert_eq!(status, 200);
+    let captured = mock
+        .last_request()
+        .await
+        .expect("upstream must have received the request");
+    assert_eq!(mock.request_count().await, 1);
+    // Body must reach upstream byte-for-byte — proves passthrough (the
+    // decode path would strip the chunk-signature framing). Note that
+    // passthrough re-signs the outbound request, so we can't rely on
+    // `x-amz-content-sha256` reaching the upstream as-is — the byte
+    // preservation check above is the load-bearing routing signal.
+    assert_eq!(captured.body.as_slice(), body.as_slice());
+    // x-amz-decoded-content-length is preserved by passthrough but the
+    // decode path strips it before forwarding. Use that as a positive
+    // routing signal alongside the body-byte check.
     let decoded_cl = captured
         .headers
         .get("x-amz-decoded-content-length")
         .expect(
-            "x-amz-decoded-content-length must reach the upstream; \
-             if missing, the request was routed to the typed PUT path",
+            "x-amz-decoded-content-length must reach the upstream; if missing, \
+             the request was decoded by the proxy rather than passed through",
         )
         .to_str()
         .unwrap();
     assert_eq!(decoded_cl, "8");
+}
 
-    // Belt-and-braces: aws-chunked body framing was forwarded too, so the
-    // upstream sees the same Content-Encoding the client sent. (Typed PUT
-    // does propagate Content-Encoding via `content_headers`, so this alone
-    // is not a routing signal — the decoded-content-length header above is.
-    // We assert it here only to confirm the framing reached the upstream.)
-    let ce = captured
-        .headers
-        .get("content-encoding")
-        .expect("content-encoding should reach upstream")
-        .to_str()
-        .unwrap();
-    assert!(
-        ce.split(',')
-            .any(|t| t.trim().eq_ignore_ascii_case("aws-chunked")),
-        "content-encoding should include aws-chunked; got: {ce}"
+/// A non-trailer aws-chunked PUT whose `x-amz-decoded-content-length` exceeds
+/// the configured `max_request_body_bytes` must be rejected with
+/// `EntityTooLarge` (HTTP 400) **before** the proxy contacts the backend —
+/// no spool file should leak under `<cache_dir>/tmp/`.
+#[tokio::test]
+#[ignore]
+async fn test_aws_chunked_decoded_length_exceeds_max_returns_entity_too_large() {
+    let mock = CountingMockUpstream::new();
+    let mock_endpoint = start_counting_mock_upstream(mock.clone()).await;
+    let cache_dir_holder = tempfile::TempDir::new().expect("cache dir");
+    let cache_dir_path = cache_dir_holder.path().to_path_buf();
+    let (_proxy_client, _http_client, proxy_endpoint, _cache_dir) =
+        build_proxy_stack_with_opts(&mock_endpoint, cache_dir_holder, |cfg| {
+            cfg.max_request_body_bytes = 4;
+        })
+        .await;
+    let proxy_host = proxy_endpoint.strip_prefix("http://").unwrap();
+
+    // Declared 8 > cap 4. Body bytes don't matter — the handler rejects on
+    // the header alone.
+    let body =
+        b"8;chunk-signature=0000000000000000000000000000000000000000000000000000000000000000\r\n\
+        abcdefgh\r\n\
+        0;chunk-signature=0000000000000000000000000000000000000000000000000000000000000000\r\n\
+        \r\n";
+    let headers = format!(
+        "PUT /{TEST_BUCKET}/oversized-decoded HTTP/1.1\r\n\
+         Host: {proxy_host}\r\n\
+         Content-Length: {}\r\n\
+         Content-Encoding: aws-chunked\r\n\
+         x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD\r\n\
+         x-amz-decoded-content-length: 8\r\n\
+         Connection: close\r\n\
+         \r\n",
+        body.len(),
     );
+    let mut request = headers.into_bytes();
+    request.extend_from_slice(body);
 
-    // Sanity (not a routing signal): on the passthrough path we expect the
-    // raw aws-chunked framing to reach the upstream byte-for-byte. The
-    // load-bearing routing signal is the `x-amz-decoded-content-length`
-    // header asserted above; this body-length check is just a passthrough
-    // byte-preservation sanity check.
+    let (status, raw_response) = raw_tcp_request(proxy_host, &request).await;
     assert_eq!(
-        captured.body.as_slice(),
-        body.as_slice(),
-        "upstream should receive the full 180-byte aws-chunked body byte-for-byte"
+        status, 400,
+        "oversized aws-chunked decoded length must be rejected with 400"
+    );
+    let resp_text = String::from_utf8_lossy(&raw_response);
+    assert!(
+        resp_text.contains("EntityTooLarge"),
+        "expected EntityTooLarge error body, got: {resp_text}",
+    );
+    assert_eq!(
+        mock.received_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "upstream must not be contacted when the decoded length cap is exceeded",
+    );
+    // No spool file should have been planted.
+    let tmp = cache_dir_path.join("tmp");
+    if tmp.exists() {
+        let mut entries = tokio::fs::read_dir(&tmp).await.unwrap();
+        while let Some(e) = entries.next_entry().await.unwrap() {
+            let name = e.file_name();
+            assert!(
+                !name.to_string_lossy().ends_with(".upload-spool.tmp"),
+                "no spool file should exist on rejected oversized request, found {name:?}",
+            );
+        }
+    }
+}
+
+/// Malformed aws-chunked framing (truncated chunk data) must produce an
+/// `IncompleteBody` 400 with no backend contact and no spool leak. Catches
+/// regressions in the decoder error → S3 error mapping.
+#[tokio::test]
+#[ignore]
+async fn test_aws_chunked_malformed_frame_returns_error_without_backend_contact() {
+    let mock = CountingMockUpstream::new();
+    let mock_endpoint = start_counting_mock_upstream(mock.clone()).await;
+    let cache_dir_holder = tempfile::TempDir::new().expect("cache dir");
+    let cache_dir_path = cache_dir_holder.path().to_path_buf();
+    let (_proxy_client, _http_client, proxy_endpoint, _cache_dir) =
+        build_proxy_stack_with_opts(&mock_endpoint, cache_dir_holder, |_cfg| {}).await;
+    let proxy_host = proxy_endpoint.strip_prefix("http://").unwrap();
+
+    // Header claims 8 bytes of payload, body has 3 then EOF — Truncated.
+    let body: &[u8] =
+        b"8;chunk-signature=0000000000000000000000000000000000000000000000000000000000000000\r\nabc";
+    let headers = format!(
+        "PUT /{TEST_BUCKET}/malformed HTTP/1.1\r\n\
+         Host: {proxy_host}\r\n\
+         Content-Length: {}\r\n\
+         Content-Encoding: aws-chunked\r\n\
+         x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD\r\n\
+         x-amz-decoded-content-length: 8\r\n\
+         Connection: close\r\n\
+         \r\n",
+        body.len(),
+    );
+    let mut request = headers.into_bytes();
+    request.extend_from_slice(body);
+
+    let (status, raw_response) = raw_tcp_request(proxy_host, &request).await;
+    assert_eq!(status, 400);
+    let resp_text = String::from_utf8_lossy(&raw_response);
+    assert!(
+        resp_text.contains("IncompleteBody"),
+        "expected IncompleteBody, got: {resp_text}",
+    );
+    assert_eq!(
+        mock.received_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "upstream must not be contacted on a malformed aws-chunked body",
+    );
+    // Spool file should be cleaned up by Drop after decode error.
+    let tmp = cache_dir_path.join("tmp");
+    if tmp.exists() {
+        let mut entries = tokio::fs::read_dir(&tmp).await.unwrap();
+        while let Some(e) = entries.next_entry().await.unwrap() {
+            let name = e.file_name();
+            assert!(
+                !name.to_string_lossy().ends_with(".upload-spool.tmp"),
+                "spool must be cleaned up after decode error, found {name:?}",
+            );
+        }
+    }
+}
+
+/// The runtime HTTPS guard in `S3Backend::put_object_from_path` must fire
+/// when the decode path tries to upload over an `http://` backend. The
+/// startup config validation is the primary defence; this guard is the
+/// runtime backstop. Result: HTTP 500 InternalError, no backend contact.
+#[tokio::test]
+#[ignore]
+async fn test_aws_chunked_decode_path_rejects_http_backend_via_runtime_guard() {
+    let mock = CountingMockUpstream::new();
+    let mock_endpoint = start_counting_mock_upstream(mock.clone()).await;
+    let cache_dir = tempfile::TempDir::new().expect("cache dir");
+    let (_proxy_client, _http_client, proxy_endpoint, _cache_dir) =
+        build_proxy_stack_with_opts(&mock_endpoint, cache_dir, |_cfg| {}).await;
+    let proxy_host = proxy_endpoint.strip_prefix("http://").unwrap();
+
+    // Well-formed single-chunk frame for `abcdefgh`.
+    let body =
+        b"8;chunk-signature=0000000000000000000000000000000000000000000000000000000000000000\r\n\
+        abcdefgh\r\n\
+        0;chunk-signature=0000000000000000000000000000000000000000000000000000000000000000\r\n\
+        \r\n";
+    let headers = format!(
+        "PUT /{TEST_BUCKET}/decode-over-http HTTP/1.1\r\n\
+         Host: {proxy_host}\r\n\
+         Content-Length: {}\r\n\
+         Content-Encoding: aws-chunked\r\n\
+         x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD\r\n\
+         x-amz-decoded-content-length: 8\r\n\
+         Connection: close\r\n\
+         \r\n",
+        body.len(),
+    );
+    let mut request = headers.into_bytes();
+    request.extend_from_slice(body);
+    let (status, raw_response) = raw_tcp_request(proxy_host, &request).await;
+    // ProxyError::Cache maps to 500 InternalError via S3Error::from_proxy_error.
+    assert_eq!(
+        status, 500,
+        "HTTPS guard must reject http:// backend with InternalError",
+    );
+    let resp_text = String::from_utf8_lossy(&raw_response);
+    assert!(
+        resp_text.contains("InternalError"),
+        "expected InternalError, got: {resp_text}",
+    );
+    // Upstream must not have been contacted.
+    assert_eq!(
+        mock.received_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "upstream must not be contacted when the HTTPS guard rejects",
+    );
+}
+
+/// Abandoned upload-spool files (`{pid}-{counter}.upload-spool.tmp`) planted
+/// before startup must be cleaned up by the tmp sweep. Mirrors the existing
+/// startup-sweep coverage in `src/cache/tmp_sweep.rs` but exercises the
+/// pattern end-to-end through `DiskCache::new`.
+#[tokio::test]
+#[ignore]
+async fn test_tmp_sweep_removes_abandoned_upload_spool_files() {
+    let mock = CountingMockUpstream::new();
+    let mock_endpoint = start_counting_mock_upstream(mock.clone()).await;
+
+    let cache_dir = tempfile::TempDir::new().expect("cache dir");
+    let tmp_dir = cache_dir.path().join("tmp");
+    tokio::fs::create_dir_all(&tmp_dir).await.unwrap();
+    let abandoned = tmp_dir.join("12345-7.upload-spool.tmp");
+    tokio::fs::write(&abandoned, b"abandoned spool body")
+        .await
+        .unwrap();
+    assert!(abandoned.exists());
+
+    // build_proxy_stack_with_opts -> DiskCache::new -> tmp sweep runs at
+    // startup. After it returns, abandoned files of the allowlisted shape
+    // must be gone.
+    let (_proxy_client, _http_client, _proxy_endpoint, _cache_dir) =
+        build_proxy_stack_with_opts(&mock_endpoint, cache_dir, |_cfg| {}).await;
+
+    assert!(
+        !abandoned.exists(),
+        "tmp sweep should have removed the abandoned upload-spool file at {}",
+        abandoned.display(),
     );
 }
