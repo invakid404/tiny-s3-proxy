@@ -258,7 +258,7 @@ async fn decode_into_spool<B: Backend, C: CacheStore>(
 ) -> Result<(UploadSpoolGuard, u64, String), S3Error> {
     use futures_compat::body_to_io_stream;
 
-    let (mut guard, file) = UploadSpoolGuard::create(&state.config.cache_dir)
+    let (guard, file) = UploadSpoolGuard::create(&state.config.cache_dir)
         .await
         .map_err(|e| {
             S3Error::internal_error(
@@ -285,8 +285,6 @@ async fn decode_into_spool<B: Backend, C: CacheStore>(
     let file = writer.into_inner();
     drop(file);
 
-    // Hand `guard` back to the caller; arm stays true so cleanup() runs.
-    let _ = &mut guard;
     Ok((guard, summary.decoded_len, summary.sha256_hex))
 }
 
@@ -298,22 +296,23 @@ mod futures_compat {
     use std::task::{Context, Poll};
     use tokio_stream::Stream;
 
-    /// Adapt an axum `Body` data stream to a
-    /// `Stream<Item = Result<Bytes, io::Error>>`, the input shape
-    /// `tokio_util::io::StreamReader` expects. We don't depend on
-    /// `futures-util`, so this is a hand-rolled error-mapping wrapper.
-    struct IoErrorMap {
-        inner: http_body_util::BodyDataStream<Body>,
+    // Adapt an axum `Body` data stream to a
+    // `Stream<Item = Result<Bytes, io::Error>>`, the input shape
+    // `tokio_util::io::StreamReader` expects. We don't depend on
+    // `futures-util`, so this is a hand-rolled error-mapping wrapper.
+    pin_project_lite::pin_project! {
+        struct IoErrorMap {
+            #[pin]
+            inner: http_body_util::BodyDataStream<Body>,
+        }
     }
 
     impl Stream for IoErrorMap {
         type Item = Result<Bytes, std::io::Error>;
 
         fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            // Safety: we never move `self`; `inner` is structurally pinned.
-            let this = unsafe { self.get_unchecked_mut() };
-            let pinned = unsafe { Pin::new_unchecked(&mut this.inner) };
-            match pinned.poll_next(cx) {
+            let this = self.project();
+            match this.inner.poll_next(cx) {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(None) => Poll::Ready(None),
                 Poll::Ready(Some(Ok(bytes))) => Poll::Ready(Some(Ok(bytes))),
