@@ -154,8 +154,9 @@ fn content_headers_for_decoded(
 
 /// Map an `AwsChunkedError` to the matching `S3Error`. Framing errors all
 /// surface as `IncompleteBody` (HTTP 400) except the chunk-size minimum,
-/// which gets its own `InvalidChunkSizeError`. I/O errors surface as
-/// `InternalError` (HTTP 500).
+/// which gets its own `InvalidChunkSizeError`. I/O is split by cause:
+/// inbound stream errors are client-caused → 400 `IncompleteBody`; spool
+/// write errors are server-caused → 500 `InternalError`.
 fn map_decode_error(err: AwsChunkedError, request_id: &str) -> S3Error {
     match err {
         AwsChunkedError::InvalidChunkSize { .. } => {

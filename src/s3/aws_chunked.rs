@@ -663,8 +663,12 @@ mod tests {
             }
         }
 
-        // Emit ~8 KiB total in 4 batches, no newline. With a working bound
-        // check, we must error out before the 5th batch could even be read.
+        // Emit ~8 KiB total in 5 batches, no newline. The load-bearing
+        // guarantee: the decoder must reject before extending its buffer
+        // past `MAX_CHUNK_HEADER_LINE_BYTES`, regardless of how the bytes
+        // are paced. We size each batch as a quarter of the cap so the
+        // cap fires partway through this stream rather than after the
+        // entire 8 KiB has been buffered.
         let reader = DripReader {
             chunk_bytes: MAX_CHUNK_HEADER_LINE_BYTES / 4,
             chunks_remaining: 5,
