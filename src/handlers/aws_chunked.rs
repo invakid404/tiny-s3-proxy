@@ -181,6 +181,43 @@ fn content_headers_for_decoded(
     out
 }
 
+/// Reject x-amz-* headers that only make sense on the aws-chunked wire
+/// format and would be wrong on the decoded backend request.
+///
+/// `x-amz-trailer` is the load-bearing case: `parse.rs` currently strips
+/// `x-amz-date`, `x-amz-content-sha256`, and `x-amz-decoded-content-length`
+/// before they reach `extra_amz_headers` but NOT `x-amz-trailer`. The
+/// trailer-precedence dispatch fix already routes trailer requests to
+/// passthrough, so production is safe — this is a belt-and-braces filter
+/// at the construction site for the decoded request.
+fn is_streaming_only_amz_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("x-amz-content-sha256")
+        || name.eq_ignore_ascii_case("x-amz-decoded-content-length")
+        || name.eq_ignore_ascii_case("x-amz-trailer")
+}
+
+/// Defense-in-depth filter for the `extra_amz_headers` map handed to the
+/// decoded backend request. Drops streaming-only x-amz-* headers that
+/// would be wrong on a normal PUT/UploadPart (see
+/// `is_streaming_only_amz_header`). Production is gated by the dispatch
+/// routing — trailer-mode goes to passthrough — but this filter ensures
+/// that even if dispatch or `parse.rs` regresses, the decoded backend
+/// inputs stay clean.
+///
+/// `x-amz-checksum-*` headers are explicitly NOT filtered: those are
+/// legitimate non-streaming S3 checksum advertisements that the decoded
+/// PutObject path must forward intact.
+fn extra_amz_headers_for_decoded(
+    parsed: &ParsedRequest,
+) -> std::collections::HashMap<String, String> {
+    parsed
+        .extra_amz_headers
+        .iter()
+        .filter(|(k, _)| !is_streaming_only_amz_header(k))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
 /// Map an `AwsChunkedError` to the matching `S3Error`. Framing errors all
 /// surface as `IncompleteBody` (HTTP 400) except the chunk-size minimum,
 /// which gets its own `InvalidChunkSizeError`. I/O is split by cause:
@@ -350,7 +387,7 @@ pub async fn handle_put_decode_aws_chunked<B: Backend, C: CacheStore>(
         content_type: parsed.content_type.clone(),
         content_md5: parsed.content_md5.clone(),
         metadata: parsed.user_metadata.clone(),
-        extra_amz_headers: parsed.extra_amz_headers.clone(),
+        extra_amz_headers: extra_amz_headers_for_decoded(parsed),
         content_headers: content_headers_for_decoded(parsed),
     };
 
@@ -459,7 +496,7 @@ pub async fn handle_upload_part_decode_aws_chunked<B: Backend, C: CacheStore>(
         len: decoded_len,
         sha256_hex,
         content_md5: parsed.content_md5.clone(),
-        extra_amz_headers: parsed.extra_amz_headers.clone(),
+        extra_amz_headers: extra_amz_headers_for_decoded(parsed),
     };
 
     let result = state.backend.upload_part_from_path(input).await;
@@ -1017,5 +1054,67 @@ mod tests {
         let s3err = map_decode_error(err, "req-test");
         assert_eq!(s3err.code, "InternalError");
         assert_eq!(s3err.http_status, http::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // ---- extra_amz_headers_for_decoded: streaming-only header filter ----
+
+    /// Defense-in-depth filter must drop `x-amz-content-sha256`,
+    /// `x-amz-decoded-content-length`, and `x-amz-trailer` from the
+    /// decoded request's `extra_amz_headers` map. Non-streaming x-amz-*
+    /// headers (checksums, SSE, …) must survive — these are legitimate
+    /// on a normal PUT.
+    #[test]
+    fn test_extra_amz_headers_for_decoded_strips_streaming_only_headers() {
+        let mut parsed = make_parsed("k");
+        parsed.extra_amz_headers.insert(
+            "x-amz-content-sha256".into(),
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".into(),
+        );
+        parsed
+            .extra_amz_headers
+            .insert("x-amz-decoded-content-length".into(), "8".into());
+        parsed
+            .extra_amz_headers
+            .insert("x-amz-trailer".into(), "x-amz-checksum-crc32".into());
+        // Should be preserved.
+        parsed
+            .extra_amz_headers
+            .insert("x-amz-checksum-crc32".into(), "abc=".into());
+        parsed
+            .extra_amz_headers
+            .insert("x-amz-server-side-encryption".into(), "AES256".into());
+
+        let filtered = extra_amz_headers_for_decoded(&parsed);
+        assert!(!filtered.contains_key("x-amz-content-sha256"));
+        assert!(!filtered.contains_key("x-amz-decoded-content-length"));
+        assert!(
+            !filtered.contains_key("x-amz-trailer"),
+            "x-amz-trailer must be filtered — parse.rs doesn't strip it",
+        );
+        assert_eq!(
+            filtered.get("x-amz-checksum-crc32").map(String::as_str),
+            Some("abc="),
+            "non-streaming checksum headers must be preserved",
+        );
+        assert_eq!(
+            filtered
+                .get("x-amz-server-side-encryption")
+                .map(String::as_str),
+            Some("AES256"),
+            "non-streaming SSE headers must be preserved",
+        );
+    }
+
+    /// HTTP header names are case-insensitive. The classifier must match
+    /// regardless of how the parser cased the key in `extra_amz_headers`.
+    #[test]
+    fn test_is_streaming_only_amz_header_case_insensitive() {
+        assert!(is_streaming_only_amz_header("X-Amz-Trailer"));
+        assert!(is_streaming_only_amz_header("x-AMZ-Decoded-Content-Length"));
+        assert!(is_streaming_only_amz_header("X-AMZ-CONTENT-SHA256"));
+        assert!(!is_streaming_only_amz_header("x-amz-checksum-crc32"));
+        assert!(!is_streaming_only_amz_header(
+            "x-amz-server-side-encryption"
+        ));
     }
 }
