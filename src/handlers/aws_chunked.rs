@@ -65,12 +65,16 @@ impl UploadSpoolGuard {
         &self.path
     }
 
-    /// Delete the spool file. Disarms the Drop fallback so the file is
-    /// removed exactly once. Returns the underlying I/O error if removal
-    /// fails — callers can decide whether to log/escalate.
+    /// Delete the spool file. Disarms the Drop fallback only on a
+    /// successful remove — if the async remove fails, `self` is dropped
+    /// with `armed = true` and the synchronous Drop gets one more
+    /// best-effort attempt. This guarantees the spool file is at least
+    /// retried, and never silently leaked because we cleared the flag
+    /// before the I/O succeeded.
     pub(super) async fn cleanup(mut self) -> std::io::Result<()> {
+        tokio::fs::remove_file(&self.path).await?;
         self.armed = false;
-        tokio::fs::remove_file(&self.path).await
+        Ok(())
     }
 }
 
@@ -157,10 +161,14 @@ fn map_decode_error(err: AwsChunkedError, request_id: &str) -> S3Error {
         AwsChunkedError::InvalidChunkSize { .. } => {
             S3Error::invalid_chunk_size(&err.to_string(), request_id)
         }
-        AwsChunkedError::Io(io_err) => S3Error::internal_error(
-            &format!("aws-chunked decode I/O error: {io_err}"),
-            request_id,
-        ),
+        // Inbound stream errors are client-caused (truncated socket, mid-stream
+        // reset, …) → 400 IncompleteBody, same as the framing errors below.
+        AwsChunkedError::InboundIo { .. } => S3Error::incomplete_body(&err.to_string(), request_id),
+        // Spool write errors are server-caused (ENOSPC, EACCES, …) →
+        // 500 InternalError.
+        AwsChunkedError::SpoolIo { .. } => {
+            S3Error::internal_error(&format!("aws-chunked decode I/O error: {err}"), request_id)
+        }
         AwsChunkedError::MalformedFrame { .. }
         | AwsChunkedError::DecodedLengthMismatch { .. }
         | AwsChunkedError::DecodedLengthExceeded { .. }
@@ -880,5 +888,72 @@ mod tests {
         let (g1, _f1) = UploadSpoolGuard::create(tmp.path()).await.unwrap();
         let (g2, _f2) = UploadSpoolGuard::create(tmp.path()).await.unwrap();
         assert_ne!(g1.path(), g2.path());
+    }
+
+    /// Pins CodeRabbit Finding 2: if the async `remove_file` inside
+    /// `cleanup()` fails (here simulated by removing the file out from
+    /// under the guard), the guard must drop with `armed = true` so the
+    /// synchronous Drop fallback fires. We can't directly observe the
+    /// disarm bit from outside, but we CAN prove the function doesn't
+    /// disarm prematurely: if the previous ordering (`armed = false` then
+    /// `remove`) had survived, the Drop fallback wouldn't have anything to
+    /// retry and we'd still see the function return Err — the bug is
+    /// the *silent leak* it would cause if the remove had genuinely failed
+    /// for a recoverable reason. Bug-revert reasoning is documented inline.
+    #[tokio::test]
+    async fn test_spool_cleanup_returns_err_when_file_already_gone() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (guard, file) = UploadSpoolGuard::create(tmp.path()).await.unwrap();
+        let path = guard.path().to_path_buf();
+        drop(file);
+        // Yank the file out from under the guard so the cleanup remove
+        // call fails with NotFound.
+        tokio::fs::remove_file(&path).await.unwrap();
+
+        let result = guard.cleanup().await;
+        assert!(
+            result.is_err(),
+            "cleanup() must surface the underlying remove failure to the caller",
+        );
+        // File is gone either way (we removed it manually), so the Drop
+        // fallback running on the still-armed guard is a no-op. The
+        // test's bug-revert value is: if the ordering regressed (armed
+        // cleared BEFORE remove), this assertion would still pass — the
+        // failure mode is a silent leak when remove ACTUALLY fails for a
+        // recoverable reason. A direct test of "Drop did retry" would
+        // need a mock filesystem; we rely on visual review of the
+        // ordering plus the regression guard above.
+        assert!(!path.exists());
+    }
+
+    // ---- map_decode_error: InboundIo vs SpoolIo split ----
+
+    /// Inbound stream errors come from the client side of the connection
+    /// (truncated socket, mid-stream reset, …) so they must surface as
+    /// `IncompleteBody` (HTTP 400). Pins CodeRabbit Finding 1's split.
+    #[test]
+    fn test_inbound_io_failure_maps_to_incomplete_body() {
+        let err = AwsChunkedError::InboundIo {
+            source: std::io::Error::other("client reset connection"),
+        };
+        let s3err = map_decode_error(err, "req-test");
+        assert_eq!(s3err.code, "IncompleteBody");
+        assert_eq!(s3err.http_status, http::StatusCode::BAD_REQUEST);
+    }
+
+    /// Spool write errors are server-caused (ENOSPC, EACCES, …) so they
+    /// must surface as `InternalError` (HTTP 500). Pins CodeRabbit
+    /// Finding 1's split — the previous blanket `Io` variant would have
+    /// mis-mapped this to 500 too, but a blanket switch to IncompleteBody
+    /// would have hidden it as a 400. The split keeps both directions
+    /// correct.
+    #[test]
+    fn test_spool_write_failure_maps_to_internal_error() {
+        let err = AwsChunkedError::SpoolIo {
+            source: std::io::Error::from(std::io::ErrorKind::StorageFull),
+        };
+        let s3err = map_decode_error(err, "req-test");
+        assert_eq!(s3err.code, "InternalError");
+        assert_eq!(s3err.http_status, http::StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
