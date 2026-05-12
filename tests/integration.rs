@@ -1892,11 +1892,11 @@ async fn test_aws_chunked_put_routes_to_passthrough_forwards_decoded_content_len
         "content-encoding should include aws-chunked; got: {ce}"
     );
 
-    // Sanity: upstream received the full chunked body bytes (not the typed
-    // PUT path, which would have buffered & decoded — but the typed PUT
-    // path doesn't decode aws-chunked, so it would store the framing as
-    // object bytes. Either way, on the passthrough path we expect the raw
-    // framing to reach the upstream byte-for-byte.)
+    // Sanity (not a routing signal): on the passthrough path we expect the
+    // raw aws-chunked framing to reach the upstream byte-for-byte. The
+    // load-bearing routing signal is the `x-amz-decoded-content-length`
+    // header asserted above; this body-length check is just a passthrough
+    // byte-preservation sanity check.
     assert_eq!(
         captured.body.len(),
         180,
