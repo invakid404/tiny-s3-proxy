@@ -464,6 +464,108 @@ async fn start_counting_mock_upstream(mock: Arc<CountingMockUpstream>) -> String
     format!("http://{}", addr)
 }
 
+/// A single request captured by `CapturingMockUpstream`. Records the inbound
+/// HTTP shape we need to assert routing — method, the path the proxy chose
+/// when constructing the upstream URL, the forwarded header set, and the
+/// fully-drained body bytes.
+#[derive(Clone)]
+struct CapturedRequest {
+    method: http::Method,
+    path: String,
+    headers: http::HeaderMap,
+    body: Vec<u8>,
+}
+
+/// Capturing mock upstream for routing assertions. Unlike
+/// `CountingMockUpstream` (which intentionally doesn't read the body so it
+/// can prove "upstream was never contacted"), this mock fully drains the
+/// body and stores the entire request shape so the test can assert on
+/// individual headers reaching the upstream. The 200 response carries a
+/// plausible `ETag` so that a regression which routed the request to the
+/// typed PUT path would still parse the upstream response cleanly — the
+/// test then fails on the routing-signal assertion, not on a response-shape
+/// error that would obscure the actual signal.
+struct CapturingMockUpstream {
+    requests: tokio::sync::Mutex<Vec<CapturedRequest>>,
+}
+
+impl CapturingMockUpstream {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            requests: tokio::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    async fn last_request(&self) -> Option<CapturedRequest> {
+        self.requests.lock().await.last().cloned()
+    }
+
+    async fn request_count(&self) -> usize {
+        self.requests.lock().await.len()
+    }
+}
+
+/// Spawn the capturing mock upstream and return its `http://host:port` URL.
+/// The returned `Arc<CapturingMockUpstream>` lets the caller assert on the
+/// recorded request after sending one through the proxy.
+async fn start_capturing_mock_upstream(mock: Arc<CapturingMockUpstream>) -> String {
+    use axum::routing::any;
+
+    async fn handle(
+        mock: Arc<CapturingMockUpstream>,
+        req: http::Request<axum::body::Body>,
+    ) -> http::Response<axum::body::Body> {
+        let method = req.method().clone();
+        let path = req.uri().path().to_string();
+        let headers = req.headers().clone();
+        let body_bytes = axum::body::to_bytes(req.into_body(), 16 * 1024 * 1024)
+            .await
+            .unwrap_or_default();
+        mock.requests.lock().await.push(CapturedRequest {
+            method,
+            path,
+            headers,
+            body: body_bytes.to_vec(),
+        });
+        http::Response::builder()
+            .status(200)
+            .header("ETag", "\"mock-etag\"")
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    let app = axum::Router::new()
+        .route(
+            "/{*path}",
+            any({
+                let mock = mock.clone();
+                move |req: http::Request<axum::body::Body>| {
+                    let mock = mock.clone();
+                    async move { handle(mock, req).await }
+                }
+            }),
+        )
+        .route(
+            "/",
+            any({
+                let mock = mock.clone();
+                move |req: http::Request<axum::body::Body>| {
+                    let mock = mock.clone();
+                    async move { handle(mock, req).await }
+                }
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("capturing mock upstream bind");
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{}", addr)
+}
+
 async fn wait_for_head_cache_status(
     http_client: &reqwest::Client,
     proxy_endpoint: &str,
@@ -1285,7 +1387,8 @@ async fn test_allowlist_mode_rejects_unknown_key() {
 
 // ---------------------------------------------------------------------------
 // Cold-review regression coverage (issue #48) — backfills end-to-end coverage
-// for the production fixes shipped in PRs #43, #44, #45, #46, #47, and #49.
+// for the production fixes shipped in PRs #52 (issue #44), #54 (issue #43),
+// #57 (issue #46), #58 (issue #47), #60 (issue #45), and #49 (issue #40).
 // ---------------------------------------------------------------------------
 
 /// Backfills coverage for PR #57 (issue #46): the LIST modifier gate must
@@ -1662,4 +1765,141 @@ async fn test_backend_endpoint_userinfo_rejected_without_leaking_endpoint_parts(
             "stderr must not leak `{forbidden}` from the rejected BACKEND_ENDPOINT; got:\n{stderr}"
         );
     }
+}
+
+/// Pins issue #48 / PR #49 — aws-chunked PUT must route to passthrough,
+/// not typed PUT.
+///
+/// Signal: `x-amz-decoded-content-length` reaches the upstream. Passthrough
+/// forwards it verbatim; typed PUT strips it during request parsing
+/// (`src/s3/parse.rs`) and forwards only modeled headers via the SDK
+/// (`src/backend/client.rs`). If the combined streaming-upload gate in
+/// `has_s3_streaming_upload_indicators` regressed, this request would go
+/// typed and the captured upstream request would not see the header.
+///
+/// Note: this test won't catch removal of a SINGLE indicator branch (we
+/// send three: Content-Encoding, x-amz-content-sha256: STREAMING-*, and
+/// x-amz-decoded-content-length — any surviving branch still triggers
+/// routing). Per-branch coverage is provided by unit tests in `modifiers.rs`.
+#[tokio::test]
+#[ignore] // Spawns an in-process mock upstream; Docker not required, but kept
+// `#[ignore]` for parity with the rest of this suite.
+async fn test_aws_chunked_put_routes_to_passthrough_forwards_decoded_content_length() {
+    let mock = CapturingMockUpstream::new();
+    let mock_endpoint = start_capturing_mock_upstream(mock.clone()).await;
+
+    let cache_dir = tempfile::TempDir::new().expect("cache dir");
+    // Default TrustedInternal auth; no Authorization header needed. We point
+    // at the capturing mock so the assertion target is what the upstream
+    // actually sees, not what VersityGW might rewrite.
+    let (_proxy_client, _http_client, proxy_endpoint, _cache_dir) =
+        build_proxy_stack_with_opts(&mock_endpoint, cache_dir, |_cfg| {}).await;
+
+    let proxy_host = proxy_endpoint
+        .strip_prefix("http://")
+        .expect("proxy endpoint should be http://host:port");
+
+    // aws-chunked body framing: one 8-byte data chunk "abcdefgh" plus the
+    // terminating zero-length chunk, both with a 64-zero chunk-signature.
+    // Each line ends in CRLF (\r\n = 2 bytes). Total length 180 bytes:
+    //   line 1 (size + signature header):  1 + 17 + 64 + 2 = 84
+    //   line 2 (data + CRLF):                       8 + 2 = 10
+    //   line 3 (final 0-size header):      1 + 17 + 64 + 2 = 84
+    //   line 4 (trailing CRLF):                          2 =  2
+    //                                                   ----
+    //                                                    180
+    let body: Vec<u8> =
+        b"8;chunk-signature=0000000000000000000000000000000000000000000000000000000000000000\r\n\
+        abcdefgh\r\n\
+        0;chunk-signature=0000000000000000000000000000000000000000000000000000000000000000\r\n\
+        \r\n"
+            .to_vec();
+    assert_eq!(
+        body.len(),
+        180,
+        "aws-chunked body must be exactly 180 bytes"
+    );
+
+    // Hand-rolled HTTP/1.1 PUT with the streaming-upload indicators that
+    // route to passthrough:
+    //   * Content-Encoding: aws-chunked          → branch 1 of the gate
+    //   * x-amz-content-sha256: STREAMING-*      → branch 2 of the gate
+    //   * x-amz-decoded-content-length: 8        → branch 4 of the gate
+    // We don't include x-amz-trailer because no trailer follows the body.
+    let headers = format!(
+        "PUT /{TEST_BUCKET}/cold-review/aws-chunked-routing HTTP/1.1\r\n\
+         Host: {proxy_host}\r\n\
+         Content-Length: 180\r\n\
+         Content-Encoding: aws-chunked\r\n\
+         x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD\r\n\
+         x-amz-decoded-content-length: 8\r\n\
+         Connection: close\r\n\
+         \r\n"
+    );
+    let mut request_bytes = headers.into_bytes();
+    request_bytes.extend_from_slice(&body);
+
+    let (status, _raw_response) = raw_tcp_request(proxy_host, &request_bytes).await;
+    assert_eq!(
+        status, 200,
+        "proxy should return the upstream's 200; got {status}"
+    );
+
+    // Routing assertion: passthrough forwards `x-amz-decoded-content-length`
+    // to the upstream; the typed PUT path strips it before forwarding via
+    // the SDK. Seeing the header at the upstream proves we went through
+    // passthrough.
+    let captured = mock
+        .last_request()
+        .await
+        .expect("upstream must have received the request");
+    assert_eq!(
+        mock.request_count().await,
+        1,
+        "upstream should receive exactly one request"
+    );
+    assert_eq!(captured.method, http::Method::PUT);
+    assert_eq!(
+        captured.path,
+        format!("/{TEST_BUCKET}/cold-review/aws-chunked-routing"),
+        "passthrough should forward the path verbatim"
+    );
+    let decoded_cl = captured
+        .headers
+        .get("x-amz-decoded-content-length")
+        .expect(
+            "x-amz-decoded-content-length must reach the upstream; \
+             if missing, the request was routed to the typed PUT path",
+        )
+        .to_str()
+        .unwrap();
+    assert_eq!(decoded_cl, "8");
+
+    // Belt-and-braces: aws-chunked body framing was forwarded too, so the
+    // upstream sees the same Content-Encoding the client sent. (Typed PUT
+    // does propagate Content-Encoding via `content_headers`, so this alone
+    // is not a routing signal — the decoded-content-length header above is.
+    // We assert it here only to confirm the framing reached the upstream.)
+    let ce = captured
+        .headers
+        .get("content-encoding")
+        .expect("content-encoding should reach upstream")
+        .to_str()
+        .unwrap();
+    assert!(
+        ce.split(',')
+            .any(|t| t.trim().eq_ignore_ascii_case("aws-chunked")),
+        "content-encoding should include aws-chunked; got: {ce}"
+    );
+
+    // Sanity: upstream received the full chunked body bytes (not the typed
+    // PUT path, which would have buffered & decoded — but the typed PUT
+    // path doesn't decode aws-chunked, so it would store the framing as
+    // object bytes. Either way, on the passthrough path we expect the raw
+    // framing to reach the upstream byte-for-byte.)
+    assert_eq!(
+        captured.body.len(),
+        180,
+        "upstream should receive the full 180-byte chunked body"
+    );
 }
