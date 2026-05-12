@@ -138,12 +138,8 @@ async fn build_proxy_stack_inner<F>(
 where
     F: FnOnce(&mut Config),
 {
-    let mut config = default_proxy_test_config(
-        backend_endpoint,
-        auth_mode,
-        allowed_keys,
-        cache_dir.path(),
-    );
+    let mut config =
+        default_proxy_test_config(backend_endpoint, auth_mode, allowed_keys, cache_dir.path());
     mutate_config(&mut config);
 
     let s3_backend = backend::client::S3Backend::from_config(&config)
@@ -385,8 +381,8 @@ async fn raw_tcp_request(addr: &str, request: &[u8]) -> (u16, Vec<u8>) {
         .windows(2)
         .position(|w| w == b"\r\n")
         .unwrap_or(header_end);
-    let first_line = std::str::from_utf8(&buf[..first_line_end])
-        .expect("raw tcp: status line not UTF-8");
+    let first_line =
+        std::str::from_utf8(&buf[..first_line_end]).expect("raw tcp: status line not UTF-8");
     let mut parts = first_line.split_whitespace();
     let _version = parts.next().expect("raw tcp: missing HTTP version");
     let status_str = parts.next().expect("raw tcp: missing status code");
@@ -1392,7 +1388,9 @@ async fn test_list_v2_preserves_checksum_algorithm_and_type_xml() {
         .bucket(TEST_BUCKET)
         .key(key)
         .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Crc32)
-        .body(aws_sdk_s3::primitives::ByteStream::from(b"crc32-probe".to_vec()))
+        .body(aws_sdk_s3::primitives::ByteStream::from(
+            b"crc32-probe".to_vec(),
+        ))
         .send()
         .await
         .expect("checksum PUT direct to backend");
@@ -1514,7 +1512,7 @@ async fn test_startup_sweeps_stale_cache_tmp_fill_body_file() {
 /// cleanest way to send that mismatch is a hand-rolled HTTP/1.1 byte stream.
 #[tokio::test]
 #[ignore] // Spawns an in-process mock upstream; Docker not required, but kept
-          // `#[ignore]` for parity with the rest of this suite.
+// `#[ignore]` for parity with the rest of this suite.
 async fn test_unsigned_streaming_put_oversized_content_length_rejected_before_backend_contact() {
     let mock = CountingMockUpstream::new();
     let mock_endpoint = start_counting_mock_upstream(mock.clone()).await;
@@ -1644,7 +1642,11 @@ async fn test_backend_endpoint_userinfo_rejected_without_leaking_endpoint_parts(
 
     // Positive: the error must name the relevant env vars so operators can
     // act on it without guesswork.
-    for needle in ["BACKEND_ENDPOINT", "BACKEND_ACCESS_KEY_ID", "BACKEND_SECRET_ACCESS_KEY"] {
+    for needle in [
+        "BACKEND_ENDPOINT",
+        "BACKEND_ACCESS_KEY_ID",
+        "BACKEND_SECRET_ACCESS_KEY",
+    ] {
         assert!(
             stderr.contains(needle),
             "stderr should reference {needle} so the operator can fix the config; got:\n{stderr}"
