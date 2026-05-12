@@ -43,6 +43,12 @@ fn write_contents(writer: &mut Writer<Vec<u8>>, contents: &[crate::backend::mode
         if let Some(ref etag) = obj.etag {
             write_text_element(writer, "ETag", etag);
         }
+        for algo in &obj.checksum_algorithm {
+            write_text_element(writer, "ChecksumAlgorithm", algo);
+        }
+        if let Some(ref ct) = obj.checksum_type {
+            write_text_element(writer, "ChecksumType", ct);
+        }
         if let Some(size) = obj.size {
             write_text_element(writer, "Size", &size.to_string());
         }
@@ -381,6 +387,8 @@ mod tests {
                     etag: Some("\"abc123\"".to_string()),
                     size: Some(1234),
                     storage_class: Some("STANDARD".to_string()),
+                    checksum_algorithm: Vec::new(),
+                    checksum_type: None,
                 },
                 ObjectInfo {
                     key: "file2.txt".to_string(),
@@ -392,6 +400,8 @@ mod tests {
                     etag: Some("\"def456\"".to_string()),
                     size: Some(5678),
                     storage_class: Some("STANDARD".to_string()),
+                    checksum_algorithm: Vec::new(),
+                    checksum_type: None,
                 },
             ],
             common_prefixes: vec!["logs/".to_string()],
@@ -464,6 +474,8 @@ mod tests {
                 etag: None,
                 size: Some(100),
                 storage_class: None,
+                checksum_algorithm: Vec::new(),
+                checksum_type: None,
             }],
             common_prefixes: vec![],
             name: "mybucket".to_string(),
@@ -494,6 +506,8 @@ mod tests {
                 etag: None,
                 size: Some(100),
                 storage_class: None,
+                checksum_algorithm: Vec::new(),
+                checksum_type: None,
             }],
             common_prefixes: vec![],
             name: "mybucket".to_string(),
@@ -698,5 +712,103 @@ mod tests {
     fn test_checksum_whitespace_before_close() {
         let body = b"<Part><ChecksumSHA1 >abc</ChecksumSHA1></Part>";
         assert!(body_has_checksum_elements(body));
+    }
+
+    fn render_with_checksums(
+        checksum_algorithm: Vec<String>,
+        checksum_type: Option<String>,
+    ) -> String {
+        let output = ListObjectsOutput {
+            is_truncated: false,
+            contents: vec![ObjectInfo {
+                key: "k".to_string(),
+                last_modified: None,
+                etag: Some("\"e\"".to_string()),
+                size: Some(7),
+                storage_class: Some("STANDARD".to_string()),
+                checksum_algorithm,
+                checksum_type,
+            }],
+            common_prefixes: vec![],
+            name: "b".to_string(),
+            prefix: None,
+            delimiter: None,
+            max_keys: 1000,
+            encoding_type: None,
+            key_count: Some(1),
+            continuation_token: None,
+            next_continuation_token: None,
+            start_after: None,
+            marker: None,
+            next_marker: None,
+        };
+        serialize_list_objects_v2(&output)
+    }
+
+    #[test]
+    fn test_write_contents_emits_multiple_checksum_algorithms_and_type() {
+        let xml = render_with_checksums(
+            vec!["CRC32".to_string(), "SHA256".to_string()],
+            Some("FULL_OBJECT".to_string()),
+        );
+
+        assert!(xml.contains(
+            "<ChecksumAlgorithm>CRC32</ChecksumAlgorithm><ChecksumAlgorithm>SHA256</ChecksumAlgorithm><ChecksumType>FULL_OBJECT</ChecksumType>"
+        ));
+
+        let etag_end = xml.find("</ETag>").expect("ETag element present");
+        let first_algo = xml
+            .find("<ChecksumAlgorithm>")
+            .expect("ChecksumAlgorithm element present");
+        assert!(etag_end < first_algo, "ETag must precede ChecksumAlgorithm");
+
+        let ctype_start = xml
+            .find("<ChecksumType>")
+            .expect("ChecksumType element present");
+        let size_start = xml.find("<Size>").expect("Size element present");
+        assert!(ctype_start < size_start, "ChecksumType must precede Size");
+    }
+
+    #[test]
+    fn test_write_contents_omits_checksum_elements_when_absent() {
+        let xml = render_with_checksums(Vec::new(), None);
+        assert!(!xml.contains("<ChecksumAlgorithm"));
+        assert!(!xml.contains("<ChecksumType"));
+    }
+
+    #[test]
+    fn test_list_v2_mapping_preserves_checksum_fields_from_sdk_object() {
+        use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumType, Object};
+
+        let sdk_obj = Object::builder()
+            .key("k")
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .checksum_algorithm(ChecksumAlgorithm::Sha256)
+            .checksum_type(ChecksumType::FullObject)
+            .build();
+
+        let info = crate::backend::client::map_sdk_object(&sdk_obj);
+
+        assert_eq!(
+            info.checksum_algorithm,
+            vec!["CRC32".to_string(), "SHA256".to_string()]
+        );
+        assert_eq!(info.checksum_type, Some("FULL_OBJECT".to_string()));
+    }
+
+    #[test]
+    fn test_list_v1_mapping_preserves_checksum_fields_from_sdk_object() {
+        use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumType, Object};
+
+        let sdk_obj = Object::builder()
+            .key("k")
+            .checksum_algorithm(ChecksumAlgorithm::Crc32C)
+            .checksum_type(ChecksumType::Composite)
+            .build();
+
+        let info = crate::backend::client::map_sdk_object(&sdk_obj);
+
+        assert_eq!(info.checksum_algorithm, vec!["CRC32C".to_string()]);
+        assert_eq!(info.checksum_type, Some("COMPOSITE".to_string()));
     }
 }

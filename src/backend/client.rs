@@ -816,6 +816,26 @@ impl Backend for S3Backend {
     }
 }
 
+/// Map an SDK `Object` (returned by both ListObjectsV1 and ListObjectsV2)
+/// into the reduced `ObjectInfo` model. Stringifies SDK enums at the
+/// boundary so we don't leak AWS SDK types into our model and preserve
+/// unknown variants verbatim.
+pub(crate) fn map_sdk_object(obj: &aws_sdk_s3::types::Object) -> ObjectInfo {
+    ObjectInfo {
+        key: obj.key().unwrap_or_default().to_string(),
+        last_modified: obj.last_modified().and_then(to_chrono),
+        etag: obj.e_tag().map(|s| s.to_string()),
+        size: obj.size(),
+        storage_class: obj.storage_class().map(|sc| sc.as_str().to_string()),
+        checksum_algorithm: obj
+            .checksum_algorithm()
+            .iter()
+            .map(|a| a.as_str().to_string())
+            .collect(),
+        checksum_type: obj.checksum_type().map(|t| t.as_str().to_string()),
+    }
+}
+
 /// Execute a ListObjectsV2 call and map the response.
 async fn list_objects_v2(
     client: &Client,
@@ -849,17 +869,7 @@ async fn list_objects_v2(
         .await
         .map_err(|e| map_sdk_error(e, "list_objects_v2"))?;
 
-    let contents = resp
-        .contents()
-        .iter()
-        .map(|obj| ObjectInfo {
-            key: obj.key().unwrap_or_default().to_string(),
-            last_modified: obj.last_modified().and_then(to_chrono),
-            etag: obj.e_tag().map(|s| s.to_string()),
-            size: obj.size(),
-            storage_class: obj.storage_class().map(|sc| sc.as_str().to_string()),
-        })
-        .collect();
+    let contents = resp.contents().iter().map(map_sdk_object).collect();
 
     let common_prefixes = resp
         .common_prefixes()
@@ -915,17 +925,7 @@ async fn list_objects_v1(
         .await
         .map_err(|e| map_sdk_error(e, "list_objects"))?;
 
-    let contents = resp
-        .contents()
-        .iter()
-        .map(|obj| ObjectInfo {
-            key: obj.key().unwrap_or_default().to_string(),
-            last_modified: obj.last_modified().and_then(to_chrono),
-            etag: obj.e_tag().map(|s| s.to_string()),
-            size: obj.size(),
-            storage_class: obj.storage_class().map(|sc| sc.as_str().to_string()),
-        })
-        .collect();
+    let contents = resp.contents().iter().map(map_sdk_object).collect();
 
     let common_prefixes = resp
         .common_prefixes()
