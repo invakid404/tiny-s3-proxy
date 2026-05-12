@@ -14,6 +14,7 @@
 //!   - `{pid}-{hash32}-{counter}.meta.tmp`     → `cache/disk.rs`: HEAD/access metadata rewrite
 //!   - `{pid}-{counter}.prev.body`             → `cache/disk.rs`: publish-time body backup
 //!   - `{pid}-{counter}.prev.meta.json`        → `cache/disk.rs`: publish-time metadata backup
+//!   - `{pid}-{counter}.upload-spool.tmp`      → `handlers/aws_chunked.rs`: decoded aws-chunked body spool
 //!   - `.readyz-probe`                         → `admin/health.rs`: readiness probe file
 //!
 //! Hand-written suffix parsers (no regex dep). Longest suffix wins: `.prev.body`
@@ -31,6 +32,7 @@ pub(super) enum TmpSweepKind {
     MetadataTmp,
     PublishBackupBody,
     PublishBackupMeta,
+    UploadSpool,
     ReadyzProbe,
 }
 
@@ -43,6 +45,7 @@ impl TmpSweepKind {
             Self::MetadataTmp => "metadata_tmp",
             Self::PublishBackupBody => "publish_backup_body",
             Self::PublishBackupMeta => "publish_backup_meta",
+            Self::UploadSpool => "upload_spool",
             Self::ReadyzProbe => "readyz_probe",
         }
     }
@@ -148,6 +151,9 @@ pub(super) fn classify(name: &str) -> Option<TmpSweepKind> {
     }
     if let Some(stem) = name.strip_suffix(".fill_id_counter.tmp") {
         return is_two_digit_segments(stem).then_some(TmpSweepKind::FillIdCounter);
+    }
+    if let Some(stem) = name.strip_suffix(".upload-spool.tmp") {
+        return is_two_digit_segments(stem).then_some(TmpSweepKind::UploadSpool);
     }
     if let Some(stem) = name.strip_suffix(".meta.tmp") {
         // `{pid}-{hash32}-{counter}` — hash is fixed-width lowercase hex with
@@ -366,6 +372,7 @@ mod tests {
         metadata_tmp: (std::path::PathBuf, u64),
         prev_body: (std::path::PathBuf, u64),
         prev_meta: (std::path::PathBuf, u64),
+        upload_spool: (std::path::PathBuf, u64),
         readyz_probe: (std::path::PathBuf, u64),
     }
 
@@ -392,6 +399,9 @@ mod tests {
         let prev_meta_p = tmp_dir.join("6-6.prev.meta.json");
         let prev_meta_sz = write_n(&prev_meta_p, 66).await;
 
+        let upload_spool_p = tmp_dir.join("7-7.upload-spool.tmp");
+        let upload_spool_sz = write_n(&upload_spool_p, 77).await;
+
         let readyz_p = tmp_dir.join(".readyz-probe");
         let readyz_sz = write_n(&readyz_p, 2).await;
 
@@ -402,6 +412,7 @@ mod tests {
             metadata_tmp: (metadata_tmp_p, metadata_tmp_sz),
             prev_body: (prev_body_p, prev_body_sz),
             prev_meta: (prev_meta_p, prev_meta_sz),
+            upload_spool: (upload_spool_p, upload_spool_sz),
             readyz_probe: (readyz_p, readyz_sz),
         }
     }
@@ -449,6 +460,7 @@ mod tests {
             ("metadata_tmp", &planted.metadata_tmp),
             ("publish_backup_body", &planted.prev_body),
             ("publish_backup_meta", &planted.prev_meta),
+            ("upload_spool", &planted.upload_spool),
             ("readyz_probe", &planted.readyz_probe),
         ] {
             assert!(
@@ -465,6 +477,7 @@ mod tests {
         assert_removed_kind(&rendered, "metadata_tmp", 1, planted.metadata_tmp.1);
         assert_removed_kind(&rendered, "publish_backup_body", 1, planted.prev_body.1);
         assert_removed_kind(&rendered, "publish_backup_meta", 1, planted.prev_meta.1);
+        assert_removed_kind(&rendered, "upload_spool", 1, planted.upload_spool.1);
         assert_removed_kind(&rendered, "readyz_probe", 1, planted.readyz_probe.1);
     }
 
@@ -764,6 +777,10 @@ mod tests {
             classify("8-9.prev.meta.json"),
             Some(TmpSweepKind::PublishBackupMeta),
         );
+        assert_eq!(
+            classify("10-11.upload-spool.tmp"),
+            Some(TmpSweepKind::UploadSpool),
+        );
     }
 
     #[test]
@@ -808,6 +825,7 @@ mod tests {
             TmpSweepKind::MetadataTmp,
             TmpSweepKind::PublishBackupBody,
             TmpSweepKind::PublishBackupMeta,
+            TmpSweepKind::UploadSpool,
             TmpSweepKind::ReadyzProbe,
         ] {
             assert_eq!(kind.to_string(), kind.as_label());

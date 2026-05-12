@@ -3,8 +3,9 @@ use std::time::Duration;
 
 use aws_credential_types::Credentials;
 use aws_sdk_s3::Client;
-use aws_sdk_s3::config::Region;
+use aws_sdk_s3::config::{Builder as S3ConfigBuilder, Region, RequestChecksumCalculation};
 use aws_sdk_s3::primitives::ByteStream;
+use aws_smithy_types::byte_stream::Length;
 use aws_smithy_types::timeout::TimeoutConfig;
 use tokio_util::io::ReaderStream;
 
@@ -19,6 +20,12 @@ pub struct S3Backend {
     client: Client,
     #[allow(dead_code)]
     default_bucket: String,
+    /// Whether the configured backend endpoint uses HTTPS. The aws-chunked
+    /// decode path forwards bodies with `x-amz-content-sha256:
+    /// UNSIGNED-PAYLOAD`, which relies on TLS for body integrity — the
+    /// `put_object_from_path` / `upload_part_from_path` methods refuse to
+    /// run over plaintext when this is false.
+    backend_endpoint_is_https: bool,
     get_policy: RetryPolicy,
     head_policy: RetryPolicy,
     list_policy: RetryPolicy,
@@ -70,11 +77,33 @@ impl S3Backend {
         Ok(Self {
             client,
             default_bucket: config.backend_bucket.clone(),
+            backend_endpoint_is_https: scheme.eq_ignore_ascii_case("https"),
             get_policy: RetryPolicy::for_reads(config.get_max_attempts, base_ms),
             head_policy: RetryPolicy::for_reads(config.head_max_attempts, base_ms),
             list_policy: RetryPolicy::for_reads(config.list_max_attempts, base_ms),
             put_policy: RetryPolicy::for_writes(config.put_max_attempts, base_ms),
             delete_policy: RetryPolicy::for_idempotent_writes(config.delete_max_attempts, base_ms),
+        })
+    }
+
+    /// Defense-in-depth: refuse to send an `UNSIGNED-PAYLOAD` body over a
+    /// plaintext backend. Body integrity in that mode depends entirely on
+    /// TLS — over HTTP, a network attacker could tamper undetectably. The
+    /// config layer should already reject this combination at startup; this
+    /// runtime check exists so a misconstructed backend can't silently
+    /// downgrade.
+    fn require_https_for_unsigned_payload(&self, operation: &str) -> Result<(), ProxyError> {
+        if self.backend_endpoint_is_https {
+            return Ok(());
+        }
+        Err(ProxyError::Cache {
+            source: format!(
+                "{operation}: refusing to forward UNSIGNED-PAYLOAD body over plaintext HTTP \
+                 backend; the aws-chunked decode path requires HTTPS for body integrity. \
+                 Use an https:// BACKEND_ENDPOINT.",
+            )
+            .into(),
+            operation: operation.to_string(),
         })
     }
 }
@@ -562,6 +591,115 @@ impl Backend for S3Backend {
         .await
     }
 
+    async fn put_object_from_path(
+        &self,
+        req: PutObjectSpoolInput,
+    ) -> Result<PutObjectOutput, ProxyError> {
+        self.require_https_for_unsigned_payload("put_object_from_path")?;
+
+        with_retry(&self.put_policy, "put_object_from_path", |_attempt| {
+            let client = &self.client;
+            let bucket = req.bucket.clone();
+            let key = req.key.clone();
+            let path = req.path.clone();
+            let len = req.len;
+            let content_type = req.content_type.clone();
+            let content_md5 = req.content_md5.clone();
+            let metadata = req.metadata.clone();
+            let extra_amz_headers = req.extra_amz_headers.clone();
+            let content_headers = req.content_headers.clone();
+            async move {
+                // Length::Exact pins Content-Length to the value we just decoded.
+                // ByteStream::from_path defaults to file metadata, which races
+                // with concurrent writers; we own the spool exclusively so the
+                // file isn't growing, but pinning is cheaper than reasoning.
+                let body = ByteStream::read_from()
+                    .path(&path)
+                    .length(Length::Exact(len))
+                    .build()
+                    .await
+                    .map_err(|e| ProxyError::Backend {
+                        source: format!("build ByteStream from spool {}: {e}", path.display())
+                            .into(),
+                        operation: "put_object_from_path".into(),
+                    })?;
+
+                let mut builder = client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .content_length(len as i64)
+                    .body(body);
+
+                if let Some(ct) = content_type {
+                    builder = builder.content_type(ct);
+                }
+                if let Some(md5) = content_md5 {
+                    builder = builder.content_md5(md5);
+                }
+                for (k, v) in &metadata {
+                    builder = builder.metadata(k, v);
+                }
+                if let Some(v) = content_headers.get("content-encoding") {
+                    builder = builder.content_encoding(v);
+                }
+                if let Some(v) = content_headers.get("content-disposition") {
+                    builder = builder.content_disposition(v);
+                }
+                if let Some(v) = content_headers.get("content-language") {
+                    builder = builder.content_language(v);
+                }
+                if let Some(v) = content_headers.get("cache-control") {
+                    builder = builder.cache_control(v);
+                }
+                let expires_val = content_headers.get("expires").cloned();
+
+                // `RequestChecksumCalculation::WhenRequired` disables the SDK's
+                // outbound aws-chunked re-encoding: the default `WhenSupported`
+                // value triggers the checksum interceptor to wrap the body in
+                // the streaming-checksum framing, which is exactly what we
+                // just decoded out of. `disable_payload_signing()` makes the
+                // SDK send `x-amz-content-sha256: UNSIGNED-PAYLOAD` — body
+                // integrity is delegated to the TLS transport. The HTTPS guard
+                // above enforces that delegation.
+                let resp = builder
+                    .customize()
+                    .mutate_request(move |req| {
+                        for (k, v) in &extra_amz_headers {
+                            if let (Ok(name), Ok(val)) = (
+                                http::header::HeaderName::from_bytes(k.as_bytes()),
+                                http::header::HeaderValue::from_str(v),
+                            ) {
+                                req.headers_mut().insert(name, val);
+                            }
+                        }
+                        if let Some(exp) = &expires_val
+                            && let Ok(val) = http::header::HeaderValue::from_str(exp)
+                        {
+                            req.headers_mut().insert(http::header::EXPIRES, val);
+                        }
+                    })
+                    .config_override(
+                        S3ConfigBuilder::new()
+                            .request_checksum_calculation(RequestChecksumCalculation::WhenRequired),
+                    )
+                    .disable_payload_signing()
+                    .send()
+                    .await
+                    .map_err(|e| map_sdk_error(e, "put_object_from_path"))?;
+
+                let mut extra_headers = extract_write_extra_headers!(&resp);
+                extract_write_extra_headers_full!(&resp, extra_headers);
+                Ok(PutObjectOutput {
+                    etag: resp.e_tag().map(|s| s.to_string()),
+                    version_id: resp.version_id().map(|s| s.to_string()),
+                    extra_headers,
+                })
+            }
+        })
+        .await
+    }
+
     async fn delete_object(
         &self,
         req: DeleteObjectInput<'_>,
@@ -731,6 +869,72 @@ impl Backend for S3Backend {
             .e_tag()
             .ok_or_else(|| ProxyError::Internal {
                 source: "upload_part returned no ETag".into(),
+            })?
+            .to_string();
+
+        let extra_headers = extract_write_extra_headers!(&resp);
+        Ok(UploadPartOutput {
+            etag,
+            extra_headers,
+        })
+    }
+
+    async fn upload_part_from_path(
+        &self,
+        req: UploadPartSpoolInput,
+    ) -> Result<UploadPartOutput, ProxyError> {
+        self.require_https_for_unsigned_payload("upload_part_from_path")?;
+
+        let body = ByteStream::read_from()
+            .path(&req.path)
+            .length(Length::Exact(req.len))
+            .build()
+            .await
+            .map_err(|e| ProxyError::Backend {
+                source: format!("build ByteStream from spool {}: {e}", req.path.display()).into(),
+                operation: "upload_part_from_path".into(),
+            })?;
+
+        let mut builder = self
+            .client
+            .upload_part()
+            .bucket(&req.bucket)
+            .key(&req.key)
+            .upload_id(&req.upload_id)
+            .part_number(req.part_number)
+            .content_length(req.len as i64)
+            .body(body);
+
+        if let Some(md5) = &req.content_md5 {
+            builder = builder.content_md5(md5);
+        }
+
+        let extra_amz_headers = req.extra_amz_headers.clone();
+        let resp = builder
+            .customize()
+            .mutate_request(move |req| {
+                for (k, v) in &extra_amz_headers {
+                    if let (Ok(name), Ok(val)) = (
+                        http::header::HeaderName::from_bytes(k.as_bytes()),
+                        http::header::HeaderValue::from_str(v),
+                    ) {
+                        req.headers_mut().insert(name, val);
+                    }
+                }
+            })
+            .config_override(
+                S3ConfigBuilder::new()
+                    .request_checksum_calculation(RequestChecksumCalculation::WhenRequired),
+            )
+            .disable_payload_signing()
+            .send()
+            .await
+            .map_err(|e| map_sdk_error(e, "upload_part_from_path"))?;
+
+        let etag = resp
+            .e_tag()
+            .ok_or_else(|| ProxyError::Internal {
+                source: "upload_part_from_path returned no ETag".into(),
             })?
             .to_string();
 

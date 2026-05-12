@@ -31,6 +31,13 @@ pub trait Backend: Send + Sync {
         &self,
         req: PutObjectInput,
     ) -> impl std::future::Future<Output = Result<PutObjectOutput, ProxyError>> + Send;
+    /// Upload an object whose body lives in a single-owner spool file on disk.
+    /// Used by the aws-chunked decode path so the decoded body can be streamed
+    /// from disk rather than held in memory.
+    fn put_object_from_path(
+        &self,
+        req: PutObjectSpoolInput,
+    ) -> impl std::future::Future<Output = Result<PutObjectOutput, ProxyError>> + Send;
     /// Delete an object.
     fn delete_object(
         &self,
@@ -50,6 +57,11 @@ pub trait Backend: Send + Sync {
     fn upload_part(
         &self,
         req: UploadPartInput,
+    ) -> impl std::future::Future<Output = Result<UploadPartOutput, ProxyError>> + Send;
+    /// Upload a single part of a multipart upload from a spool file on disk.
+    fn upload_part_from_path(
+        &self,
+        req: UploadPartSpoolInput,
     ) -> impl std::future::Future<Output = Result<UploadPartOutput, ProxyError>> + Send;
     /// Finalize a multipart upload by assembling its parts.
     fn complete_multipart_upload(
