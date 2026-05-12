@@ -469,12 +469,9 @@ mod tests {
     }
 
     /// Files outside the allowlist (random names, near-miss patterns,
-    /// subdirectories) must be preserved. Each preserved entry must produce
-    /// a WARN log and emit a `skipped_total{reason=...}` series. Per-entry
-    /// counts are checked through the WARN log path; the rendered metric
-    /// surface only pins series presence because the Prometheus recorder's
-    /// per-call counter handles do not accumulate across distinct
-    /// `counter!` macro invocations under a local recorder.
+    /// subdirectories) must be preserved, each preserved entry must produce
+    /// a WARN log, and the rendered Prometheus surface must report exact
+    /// per-reason skip counts.
     #[tokio::test(flavor = "current_thread")]
     #[tracing_test::traced_test]
     async fn test_tmp_sweep_preserves_unknown_files_and_warns() {
@@ -524,12 +521,13 @@ mod tests {
 
         let rendered = handle.render();
         assert!(
-            rendered.contains("s3proxy_cache_tmp_sweep_skipped_total{reason=\"unknown_pattern\"}"),
-            "expected unknown_pattern skip series, got:\n{rendered}",
+            rendered
+                .contains("s3proxy_cache_tmp_sweep_skipped_total{reason=\"unknown_pattern\"} 3"),
+            "expected 3 unknown_pattern skips, got:\n{rendered}",
         );
         assert!(
-            rendered.contains("s3proxy_cache_tmp_sweep_skipped_total{reason=\"non_regular\"}"),
-            "expected non_regular skip series, got:\n{rendered}",
+            rendered.contains("s3proxy_cache_tmp_sweep_skipped_total{reason=\"non_regular\"} 1"),
+            "expected 1 non_regular skip, got:\n{rendered}",
         );
     }
 

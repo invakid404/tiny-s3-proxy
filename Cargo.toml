@@ -16,6 +16,15 @@ http = "=1.4.0"
 http-body-util = "=0.1.3"
 metrics = "=0.24.5"
 metrics-exporter-prometheus = "=0.18.3"
+# Pin metrics-util to the same version metrics-exporter-prometheus 0.18.3
+# resolves to with our metrics 0.24.5 pin. metrics-util 0.20.1 (the previously
+# resolved transitive) used the old metrics::KeyHasher which is incompatible
+# with rapidhash Key hashing in metrics 0.24.4+, causing counters with
+# identical labels to silently undercount. See
+# https://github.com/metrics-rs/metrics/issues/692.
+# This is a resolver pin even though we don't use metrics-util directly —
+# don't remove as "unused".
+metrics-util = { version = "=0.20.3", default-features = false }
 percent-encoding = "=2.3.2"
 quick-xml = "=0.40.0"
 reqwest = { version = "=0.13.3", features = ["stream"] }
