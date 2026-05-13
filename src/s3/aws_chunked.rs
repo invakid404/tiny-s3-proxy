@@ -1,20 +1,42 @@
-//! Decoder for the AWS aws-chunked wire format (non-trailer mode only).
+//! Decoder for the AWS aws-chunked wire format. Handles three modes:
 //!
-//! Parses the framing produced by SigV4 streaming uploads with
-//! `x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD` and writes the
-//! decoded body bytes to an async writer. Chunk signatures are validated for
-//! syntactic shape (64 hex chars) but NOT cryptographically verified — strict
-//! verification is tracked in issue #63.
+//! - `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` (non-trailer): signed chunks, no
+//!   HTTP trailers after the final zero chunk.
+//! - `STREAMING-UNSIGNED-PAYLOAD-TRAILER`: bare-size chunk headers (no
+//!   signature), followed by a single `x-amz-checksum-*` trailer line.
+//! - `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`: signed chunks PLUS a
+//!   trailer line PLUS an `x-amz-trailer-signature` line. Trailer-signature
+//!   is shape-validated only (64 hex chars); the crypto check is #63.
 //!
-//! Trailer-mode variants (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`,
-//! `STREAMING-UNSIGNED-PAYLOAD-TRAILER`, ECDSA streaming) are out of scope and
-//! must be routed to passthrough by the caller.
+//! For trailer modes the decoder ALSO validates that the declared checksum
+//! matches the computed checksum over the decoded body. A mismatch fails the
+//! decode before any backend contact happens.
+//!
+//! ECDSA streaming variants (`STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD*`)
+//! remain out of scope and must be routed to passthrough by the caller.
 
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
-/// The non-trailer SigV4 streaming sentinel that this decoder handles.
+use crate::s3::checksum::{ChecksumAlgorithm, ChecksumHeader};
+
+/// The non-trailer SigV4 streaming sentinel.
 pub const STREAMING_AWS4_HMAC_SHA256_PAYLOAD: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+
+/// Unsigned-trailer streaming sentinel — chunks carry no signature, but the
+/// stream ends with a single `x-amz-checksum-*` trailer line.
+pub const STREAMING_UNSIGNED_PAYLOAD_TRAILER: &str = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
+
+/// Signed-trailer streaming sentinel — chunks carry signatures AND the stream
+/// ends with a trailer line plus an `x-amz-trailer-signature` line.
+pub const STREAMING_AWS4_HMAC_SHA256_PAYLOAD_TRAILER: &str =
+    "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER";
+
+/// Maximum bytes for a single trailer header line. Trailers are short
+/// (`x-amz-checksum-<algo>:<base64>`) so the cap is intentionally generous,
+/// matching the chunk-header cap rather than introducing a separate constant
+/// to bound the read.
+pub const MAX_TRAILER_LINE_BYTES: usize = MAX_CHUNK_HEADER_LINE_BYTES;
 
 /// Maximum bytes for a single chunk-header line (`<hex-size>;chunk-signature=<hex>\r\n`).
 /// Way larger than any legitimate header — bounds the worst-case allocation when
@@ -28,12 +50,61 @@ pub const CHUNK_SIGNATURE_HEX_LEN: usize = 64;
 /// non-final chunks fragment the signature stream and are rejected.
 pub const MIN_NON_FINAL_CHUNK_BYTES: u64 = 8192;
 
+/// Wire-format mode the decoder should expect. The caller derives this from
+/// the inbound `x-amz-content-sha256` sentinel plus the `x-amz-trailer`
+/// header — see `handlers::aws_chunked::decoder_mode_from_headers`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecoderMode {
+    /// Non-trailer SigV4 streaming. Chunk headers carry `;chunk-signature=...`,
+    /// no trailers follow the final zero chunk.
+    NonTrailer,
+    /// `STREAMING-UNSIGNED-PAYLOAD-TRAILER`. Chunk headers are bare
+    /// `<hex-size>\r\n` (signature MUST be absent), and the stream ends with
+    /// a single `x-amz-checksum-<algo>:<base64>` trailer line.
+    UnsignedTrailer {
+        expected_trailer_name: String,
+        algorithm: ChecksumAlgorithm,
+    },
+    /// `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`. Chunk headers carry
+    /// `;chunk-signature=...`, the stream ends with a trailer line followed
+    /// by `x-amz-trailer-signature:<64 hex>`.
+    SignedTrailer {
+        expected_trailer_name: String,
+        algorithm: ChecksumAlgorithm,
+    },
+}
+
+impl DecoderMode {
+    fn expects_chunk_signature(&self) -> bool {
+        !matches!(self, DecoderMode::UnsignedTrailer { .. })
+    }
+
+    fn trailer_info(&self) -> Option<(&str, ChecksumAlgorithm, bool)> {
+        match self {
+            DecoderMode::NonTrailer => None,
+            DecoderMode::UnsignedTrailer {
+                expected_trailer_name,
+                algorithm,
+            } => Some((expected_trailer_name.as_str(), *algorithm, false)),
+            DecoderMode::SignedTrailer {
+                expected_trailer_name,
+                algorithm,
+            } => Some((expected_trailer_name.as_str(), *algorithm, true)),
+        }
+    }
+}
+
 /// Summary of a successful decode pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedSummary {
     pub decoded_len: u64,
     pub sha256: [u8; 32],
     pub sha256_hex: String,
+    /// `Some(_)` for trailer-mode decodes, populated only after the trailer
+    /// has been parsed AND the declared checksum has been verified against
+    /// the decoded body. The handler forwards this verbatim to the upstream
+    /// backend as a non-streaming `x-amz-checksum-*` request header.
+    pub trailer: Option<ChecksumHeader>,
 }
 
 /// Decoder errors. Maps to S3 errors at the handler boundary.
@@ -81,19 +152,56 @@ pub enum AwsChunkedError {
         #[source]
         source: std::io::Error,
     },
+
+    /// Trailer header line was syntactically malformed (missing colon, wrong
+    /// name, multiple lines where one expected, invalid line terminator).
+    /// Maps to 400 `InvalidRequest` at the handler boundary.
+    #[error("invalid aws-chunked trailer header: {message}")]
+    InvalidTrailer { message: String },
+
+    /// Stream ended where a trailer header line was expected. Distinguished
+    /// from `InvalidTrailer` so the handler can surface a more specific
+    /// `InvalidRequest` message (the trailer the request advertised never
+    /// arrived). Maps to 400 `InvalidRequest`.
+    #[error("missing aws-chunked trailer header: {name}")]
+    MissingTrailer { name: String },
+
+    /// Trailer value was not valid base64, or decoded to a length that
+    /// doesn't match the algorithm's expected digest size. Maps to 400
+    /// `InvalidDigest` at the handler boundary.
+    #[error("invalid trailer checksum: {message}")]
+    InvalidTrailerChecksum { message: String },
+
+    /// Trailer was syntactically well-formed but the computed checksum over
+    /// the decoded body didn't match the declared value. The load-bearing
+    /// integrity check for trailer-mode uploads. Maps to 400 `BadDigest`.
+    #[error("trailer checksum mismatch for {name}")]
+    TrailerChecksumMismatch { name: String },
+
+    /// `x-amz-trailer-signature` line was missing or malformed on a signed
+    /// trailer upload. Shape-validation only; crypto verification is #63.
+    /// Maps to 400 `InvalidRequest`.
+    #[error("invalid trailer signature: {message}")]
+    InvalidTrailerSignature { message: String },
 }
 
 /// Streaming aws-chunked decoder. Reads frames from `inner`, validates them,
 /// and writes the decoded payload bytes to a caller-supplied writer.
 ///
 /// The decoder enforces:
-/// - Each chunk header is exactly `<hex-size>;chunk-signature=<64 hex>\r\n`.
+/// - For non-trailer / signed-trailer modes: each chunk header is exactly
+///   `<hex-size>;chunk-signature=<64 hex>\r\n`. For unsigned-trailer mode:
+///   each chunk header is exactly `<hex-size>\r\n` (signature MUST be absent).
 /// - Each chunk payload is followed by `\r\n`.
-/// - The final chunk has size `0` and is followed by a terminating `\r\n`
-///   (no trailers; trailer-mode is out of scope for this PR).
+/// - The final chunk has size `0`. For non-trailer mode it is followed by a
+///   terminating `\r\n`. For trailer modes the final chunk header is
+///   followed by `x-amz-checksum-<algo>:<base64>` (and `x-amz-trailer-signature`
+///   on signed trailers), then a closing `\r\n`.
 /// - The sum of chunk sizes equals `declared_decoded_len` exactly.
 /// - Every non-final data chunk is at least `MIN_NON_FINAL_CHUNK_BYTES`.
-/// - There is no data after the final chunk's terminating CRLF.
+/// - There is no data after the closing CRLF.
+/// - For trailer modes: the declared checksum value (post-base64-decode)
+///   exactly equals the algorithm's digest of the decoded body.
 pub struct AwsChunkedDecoder<R> {
     inner: BufReader<R>,
     declared_decoded_len: u64,
@@ -101,10 +209,27 @@ pub struct AwsChunkedDecoder<R> {
     hasher: Sha256,
     chunk_index: u64,
     previous_data_chunk_size: Option<u64>,
+    mode: DecoderMode,
+    /// Side-channel hasher for trailer-mode checksum validation. Built upfront
+    /// (in `with_mode`) for every non-SHA256 trailer algorithm; left `None`
+    /// for non-trailer mode and for SHA256 trailers (the body SHA256 we
+    /// always compute satisfies that case directly).
+    algo_hasher: Option<Box<dyn aws_smithy_checksums::http::HttpChecksum>>,
 }
 
 impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
+    /// Build a non-trailer decoder. Equivalent to
+    /// `with_mode(inner, declared_decoded_len, DecoderMode::NonTrailer)`.
     pub fn new(inner: R, declared_decoded_len: u64) -> Self {
+        Self::with_mode(inner, declared_decoded_len, DecoderMode::NonTrailer)
+    }
+
+    /// Build a decoder for the specified wire-format mode.
+    pub fn with_mode(inner: R, declared_decoded_len: u64, mode: DecoderMode) -> Self {
+        let algo_hasher = match mode.trailer_info() {
+            Some((_, ChecksumAlgorithm::Sha256, _)) | None => None,
+            Some((_, algo, _)) => Some(algo.into_smithy_impl()),
+        };
         Self {
             inner: BufReader::new(inner),
             declared_decoded_len,
@@ -112,12 +237,15 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
             hasher: Sha256::new(),
             chunk_index: 0,
             previous_data_chunk_size: None,
+            mode,
+            algo_hasher,
         }
     }
 
     /// Drive the decode loop. Reads chunks until the final `0`-size chunk and
     /// writes decoded payload bytes to `writer`. Returns a summary including
-    /// the SHA-256 of the decoded payload.
+    /// the SHA-256 of the decoded payload (and, for trailer modes, the
+    /// validated checksum trailer).
     pub async fn decode_to_writer<W>(
         mut self,
         writer: &mut W,
@@ -125,31 +253,14 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
     where
         W: AsyncWrite + Unpin,
     {
+        let expects_signature = self.mode.expects_chunk_signature();
+
         loop {
             let header = self.read_chunk_header_line().await?;
-            let chunk_size = parse_chunk_header(&header)?;
+            let chunk_size = parse_chunk_header(&header, expects_signature)?;
 
             if chunk_size == 0 {
-                // Final chunk: must be followed by a single CRLF terminator
-                // and nothing else (no trailer headers in non-trailer mode).
-                self.expect_crlf().await?;
-                self.expect_eof().await?;
-
-                if self.decoded_len != self.declared_decoded_len {
-                    return Err(AwsChunkedError::DecodedLengthMismatch {
-                        declared: self.declared_decoded_len,
-                        actual: self.decoded_len,
-                    });
-                }
-
-                let digest = self.hasher.finalize();
-                let mut sha256 = [0u8; 32];
-                sha256.copy_from_slice(&digest);
-                return Ok(DecodedSummary {
-                    decoded_len: self.decoded_len,
-                    sha256,
-                    sha256_hex: hex_encode_lower(&sha256),
-                });
+                return self.finalize(writer).await;
             }
 
             // A previous data chunk that was below the minimum is only an
@@ -182,6 +293,86 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
             self.previous_data_chunk_size = Some(chunk_size);
             self.chunk_index += 1;
         }
+    }
+
+    /// Final-chunk handling. Validates the decoded length, consumes any
+    /// trailer line(s) the mode requires, verifies the trailer checksum
+    /// against the computed digest, and returns the summary.
+    async fn finalize<W>(mut self, _writer: &mut W) -> Result<DecodedSummary, AwsChunkedError>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let algo_hasher = self.algo_hasher.take();
+        // The trailer info needs to be cloned out before we move chunks of
+        // `self` into helper methods.
+        let trailer_expectation = self
+            .mode
+            .trailer_info()
+            .map(|(name, algo, signed)| (name.to_string(), algo, signed));
+
+        let trailer = match trailer_expectation {
+            None => {
+                // Non-trailer: a single CRLF terminator and EOF.
+                self.expect_crlf().await?;
+                self.expect_eof().await?;
+                None
+            }
+            Some((expected_name, algo, signed)) => {
+                let parsed = self.read_and_validate_trailer(&expected_name, algo).await?;
+                if signed {
+                    self.read_and_validate_trailer_signature().await?;
+                }
+                self.expect_crlf().await?;
+                self.expect_eof().await?;
+                Some(parsed)
+            }
+        };
+
+        if self.decoded_len != self.declared_decoded_len {
+            return Err(AwsChunkedError::DecodedLengthMismatch {
+                declared: self.declared_decoded_len,
+                actual: self.decoded_len,
+            });
+        }
+
+        let digest = self.hasher.finalize();
+        let mut sha256 = [0u8; 32];
+        sha256.copy_from_slice(&digest);
+
+        // If a trailer was declared, verify its decoded value against the
+        // computed checksum. SHA-256 reuses the body SHA-256 above; every
+        // other algorithm has its own hasher we drove during `copy_chunk_payload`.
+        let trailer = if let Some(header) = trailer {
+            let expected_bytes = aws_smithy_types::base64::decode(&header.value).map_err(|e| {
+                AwsChunkedError::InvalidTrailerChecksum {
+                    message: format!("base64 decode failed: {e}"),
+                }
+            })?;
+            let computed: Vec<u8> = match header.algorithm {
+                ChecksumAlgorithm::Sha256 => sha256.to_vec(),
+                _ => {
+                    let hasher = algo_hasher.expect(
+                        "side-channel hasher was constructed for non-SHA256 trailer algorithms",
+                    );
+                    aws_smithy_checksums::Checksum::finalize(hasher).to_vec()
+                }
+            };
+            if computed != expected_bytes {
+                return Err(AwsChunkedError::TrailerChecksumMismatch {
+                    name: header.name.clone(),
+                });
+            }
+            Some(header)
+        } else {
+            None
+        };
+
+        Ok(DecodedSummary {
+            decoded_len: self.decoded_len,
+            sha256,
+            sha256_hex: hex_encode_lower(&sha256),
+            trailer,
+        })
     }
 
     /// Read a single chunk-header line (terminated by `\r\n`) using a
@@ -247,7 +438,8 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
     }
 
     /// Copy `chunk_size` bytes of payload from the inner reader to `writer`,
-    /// updating the running SHA-256 hasher along the way.
+    /// updating both the running SHA-256 hasher and (for trailer modes) the
+    /// algorithm-specific side-channel hasher along the way.
     async fn copy_chunk_payload<W>(
         &mut self,
         writer: &mut W,
@@ -269,6 +461,9 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
                 return Err(AwsChunkedError::Truncated);
             }
             self.hasher.update(&buf[..n]);
+            if let Some(h) = self.algo_hasher.as_deref_mut() {
+                aws_smithy_checksums::Checksum::update(h, &buf[..n]);
+            }
             writer
                 .write_all(&buf[..n])
                 .await
@@ -276,6 +471,172 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
             remaining -= n as u64;
         }
         Ok(())
+    }
+
+    /// Read the post-final-chunk trailer line and validate it.
+    ///
+    /// Accepts `<name>:<value>\r\n` OR `<name>:<value>\n` — AWS docs are not
+    /// consistent about whether a real SDK emits the bare-LF form, and we'd
+    /// rather accept both than fail integration with a particular SDK build.
+    /// The trailer NAME must case-insensitively equal `expected_name`. The
+    /// trailer VALUE must be valid base64, and its decoded length must match
+    /// the algorithm's expected digest size. The actual checksum-vs-body
+    /// comparison happens in `finalize()`.
+    async fn read_and_validate_trailer(
+        &mut self,
+        expected_name: &str,
+        algorithm: ChecksumAlgorithm,
+    ) -> Result<ChecksumHeader, AwsChunkedError> {
+        let line = self.read_trailer_line(expected_name).await?;
+
+        let (name, value) =
+            line.split_once(':')
+                .ok_or_else(|| AwsChunkedError::InvalidTrailer {
+                    message: format!("trailer header missing `:` separator: `{line}`"),
+                })?;
+        let trimmed_name = name.trim();
+        let trimmed_value = value.trim();
+
+        if !trimmed_name.eq_ignore_ascii_case(expected_name) {
+            return Err(AwsChunkedError::InvalidTrailer {
+                message: format!(
+                    "trailer header name `{trimmed_name}` does not match declared `{expected_name}`",
+                ),
+            });
+        }
+
+        let decoded = aws_smithy_types::base64::decode(trimmed_value).map_err(|e| {
+            AwsChunkedError::InvalidTrailerChecksum {
+                message: format!("base64 decode failed: {e}"),
+            }
+        })?;
+        if decoded.len() != algorithm.digest_len() {
+            return Err(AwsChunkedError::InvalidTrailerChecksum {
+                message: format!(
+                    "trailer for {expected_name} decoded to {} bytes, expected {}",
+                    decoded.len(),
+                    algorithm.digest_len(),
+                ),
+            });
+        }
+
+        Ok(ChecksumHeader {
+            algorithm,
+            name: algorithm.header_name().to_string(),
+            value: trimmed_value.to_string(),
+        })
+    }
+
+    /// Read the `x-amz-trailer-signature:<64 hex>` line that follows the
+    /// declared trailer on signed-trailer uploads. Shape-validation only;
+    /// crypto verification is tracked in #63. The trailing line terminator
+    /// (CRLF or bare LF) is consumed.
+    async fn read_and_validate_trailer_signature(&mut self) -> Result<(), AwsChunkedError> {
+        let line = self
+            .read_trailer_line("x-amz-trailer-signature")
+            .await
+            .map_err(|e| match e {
+                AwsChunkedError::Truncated | AwsChunkedError::MissingTrailer { .. } => {
+                    AwsChunkedError::InvalidTrailerSignature {
+                        message: "x-amz-trailer-signature line missing".to_string(),
+                    }
+                }
+                other => other,
+            })?;
+
+        let (name, value) =
+            line.split_once(':')
+                .ok_or_else(|| AwsChunkedError::InvalidTrailerSignature {
+                    message: format!("missing `:` separator: `{line}`"),
+                })?;
+        if !name.trim().eq_ignore_ascii_case("x-amz-trailer-signature") {
+            return Err(AwsChunkedError::InvalidTrailerSignature {
+                message: format!("unexpected name `{name}`"),
+            });
+        }
+        let sig = value.trim();
+        if sig.len() != CHUNK_SIGNATURE_HEX_LEN {
+            return Err(AwsChunkedError::InvalidTrailerSignature {
+                message: format!(
+                    "x-amz-trailer-signature must be {CHUNK_SIGNATURE_HEX_LEN} hex chars, got {}",
+                    sig.len(),
+                ),
+            });
+        }
+        if !sig.bytes().all(is_lower_hex_byte) {
+            return Err(AwsChunkedError::InvalidTrailerSignature {
+                message: "x-amz-trailer-signature must be lowercase hex".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Read one trailer line. Accepts either `\r\n` or bare `\n` as terminator;
+    /// the returned string excludes that terminator. The line bytes are
+    /// bounded by `MAX_TRAILER_LINE_BYTES` (same cap as chunk headers).
+    /// `expected_name` is used only for error messages — name validation is
+    /// done by the caller.
+    async fn read_trailer_line(&mut self, expected_name: &str) -> Result<String, AwsChunkedError> {
+        let mut buf: Vec<u8> = Vec::with_capacity(64);
+        let raw = loop {
+            let chunk = self
+                .inner
+                .fill_buf()
+                .await
+                .map_err(|source| AwsChunkedError::InboundIo { source })?;
+            if chunk.is_empty() {
+                if buf.is_empty() {
+                    return Err(AwsChunkedError::MissingTrailer {
+                        name: expected_name.to_string(),
+                    });
+                }
+                return Err(AwsChunkedError::InvalidTrailer {
+                    message: "trailer line missing LF terminator".to_string(),
+                });
+            }
+            if let Some(idx) = chunk.iter().position(|&b| b == b'\n') {
+                let line_bytes_in_chunk = idx + 1;
+                if buf.len() + line_bytes_in_chunk > MAX_TRAILER_LINE_BYTES {
+                    return Err(AwsChunkedError::InvalidTrailer {
+                        message: format!("trailer line exceeded {MAX_TRAILER_LINE_BYTES} bytes",),
+                    });
+                }
+                buf.extend_from_slice(&chunk[..line_bytes_in_chunk]);
+                self.inner.consume(line_bytes_in_chunk);
+                break buf;
+            }
+            if buf.len() + chunk.len() > MAX_TRAILER_LINE_BYTES {
+                return Err(AwsChunkedError::InvalidTrailer {
+                    message: format!("trailer line exceeded {MAX_TRAILER_LINE_BYTES} bytes"),
+                });
+            }
+            buf.extend_from_slice(chunk);
+            let consumed = chunk.len();
+            self.inner.consume(consumed);
+        };
+
+        // Strip terminator: accept CRLF or bare LF.
+        let line_bytes = if raw.ends_with(b"\r\n") {
+            &raw[..raw.len() - 2]
+        } else if raw.ends_with(b"\n") {
+            &raw[..raw.len() - 1]
+        } else {
+            return Err(AwsChunkedError::InvalidTrailer {
+                message: "trailer line not terminated by LF".to_string(),
+            });
+        };
+
+        if line_bytes.is_empty() {
+            return Err(AwsChunkedError::MissingTrailer {
+                name: expected_name.to_string(),
+            });
+        }
+
+        std::str::from_utf8(line_bytes)
+            .map(|s| s.to_string())
+            .map_err(|_| AwsChunkedError::InvalidTrailer {
+                message: "trailer line contained non-UTF-8 bytes".to_string(),
+            })
     }
 
     /// Consume exactly `\r\n` from the inner reader. Anything else is a
@@ -309,47 +670,74 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
     }
 }
 
-/// Parse a chunk header line of the form `<hex-size>;chunk-signature=<64 hex>`.
-/// Returns the chunk size on success.
-fn parse_chunk_header(line: &str) -> Result<u64, AwsChunkedError> {
-    // Split on the first `;`. Anything before is the hex size; the remainder
-    // must be exactly `chunk-signature=<64 hex>` (no extra extensions; the
-    // AWS aws-chunked wire format defines only the signature extension).
-    let (size_part, sig_part) =
-        line.split_once(';')
-            .ok_or_else(|| AwsChunkedError::MalformedFrame {
-                message: format!("chunk header missing `;chunk-signature=` extension: `{line}`"),
-            })?;
+/// Parse a chunk header line.
+///
+/// When `expects_signature` is true (non-trailer and signed-trailer modes),
+/// the form is `<hex-size>;chunk-signature=<64 hex>`. When false (unsigned
+/// trailer mode), the form is the bare `<hex-size>` with no extensions; any
+/// `;`-extension is rejected.
+fn parse_chunk_header(line: &str, expects_signature: bool) -> Result<u64, AwsChunkedError> {
+    if expects_signature {
+        // Split on the first `;`. Anything before is the hex size; the
+        // remainder must be exactly `chunk-signature=<64 hex>`.
+        let (size_part, sig_part) =
+            line.split_once(';')
+                .ok_or_else(|| AwsChunkedError::MalformedFrame {
+                    message: format!(
+                        "chunk header missing `;chunk-signature=` extension: `{line}`",
+                    ),
+                })?;
 
+        let size = parse_chunk_size(size_part)?;
+
+        let sig_hex = sig_part.strip_prefix("chunk-signature=").ok_or_else(|| {
+            AwsChunkedError::MalformedFrame {
+                message: format!(
+                    "chunk header extension is not `chunk-signature=...`: `{sig_part}`",
+                ),
+            }
+        })?;
+        if sig_hex.len() != CHUNK_SIGNATURE_HEX_LEN {
+            return Err(AwsChunkedError::MalformedFrame {
+                message: format!(
+                    "chunk-signature must be {CHUNK_SIGNATURE_HEX_LEN} hex chars, got {}",
+                    sig_hex.len(),
+                ),
+            });
+        }
+        if !sig_hex.bytes().all(is_lower_hex_byte) {
+            return Err(AwsChunkedError::MalformedFrame {
+                message: "chunk-signature must be lowercase hex".to_string(),
+            });
+        }
+        Ok(size)
+    } else {
+        // Unsigned trailer mode: bare `<hex-size>`. Any extension — including
+        // a spurious `chunk-signature` — is a framing violation. Rejecting
+        // here is the load-bearing classifier: a signature appearing on an
+        // unsigned-trailer chunk is the kind of thing a client SDK might do
+        // by mistake, and forwarding it would mean we accepted a stream we
+        // didn't actually validate.
+        if line.contains(';') {
+            return Err(AwsChunkedError::MalformedFrame {
+                message: format!(
+                    "unsigned-trailer chunk header must be bare `<hex-size>` without extensions, got `{line}`",
+                ),
+            });
+        }
+        parse_chunk_size(line)
+    }
+}
+
+fn parse_chunk_size(size_part: &str) -> Result<u64, AwsChunkedError> {
     if size_part.is_empty() {
         return Err(AwsChunkedError::MalformedFrame {
             message: "chunk header had empty size field".to_string(),
         });
     }
-    let size = u64::from_str_radix(size_part, 16).map_err(|_| AwsChunkedError::MalformedFrame {
+    u64::from_str_radix(size_part, 16).map_err(|_| AwsChunkedError::MalformedFrame {
         message: format!("chunk size is not valid hex: `{size_part}`"),
-    })?;
-
-    let sig_hex = sig_part.strip_prefix("chunk-signature=").ok_or_else(|| {
-        AwsChunkedError::MalformedFrame {
-            message: format!("chunk header extension is not `chunk-signature=...`: `{sig_part}`"),
-        }
-    })?;
-    if sig_hex.len() != CHUNK_SIGNATURE_HEX_LEN {
-        return Err(AwsChunkedError::MalformedFrame {
-            message: format!(
-                "chunk-signature must be {CHUNK_SIGNATURE_HEX_LEN} hex chars, got {}",
-                sig_hex.len()
-            ),
-        });
-    }
-    if !sig_hex.bytes().all(is_lower_hex_byte) {
-        return Err(AwsChunkedError::MalformedFrame {
-            message: "chunk-signature must be lowercase hex".to_string(),
-        });
-    }
-
-    Ok(size)
+    })
 }
 
 fn is_lower_hex_byte(b: u8) -> bool {
@@ -686,6 +1074,437 @@ mod tests {
         }
     }
 
+    // ---- trailer-mode coverage ----
+
+    use crate::s3::checksum::ChecksumAlgorithm;
+    use aws_smithy_types::base64;
+
+    /// Compute the base64-encoded checksum that the spec says should appear in
+    /// the trailer for the given algorithm + body. Matches what a compliant
+    /// client SDK emits.
+    fn compute_trailer_value(algo: ChecksumAlgorithm, body: &[u8]) -> String {
+        match algo {
+            ChecksumAlgorithm::Sha256 => {
+                use sha2::Digest;
+                let bytes = sha2::Sha256::digest(body);
+                base64::encode(&bytes[..])
+            }
+            _ => {
+                let mut hasher = algo.into_smithy_impl();
+                aws_smithy_checksums::Checksum::update(hasher.as_mut(), body);
+                let bytes = aws_smithy_checksums::Checksum::finalize(hasher);
+                base64::encode(&bytes[..])
+            }
+        }
+    }
+
+    /// Build an unsigned-trailer frame: bare-size chunks (no signature) +
+    /// final `0\r\n` + trailer line + closing `\r\n`.
+    fn build_unsigned_trailer_frame(
+        chunks: &[&[u8]],
+        trailer_name: &str,
+        trailer_value: &str,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        for c in chunks {
+            out.extend_from_slice(format!("{:x}\r\n", c.len()).as_bytes());
+            out.extend_from_slice(c);
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(b"0\r\n");
+        out.extend_from_slice(format!("{trailer_name}:{trailer_value}\r\n").as_bytes());
+        out.extend_from_slice(b"\r\n");
+        out
+    }
+
+    /// Build a signed-trailer frame: signed chunks (with `;chunk-signature=`)
+    /// + signed final `0;chunk-signature=...\r\n` + trailer line + trailer
+    ///   signature line + closing `\r\n`.
+    fn build_signed_trailer_frame(
+        chunks: &[&[u8]],
+        trailer_name: &str,
+        trailer_value: &str,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        for c in chunks {
+            out.extend_from_slice(format!("{:x};chunk-signature={SIG}\r\n", c.len()).as_bytes());
+            out.extend_from_slice(c);
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(format!("0;chunk-signature={SIG}\r\n").as_bytes());
+        out.extend_from_slice(format!("{trailer_name}:{trailer_value}\r\n").as_bytes());
+        out.extend_from_slice(format!("x-amz-trailer-signature:{SIG}\r\n").as_bytes());
+        out.extend_from_slice(b"\r\n");
+        out
+    }
+
+    async fn decode_with_mode(
+        frame: &[u8],
+        declared_len: u64,
+        mode: DecoderMode,
+    ) -> Result<(Vec<u8>, DecodedSummary), AwsChunkedError> {
+        let mut sink: BufWriter<Vec<u8>> = BufWriter::new(Vec::new());
+        let summary = AwsChunkedDecoder::with_mode(frame, declared_len, mode)
+            .decode_to_writer(&mut sink)
+            .await?;
+        sink.flush().await.unwrap();
+        Ok((sink.into_inner(), summary))
+    }
+
+    fn unsigned_mode(algo: ChecksumAlgorithm) -> DecoderMode {
+        DecoderMode::UnsignedTrailer {
+            expected_trailer_name: algo.header_name().to_string(),
+            algorithm: algo,
+        }
+    }
+
+    fn signed_mode(algo: ChecksumAlgorithm) -> DecoderMode {
+        DecoderMode::SignedTrailer {
+            expected_trailer_name: algo.header_name().to_string(),
+            algorithm: algo,
+        }
+    }
+
+    /// Tests that every algorithm decodes a well-formed unsigned-trailer
+    /// frame and reports the validated trailer in the summary. Sweeps the
+    /// full algorithm matrix so a typo in `header_name()` or `digest_len()`
+    /// is caught at the algorithm boundary.
+    #[tokio::test]
+    async fn test_unsigned_trailer_success_per_algorithm() {
+        let payload = b"abcdefgh";
+        for algo in [
+            ChecksumAlgorithm::Crc32,
+            ChecksumAlgorithm::Crc32C,
+            ChecksumAlgorithm::Crc64Nvme,
+            ChecksumAlgorithm::Sha1,
+            ChecksumAlgorithm::Sha256,
+        ] {
+            let value = compute_trailer_value(algo, payload);
+            let frame = build_unsigned_trailer_frame(&[payload], algo.header_name(), &value);
+            let (decoded, summary) =
+                decode_with_mode(&frame, payload.len() as u64, unsigned_mode(algo))
+                    .await
+                    .unwrap_or_else(|e| panic!("decode for {algo:?} failed: {e:?}"));
+            assert_eq!(decoded, payload);
+            let trailer = summary.trailer.expect("trailer must be present");
+            assert_eq!(trailer.algorithm, algo);
+            assert_eq!(trailer.name, algo.header_name());
+            assert_eq!(trailer.value, value);
+        }
+    }
+
+    /// Same matrix as unsigned-trailer, against the signed-trailer mode.
+    #[tokio::test]
+    async fn test_signed_trailer_success_per_algorithm() {
+        let payload = b"abcdefgh";
+        for algo in [
+            ChecksumAlgorithm::Crc32,
+            ChecksumAlgorithm::Crc32C,
+            ChecksumAlgorithm::Crc64Nvme,
+            ChecksumAlgorithm::Sha1,
+            ChecksumAlgorithm::Sha256,
+        ] {
+            let value = compute_trailer_value(algo, payload);
+            let frame = build_signed_trailer_frame(&[payload], algo.header_name(), &value);
+            let (decoded, summary) =
+                decode_with_mode(&frame, payload.len() as u64, signed_mode(algo))
+                    .await
+                    .unwrap_or_else(|e| panic!("signed decode for {algo:?} failed: {e:?}"));
+            assert_eq!(decoded, payload);
+            let trailer = summary.trailer.expect("trailer must be present");
+            assert_eq!(trailer.algorithm, algo);
+            assert_eq!(trailer.value, value);
+        }
+    }
+
+    /// AWS docs are inconsistent about whether trailer lines end with CRLF or
+    /// bare LF; we accept both so we don't fail integration with a specific
+    /// SDK build. This proves bare-LF works on the unsigned path.
+    #[tokio::test]
+    async fn test_unsigned_trailer_bare_lf_terminator_accepted() {
+        let payload = b"abcdefgh";
+        let algo = ChecksumAlgorithm::Crc32;
+        let value = compute_trailer_value(algo, payload);
+        // Hand-build the frame with bare LF after the trailer value.
+        let mut frame = Vec::new();
+        frame.extend_from_slice(format!("{:x}\r\n", payload.len()).as_bytes());
+        frame.extend_from_slice(payload);
+        frame.extend_from_slice(b"\r\n0\r\n");
+        frame.extend_from_slice(format!("{}:{value}\n", algo.header_name()).as_bytes());
+        frame.extend_from_slice(b"\r\n");
+        let (_, summary) = decode_with_mode(&frame, payload.len() as u64, unsigned_mode(algo))
+            .await
+            .unwrap();
+        assert_eq!(summary.trailer.unwrap().value, value);
+    }
+
+    /// Companion: bare-LF after the trailer line is accepted on signed mode
+    /// too. The trailer-signature line still uses CRLF so we can isolate the
+    /// terminator-flexibility test to just the trailer line itself.
+    #[tokio::test]
+    async fn test_signed_trailer_bare_lf_terminator_accepted() {
+        let payload = b"abcdefgh";
+        let algo = ChecksumAlgorithm::Sha1;
+        let value = compute_trailer_value(algo, payload);
+        let mut frame = Vec::new();
+        frame
+            .extend_from_slice(format!("{:x};chunk-signature={SIG}\r\n", payload.len()).as_bytes());
+        frame.extend_from_slice(payload);
+        frame.extend_from_slice(b"\r\n");
+        frame.extend_from_slice(format!("0;chunk-signature={SIG}\r\n").as_bytes());
+        // Bare LF after the trailer value.
+        frame.extend_from_slice(format!("{}:{value}\n", algo.header_name()).as_bytes());
+        frame.extend_from_slice(format!("x-amz-trailer-signature:{SIG}\r\n").as_bytes());
+        frame.extend_from_slice(b"\r\n");
+        let (_, summary) = decode_with_mode(&frame, payload.len() as u64, signed_mode(algo))
+            .await
+            .unwrap();
+        assert_eq!(summary.trailer.unwrap().value, value);
+    }
+
+    /// Declared trailer was CRC32 but the body carries `x-amz-checksum-sha256`.
+    /// Reject as InvalidTrailer — the proxy must not silently accept a
+    /// mismatched name because the value happens to base64-decode.
+    #[tokio::test]
+    async fn test_trailer_name_mismatch_rejected() {
+        let payload = b"abcdefgh";
+        let value = compute_trailer_value(ChecksumAlgorithm::Sha256, payload);
+        // Frame uses the SHA256 trailer name but the mode expects CRC32.
+        let frame = build_unsigned_trailer_frame(&[payload], "x-amz-checksum-sha256", &value);
+        let err = decode_with_mode(
+            &frame,
+            payload.len() as u64,
+            unsigned_mode(ChecksumAlgorithm::Crc32),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, AwsChunkedError::InvalidTrailer { .. }),
+            "got {err:?}",
+        );
+    }
+
+    /// No trailer line at all on a mode that requires one — the stream just
+    /// ends after the final `0\r\n`. Surface MissingTrailer so the handler
+    /// can produce a specific InvalidRequest message.
+    #[tokio::test]
+    async fn test_trailer_missing_rejected() {
+        let payload = b"abcdefgh";
+        // Skip the trailer line entirely: `0\r\n` then closing `\r\n`.
+        let mut frame = Vec::new();
+        frame.extend_from_slice(format!("{:x}\r\n", payload.len()).as_bytes());
+        frame.extend_from_slice(payload);
+        frame.extend_from_slice(b"\r\n0\r\n\r\n");
+        let err = decode_with_mode(
+            &frame,
+            payload.len() as u64,
+            unsigned_mode(ChecksumAlgorithm::Crc32),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, AwsChunkedError::MissingTrailer { .. }),
+            "got {err:?}",
+        );
+    }
+
+    /// A SECOND trailer-style line after the declared one is illegal — only
+    /// one trailer is allowed per upload. The decoder rejects on the EOF
+    /// expectation after the closing CRLF.
+    #[tokio::test]
+    async fn test_extra_trailer_line_rejected() {
+        let payload = b"abcdefgh";
+        let algo = ChecksumAlgorithm::Crc32;
+        let value = compute_trailer_value(algo, payload);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(format!("{:x}\r\n", payload.len()).as_bytes());
+        frame.extend_from_slice(payload);
+        frame.extend_from_slice(b"\r\n0\r\n");
+        // Two trailer lines, then closing CRLF.
+        frame.extend_from_slice(format!("{}:{value}\r\n", algo.header_name()).as_bytes());
+        frame.extend_from_slice(b"x-amz-extra-thing:abc\r\n");
+        frame.extend_from_slice(b"\r\n");
+        let err = decode_with_mode(&frame, payload.len() as u64, unsigned_mode(algo))
+            .await
+            .unwrap_err();
+        // The extra line is read as "the closing \r\n", which makes
+        // expect_eof fire on the next bytes — but the more common surfaced
+        // error is TrailingData. Accept either of those framing errors.
+        assert!(
+            matches!(
+                err,
+                AwsChunkedError::TrailingData
+                    | AwsChunkedError::InvalidTrailer { .. }
+                    | AwsChunkedError::MalformedFrame { .. }
+            ),
+            "got {err:?}",
+        );
+    }
+
+    /// Trailer value isn't valid base64. Reject as InvalidTrailerChecksum so
+    /// the handler can produce an InvalidDigest response.
+    #[tokio::test]
+    async fn test_trailer_invalid_base64_rejected() {
+        let payload = b"abcdefgh";
+        let algo = ChecksumAlgorithm::Crc32;
+        // `!` is not a valid base64 char.
+        let frame = build_unsigned_trailer_frame(&[payload], algo.header_name(), "!!!!");
+        let err = decode_with_mode(&frame, payload.len() as u64, unsigned_mode(algo))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AwsChunkedError::InvalidTrailerChecksum { .. }),
+            "got {err:?}",
+        );
+    }
+
+    /// Trailer value decodes cleanly but the decoded length doesn't match
+    /// the declared algorithm. Catches a CRC32 trailer-name carrying a
+    /// SHA-256 value, for example.
+    #[tokio::test]
+    async fn test_trailer_wrong_digest_length_rejected() {
+        let payload = b"abcdefgh";
+        let algo = ChecksumAlgorithm::Crc32;
+        // Use a SHA-256-sized digest (32 bytes) as the trailer value.
+        let oversized = base64::encode(vec![0u8; 32]);
+        let frame = build_unsigned_trailer_frame(&[payload], algo.header_name(), &oversized);
+        let err = decode_with_mode(&frame, payload.len() as u64, unsigned_mode(algo))
+            .await
+            .unwrap_err();
+        match err {
+            AwsChunkedError::InvalidTrailerChecksum { message } => {
+                assert!(
+                    message.contains("decoded to 32 bytes"),
+                    "error should cite the wrong byte count, got: {message}",
+                );
+            }
+            other => panic!("expected InvalidTrailerChecksum, got {other:?}"),
+        }
+    }
+
+    /// Load-bearing integrity check: a well-formed, correctly-sized trailer
+    /// whose value doesn't match the actual digest must produce
+    /// `TrailerChecksumMismatch`. This is the case where the handler returns
+    /// `BadDigest`.
+    ///
+    /// Bug-revert reasoning: removing the checksum comparison inside
+    /// `finalize()` would make this test pass with `Ok(...)`. We verified
+    /// that by temporarily commenting out the `if computed != expected_bytes`
+    /// branch before re-enabling it; with the check disabled the assertion
+    /// here flips and the test fails with "expected error, got Ok(...)".
+    #[tokio::test]
+    async fn test_trailer_checksum_mismatch_rejected() {
+        let payload = b"abcdefgh";
+        let algo = ChecksumAlgorithm::Crc32;
+        // Right shape (4 bytes of base64), wrong value.
+        let wrong = base64::encode(b"WRNG");
+        let frame = build_unsigned_trailer_frame(&[payload], algo.header_name(), &wrong);
+        let err = decode_with_mode(&frame, payload.len() as u64, unsigned_mode(algo))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AwsChunkedError::TrailerChecksumMismatch { .. }),
+            "got {err:?}",
+        );
+    }
+
+    /// Signed-trailer mode whose `x-amz-trailer-signature` line is missing
+    /// (frame ends right after the data trailer's CRLF). Surface as
+    /// InvalidTrailerSignature so the handler returns InvalidRequest.
+    #[tokio::test]
+    async fn test_signed_trailer_missing_signature_rejected() {
+        let payload = b"abcdefgh";
+        let algo = ChecksumAlgorithm::Crc32;
+        let value = compute_trailer_value(algo, payload);
+        let mut frame = Vec::new();
+        frame
+            .extend_from_slice(format!("{:x};chunk-signature={SIG}\r\n", payload.len()).as_bytes());
+        frame.extend_from_slice(payload);
+        frame.extend_from_slice(b"\r\n");
+        frame.extend_from_slice(format!("0;chunk-signature={SIG}\r\n").as_bytes());
+        frame.extend_from_slice(format!("{}:{value}\r\n", algo.header_name()).as_bytes());
+        // Trailer signature omitted; just a closing CRLF.
+        frame.extend_from_slice(b"\r\n");
+        let err = decode_with_mode(&frame, payload.len() as u64, signed_mode(algo))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AwsChunkedError::InvalidTrailerSignature { .. }
+                    | AwsChunkedError::MissingTrailer { .. }
+            ),
+            "got {err:?}",
+        );
+    }
+
+    /// Signed-trailer with a non-hex `x-amz-trailer-signature` value. Catches
+    /// regressions in the shape-check (which is the only check we do until #63).
+    #[tokio::test]
+    async fn test_signed_trailer_non_hex_signature_rejected() {
+        let payload = b"abcdefgh";
+        let algo = ChecksumAlgorithm::Crc32;
+        let value = compute_trailer_value(algo, payload);
+        // 64-char signature but with a non-hex `z` planted at the front.
+        let bad_sig = "z".to_string() + &"0".repeat(63);
+        let mut frame = Vec::new();
+        frame
+            .extend_from_slice(format!("{:x};chunk-signature={SIG}\r\n", payload.len()).as_bytes());
+        frame.extend_from_slice(payload);
+        frame.extend_from_slice(b"\r\n");
+        frame.extend_from_slice(format!("0;chunk-signature={SIG}\r\n").as_bytes());
+        frame.extend_from_slice(format!("{}:{value}\r\n", algo.header_name()).as_bytes());
+        frame.extend_from_slice(format!("x-amz-trailer-signature:{bad_sig}\r\n").as_bytes());
+        frame.extend_from_slice(b"\r\n");
+        let err = decode_with_mode(&frame, payload.len() as u64, signed_mode(algo))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AwsChunkedError::InvalidTrailerSignature { .. }),
+            "got {err:?}",
+        );
+    }
+
+    /// Unsigned-trailer mode must reject a chunk header that carries a
+    /// `;chunk-signature=` extension. Bug-revert reasoning: removing the
+    /// `line.contains(';')` guard in `parse_chunk_header(_, false)` would let
+    /// signed framing slip past the unsigned classifier and the proxy would
+    /// silently accept a stream it never validated as unsigned. Verified by
+    /// commenting out the guard — the assertion below flipped to Ok().
+    #[tokio::test]
+    async fn test_unsigned_mode_with_signed_chunk_rejected() {
+        let payload = b"abcdefgh";
+        let algo = ChecksumAlgorithm::Crc32;
+        let value = compute_trailer_value(algo, payload);
+        // Build a SIGNED frame, then try to decode it in UNSIGNED mode.
+        let frame = build_signed_trailer_frame(&[payload], algo.header_name(), &value);
+        let err = decode_with_mode(&frame, payload.len() as u64, unsigned_mode(algo))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AwsChunkedError::MalformedFrame { .. }),
+            "got {err:?}",
+        );
+    }
+
+    /// Signed mode with a bare-size chunk header (no signature). Must reject
+    /// — these are framing classes we explicitly route differently.
+    #[tokio::test]
+    async fn test_signed_mode_with_bare_size_chunk_rejected() {
+        let payload = b"abcdefgh";
+        let algo = ChecksumAlgorithm::Crc32;
+        let value = compute_trailer_value(algo, payload);
+        // Build an UNSIGNED frame, then try to decode it in SIGNED mode.
+        let frame = build_unsigned_trailer_frame(&[payload], algo.header_name(), &value);
+        let err = decode_with_mode(&frame, payload.len() as u64, signed_mode(algo))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AwsChunkedError::MalformedFrame { .. }),
+            "got {err:?}",
+        );
+    }
+
     // ---- parse_chunk_header unit-level coverage ----
 
     #[test]
@@ -693,7 +1512,7 @@ mod tests {
         // 64 uppercase hex characters — protocol mandates lowercase.
         let upper = "0".repeat(63) + "A";
         let line = format!("8;chunk-signature={upper}");
-        let err = parse_chunk_header(&line).unwrap_err();
+        let err = parse_chunk_header(&line, true).unwrap_err();
         assert!(
             matches!(err, AwsChunkedError::MalformedFrame { .. }),
             "got {err:?}"
@@ -703,7 +1522,7 @@ mod tests {
     #[test]
     fn test_parse_header_empty_size_rejected() {
         let line = format!(";chunk-signature={SIG}");
-        let err = parse_chunk_header(&line).unwrap_err();
+        let err = parse_chunk_header(&line, true).unwrap_err();
         assert!(
             matches!(err, AwsChunkedError::MalformedFrame { .. }),
             "got {err:?}"

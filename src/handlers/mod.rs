@@ -715,6 +715,7 @@ pub mod test_utils {
                     metadata: req.metadata.clone(),
                     extra_amz_headers: req.extra_amz_headers.clone(),
                     content_headers: req.content_headers.clone(),
+                    checksum: req.checksum.clone(),
                 });
             self.put_response.lock().unwrap().take().unwrap_or_else(|| {
                 Err(ProxyError::Backend {
@@ -816,6 +817,7 @@ pub mod test_utils {
                     sha256_hex: req.sha256_hex.clone(),
                     content_md5: req.content_md5.clone(),
                     extra_amz_headers: req.extra_amz_headers.clone(),
+                    checksum: req.checksum.clone(),
                 });
             self.upload_part_response
                 .lock()
@@ -1647,9 +1649,12 @@ mod tests {
         assert!(body_str.contains("AccessDenied"));
     }
 
-    /// PUT with aws-chunked / SigV4 streaming indicators must bypass the typed
-    /// PUT path (which buffers the raw body verbatim, storing chunk-signature
-    /// frames as object body bytes) and instead route to passthrough.
+    /// PUT with an aws-chunked variant the in-house decoder does NOT handle
+    /// (here: ECDSA-signed streaming) must bypass the typed PUT path and
+    /// route to passthrough. Was originally written for trailer mode, which
+    /// now goes through the decoder; flipped to ECDSA so the test still pins
+    /// the load-bearing decision: "anything the decoder can't validate must
+    /// reach the upstream byte-for-byte". ECDSA is tracked in #63.
     #[tokio::test]
     async fn test_aws_chunked_put_routes_to_passthrough() {
         use axum::routing::any;
@@ -1727,10 +1732,9 @@ mod tests {
             .header("content-encoding", "aws-chunked")
             .header(
                 "x-amz-content-sha256",
-                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+                "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD",
             )
             .header("x-amz-decoded-content-length", "5")
-            .header("x-amz-trailer", "x-amz-checksum-crc32")
             .body(Body::from(framed_body.to_vec()))
             .unwrap();
 
@@ -1776,13 +1780,13 @@ mod tests {
                 .unwrap(),
             "5"
         );
-        assert_eq!(
-            hdrs.get("x-amz-trailer")
-                .expect("x-amz-trailer forwarded")
-                .to_str()
-                .unwrap(),
-            "x-amz-checksum-crc32"
-        );
+        // `x-amz-decoded-content-length` reaching the upstream is the
+        // load-bearing passthrough signal — the typed PUT path and the
+        // decode path both strip it (see `is_streaming_only_amz_header` and
+        // parse.rs). The assertion above on its value (`"5"`) already covers
+        // this. Note that passthrough re-signs the request with SigV4, so
+        // `x-amz-content-sha256` is REPLACED by the SDK before reaching the
+        // upstream — we can't assert on the original ECDSA sentinel here.
         assert_eq!(
             call_count.load(Ordering::SeqCst),
             1,

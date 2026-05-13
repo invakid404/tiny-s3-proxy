@@ -467,10 +467,13 @@ async fn start_counting_mock_upstream(mock: Arc<CountingMockUpstream>) -> String
 /// A single request captured by `CapturingMockUpstream`. Records the inbound
 /// HTTP shape we need to assert routing — method, the path the proxy chose
 /// when constructing the upstream URL, the forwarded header set, and the
-/// fully-drained body bytes.
+/// fully-drained body bytes. `method` and `path` are kept for the contract
+/// — tests that need them can downcast — even if no current test reads them.
 #[derive(Clone)]
 struct CapturedRequest {
+    #[allow(dead_code)]
     method: http::Method,
+    #[allow(dead_code)]
     path: String,
     headers: http::HeaderMap,
     body: Vec<u8>,
@@ -1640,11 +1643,13 @@ async fn test_unsigned_streaming_put_oversized_content_length_rejected_before_ba
     // Hand-rolled HTTP/1.1 PUT:
     //   * declared Content-Length 32 > cap 16 → preflight rejects
     //   * actual body 8 bytes < cap 16        → Limited backstop would NOT fire
-    //   * STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER with x-amz-trailer:
-    //     trailer-mode aws-chunked still routes through passthrough (PR #2
-    //     of issue #50 will move trailer-mode into the in-house decoder).
-    //     The non-trailer variant now goes through the decoder, so using
-    //     it here would no longer exercise the passthrough preflight.
+    //   * STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER with `x-amz-trailer:
+    //     x-amz-checksum-md5`: trailer-mode with an unsupported algorithm
+    //     routes to passthrough via `AwsChunkedUploadMode::OtherStreaming`.
+    //     This is the only remaining shape that exercises the passthrough
+    //     preflight after issue #50 PR #2 moved supported-algorithm trailer
+    //     modes into the in-house decoder (which has its own preflight
+    //     keyed on `x-amz-decoded-content-length`, not `Content-Length`).
     let request = format!(
         "PUT /{TEST_BUCKET}/cold-review/oversized-cl HTTP/1.1\r\n\
          Host: {proxy_host}\r\n\
@@ -1652,7 +1657,7 @@ async fn test_unsigned_streaming_put_oversized_content_length_rejected_before_ba
          Content-Encoding: aws-chunked\r\n\
          x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER\r\n\
          x-amz-decoded-content-length: 8\r\n\
-         x-amz-trailer: x-amz-checksum-crc32\r\n\
+         x-amz-trailer: x-amz-checksum-md5\r\n\
          Connection: close\r\n\
          \r\n\
          AAAAAAAA"
@@ -1772,102 +1777,426 @@ async fn test_backend_endpoint_userinfo_rejected_without_leaking_endpoint_parts(
     }
 }
 
-/// Pins the routing decision for aws-chunked TRAILER-mode uploads — those
-/// must still go through passthrough because PR #1 of issue #50 only handles
-/// non-trailer mode. PR #2 will add trailer support.
+/// Compute the canonical base64-encoded checksum for `body` under the given
+/// algorithm — the value a compliant client SDK would emit in the
+/// `x-amz-checksum-<algo>` trailer line.
+fn compute_smithy_checksum_b64(
+    algo: tiny_s3_proxy::s3::checksum::ChecksumAlgorithm,
+    body: &[u8],
+) -> String {
+    let mut hasher = algo.into_smithy_impl();
+    aws_smithy_checksums::Checksum::update(hasher.as_mut(), body);
+    let bytes = aws_smithy_checksums::Checksum::finalize(hasher);
+    aws_smithy_types::base64::encode(&bytes[..])
+}
+
+/// Build an unsigned-trailer aws-chunked frame: bare-size chunk header,
+/// payload, final `0\r\n`, trailer line, closing `\r\n`.
+fn build_unsigned_trailer_frame_bytes(
+    payload: &[u8],
+    trailer_name: &str,
+    trailer_value: &str,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(format!("{:x}\r\n", payload.len()).as_bytes());
+    out.extend_from_slice(payload);
+    out.extend_from_slice(b"\r\n0\r\n");
+    out.extend_from_slice(format!("{trailer_name}:{trailer_value}\r\n").as_bytes());
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
+/// Build a signed-trailer aws-chunked frame.
+fn build_signed_trailer_frame_bytes(
+    payload: &[u8],
+    trailer_name: &str,
+    trailer_value: &str,
+) -> Vec<u8> {
+    const SIG: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+    let mut out = Vec::new();
+    out.extend_from_slice(format!("{:x};chunk-signature={SIG}\r\n", payload.len()).as_bytes());
+    out.extend_from_slice(payload);
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(format!("0;chunk-signature={SIG}\r\n").as_bytes());
+    out.extend_from_slice(format!("{trailer_name}:{trailer_value}\r\n").as_bytes());
+    out.extend_from_slice(format!("x-amz-trailer-signature:{SIG}\r\n").as_bytes());
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
+/// Pins the routing decision for aws-chunked TRAILER-mode uploads: trailer
+/// mode with a supported algorithm routes to the in-house decoder. A
+/// well-formed unsigned-trailer body must:
+/// 1. Pass trailer-checksum validation (we do NOT see the 400 BadDigest
+///    response that a mismatched trailer would produce).
+/// 2. Reach the upstream-contact stage, which over HTTP triggers the HTTPS
+///    guard (`require_https_for_unsigned_payload`) and produces 500
+///    InternalError with no upstream contact.
 ///
-/// Signal: `x-amz-decoded-content-length` + `x-amz-trailer` reach the upstream.
-/// Passthrough forwards both verbatim; typed PUT strips
-/// `x-amz-decoded-content-length` during request parsing
-/// (`src/s3/parse.rs`) and the decode path would consume the body before
-/// forwarding the framing. Seeing the trailer header at the upstream proves
-/// we routed through passthrough.
+/// This indirect signal pins routing because the alternative routes have
+/// distinguishable response shapes:
+/// - Typed PUT path: would 200 against the HTTP mock with the raw
+///   aws-chunked bytes stored as the object body.
+/// - Passthrough: would 200 against the HTTP mock (no HTTPS guard there).
+/// - Decode path: 500 InternalError, message references the HTTPS guard,
+///   mock count == 0.
 ///
-/// Replaces the earlier non-trailer routing test from PR #62 — non-trailer
-/// aws-chunked now goes through the in-house decoder (issue #50 PR #1), so
-/// the routing target has changed. Trailer mode remains on passthrough until
-/// PR #2 lands.
+/// Companion happy-path coverage that the upstream actually sees the
+/// decoded body + per-algorithm checksum header lives in the handler-level
+/// unit tests (`test_decode_put_unsigned_trailer_forwards_checksum_to_backend`),
+/// which uses MockBackend and isn't subject to the HTTPS guard.
+///
+/// Flipped from the earlier PR #62 test that asserted passthrough — that
+/// test asserted the pre-trailer-decoder behavior and is no longer valid.
 #[tokio::test]
-#[ignore] // Spawns an in-process mock upstream; Docker not required, but kept
-// `#[ignore]` for parity with the rest of this suite.
-async fn test_aws_chunked_trailer_mode_routes_to_passthrough() {
-    let mock = CapturingMockUpstream::new();
-    let mock_endpoint = start_capturing_mock_upstream(mock.clone()).await;
+#[ignore]
+async fn test_aws_chunked_unsigned_trailer_put_routes_to_decoder() {
+    let mock = CountingMockUpstream::new();
+    let mock_endpoint = start_counting_mock_upstream(mock.clone()).await;
 
     let cache_dir = tempfile::TempDir::new().expect("cache dir");
     let (_proxy_client, _http_client, proxy_endpoint, _cache_dir) =
         build_proxy_stack_with_opts(&mock_endpoint, cache_dir, |_cfg| {}).await;
+    let proxy_host = proxy_endpoint.strip_prefix("http://").unwrap();
 
-    let proxy_host = proxy_endpoint
-        .strip_prefix("http://")
-        .expect("proxy endpoint should be http://host:port");
+    let payload = b"abcdefgh";
+    let algo = tiny_s3_proxy::s3::checksum::ChecksumAlgorithm::Crc32;
+    let value = compute_smithy_checksum_b64(algo, payload);
+    let frame = build_unsigned_trailer_frame_bytes(payload, algo.header_name(), &value);
 
-    // Same 180-byte aws-chunked body as the original PR #62 test. The body
-    // shape is only checked for byte-for-byte preservation; the routing
-    // signal is the trailer header below.
-    let body: Vec<u8> =
-        b"8;chunk-signature=0000000000000000000000000000000000000000000000000000000000000000\r\n\
-        abcdefgh\r\n\
-        0;chunk-signature=0000000000000000000000000000000000000000000000000000000000000000\r\n\
-        \r\n"
-            .to_vec();
-    assert_eq!(
-        body.len(),
-        180,
-        "aws-chunked body must be exactly 180 bytes"
-    );
-
-    // Trailer-mode indicators force passthrough routing:
-    //   * x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER
-    //   * x-amz-trailer: x-amz-checksum-crc32
     let headers = format!(
         "PUT /{TEST_BUCKET}/cold-review/aws-chunked-trailer-routing HTTP/1.1\r\n\
          Host: {proxy_host}\r\n\
-         Content-Length: 180\r\n\
+         Content-Length: {body_len}\r\n\
          Content-Encoding: aws-chunked\r\n\
-         x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER\r\n\
-         x-amz-decoded-content-length: 8\r\n\
+         x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER\r\n\
+         x-amz-decoded-content-length: {payload_len}\r\n\
          x-amz-trailer: x-amz-checksum-crc32\r\n\
          Connection: close\r\n\
-         \r\n"
+         \r\n",
+        body_len = frame.len(),
+        payload_len = payload.len(),
     );
     let mut request_bytes = headers.into_bytes();
-    request_bytes.extend_from_slice(&body);
+    request_bytes.extend_from_slice(&frame);
 
-    let (status, _raw_response) = raw_tcp_request(proxy_host, &request_bytes).await;
+    let (status, raw_response) = raw_tcp_request(proxy_host, &request_bytes).await;
+    let resp_text = String::from_utf8_lossy(&raw_response);
+    // 500 InternalError from the HTTPS guard proves we reached the
+    // upstream-contact stage. A 400 here would mean trailer validation
+    // failed — the regression we're guarding against. A 200 would mean we
+    // routed to typed or passthrough instead.
     assert_eq!(
-        status, 200,
-        "proxy should return the upstream's 200; got {status}"
+        status, 500,
+        "trailer mode must route to decode path (HTTPS guard fires); got status {status} \
+         with body: {resp_text}",
     );
+    assert!(
+        resp_text.contains("InternalError"),
+        "expected InternalError, got: {resp_text}",
+    );
+    assert_eq!(
+        mock.received_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "decode path must reject HTTP upstream before contact",
+    );
+}
 
-    let captured = mock
-        .last_request()
-        .await
-        .expect("upstream must have received the request");
-    assert_eq!(mock.request_count().await, 1);
-    assert_eq!(captured.method, http::Method::PUT);
+/// Sweep all five trailer algorithms (unsigned-trailer mode). For each
+/// algorithm: build a frame with the canonical checksum, send through the
+/// proxy, assert the request reaches the HTTPS guard (status 500
+/// InternalError, zero upstream contact). Per-algorithm forwarding of the
+/// checksum value to the upstream is covered by the handler unit tests.
+///
+/// Each algorithm is independently validated; a regression in one
+/// algorithm's wiring (wrong `into_smithy_impl` mapping, wrong header name,
+/// wrong digest_len) would surface as a 400 InvalidDigest / BadDigest
+/// instead of the 500 we expect.
+#[tokio::test]
+#[ignore]
+async fn test_aws_chunked_unsigned_trailer_all_algorithms_route_to_decoder() {
+    use tiny_s3_proxy::s3::checksum::ChecksumAlgorithm;
+
+    let mock = CountingMockUpstream::new();
+    let mock_endpoint = start_counting_mock_upstream(mock.clone()).await;
+    let cache_dir = tempfile::TempDir::new().expect("cache dir");
+    let (_proxy_client, _http_client, proxy_endpoint, _cache_dir) =
+        build_proxy_stack_with_opts(&mock_endpoint, cache_dir, |_cfg| {}).await;
+    let proxy_host = proxy_endpoint.strip_prefix("http://").unwrap();
+
+    let payload = b"the quick brown fox";
+
+    for algo in [
+        ChecksumAlgorithm::Crc32,
+        ChecksumAlgorithm::Crc32C,
+        ChecksumAlgorithm::Crc64Nvme,
+        ChecksumAlgorithm::Sha1,
+        ChecksumAlgorithm::Sha256,
+    ] {
+        let value = compute_smithy_checksum_b64(algo, payload);
+        let frame = build_unsigned_trailer_frame_bytes(payload, algo.header_name(), &value);
+        let key = format!("trailer-sweep/{}.bin", algo.header_name());
+        let headers = format!(
+            "PUT /{TEST_BUCKET}/{key} HTTP/1.1\r\n\
+             Host: {proxy_host}\r\n\
+             Content-Length: {body_len}\r\n\
+             Content-Encoding: aws-chunked\r\n\
+             x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER\r\n\
+             x-amz-decoded-content-length: {payload_len}\r\n\
+             x-amz-trailer: {trailer_name}\r\n\
+             Connection: close\r\n\
+             \r\n",
+            body_len = frame.len(),
+            payload_len = payload.len(),
+            trailer_name = algo.header_name(),
+        );
+        let mut request = headers.into_bytes();
+        request.extend_from_slice(&frame);
+        let (status, raw) = raw_tcp_request(proxy_host, &request).await;
+        let resp_text = String::from_utf8_lossy(&raw);
+        assert_eq!(
+            status, 500,
+            "{algo:?}: trailer must validate and route to decode (HTTPS guard fires). \
+             Got status {status} with body: {resp_text}",
+        );
+        assert!(
+            resp_text.contains("InternalError"),
+            "{algo:?}: expected InternalError, got: {resp_text}",
+        );
+    }
     assert_eq!(
-        captured.path,
-        format!("/{TEST_BUCKET}/cold-review/aws-chunked-trailer-routing"),
+        mock.received_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no algorithm should contact the HTTP upstream",
     );
-    // x-amz-trailer reaching the upstream proves passthrough — the typed
-    // path and the decode path both strip this.
-    let trailer = captured
-        .headers
-        .get("x-amz-trailer")
-        .expect(
-            "x-amz-trailer must reach the upstream; if missing, the request \
-             was decoded by the proxy rather than passed through",
-        )
-        .to_str()
-        .unwrap();
-    assert_eq!(trailer, "x-amz-checksum-crc32");
-    // The raw aws-chunked framing must also have reached the upstream
-    // byte-for-byte (passthrough byte preservation).
+}
+
+/// Signed-trailer (HMAC-SHA256) variant. Same routing assertion as the
+/// unsigned sweep but with `;chunk-signature=...` extensions on every chunk
+/// header plus a trailing `x-amz-trailer-signature` line.
+#[tokio::test]
+#[ignore]
+async fn test_aws_chunked_signed_trailer_put_routes_to_decoder() {
+    use tiny_s3_proxy::s3::checksum::ChecksumAlgorithm;
+
+    let mock = CountingMockUpstream::new();
+    let mock_endpoint = start_counting_mock_upstream(mock.clone()).await;
+    let cache_dir = tempfile::TempDir::new().expect("cache dir");
+    let (_proxy_client, _http_client, proxy_endpoint, _cache_dir) =
+        build_proxy_stack_with_opts(&mock_endpoint, cache_dir, |_cfg| {}).await;
+    let proxy_host = proxy_endpoint.strip_prefix("http://").unwrap();
+
+    let payload = b"abcdefgh";
+    let algo = ChecksumAlgorithm::Sha256;
+    let value = compute_smithy_checksum_b64(algo, payload);
+    let frame = build_signed_trailer_frame_bytes(payload, algo.header_name(), &value);
+
+    let headers = format!(
+        "PUT /{TEST_BUCKET}/trailer/signed-sha256.bin HTTP/1.1\r\n\
+         Host: {proxy_host}\r\n\
+         Content-Length: {body_len}\r\n\
+         Content-Encoding: aws-chunked\r\n\
+         x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER\r\n\
+         x-amz-decoded-content-length: {payload_len}\r\n\
+         x-amz-trailer: x-amz-checksum-sha256\r\n\
+         Connection: close\r\n\
+         \r\n",
+        body_len = frame.len(),
+        payload_len = payload.len(),
+    );
+    let mut request = headers.into_bytes();
+    request.extend_from_slice(&frame);
+    let (status, raw) = raw_tcp_request(proxy_host, &request).await;
+    let resp_text = String::from_utf8_lossy(&raw);
     assert_eq!(
-        captured.body.as_slice(),
-        body.as_slice(),
-        "upstream should receive the trailer-framed body byte-for-byte",
+        status, 500,
+        "signed-trailer must reach decode-path HTTPS guard. body: {resp_text}",
+    );
+    assert!(resp_text.contains("InternalError"));
+    assert_eq!(
+        mock.received_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+    );
+}
+
+/// Load-bearing integrity guard: a trailer with a wrong checksum value must
+/// produce a BadDigest 400 BEFORE the proxy contacts the upstream. The
+/// `CountingMockUpstream`'s `received_count == 0` assertion is what makes
+/// this a regression guard rather than a happy-path smoke test.
+///
+/// Bug-revert reasoning: removing the `if computed != expected_bytes` guard
+/// in `AwsChunkedDecoder::finalize` (the same bug-revert verified by the
+/// unit-level `test_trailer_checksum_mismatch_rejected`) would let this
+/// request reach the upstream — `received_count` would bump to 1 and the
+/// assertion would fail.
+#[tokio::test]
+#[ignore]
+async fn test_aws_chunked_trailer_checksum_mismatch_rejected_before_backend() {
+    let mock = CountingMockUpstream::new();
+    let mock_endpoint = start_counting_mock_upstream(mock.clone()).await;
+    let cache_dir_holder = tempfile::TempDir::new().expect("cache dir");
+    let cache_dir_path = cache_dir_holder.path().to_path_buf();
+    let (_proxy_client, _http_client, proxy_endpoint, _cache_dir) =
+        build_proxy_stack_with_opts(&mock_endpoint, cache_dir_holder, |_cfg| {}).await;
+    let proxy_host = proxy_endpoint.strip_prefix("http://").unwrap();
+
+    let payload = b"abcdefgh";
+    // 4 bytes of zeros — a valid-shape CRC32 trailer value that is NOT the
+    // actual CRC32 of the payload.
+    let wrong_value = aws_smithy_types::base64::encode([0u8; 4]);
+    let frame = build_unsigned_trailer_frame_bytes(payload, "x-amz-checksum-crc32", &wrong_value);
+
+    let headers = format!(
+        "PUT /{TEST_BUCKET}/trailer/mismatch.bin HTTP/1.1\r\n\
+         Host: {proxy_host}\r\n\
+         Content-Length: {body_len}\r\n\
+         Content-Encoding: aws-chunked\r\n\
+         x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER\r\n\
+         x-amz-decoded-content-length: {payload_len}\r\n\
+         x-amz-trailer: x-amz-checksum-crc32\r\n\
+         Connection: close\r\n\
+         \r\n",
+        body_len = frame.len(),
+        payload_len = payload.len(),
+    );
+    let mut request = headers.into_bytes();
+    request.extend_from_slice(&frame);
+    let (status, raw) = raw_tcp_request(proxy_host, &request).await;
+    assert_eq!(status, 400);
+    let resp_text = String::from_utf8_lossy(&raw);
+    assert!(
+        resp_text.contains("BadDigest"),
+        "expected BadDigest in response body, got: {resp_text}",
+    );
+    assert_eq!(
+        mock.received_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "trailer checksum mismatch must reject before backend contact",
+    );
+    // Spool file must be cleaned up after the decode error.
+    let tmp = cache_dir_path.join("tmp");
+    if tmp.exists() {
+        let mut entries = tokio::fs::read_dir(&tmp).await.unwrap();
+        while let Some(e) = entries.next_entry().await.unwrap() {
+            let name = e.file_name();
+            assert!(
+                !name.to_string_lossy().ends_with(".upload-spool.tmp"),
+                "spool must be cleaned up after trailer mismatch, found {name:?}",
+            );
+        }
+    }
+}
+
+/// Trailer mode declared via `x-amz-trailer` but the body has no trailer
+/// line — the stream ends right after `0\r\n`. Must surface as 400
+/// InvalidRequest with no backend contact.
+#[tokio::test]
+#[ignore]
+async fn test_aws_chunked_trailer_missing_rejected() {
+    let mock = CountingMockUpstream::new();
+    let mock_endpoint = start_counting_mock_upstream(mock.clone()).await;
+    let cache_dir = tempfile::TempDir::new().expect("cache dir");
+    let (_proxy_client, _http_client, proxy_endpoint, _cache_dir) =
+        build_proxy_stack_with_opts(&mock_endpoint, cache_dir, |_cfg| {}).await;
+    let proxy_host = proxy_endpoint.strip_prefix("http://").unwrap();
+
+    let payload = b"abcdefgh";
+    // No trailer line: `0\r\n\r\n` ends the frame directly.
+    let mut frame = Vec::new();
+    frame.extend_from_slice(format!("{:x}\r\n", payload.len()).as_bytes());
+    frame.extend_from_slice(payload);
+    frame.extend_from_slice(b"\r\n0\r\n\r\n");
+    let headers = format!(
+        "PUT /{TEST_BUCKET}/trailer/missing.bin HTTP/1.1\r\n\
+         Host: {proxy_host}\r\n\
+         Content-Length: {body_len}\r\n\
+         Content-Encoding: aws-chunked\r\n\
+         x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER\r\n\
+         x-amz-decoded-content-length: {payload_len}\r\n\
+         x-amz-trailer: x-amz-checksum-crc32\r\n\
+         Connection: close\r\n\
+         \r\n",
+        body_len = frame.len(),
+        payload_len = payload.len(),
+    );
+    let mut request = headers.into_bytes();
+    request.extend_from_slice(&frame);
+    let (status, raw) = raw_tcp_request(proxy_host, &request).await;
+    assert_eq!(status, 400);
+    let resp_text = String::from_utf8_lossy(&raw);
+    assert!(
+        resp_text.contains("InvalidRequest"),
+        "expected InvalidRequest, got: {resp_text}",
+    );
+    assert_eq!(
+        mock.received_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+    );
+}
+
+/// UploadPart variant: trailer mode for multipart parts must route to the
+/// decoder even though `x-amz-sdk-checksum-algorithm` (which AWS SDKs send
+/// alongside `x-amz-trailer`) would normally force passthrough via the
+/// multipart checksum gate. Pins the classifier-before-multipart-gate
+/// ordering.
+///
+/// Signal: 500 InternalError from the HTTPS guard proves the request
+/// reached the decode path. A 200 would mean the multipart gate forced
+/// passthrough (the regression we're guarding against, since the gate
+/// would happily forward the trailer framing to upstream verbatim).
+#[tokio::test]
+#[ignore]
+async fn test_aws_chunked_unsigned_trailer_upload_part_routes_to_decoder() {
+    use tiny_s3_proxy::s3::checksum::ChecksumAlgorithm;
+
+    let mock = CountingMockUpstream::new();
+    let mock_endpoint = start_counting_mock_upstream(mock.clone()).await;
+    let cache_dir = tempfile::TempDir::new().expect("cache dir");
+    let (_proxy_client, _http_client, proxy_endpoint, _cache_dir) =
+        build_proxy_stack_with_opts(&mock_endpoint, cache_dir, |_cfg| {}).await;
+    let proxy_host = proxy_endpoint.strip_prefix("http://").unwrap();
+
+    let key = "trailer/upload-part-multipart.bin";
+    // Small payload — the upload-part-min-size enforcement happens at
+    // CompleteMultipartUpload time, not on individual parts.
+    let payload = b"abcdefgh";
+    let algo = ChecksumAlgorithm::Crc32;
+    let value = compute_smithy_checksum_b64(algo, payload);
+    let frame = build_unsigned_trailer_frame_bytes(payload, algo.header_name(), &value);
+
+    let headers = format!(
+        "PUT /{TEST_BUCKET}/{key}?partNumber=1&uploadId=fake-upload-id HTTP/1.1\r\n\
+         Host: {proxy_host}\r\n\
+         Content-Length: {body_len}\r\n\
+         Content-Encoding: aws-chunked\r\n\
+         x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER\r\n\
+         x-amz-decoded-content-length: {payload_len}\r\n\
+         x-amz-trailer: x-amz-checksum-crc32\r\n\
+         x-amz-sdk-checksum-algorithm: CRC32\r\n\
+         Connection: close\r\n\
+         \r\n",
+        body_len = frame.len(),
+        payload_len = payload.len(),
+    );
+    let mut request = headers.into_bytes();
+    request.extend_from_slice(&frame);
+    let (status, raw) = raw_tcp_request(proxy_host, &request).await;
+    let resp_text = String::from_utf8_lossy(&raw);
+    assert_eq!(
+        status, 500,
+        "trailer-mode UploadPart must route to decoder (HTTPS guard fires). Got: {resp_text}",
+    );
+    assert!(resp_text.contains("InternalError"));
+    assert_eq!(
+        mock.received_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "decode path must reject HTTP upstream before contact",
     );
 }
 
