@@ -37,6 +37,24 @@ pub struct S3Backend {
 impl S3Backend {
     /// Build an S3Backend from the application configuration.
     pub async fn from_config(config: &Config) -> Result<Self, ProxyError> {
+        Self::from_config_inner(config, None).await
+    }
+
+    /// Build an S3Backend using a caller-supplied outbound HTTP client. The
+    /// integration test harness uses this to inject a TLS-trusting client for
+    /// the HTTPS-backed VersityGW fixture; production callers should keep
+    /// using `from_config`.
+    pub async fn from_config_with_http_client(
+        config: &Config,
+        http_client: aws_sdk_s3::config::SharedHttpClient,
+    ) -> Result<Self, ProxyError> {
+        Self::from_config_inner(config, Some(http_client)).await
+    }
+
+    async fn from_config_inner(
+        config: &Config,
+        http_client: Option<aws_sdk_s3::config::SharedHttpClient>,
+    ) -> Result<Self, ProxyError> {
         // Enforce BACKEND_ALLOW_HTTP: reject http:// endpoints unless explicitly allowed.
         let scheme = endpoint_scheme(&config.backend_endpoint);
         if !config.backend_allow_http && scheme.eq_ignore_ascii_case("http") {
@@ -62,14 +80,17 @@ impl S3Backend {
             .read_timeout(Duration::from_millis(config.upstream_request_timeout_ms))
             .build();
 
-        let sdk_config = aws_sdk_s3::config::Builder::new()
+        let mut builder = aws_sdk_s3::config::Builder::new()
             .endpoint_url(&config.backend_endpoint)
             .region(Region::new(config.backend_region.clone()))
             .credentials_provider(credentials)
             .force_path_style(config.backend_use_path_style)
             .timeout_config(timeout_config)
-            .behavior_version_latest()
-            .build();
+            .behavior_version_latest();
+        if let Some(http_client) = http_client {
+            builder = builder.http_client(http_client);
+        }
+        let sdk_config = builder.build();
 
         let client = Client::from_conf(sdk_config);
 
