@@ -8,6 +8,7 @@ use super::scan::{CACHE_HASH_DIR_SCAN_CONCURRENCY, bounded_parallel_scan};
 use crate::cache::entry::CacheEntry;
 use crate::cache::key::CacheKey;
 use crate::cache::metadata::CacheMeta;
+use crate::cache::perms::{create_dir_all_secure, create_dir_secure, open_std_file_secure};
 use crate::cache::policy::CachePolicy;
 use crate::cache::{CacheStats, CacheStatsSnapshot, CacheStore, FillGuard, FillId};
 use crate::error::ProxyError;
@@ -149,13 +150,10 @@ impl CacheDirLock {
     /// exists.
     fn acquire(cache_dir: &std::path::Path) -> Result<Self, ProxyError> {
         let lock_path = cache_dir.join(".lock");
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|e| ProxyError::Cache {
+        let file = open_std_file_secure(&lock_path, |o| {
+            o.read(true).write(true).create(true).truncate(false);
+        })
+        .map_err(|e| ProxyError::Cache {
                 source: Box::new(e),
                 operation: format!("open cache_dir lock file {}", lock_path.display()),
             })?;
@@ -260,8 +258,11 @@ impl DiskCache {
         _policy: CachePolicy,
     ) -> Result<Self, ProxyError> {
         // Ensure the cache root dir exists so we can place the lock file
-        // inside it before any other state touches the directory.
-        tokio::fs::create_dir_all(&cache_dir)
+        // inside it before any other state touches the directory. New
+        // directories created by the proxy are 0o700; pre-existing
+        // directories with looser modes are left alone with a warning so
+        // operator-set permissions remain authoritative.
+        create_dir_all_secure(&cache_dir)
             .await
             .map_err(|e| ProxyError::Cache {
                 source: Box::new(e),
@@ -277,13 +278,13 @@ impl DiskCache {
         let lock = CacheDirLock::acquire(&cache_dir)?;
 
         // Create directory structure
-        tokio::fs::create_dir_all(cache_dir.join("objects"))
+        create_dir_secure(&cache_dir.join("objects"))
             .await
             .map_err(|e| ProxyError::Cache {
                 source: Box::new(e),
                 operation: "create objects dir".into(),
             })?;
-        tokio::fs::create_dir_all(cache_dir.join("tmp"))
+        create_dir_secure(&cache_dir.join("tmp"))
             .await
             .map_err(|e| ProxyError::Cache {
                 source: Box::new(e),
@@ -3958,5 +3959,66 @@ mod tests {
                 Err(e) => panic!("lock never released after meta_lock drop; last error: {e}",),
             }
         }
+    }
+
+    /// Pins the directory-permissions contract from issue #66: a fresh
+    /// `DiskCache::new` must leave the cache root, `objects/`, and `tmp/`
+    /// all at `0o700` regardless of the process umask.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_disk_cache_new_creates_cache_dirs_with_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_dir = tmp.path().join("cache");
+
+        let _cache = DiskCache::new(cache_dir.clone(), 1_000_000, test_policy())
+            .await
+            .unwrap();
+
+        let mode_of = |p: &std::path::Path| {
+            std::fs::metadata(p).unwrap().permissions().mode() & 0o7777
+        };
+        assert_eq!(mode_of(&cache_dir), 0o700, "cache root must be 0700");
+        assert_eq!(
+            mode_of(&cache_dir.join("objects")),
+            0o700,
+            "objects dir must be 0700"
+        );
+        assert_eq!(
+            mode_of(&cache_dir.join("tmp")),
+            0o700,
+            "tmp dir must be 0700"
+        );
+    }
+
+    /// Pins the warn-and-leave contract: if the operator pre-creates
+    /// `CACHE_DIR` at a looser mode, the proxy must not silently tighten
+    /// it. The directory mode stays exactly as the operator set it, and a
+    /// warning is emitted so the divergence is observable.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn test_disk_cache_new_with_existing_loose_root_warns_and_leaves() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_dir = tmp.path().join("cache");
+        std::fs::create_dir(&cache_dir).unwrap();
+        std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _cache = DiskCache::new(cache_dir.clone(), 1_000_000, test_policy())
+            .await
+            .unwrap();
+
+        let mode = std::fs::metadata(&cache_dir).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            mode, 0o755,
+            "pre-existing cache root mode must be preserved, not chmod'd"
+        );
+        assert!(
+            logs_contain("cache directory pre-exists with group/other access"),
+            "expected warn about pre-existing loose cache dir"
+        );
     }
 }

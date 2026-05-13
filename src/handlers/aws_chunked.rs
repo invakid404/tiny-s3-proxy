@@ -20,6 +20,7 @@ use crate::backend::Backend;
 use crate::backend::models::{PutObjectSpoolInput, UploadPartSpoolInput};
 use crate::cache::CacheStore;
 use crate::cache::key::CacheKey;
+use crate::cache::perms::{create_dir_secure, open_file_secure};
 use crate::handlers::AppState;
 use crate::s3::aws_chunked::{
     AwsChunkedDecoder, AwsChunkedError, DecodedSummary, DecoderMode,
@@ -39,33 +40,13 @@ static UPLOAD_SPOOL_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Create the spool file `O_CREAT | O_EXCL | O_WRONLY` with owner-only
 /// permissions on Unix. The decoded body contains the object payload, so
 /// group/other readability under a typical 022 umask would be a needless
-/// exposure. On non-Unix targets we fall back to `tokio`'s default
-/// `OpenOptions` (umask has no equivalent there).
+/// exposure. Delegates to `cache::perms::open_file_secure` so the
+/// `0o600` policy stays centralized with the rest of the cache tree.
 async fn open_upload_spool_file(path: &Path) -> std::io::Result<File> {
-    open_upload_spool_file_platform(path).await
-}
-
-#[cfg(unix)]
-async fn open_upload_spool_file_platform(path: &Path) -> std::io::Result<File> {
-    // Owner-only (0600): the spool holds the decoded object body for the
-    // lifetime of the upload, so group/other readability would be a
-    // needless exposure. `mode(0o600)` is still masked by the process
-    // umask, but umask can only REMOVE bits — group/other stays cleared.
-    tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .await
-}
-
-#[cfg(not(unix))]
-async fn open_upload_spool_file_platform(path: &Path) -> std::io::Result<File> {
-    tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .await
+    open_file_secure(path, |o| {
+        o.write(true).create_new(true);
+    })
+    .await
 }
 
 /// Owns the lifecycle of one decoded-body spool file. Drop is a best-effort
@@ -84,7 +65,7 @@ impl UploadSpoolGuard {
     /// decoded body isn't readable by group/other regardless of umask.
     pub(super) async fn create(cache_dir: &Path) -> std::io::Result<(Self, File)> {
         let tmp_dir = cache_dir.join("tmp");
-        tokio::fs::create_dir_all(&tmp_dir).await?;
+        create_dir_secure(&tmp_dir).await?;
 
         let pid = std::process::id();
         let counter = UPLOAD_SPOOL_COUNTER.fetch_add(1, Ordering::Relaxed);

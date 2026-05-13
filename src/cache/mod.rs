@@ -4,6 +4,7 @@ pub mod eviction;
 pub mod key;
 mod layout;
 pub mod metadata;
+pub(crate) mod perms;
 pub mod policy;
 mod scan;
 pub mod singleflight;
