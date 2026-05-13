@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use typed_builder::TypedBuilder;
 
+use crate::s3::checksum::ChecksumHeader;
+
 /// Input for get_object operations.
 #[derive(Debug, TypedBuilder)]
 #[non_exhaustive]
@@ -233,6 +235,13 @@ pub struct PutObjectSpoolInput {
     pub extra_amz_headers: HashMap<String, String>,
     #[builder(default)]
     pub content_headers: HashMap<String, String>,
+    /// Validated `x-amz-checksum-*` from a trailer-mode aws-chunked upload.
+    /// `Some` only when the proxy decoded and verified the trailer; the
+    /// backend client forwards it via the per-algorithm SDK setter, NOT via
+    /// `extra_amz_headers` (raw forwarding would re-trigger SDK aws-chunked
+    /// re-encoding).
+    #[builder(default)]
+    pub checksum: Option<ChecksumHeader>,
 }
 
 /// Input for `upload_part_from_path`. Spool-file counterpart to
@@ -251,6 +260,9 @@ pub struct UploadPartSpoolInput {
     pub content_md5: Option<String>,
     #[builder(default)]
     pub extra_amz_headers: HashMap<String, String>,
+    /// See `PutObjectSpoolInput::checksum`.
+    #[builder(default)]
+    pub checksum: Option<ChecksumHeader>,
 }
 
 #[derive(Debug)]

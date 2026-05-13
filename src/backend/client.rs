@@ -14,6 +14,7 @@ use crate::backend::retry::{RetryPolicy, with_retry};
 use crate::backend::{Backend, BoxByteStream};
 use crate::config::{Config, endpoint_scheme};
 use crate::error::ProxyError;
+use crate::s3::checksum::ChecksumAlgorithm;
 
 /// S3 backend client that uses the aws-sdk-s3 crate to talk to an S3-compatible backend.
 pub struct S3Backend {
@@ -608,6 +609,7 @@ impl Backend for S3Backend {
             let metadata = req.metadata.clone();
             let extra_amz_headers = req.extra_amz_headers.clone();
             let content_headers = req.content_headers.clone();
+            let checksum = req.checksum.clone();
             async move {
                 // Length::Exact pins Content-Length to the value we just decoded.
                 // ByteStream::from_path defaults to file metadata, which races
@@ -652,6 +654,26 @@ impl Backend for S3Backend {
                 if let Some(v) = content_headers.get("cache-control") {
                     builder = builder.cache_control(v);
                 }
+
+                // Forward a trailer-mode checksum via the per-algorithm SDK
+                // setter. Critically, we do NOT call `.checksum_algorithm()`
+                // here — that re-activates the SDK's outbound aws-chunked
+                // re-encoding (the very thing we just decoded out of). The
+                // per-algorithm setter sends the validated digest as a plain
+                // `x-amz-checksum-<algo>` request header without changing
+                // the body framing.
+                if let Some(c) = &checksum {
+                    builder = match c.algorithm {
+                        ChecksumAlgorithm::Crc32 => builder.checksum_crc32(c.value.clone()),
+                        ChecksumAlgorithm::Crc32C => builder.checksum_crc32_c(c.value.clone()),
+                        ChecksumAlgorithm::Crc64Nvme => {
+                            builder.checksum_crc64_nvme(c.value.clone())
+                        }
+                        ChecksumAlgorithm::Sha1 => builder.checksum_sha1(c.value.clone()),
+                        ChecksumAlgorithm::Sha256 => builder.checksum_sha256(c.value.clone()),
+                    };
+                }
+
                 let expires_val = content_headers.get("expires").cloned();
 
                 // `RequestChecksumCalculation::WhenRequired` disables the SDK's
@@ -907,6 +929,18 @@ impl Backend for S3Backend {
 
         if let Some(md5) = &req.content_md5 {
             builder = builder.content_md5(md5);
+        }
+
+        // Per-algorithm checksum forwarding — see `put_object_from_path` for
+        // the rationale around NOT calling `.checksum_algorithm()`.
+        if let Some(c) = &req.checksum {
+            builder = match c.algorithm {
+                ChecksumAlgorithm::Crc32 => builder.checksum_crc32(c.value.clone()),
+                ChecksumAlgorithm::Crc32C => builder.checksum_crc32_c(c.value.clone()),
+                ChecksumAlgorithm::Crc64Nvme => builder.checksum_crc64_nvme(c.value.clone()),
+                ChecksumAlgorithm::Sha1 => builder.checksum_sha1(c.value.clone()),
+                ChecksumAlgorithm::Sha256 => builder.checksum_sha256(c.value.clone()),
+            };
         }
 
         let extra_amz_headers = req.extra_amz_headers.clone();

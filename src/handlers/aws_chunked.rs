@@ -21,7 +21,11 @@ use crate::backend::models::{PutObjectSpoolInput, UploadPartSpoolInput};
 use crate::cache::CacheStore;
 use crate::cache::key::CacheKey;
 use crate::handlers::AppState;
-use crate::s3::aws_chunked::{AwsChunkedDecoder, AwsChunkedError};
+use crate::s3::aws_chunked::{
+    AwsChunkedDecoder, AwsChunkedError, DecodedSummary, DecoderMode,
+    STREAMING_AWS4_HMAC_SHA256_PAYLOAD_TRAILER, STREAMING_UNSIGNED_PAYLOAD_TRAILER,
+};
+use crate::s3::checksum::{ChecksumAlgorithm, ChecksumHeader};
 use crate::s3::errors::S3Error;
 use crate::s3::headers::{append_extra_headers, common_headers, put_object_headers};
 use crate::s3::ops::ParsedRequest;
@@ -184,16 +188,23 @@ fn content_headers_for_decoded(
 /// Reject x-amz-* headers that only make sense on the aws-chunked wire
 /// format and would be wrong on the decoded backend request.
 ///
-/// `x-amz-trailer` is the load-bearing case: `parse.rs` currently strips
-/// `x-amz-date`, `x-amz-content-sha256`, and `x-amz-decoded-content-length`
-/// before they reach `extra_amz_headers` but NOT `x-amz-trailer`. The
-/// trailer-precedence dispatch fix already routes trailer requests to
-/// passthrough, so production is safe — this is a belt-and-braces filter
-/// at the construction site for the decoded request.
+/// - `x-amz-content-sha256` / `x-amz-decoded-content-length` describe the
+///   streaming framing the proxy just decoded out of; forwarding them to a
+///   non-streaming PUT would lie about the body shape.
+/// - `x-amz-trailer` advertises HTTP trailers; we've already consumed and
+///   validated the trailer inline, and the decoded request has no trailer
+///   to deliver.
+/// - `x-amz-sdk-checksum-algorithm` is the SDK-internal switch that tells
+///   AWS SDKs to wrap the body in aws-chunked streaming-checksum framing.
+///   If forwarded to the backend SDK it would re-activate exactly the
+///   re-encoding we paid a streaming decode to avoid. The
+///   per-algorithm `.checksum_*()` setters in client.rs ARE the supported
+///   way to forward the actual checksum value.
 fn is_streaming_only_amz_header(name: &str) -> bool {
     name.eq_ignore_ascii_case("x-amz-content-sha256")
         || name.eq_ignore_ascii_case("x-amz-decoded-content-length")
         || name.eq_ignore_ascii_case("x-amz-trailer")
+        || name.eq_ignore_ascii_case("x-amz-sdk-checksum-algorithm")
 }
 
 /// Defense-in-depth filter for the `extra_amz_headers` map handed to the
@@ -267,14 +278,16 @@ fn map_decode_error(err: AwsChunkedError, request_id: &str) -> S3Error {
 }
 
 /// Decode the inbound aws-chunked body into a spool file. Returns the spool
-/// guard, the decoded length, and the SHA-256 of the decoded body. On error,
-/// the spool file is cleaned up by Drop (we never returned the guard).
+/// guard and the full decoded summary (length, SHA-256, optional validated
+/// trailer). On error, the spool file is cleaned up by Drop (we never
+/// returned the guard).
 async fn decode_into_spool<B: Backend, C: CacheStore>(
     state: &Arc<AppState<B, C>>,
     parsed: &ParsedRequest,
     body: Body,
     declared_len: u64,
-) -> Result<(UploadSpoolGuard, u64, String), S3Error> {
+    mode: DecoderMode,
+) -> Result<(UploadSpoolGuard, DecodedSummary), S3Error> {
     use futures_compat::body_to_io_stream;
 
     let (guard, file) = UploadSpoolGuard::create(&state.config.cache_dir)
@@ -288,7 +301,7 @@ async fn decode_into_spool<B: Backend, C: CacheStore>(
 
     let reader = StreamReader::new(body_to_io_stream(body));
     let mut writer = BufWriter::new(file);
-    let summary = AwsChunkedDecoder::new(reader, declared_len)
+    let summary = AwsChunkedDecoder::with_mode(reader, declared_len, mode)
         .decode_to_writer(&mut writer)
         .await
         .map_err(|e| map_decode_error(e, &parsed.request_id))?;
@@ -304,7 +317,87 @@ async fn decode_into_spool<B: Backend, C: CacheStore>(
     let file = writer.into_inner();
     drop(file);
 
-    Ok((guard, summary.decoded_len, summary.sha256_hex))
+    Ok((guard, summary))
+}
+
+/// Inspect the inbound `x-amz-content-sha256` sentinel plus the
+/// `x-amz-trailer` header on `raw_headers` and produce the matching
+/// `DecoderMode`. The dispatch routing already rejects unsupported sentinels
+/// (ECDSA, unknown) by routing them to passthrough; this helper assumes the
+/// request is going through the decode path and rejects the residual cases
+/// (no sentinel match, trailer-mode without a usable trailer header) with
+/// `InvalidRequest`.
+pub(super) fn decoder_mode_from_headers(
+    raw_headers: &http::HeaderMap,
+    request_id: &str,
+) -> Result<DecoderMode, S3Error> {
+    let sentinel = raw_headers
+        .get_all("x-amz-content-sha256")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .ok_or_else(|| {
+            S3Error::invalid_request(
+                "aws-chunked decode path requires x-amz-content-sha256 header",
+                request_id,
+            )
+        })?;
+    let upper = sentinel.to_ascii_uppercase();
+    if upper == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" {
+        return Ok(DecoderMode::NonTrailer);
+    }
+
+    let header = read_declared_trailer(raw_headers, request_id)?;
+    if upper == STREAMING_UNSIGNED_PAYLOAD_TRAILER {
+        Ok(DecoderMode::UnsignedTrailer {
+            expected_trailer_name: header.name,
+            algorithm: header.algorithm,
+        })
+    } else if upper == STREAMING_AWS4_HMAC_SHA256_PAYLOAD_TRAILER {
+        Ok(DecoderMode::SignedTrailer {
+            expected_trailer_name: header.name,
+            algorithm: header.algorithm,
+        })
+    } else {
+        Err(S3Error::invalid_request(
+            &format!("unsupported aws-chunked sentinel `{sentinel}` reached the decode path"),
+            request_id,
+        ))
+    }
+}
+
+/// Read and validate the `x-amz-trailer` header on a trailer-mode request.
+/// Required: the value must name exactly one supported `x-amz-checksum-<algo>`
+/// header. Anything else is `InvalidRequest`.
+fn read_declared_trailer(
+    raw_headers: &http::HeaderMap,
+    request_id: &str,
+) -> Result<ChecksumHeader, S3Error> {
+    let raw = raw_headers.get("x-amz-trailer").ok_or_else(|| {
+        S3Error::invalid_request(
+            "trailer-mode aws-chunked upload missing required x-amz-trailer header",
+            request_id,
+        )
+    })?;
+    let value = raw.to_str().map_err(|_| {
+        S3Error::invalid_request("x-amz-trailer header was not valid ASCII", request_id)
+    })?;
+    let trimmed = value.trim();
+    let algo = ChecksumAlgorithm::from_header_name(trimmed).ok_or_else(|| {
+        S3Error::invalid_request(
+            &format!("x-amz-trailer declared unsupported trailer header `{trimmed}`"),
+            request_id,
+        )
+    })?;
+    // The trailer VALUE isn't known until the body is consumed — this
+    // declaration is shape-only. The decoder fills the validated `value` in
+    // when it parses the trailer line.
+    Ok(ChecksumHeader {
+        algorithm: algo,
+        name: algo.header_name().to_string(),
+        value: String::new(),
+    })
 }
 
 mod futures_compat {
@@ -390,23 +483,29 @@ pub async fn handle_put_decode_aws_chunked<B: Backend, C: CacheStore>(
         return resp;
     }
 
-    let (guard, decoded_len, sha256_hex) =
-        match decode_into_spool(state, parsed, body, declared_len).await {
-            Ok(v) => v,
-            Err(e) => return e.to_response(),
-        };
+    let mode = match decoder_mode_from_headers(raw_headers, &parsed.request_id) {
+        Ok(m) => m,
+        Err(e) => return e.to_response(),
+    };
+
+    let (guard, summary) = match decode_into_spool(state, parsed, body, declared_len, mode).await {
+        Ok(v) => v,
+        Err(e) => return e.to_response(),
+    };
+    let decoded_len = summary.decoded_len;
 
     let input = PutObjectSpoolInput {
         bucket: state.backend_bucket.to_string(),
         key: key.to_string(),
         path: guard.path().to_path_buf(),
         len: decoded_len,
-        sha256_hex,
+        sha256_hex: summary.sha256_hex,
         content_type: parsed.content_type.clone(),
         content_md5: parsed.content_md5.clone(),
         metadata: parsed.user_metadata.clone(),
         extra_amz_headers: extra_amz_headers_for_decoded(parsed),
         content_headers: content_headers_for_decoded(parsed),
+        checksum: summary.trailer,
     };
 
     let result = state.backend.put_object_from_path(input).await;
@@ -499,11 +598,16 @@ pub async fn handle_upload_part_decode_aws_chunked<B: Backend, C: CacheStore>(
         return resp;
     }
 
-    let (guard, decoded_len, sha256_hex) =
-        match decode_into_spool(state, parsed, body, declared_len).await {
-            Ok(v) => v,
-            Err(e) => return e.to_response(),
-        };
+    let mode = match decoder_mode_from_headers(raw_headers, &parsed.request_id) {
+        Ok(m) => m,
+        Err(e) => return e.to_response(),
+    };
+
+    let (guard, summary) = match decode_into_spool(state, parsed, body, declared_len, mode).await {
+        Ok(v) => v,
+        Err(e) => return e.to_response(),
+    };
+    let decoded_len = summary.decoded_len;
 
     let input = UploadPartSpoolInput {
         bucket: state.backend_bucket.to_string(),
@@ -512,9 +616,10 @@ pub async fn handle_upload_part_decode_aws_chunked<B: Backend, C: CacheStore>(
         part_number,
         path: guard.path().to_path_buf(),
         len: decoded_len,
-        sha256_hex,
+        sha256_hex: summary.sha256_hex,
         content_md5: parsed.content_md5.clone(),
         extra_amz_headers: extra_amz_headers_for_decoded(parsed),
+        checksum: summary.trailer,
     };
 
     let result = state.backend.upload_part_from_path(input).await;
@@ -625,6 +730,10 @@ mod tests {
 
         let mut headers = http::HeaderMap::new();
         headers.insert("x-amz-decoded-content-length", "8".parse().unwrap());
+        headers.insert(
+            "x-amz-content-sha256",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".parse().unwrap(),
+        );
         headers.insert("content-encoding", "aws-chunked".parse().unwrap());
 
         let body = Body::from(aws_chunked_single_chunk(b"abcdefgh"));
@@ -680,6 +789,10 @@ mod tests {
 
         let mut headers = http::HeaderMap::new();
         headers.insert("x-amz-decoded-content-length", "8".parse().unwrap());
+        headers.insert(
+            "x-amz-content-sha256",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".parse().unwrap(),
+        );
         headers.insert("content-encoding", "gzip, aws-chunked".parse().unwrap());
         let body = Body::from(aws_chunked_single_chunk(b"abcdefgh"));
         let resp = handle_put_decode_aws_chunked(&state, &parsed, key, &headers, body).await;
@@ -742,6 +855,10 @@ mod tests {
         let parsed = make_parsed(key);
         let mut headers = http::HeaderMap::new();
         headers.insert("x-amz-decoded-content-length", "8".parse().unwrap());
+        headers.insert(
+            "x-amz-content-sha256",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".parse().unwrap(),
+        );
         let body = Body::from(aws_chunked_single_chunk(b"abcdefgh"));
         let resp = handle_put_decode_aws_chunked(&state, &parsed, key, &headers, body).await;
         assert_eq!(resp.status(), 400);
@@ -780,6 +897,10 @@ mod tests {
         let parsed = make_parsed(key);
         let mut headers = http::HeaderMap::new();
         headers.insert("x-amz-decoded-content-length", "8".parse().unwrap());
+        headers.insert(
+            "x-amz-content-sha256",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".parse().unwrap(),
+        );
         // Truncated frame: header says 8 bytes but body has 3 and then EOF.
         let body = Body::from(format!("8;chunk-signature={SIG}\r\nabc").into_bytes());
         let resp = handle_put_decode_aws_chunked(&state, &parsed, key, &headers, body).await;
@@ -828,6 +949,10 @@ mod tests {
             "x-amz-decoded-content-length",
             total.to_string().parse().unwrap(),
         );
+        headers.insert(
+            "x-amz-content-sha256",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".parse().unwrap(),
+        );
 
         let mut frame = Vec::new();
         frame.extend_from_slice(format!("{:x};chunk-signature={SIG}\r\n", small.len()).as_bytes());
@@ -865,6 +990,10 @@ mod tests {
 
         let mut headers = http::HeaderMap::new();
         headers.insert("x-amz-decoded-content-length", "8".parse().unwrap());
+        headers.insert(
+            "x-amz-content-sha256",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".parse().unwrap(),
+        );
         let body = Body::from(aws_chunked_single_chunk(b"abcdefgh"));
         let resp = handle_put_decode_aws_chunked(&state, &parsed, key, &headers, body).await;
         assert_eq!(resp.status(), 200);
@@ -884,6 +1013,10 @@ mod tests {
         let parsed = make_parsed(key);
         let mut headers = http::HeaderMap::new();
         headers.insert("x-amz-decoded-content-length", "8".parse().unwrap());
+        headers.insert(
+            "x-amz-content-sha256",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".parse().unwrap(),
+        );
         let body = Body::from(aws_chunked_single_chunk(b"abcdefgh"));
         let resp = handle_put_decode_aws_chunked(&state, &parsed, key, &headers, body).await;
         assert_eq!(resp.status(), 502);
@@ -920,6 +1053,10 @@ mod tests {
 
         let mut headers = http::HeaderMap::new();
         headers.insert("x-amz-decoded-content-length", "8".parse().unwrap());
+        headers.insert(
+            "x-amz-content-sha256",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".parse().unwrap(),
+        );
         let body = Body::from(aws_chunked_single_chunk(b"abcdefgh"));
 
         let resp =
@@ -1134,5 +1271,221 @@ mod tests {
         assert!(!is_streaming_only_amz_header(
             "x-amz-server-side-encryption"
         ));
+    }
+
+    /// `x-amz-sdk-checksum-algorithm` must be filtered from
+    /// `extra_amz_headers` on the decoded backend request — if forwarded, it
+    /// would re-activate the SDK's outbound aws-chunked re-encoding. The
+    /// per-algorithm `.checksum_*()` setters on the backend client are the
+    /// supported way to forward the checksum value.
+    #[test]
+    fn test_is_streaming_only_amz_header_includes_sdk_checksum_algorithm() {
+        assert!(is_streaming_only_amz_header("x-amz-sdk-checksum-algorithm"));
+        assert!(is_streaming_only_amz_header("X-AMZ-SDK-CHECKSUM-ALGORITHM"));
+    }
+
+    // ---- decoder_mode_from_headers ----
+
+    use crate::s3::aws_chunked::DecoderMode;
+
+    fn make_headers(pairs: &[(&str, &str)]) -> http::HeaderMap {
+        let mut h = http::HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                http::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                http::header::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn test_decoder_mode_from_headers_non_trailer() {
+        let h = make_headers(&[("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")]);
+        assert_eq!(
+            decoder_mode_from_headers(&h, "r").unwrap(),
+            DecoderMode::NonTrailer,
+        );
+    }
+
+    #[test]
+    fn test_decoder_mode_from_headers_unsigned_trailer() {
+        let h = make_headers(&[
+            ("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER"),
+            ("x-amz-trailer", "x-amz-checksum-crc32"),
+        ]);
+        let mode = decoder_mode_from_headers(&h, "r").unwrap();
+        match mode {
+            DecoderMode::UnsignedTrailer {
+                expected_trailer_name,
+                algorithm,
+            } => {
+                assert_eq!(expected_trailer_name, "x-amz-checksum-crc32");
+                assert_eq!(algorithm, ChecksumAlgorithm::Crc32);
+            }
+            other => panic!("expected UnsignedTrailer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decoder_mode_from_headers_signed_trailer() {
+        let h = make_headers(&[
+            (
+                "x-amz-content-sha256",
+                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+            ),
+            ("x-amz-trailer", "x-amz-checksum-sha256"),
+        ]);
+        let mode = decoder_mode_from_headers(&h, "r").unwrap();
+        match mode {
+            DecoderMode::SignedTrailer {
+                expected_trailer_name,
+                algorithm,
+            } => {
+                assert_eq!(expected_trailer_name, "x-amz-checksum-sha256");
+                assert_eq!(algorithm, ChecksumAlgorithm::Sha256);
+            }
+            other => panic!("expected SignedTrailer, got {other:?}"),
+        }
+    }
+
+    /// Trailer mode declared but the x-amz-trailer header points at an
+    /// unsupported algorithm — must surface InvalidRequest so the handler
+    /// can return 400 rather than route the request through the decode path
+    /// with an unrecognised algorithm.
+    #[test]
+    fn test_decoder_mode_from_headers_unsupported_trailer_algo() {
+        let h = make_headers(&[
+            ("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER"),
+            ("x-amz-trailer", "x-amz-checksum-md5"),
+        ]);
+        let err = decoder_mode_from_headers(&h, "r").unwrap_err();
+        assert_eq!(err.code, "InvalidRequest");
+    }
+
+    /// Trailer mode declared but x-amz-trailer is missing entirely.
+    #[test]
+    fn test_decoder_mode_from_headers_missing_trailer_header() {
+        let h = make_headers(&[("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")]);
+        let err = decoder_mode_from_headers(&h, "r").unwrap_err();
+        assert_eq!(err.code, "InvalidRequest");
+    }
+
+    /// End-to-end unsigned-trailer PUT: builds a valid CRC32 trailer frame,
+    /// asserts the decode succeeds, and asserts the validated checksum
+    /// reaches the backend as a `ChecksumHeader` (NOT via extra_amz_headers).
+    #[tokio::test]
+    async fn test_decode_put_unsigned_trailer_forwards_checksum_to_backend() {
+        use crate::s3::checksum::ChecksumAlgorithm;
+        let key = "trailer/unsigned.bin";
+        let backend = MockBackend::new().with_put(Ok(PutObjectOutput {
+            etag: Some("\"trailer-etag\"".into()),
+            version_id: None,
+            extra_headers: HashMap::new(),
+        }));
+        let state = build_app_state(backend, MockCache::new(), MockAuth::allow_all());
+        let parsed = make_parsed(key);
+
+        let payload = b"abcdefgh";
+        let algo = ChecksumAlgorithm::Crc32;
+        // Compute the expected CRC32 trailer value via smithy.
+        let mut hasher = algo.into_smithy_impl();
+        aws_smithy_checksums::Checksum::update(hasher.as_mut(), payload);
+        let bytes = aws_smithy_checksums::Checksum::finalize(hasher);
+        let value = aws_smithy_types::base64::encode(&bytes[..]);
+
+        // Build the frame: bare-size chunk + trailer + closing CRLF.
+        let mut frame = Vec::new();
+        frame.extend_from_slice(format!("{:x}\r\n", payload.len()).as_bytes());
+        frame.extend_from_slice(payload);
+        frame.extend_from_slice(b"\r\n0\r\n");
+        frame.extend_from_slice(format!("{}:{value}\r\n", algo.header_name()).as_bytes());
+        frame.extend_from_slice(b"\r\n");
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-amz-decoded-content-length",
+            payload.len().to_string().parse().unwrap(),
+        );
+        headers.insert(
+            "x-amz-content-sha256",
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER".parse().unwrap(),
+        );
+        headers.insert("x-amz-trailer", "x-amz-checksum-crc32".parse().unwrap());
+
+        let resp =
+            handle_put_decode_aws_chunked(&state, &parsed, key, &headers, Body::from(frame)).await;
+        assert_eq!(resp.status(), 200);
+
+        let calls = state.backend.put_spool_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let checksum = calls[0]
+            .checksum
+            .as_ref()
+            .expect("trailer-mode PUT must forward the validated checksum to the backend");
+        assert_eq!(checksum.algorithm, ChecksumAlgorithm::Crc32);
+        assert_eq!(checksum.name, "x-amz-checksum-crc32");
+        assert_eq!(checksum.value, value);
+        // The checksum field is the contract — extra_amz_headers must NOT
+        // also carry the trailer or the sdk-checksum-algorithm header.
+        assert!(!calls[0].extra_amz_headers.contains_key("x-amz-trailer"));
+        assert!(
+            !calls[0]
+                .extra_amz_headers
+                .contains_key("x-amz-sdk-checksum-algorithm"),
+        );
+    }
+
+    /// A trailer with a wrong checksum must produce a BadDigest 400 BEFORE
+    /// the backend is contacted. Pins the load-bearing integrity guard.
+    #[tokio::test]
+    async fn test_decode_put_trailer_mismatch_returns_bad_digest() {
+        use crate::s3::checksum::ChecksumAlgorithm;
+        let key = "trailer/mismatch.bin";
+        let backend = MockBackend::new();
+        let state = build_app_state(backend, MockCache::new(), MockAuth::allow_all());
+        let parsed = make_parsed(key);
+
+        let payload = b"abcdefgh";
+        let algo = ChecksumAlgorithm::Crc32;
+        // Right shape (4 bytes of base64), wrong value.
+        let wrong = aws_smithy_types::base64::encode(b"WRNG");
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(format!("{:x}\r\n", payload.len()).as_bytes());
+        frame.extend_from_slice(payload);
+        frame.extend_from_slice(b"\r\n0\r\n");
+        frame.extend_from_slice(format!("{}:{wrong}\r\n", algo.header_name()).as_bytes());
+        frame.extend_from_slice(b"\r\n");
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-amz-decoded-content-length",
+            payload.len().to_string().parse().unwrap(),
+        );
+        headers.insert(
+            "x-amz-content-sha256",
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER".parse().unwrap(),
+        );
+        headers.insert("x-amz-trailer", "x-amz-checksum-crc32".parse().unwrap());
+
+        let resp =
+            handle_put_decode_aws_chunked(&state, &parsed, key, &headers, Body::from(frame)).await;
+        assert_eq!(resp.status(), 400);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        assert!(
+            body_str.contains("BadDigest"),
+            "expected BadDigest, got: {body_str}",
+        );
+        // Backend must NOT be called.
+        assert_eq!(
+            state
+                .backend
+                .total_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "trailer-mismatch must reject before backend contact",
+        );
     }
 }

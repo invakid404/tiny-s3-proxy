@@ -715,6 +715,7 @@ pub mod test_utils {
                     metadata: req.metadata.clone(),
                     extra_amz_headers: req.extra_amz_headers.clone(),
                     content_headers: req.content_headers.clone(),
+                    checksum: req.checksum.clone(),
                 });
             self.put_response.lock().unwrap().take().unwrap_or_else(|| {
                 Err(ProxyError::Backend {
@@ -816,6 +817,7 @@ pub mod test_utils {
                     sha256_hex: req.sha256_hex.clone(),
                     content_md5: req.content_md5.clone(),
                     extra_amz_headers: req.extra_amz_headers.clone(),
+                    checksum: req.checksum.clone(),
                 });
             self.upload_part_response
                 .lock()
