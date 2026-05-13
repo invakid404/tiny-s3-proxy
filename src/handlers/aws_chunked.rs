@@ -368,18 +368,35 @@ pub(super) fn decoder_mode_from_headers(
 }
 
 /// Read and validate the `x-amz-trailer` header on a trailer-mode request.
-/// Required: the value must name exactly one supported `x-amz-checksum-<algo>`
-/// header. Anything else is `InvalidRequest`.
+/// Exactly one header value must be present, and it must name a supported
+/// `x-amz-checksum-<algo>` header. Zero or multiple values, or an unsupported
+/// algorithm, all surface as `InvalidRequest`.
+///
+/// Duplicate `x-amz-trailer` headers must be rejected outright: `.get()`
+/// alone would silently pick the first and drop the rest, which lets a
+/// client smuggle a second contradictory trailer declaration past the
+/// classifier. Different headers expressing different intents is a contract
+/// violation regardless of which one we'd pick — better to reject.
 fn read_declared_trailer(
     raw_headers: &http::HeaderMap,
     request_id: &str,
 ) -> Result<ChecksumHeader, S3Error> {
-    let raw = raw_headers.get("x-amz-trailer").ok_or_else(|| {
-        S3Error::invalid_request(
-            "trailer-mode aws-chunked upload missing required x-amz-trailer header",
-            request_id,
-        )
-    })?;
+    let values: Vec<&http::HeaderValue> = raw_headers.get_all("x-amz-trailer").iter().collect();
+    let raw = match values.as_slice() {
+        [] => {
+            return Err(S3Error::invalid_request(
+                "trailer-mode aws-chunked upload missing required x-amz-trailer header",
+                request_id,
+            ));
+        }
+        [single] => *single,
+        _ => {
+            return Err(S3Error::invalid_request(
+                "trailer-mode aws-chunked upload has multiple x-amz-trailer headers; only one is supported",
+                request_id,
+            ));
+        }
+    };
     let value = raw.to_str().map_err(|_| {
         S3Error::invalid_request("x-amz-trailer header was not valid ASCII", request_id)
     })?;
@@ -1369,6 +1386,44 @@ mod tests {
         let h = make_headers(&[("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")]);
         let err = decoder_mode_from_headers(&h, "r").unwrap_err();
         assert_eq!(err.code, "InvalidRequest");
+    }
+
+    /// Missing `x-amz-trailer` surfaces InvalidRequest from
+    /// `read_declared_trailer`. Companion to the integration-level coverage,
+    /// pinning the exact S3 error code at the helper boundary.
+    #[test]
+    fn test_read_declared_trailer_rejects_missing_header() {
+        let h = http::HeaderMap::new();
+        let err = read_declared_trailer(&h, "r").unwrap_err();
+        assert_eq!(err.code, "InvalidRequest");
+        assert!(
+            err.message.contains("missing"),
+            "error should explain why, got: {}",
+            err.message,
+        );
+    }
+
+    /// Two `x-amz-trailer` headers MUST be rejected outright: the helper
+    /// can't safely pick one (they may name different algorithms) and
+    /// `.get()` alone would silently drop all but the first, letting a
+    /// contradictory second declaration slip through the classifier.
+    ///
+    /// Bug-revert reasoning: reverting `read_declared_trailer` to a single
+    /// `raw_headers.get("x-amz-trailer")` call returns `Ok` on this input
+    /// (picks the first value), and this assertion flips to a panic on the
+    /// `.unwrap_err()` call.
+    #[test]
+    fn test_read_declared_trailer_rejects_duplicate_headers() {
+        let mut h = http::HeaderMap::new();
+        h.append("x-amz-trailer", "x-amz-checksum-crc32".parse().unwrap());
+        h.append("x-amz-trailer", "x-amz-checksum-sha256".parse().unwrap());
+        let err = read_declared_trailer(&h, "r").unwrap_err();
+        assert_eq!(err.code, "InvalidRequest");
+        assert!(
+            err.message.contains("multiple"),
+            "error should mention the duplicate, got: {}",
+            err.message,
+        );
     }
 
     /// End-to-end unsigned-trailer PUT: builds a valid CRC32 trailer frame,

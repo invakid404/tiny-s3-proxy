@@ -206,10 +206,28 @@ pub(super) fn classify_aws_chunked_upload(
     }
 
     // `x-amz-trailer` on a request whose `x-amz-content-sha256` doesn't
-    // advertise a trailer-mode sentinel is suspicious — either the sentinel
-    // is wrong or the client is trying to slip trailer framing past a
-    // single-header check. Conservative fallback: passthrough.
-    if mode.is_none() && raw_headers.contains_key("x-amz-trailer") {
+    // advertise a trailer-mode sentinel (or advertises the non-trailer
+    // sentinel) is contradictory — either the sentinel is wrong or the
+    // client is trying to slip trailer framing past a single-header check.
+    // Conservative fallback: passthrough, where the upstream gets to decide
+    // what to do with the contradictory headers.
+    //
+    // Without this check a request with `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`
+    // + `x-amz-trailer` would classify as `NonTrailerHmacSha256` and route
+    // to the decoder, which builds `DecoderMode::NonTrailer`, strips the
+    // trailer header via the streaming-only filter, and silently accepts a
+    // trailerless body — bypassing the "trailer declared but absent →
+    // reject" contract.
+    if raw_headers.contains_key("x-amz-trailer")
+        && !matches!(
+            mode,
+            Some(
+                AwsChunkedUploadMode::UnsignedTrailer
+                    | AwsChunkedUploadMode::SignedTrailerHmacSha256
+                    | AwsChunkedUploadMode::Ecdsa,
+            ),
+        )
+    {
         return Some(AwsChunkedUploadMode::OtherStreaming);
     }
 
@@ -476,35 +494,39 @@ mod tests {
         );
     }
 
-    /// `x-amz-trailer` on a request whose sha256 sentinel doesn't advertise
-    /// a trailer-mode value is suspicious — the conservative fallback is
-    /// passthrough.
+    /// `x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD` (non-trailer
+    /// sentinel) PLUS `x-amz-trailer` is contradictory — the sentinel says
+    /// "no trailer follows" but the header says "expect a trailer". The
+    /// classifier must reclassify as `OtherStreaming` and the route must be
+    /// `Passthrough` for both PUT and UploadPart.
+    ///
+    /// Bug-revert reasoning: without the contradiction guard the classifier
+    /// returns `NonTrailerHmacSha256`, the route is `DecodeAwsChunked`, the
+    /// handler builds `DecoderMode::NonTrailer`, the streaming-only filter
+    /// strips `x-amz-trailer` from the decoded backend request, and the
+    /// trailer-declared-but-absent contract is silently violated.
     #[test]
-    fn test_trailer_header_without_trailer_sentinel_falls_back_to_passthrough() {
+    fn test_non_trailer_sentinel_with_trailer_header_routes_to_passthrough() {
         let mut headers = http::HeaderMap::new();
         headers.insert(
             "x-amz-content-sha256",
             "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".parse().unwrap(),
         );
         headers.insert("x-amz-trailer", "x-amz-checksum-crc32".parse().unwrap());
-        // sha256 says NonTrailer; trailer header is suspicious. Conservative
-        // fallback: OtherStreaming → passthrough.
-        let mode = classify_aws_chunked_upload(&headers);
-        assert_eq!(mode, Some(AwsChunkedUploadMode::NonTrailerHmacSha256));
-        // Despite the NonTrailer classification, the routing must not be
-        // DecodeAwsChunked — the non-trailer decoder doesn't consume
-        // trailers, so the trailer header would leak. We do this by way of
-        // the classifier currently returning NonTrailerHmacSha256, but the
-        // ROUTING is determined by `aws_chunked_route_for`. So this test
-        // documents the current behavior; if a future change wants stricter
-        // trailer-precedence, flip this and `aws_chunked_route_for`.
-        //
-        // Actually — this is a regression risk. The non-trailer decoder
-        // doesn't consume trailers, so it would just see the trailer line
-        // as `TrailingData` after the final CRLF. Verify this scenario is
-        // safe in `extra_amz_headers_for_decoded`, which filters trailer.
+
+        assert_eq!(
+            classify_aws_chunked_upload(&headers),
+            Some(AwsChunkedUploadMode::OtherStreaming),
+        );
         let extra_amz = std::collections::HashMap::new();
-        let _ = classify_put_body_route(&extra_amz, &headers);
+        assert_eq!(
+            classify_put_body_route(&extra_amz, &headers),
+            WriteBodyRoute::Passthrough,
+        );
+        assert_eq!(
+            classify_upload_part_body_route(&extra_amz, &headers),
+            WriteBodyRoute::Passthrough,
+        );
     }
 
     /// UploadPart route MUST classify aws-chunked BEFORE the multipart
