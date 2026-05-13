@@ -218,8 +218,12 @@ fn aws_http_client_trusting(ca_pem: &str) -> aws_sdk_s3::config::SharedHttpClien
         .build_https()
 }
 
-/// Build a `reqwest::Client` that trusts the supplied CA PEM as a root.
-/// Used for the proxy's OUTBOUND passthrough client in the HTTPS fixture —
+/// Build a `reqwest::Client` whose trust store contains ONLY the supplied
+/// CA PEM — native / built-in roots are explicitly disabled by
+/// `tls_certs_only`, mirroring the AWS-SDK helper's
+/// `TrustStore::empty().with_native_roots(false)` behaviour so a real CA
+/// can never silently substitute for the test trust anchor. Used for the
+/// proxy's OUTBOUND passthrough client in the HTTPS fixture —
 /// `passthrough::handle_passthrough` issues requests via
 /// `state.http_client` (a `reqwest::Client`), so without this the
 /// passthrough route would fail TLS verification against the
@@ -229,7 +233,7 @@ fn reqwest_client_trusting(ca_pem: &str) -> reqwest::Client {
     let cert =
         reqwest::Certificate::from_pem(ca_pem.as_bytes()).expect("parse test CA PEM for reqwest");
     reqwest::Client::builder()
-        .add_root_certificate(cert)
+        .tls_certs_only(std::iter::once(cert))
         .build()
         .expect("build reqwest client trusting test CA")
 }
