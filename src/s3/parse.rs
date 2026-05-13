@@ -351,25 +351,30 @@ pub fn parse_request<B>(req: &Request<B>) -> ParsedRequest {
         }
     }
 
-    // Capture standard content headers that the typed write path needs to forward.
+    // Capture standard content headers that the typed write path needs to
+    // forward. Two groups by ABNF shape:
     //
-    // Content-Encoding is list-valued: a client may send it as multiple
-    // `Content-Encoding: <token>` lines (RFC 7230 §3.2.2) instead of one
-    // comma-separated value. The strip-aws-chunked logic downstream operates
-    // on a single comma-list, so we normalize repeated headers into one
-    // joined value here. The other headers in this list are single-valued
-    // per their respective RFCs (no "Cache-Control: a" + "Cache-Control: b"
-    // smuggling concern), so `header_str` is enough for them.
+    // - List-valued (RFC 9110 #-syntax): a client may send repeated
+    //   field-lines that semantically combine with commas. Dropping every
+    //   value after the first silently mis-describes the request to the
+    //   upstream — e.g. two `Cache-Control: max-age=60` + `Cache-Control:
+    //   public` lines collapse to just `max-age=60`. Covers
+    //   `Content-Encoding` (`#content-coding`), `Content-Language`
+    //   (`#language-tag`), and `Cache-Control` (`#cache-directive`,
+    //   RFC 9111). The aws-chunked strip path also depends on this for
+    //   `Content-Encoding`.
+    //
+    // - Single-valued: not list-valued per RFC, so the first value wins
+    //   and any subsequent field-line is a client bug. `Content-Disposition`
+    //   is a single `disposition-type` + parameters; `Expires` is a single
+    //   `HTTP-date`.
     let mut content_headers = HashMap::new();
-    if let Some(val) = header_str_combined(req, "content-encoding") {
-        content_headers.insert("content-encoding".to_string(), val);
+    for name in &["content-encoding", "content-language", "cache-control"] {
+        if let Some(val) = header_str_combined(req, name) {
+            content_headers.insert(name.to_string(), val);
+        }
     }
-    for name in &[
-        "content-disposition",
-        "content-language",
-        "cache-control",
-        "expires",
-    ] {
+    for name in &["content-disposition", "expires"] {
         if let Some(val) = header_str(req, name) {
             content_headers.insert(name.to_string(), val);
         }
@@ -937,5 +942,105 @@ mod tests {
             .unwrap();
         let parsed = parse_request(&req);
         assert!(!parsed.content_headers.contains_key("content-encoding"));
+    }
+
+    /// Repeated `Cache-Control` field-lines must combine into one comma-
+    /// joined value in source order. Without this, two directives like
+    /// `Cache-Control: max-age=60` + `Cache-Control: public` collapse to
+    /// just `max-age=60` on the forwarded upstream PUT — the response
+    /// becomes private even though the client declared `public`.
+    /// `Cache-Control` is `#cache-directive` per RFC 9111.
+    ///
+    /// Bug-revert reasoning: moving `cache-control` back to the single-
+    /// value loop calls `header_str` (= `.get()`) and returns only the
+    /// first value, flipping this assertion from
+    /// `Some("max-age=60, public")` to `Some("max-age=60")`.
+    #[test]
+    fn test_repeated_cache_control_headers_combined() {
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/mybucket/mykey")
+            .header("cache-control", "max-age=60")
+            .header("cache-control", "public")
+            .body(())
+            .unwrap();
+        let parsed = parse_request(&req);
+        assert_eq!(
+            parsed
+                .content_headers
+                .get("cache-control")
+                .map(String::as_str),
+            Some("max-age=60, public"),
+        );
+    }
+
+    /// Repeated `Content-Language` field-lines must combine into one comma-
+    /// joined value in source order. RFC 9110 defines Content-Language as
+    /// `#language-tag` — list-valued, so two lines (`en` + `fr`) describe
+    /// a bilingual entity, not just the first language.
+    ///
+    /// Bug-revert reasoning: moving `content-language` back to the single-
+    /// value loop returns only `Some("en")` here, flipping the assertion.
+    #[test]
+    fn test_repeated_content_language_headers_combined() {
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/mybucket/mykey")
+            .header("content-language", "en")
+            .header("content-language", "fr")
+            .body(())
+            .unwrap();
+        let parsed = parse_request(&req);
+        assert_eq!(
+            parsed
+                .content_headers
+                .get("content-language")
+                .map(String::as_str),
+            Some("en, fr"),
+        );
+    }
+
+    /// `Content-Disposition` is NOT list-valued — a single
+    /// `disposition-type` with parameters — so repeated field-lines are a
+    /// client contract violation and we should take the first occurrence
+    /// rather than stitch two unrelated dispositions into one nonsense
+    /// comma-list. Guard test: catches an accidental widening that lumps
+    /// `content-disposition` into the combined loop.
+    #[test]
+    fn test_content_disposition_remains_single_value() {
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/mybucket/mykey")
+            .header("content-disposition", "attachment; filename=\"a.txt\"")
+            .header("content-disposition", "inline")
+            .body(())
+            .unwrap();
+        let parsed = parse_request(&req);
+        assert_eq!(
+            parsed
+                .content_headers
+                .get("content-disposition")
+                .map(String::as_str),
+            Some("attachment; filename=\"a.txt\""),
+        );
+    }
+
+    /// `Expires` is a single `HTTP-date`; repeated field-lines are a
+    /// client contract violation. Guard test: same shape as
+    /// `Content-Disposition`, catches accidental widening.
+    #[test]
+    fn test_expires_remains_single_value() {
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/mybucket/mykey")
+            .header("expires", "Thu, 01 Dec 1994 16:00:00 GMT")
+            .header("expires", "Fri, 02 Dec 1994 16:00:00 GMT")
+            .body(())
+            .unwrap();
+        let parsed = parse_request(&req);
+        assert_eq!(
+            parsed.content_headers.get("expires").map(String::as_str),
+            Some("Thu, 01 Dec 1994 16:00:00 GMT"),
+        );
     }
 }
