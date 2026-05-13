@@ -131,14 +131,29 @@ fn read_declared_decoded_length(
     raw_headers: &http::HeaderMap,
     request_id: &str,
 ) -> Result<u64, S3Error> {
-    let raw = raw_headers
-        .get("x-amz-decoded-content-length")
-        .ok_or_else(|| {
-            S3Error::invalid_argument(
+    // Reject zero or multiple values for the same reason
+    // `decoder_mode_from_headers` rejects duplicate `x-amz-content-sha256`:
+    // `.get()` alone would silently pick the first value and drop any
+    // others, letting a contradictory second declaration past this gate.
+    let values: Vec<&http::HeaderValue> = raw_headers
+        .get_all("x-amz-decoded-content-length")
+        .iter()
+        .collect();
+    let raw = match values.as_slice() {
+        [] => {
+            return Err(S3Error::invalid_argument(
                 "aws-chunked upload missing required header x-amz-decoded-content-length",
                 request_id,
-            )
-        })?;
+            ));
+        }
+        [single] => *single,
+        _ => {
+            return Err(S3Error::invalid_argument(
+                "aws-chunked upload has multiple x-amz-decoded-content-length headers; only one is supported",
+                request_id,
+            ));
+        }
+    };
     let s = raw.to_str().map_err(|_| {
         S3Error::invalid_argument(
             "x-amz-decoded-content-length header was not valid ASCII",
@@ -327,22 +342,48 @@ async fn decode_into_spool<B: Backend, C: CacheStore>(
 /// request is going through the decode path and rejects the residual cases
 /// (no sentinel match, trailer-mode without a usable trailer header) with
 /// `InvalidRequest`.
+///
+/// `x-amz-content-sha256` must appear exactly once with an ASCII, non-empty
+/// value. The dispatch classifier inspects every value defensively, so a
+/// client that sent two contradictory sentinels could be routed by one and
+/// decoded under another if we picked a different value here. Reject the
+/// ambiguity outright instead.
 pub(super) fn decoder_mode_from_headers(
     raw_headers: &http::HeaderMap,
     request_id: &str,
 ) -> Result<DecoderMode, S3Error> {
-    let sentinel = raw_headers
-        .get_all("x-amz-content-sha256")
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .map(str::trim)
-        .find(|s| !s.is_empty())
-        .ok_or_else(|| {
-            S3Error::invalid_request(
+    let values: Vec<&http::HeaderValue> =
+        raw_headers.get_all("x-amz-content-sha256").iter().collect();
+    let raw = match values.as_slice() {
+        [] => {
+            return Err(S3Error::invalid_request(
                 "aws-chunked decode path requires x-amz-content-sha256 header",
                 request_id,
+            ));
+        }
+        [single] => *single,
+        _ => {
+            return Err(S3Error::invalid_request(
+                "aws-chunked decode path has multiple x-amz-content-sha256 headers; only one is supported",
+                request_id,
+            ));
+        }
+    };
+    let sentinel = raw
+        .to_str()
+        .map_err(|_| {
+            S3Error::invalid_request(
+                "x-amz-content-sha256 header was not valid ASCII",
+                request_id,
             )
-        })?;
+        })?
+        .trim();
+    if sentinel.is_empty() {
+        return Err(S3Error::invalid_request(
+            "x-amz-content-sha256 header was empty",
+            request_id,
+        ));
+    }
     let upper = sentinel.to_ascii_uppercase();
     if upper == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" {
         return Ok(DecoderMode::NonTrailer);
@@ -1419,6 +1460,90 @@ mod tests {
         h.append("x-amz-trailer", "x-amz-checksum-sha256".parse().unwrap());
         let err = read_declared_trailer(&h, "r").unwrap_err();
         assert_eq!(err.code, "InvalidRequest");
+        assert!(
+            err.message.contains("multiple"),
+            "error should mention the duplicate, got: {}",
+            err.message,
+        );
+    }
+
+    /// Two `x-amz-content-sha256` headers must be rejected outright. The
+    /// dispatch classifier (`classify_aws_chunked_upload`) inspects every
+    /// value defensively to detect smuggled sentinels, but
+    /// `decoder_mode_from_headers` chose a single value to decode under —
+    /// without this guard, a client could route via one sentinel and
+    /// decode under another.
+    ///
+    /// Bug-revert reasoning: reverting `decoder_mode_from_headers` to the
+    /// previous `get_all().filter_map(to_str).find(!is_empty)` chain
+    /// returns `Ok(DecoderMode::NonTrailer)` on this input (picks the
+    /// first usable value), and this assertion flips to a panic on the
+    /// `.unwrap_err()` call.
+    #[test]
+    fn test_decoder_mode_from_headers_rejects_duplicate_content_sha256() {
+        let mut h = http::HeaderMap::new();
+        h.append(
+            "x-amz-content-sha256",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".parse().unwrap(),
+        );
+        h.append(
+            "x-amz-content-sha256",
+            "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD".parse().unwrap(),
+        );
+        let err = decoder_mode_from_headers(&h, "r").unwrap_err();
+        assert_eq!(err.code, "InvalidRequest");
+        assert!(
+            err.message.contains("multiple"),
+            "error should mention the duplicate, got: {}",
+            err.message,
+        );
+    }
+
+    /// Non-ASCII bytes in `x-amz-content-sha256` are nonsensical for any of
+    /// the recognised STREAMING-* sentinels and must be rejected.
+    #[test]
+    fn test_decoder_mode_from_headers_rejects_non_ascii_content_sha256() {
+        let mut h = http::HeaderMap::new();
+        // 0x80 is invalid as a standalone byte in UTF-8 / ASCII.
+        let val = http::HeaderValue::from_bytes(&[0x80]).unwrap();
+        h.insert("x-amz-content-sha256", val);
+        let err = decoder_mode_from_headers(&h, "r").unwrap_err();
+        assert_eq!(err.code, "InvalidRequest");
+    }
+
+    /// Empty `x-amz-content-sha256` value is rejected. Catches the case
+    /// where the header is technically present but conveys no sentinel.
+    #[test]
+    fn test_decoder_mode_from_headers_rejects_empty_content_sha256() {
+        let h = make_headers(&[("x-amz-content-sha256", "   ")]);
+        let err = decoder_mode_from_headers(&h, "r").unwrap_err();
+        assert_eq!(err.code, "InvalidRequest");
+        assert!(
+            err.message.contains("empty"),
+            "error should mention emptiness, got: {}",
+            err.message,
+        );
+    }
+
+    /// Two `x-amz-decoded-content-length` headers must be rejected. Same
+    /// failure mode as `x-amz-content-sha256` duplicates: `.get()` alone
+    /// picks the first value, letting a contradictory second declaration
+    /// past the gate that the rest of the decode pipeline (oversize
+    /// preflight, decoder length-match check) relies on.
+    ///
+    /// Bug-revert reasoning: reverting `read_declared_decoded_length` to a
+    /// single `raw_headers.get("x-amz-decoded-content-length")` call
+    /// returns `Ok(8)` on this input, and this assertion flips to a panic
+    /// on the `.unwrap_err()` call.
+    #[test]
+    fn test_read_declared_decoded_length_rejects_duplicate_headers() {
+        let mut h = http::HeaderMap::new();
+        h.append("x-amz-decoded-content-length", "8".parse().unwrap());
+        h.append("x-amz-decoded-content-length", "16".parse().unwrap());
+        let err = read_declared_decoded_length(&h, "r").unwrap_err();
+        // Existing missing-case uses InvalidArgument; the new "multiple"
+        // case mirrors it.
+        assert_eq!(err.code, "InvalidArgument");
         assert!(
             err.message.contains("multiple"),
             "error should mention the duplicate, got: {}",
