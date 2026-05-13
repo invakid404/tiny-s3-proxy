@@ -133,8 +133,8 @@ fn generate_test_tls() -> TestTls {
     let ca_cert = ca_params.self_signed(&ca_key).expect("self-sign CA");
     let issuer = Issuer::new(ca_params, ca_key);
 
-    let mut leaf_params = CertificateParams::new(vec!["localhost".to_string()])
-        .expect("leaf params: known-good SAN");
+    let mut leaf_params =
+        CertificateParams::new(vec!["localhost".to_string()]).expect("leaf params: known-good SAN");
     leaf_params
         .distinguished_name
         .push(DnType::CommonName, "127.0.0.1");
@@ -2803,5 +2803,191 @@ async fn test_tmp_sweep_removes_abandoned_upload_spool_files() {
         !abandoned.exists(),
         "tmp sweep should have removed the abandoned upload-spool file at {}",
         abandoned.display(),
+    );
+}
+
+/// Build a non-trailer signed aws-chunked frame for a single payload chunk.
+/// Chunk signatures are dummy zero hex — the proxy does not cryptographically
+/// verify them (it decodes and forwards). Shape:
+///   `<hex-size>;chunk-signature=<64-hex>\r\n<payload>\r\n0;chunk-signature=<64-hex>\r\n\r\n`.
+fn build_signed_non_trailer_frame_bytes(payload: &[u8]) -> Vec<u8> {
+    const SIG: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+    let mut out = Vec::new();
+    out.extend_from_slice(format!("{:x};chunk-signature={SIG}\r\n", payload.len()).as_bytes());
+    out.extend_from_slice(payload);
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(format!("0;chunk-signature={SIG}\r\n").as_bytes());
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
+/// End-to-end aws-chunked round-trip against a REAL HTTPS-backed VersityGW.
+/// Sends an unsigned-trailer PUT with a CRC32 trailer through the proxy,
+/// then reads back via a direct (trust-pinned) SDK GET against the same
+/// VersityGW. Asserts the upstream sees the decoded payload bytes — proving
+/// that the aws-chunked decode path actually rewrites the wire body rather
+/// than just routing to it.
+///
+/// Regression caught: if `RequestChecksumCalculation::WhenRequired` is
+/// flipped back to `WhenSupported` in `S3Backend::put_object_from_path`,
+/// the SDK re-wraps the body in streaming-checksum framing and the GET
+/// returns aws-chunked-framed bytes instead of the original payload — the
+/// final `assert_eq!(body, payload)` fails.
+///
+/// Docker + the pinned `versity/versitygw` image required.
+#[tokio::test]
+#[ignore]
+async fn test_aws_chunked_unsigned_trailer_crc32_full_https_backend_round_trip() {
+    use tiny_s3_proxy::s3::checksum::ChecksumAlgorithm;
+
+    let tls = generate_test_tls();
+    let (_container, backend_endpoint) = start_versitygw_https(&tls).await;
+
+    // Direct SDK client over HTTPS for bucket setup + GET verification.
+    let direct_http_client = aws_http_client_trusting(&tls.ca_pem);
+    let direct_client = build_raw_s3_client_with_http_client(
+        &backend_endpoint,
+        TEST_ACCESS_KEY,
+        TEST_SECRET_KEY,
+        direct_http_client,
+    )
+    .await;
+    direct_client
+        .create_bucket()
+        .bucket(TEST_BUCKET)
+        .send()
+        .await
+        .expect("create_bucket on HTTPS VersityGW");
+
+    let (_proxy_client, _http_client, proxy_endpoint, _cache_dir) =
+        build_proxy_stack_with_https_backend(&backend_endpoint, &tls.ca_pem).await;
+    let proxy_host = proxy_endpoint.strip_prefix("http://").unwrap();
+
+    let key = "https-backend/unsigned-trailer-crc32.bin";
+    let payload: &[u8] = b"hello aws-chunked unsigned trailer over https";
+    let value = compute_smithy_checksum_b64(ChecksumAlgorithm::Crc32, payload);
+    let frame = build_unsigned_trailer_frame_bytes(payload, "x-amz-checksum-crc32", &value);
+    let headers = format!(
+        "PUT /{TEST_BUCKET}/{key} HTTP/1.1\r\n\
+         Host: {proxy_host}\r\n\
+         Content-Length: {body_len}\r\n\
+         Content-Encoding: aws-chunked\r\n\
+         x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER\r\n\
+         x-amz-decoded-content-length: {payload_len}\r\n\
+         x-amz-trailer: x-amz-checksum-crc32\r\n\
+         Connection: close\r\n\
+         \r\n",
+        body_len = frame.len(),
+        payload_len = payload.len(),
+    );
+    let mut request = headers.into_bytes();
+    request.extend_from_slice(&frame);
+
+    let (status, raw_response) = raw_tcp_request(proxy_host, &request).await;
+    let resp_text = String::from_utf8_lossy(&raw_response);
+    assert_eq!(
+        status, 200,
+        "PUT through proxy to HTTPS VersityGW must succeed; got status {status} with body: {resp_text}",
+    );
+
+    // Read back DIRECTLY from VersityGW (bypassing the proxy) and assert
+    // the upstream sees the decoded payload bytes. The proxy claims to
+    // decode aws-chunked into a plain body before forwarding — this is
+    // the load-bearing assertion.
+    let get_resp = direct_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key(key)
+        .send()
+        .await
+        .expect("get_object on HTTPS VersityGW");
+    let body = get_resp
+        .body
+        .collect()
+        .await
+        .expect("read body")
+        .into_bytes();
+    assert_eq!(
+        body.as_ref(),
+        payload,
+        "decoded body on HTTPS VersityGW must match the original payload — if this fails the aws-chunked framing leaked through the proxy to the upstream",
+    );
+}
+
+/// End-to-end aws-chunked round-trip for the SIGNED non-trailer mode
+/// (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`). Same shape as the unsigned-trailer
+/// test but exercises the other major decode branch — chunk-signature
+/// framing without a checksum trailer. Chunk signatures are dummy zeros:
+/// the proxy decodes and forwards without verifying chunk signatures
+/// cryptographically.
+///
+/// Docker + the pinned `versity/versitygw` image required.
+#[tokio::test]
+#[ignore]
+async fn test_aws_chunked_signed_non_trailer_full_https_backend_round_trip() {
+    let tls = generate_test_tls();
+    let (_container, backend_endpoint) = start_versitygw_https(&tls).await;
+
+    let direct_http_client = aws_http_client_trusting(&tls.ca_pem);
+    let direct_client = build_raw_s3_client_with_http_client(
+        &backend_endpoint,
+        TEST_ACCESS_KEY,
+        TEST_SECRET_KEY,
+        direct_http_client,
+    )
+    .await;
+    direct_client
+        .create_bucket()
+        .bucket(TEST_BUCKET)
+        .send()
+        .await
+        .expect("create_bucket on HTTPS VersityGW");
+
+    let (_proxy_client, _http_client, proxy_endpoint, _cache_dir) =
+        build_proxy_stack_with_https_backend(&backend_endpoint, &tls.ca_pem).await;
+    let proxy_host = proxy_endpoint.strip_prefix("http://").unwrap();
+
+    let key = "https-backend/signed-non-trailer.bin";
+    let payload: &[u8] = b"hello aws-chunked signed non-trailer over https";
+    let frame = build_signed_non_trailer_frame_bytes(payload);
+    let headers = format!(
+        "PUT /{TEST_BUCKET}/{key} HTTP/1.1\r\n\
+         Host: {proxy_host}\r\n\
+         Content-Length: {body_len}\r\n\
+         Content-Encoding: aws-chunked\r\n\
+         x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD\r\n\
+         x-amz-decoded-content-length: {payload_len}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        body_len = frame.len(),
+        payload_len = payload.len(),
+    );
+    let mut request = headers.into_bytes();
+    request.extend_from_slice(&frame);
+
+    let (status, raw_response) = raw_tcp_request(proxy_host, &request).await;
+    let resp_text = String::from_utf8_lossy(&raw_response);
+    assert_eq!(
+        status, 200,
+        "signed non-trailer PUT through proxy must succeed; got status {status} with body: {resp_text}",
+    );
+
+    let get_resp = direct_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key(key)
+        .send()
+        .await
+        .expect("get_object on HTTPS VersityGW");
+    let body = get_resp
+        .body
+        .collect()
+        .await
+        .expect("read body")
+        .into_bytes();
+    assert_eq!(
+        body.as_ref(),
+        payload,
+        "decoded body on HTTPS VersityGW must match the original payload",
     );
 }
