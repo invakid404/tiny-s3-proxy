@@ -23,7 +23,8 @@ use crate::cache::key::CacheKey;
 use crate::handlers::AppState;
 use crate::s3::aws_chunked::{
     AwsChunkedDecoder, AwsChunkedError, DecodedSummary, DecoderMode,
-    STREAMING_AWS4_HMAC_SHA256_PAYLOAD_TRAILER, STREAMING_UNSIGNED_PAYLOAD_TRAILER,
+    STREAMING_AWS4_HMAC_SHA256_PAYLOAD, STREAMING_AWS4_HMAC_SHA256_PAYLOAD_TRAILER,
+    STREAMING_UNSIGNED_PAYLOAD_TRAILER,
 };
 use crate::s3::checksum::{ChecksumAlgorithm, ChecksumHeader};
 use crate::s3::errors::S3Error;
@@ -385,7 +386,7 @@ pub(super) fn decoder_mode_from_headers(
         ));
     }
     let upper = sentinel.to_ascii_uppercase();
-    if upper == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" {
+    if upper == STREAMING_AWS4_HMAC_SHA256_PAYLOAD {
         return Ok(DecoderMode::NonTrailer);
     }
 

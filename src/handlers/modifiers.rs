@@ -165,7 +165,7 @@ pub(super) fn classify_aws_chunked_upload(
             continue;
         }
         let upper = trimmed.to_ascii_uppercase();
-        let candidate = if upper == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" {
+        let candidate = if upper == crate::s3::aws_chunked::STREAMING_AWS4_HMAC_SHA256_PAYLOAD {
             Some(AwsChunkedUploadMode::NonTrailerHmacSha256)
         } else if upper.contains("ECDSA") && upper.starts_with("STREAMING-") {
             // ECDSA streaming is out of scope (#63) regardless of trailer state.
