@@ -1643,11 +1643,13 @@ async fn test_unsigned_streaming_put_oversized_content_length_rejected_before_ba
     // Hand-rolled HTTP/1.1 PUT:
     //   * declared Content-Length 32 > cap 16 → preflight rejects
     //   * actual body 8 bytes < cap 16        → Limited backstop would NOT fire
-    //   * STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER with x-amz-trailer:
-    //     trailer-mode aws-chunked still routes through passthrough (PR #2
-    //     of issue #50 will move trailer-mode into the in-house decoder).
-    //     The non-trailer variant now goes through the decoder, so using
-    //     it here would no longer exercise the passthrough preflight.
+    //   * STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER with `x-amz-trailer:
+    //     x-amz-checksum-md5`: trailer-mode with an unsupported algorithm
+    //     routes to passthrough via `AwsChunkedUploadMode::OtherStreaming`.
+    //     This is the only remaining shape that exercises the passthrough
+    //     preflight after issue #50 PR #2 moved supported-algorithm trailer
+    //     modes into the in-house decoder (which has its own preflight
+    //     keyed on `x-amz-decoded-content-length`, not `Content-Length`).
     let request = format!(
         "PUT /{TEST_BUCKET}/cold-review/oversized-cl HTTP/1.1\r\n\
          Host: {proxy_host}\r\n\
@@ -1655,7 +1657,7 @@ async fn test_unsigned_streaming_put_oversized_content_length_rejected_before_ba
          Content-Encoding: aws-chunked\r\n\
          x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER\r\n\
          x-amz-decoded-content-length: 8\r\n\
-         x-amz-trailer: x-amz-checksum-crc32\r\n\
+         x-amz-trailer: x-amz-checksum-md5\r\n\
          Connection: close\r\n\
          \r\n\
          AAAAAAAA"
