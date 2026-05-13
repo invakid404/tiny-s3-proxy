@@ -2201,12 +2201,19 @@ async fn test_aws_chunked_unsigned_trailer_upload_part_routes_to_decoder() {
 }
 
 /// ECDSA-signed streaming uploads (`STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD`)
-/// are out of scope for the in-house decoder — they must continue to route
-/// through passthrough. Pins the routing decision so a future change to the
-/// aws-chunked classifier doesn't accidentally swallow ECDSA frames.
+/// must be rejected up front with `UnsupportedSignature` (HTTP 400) rather
+/// than silently routed through passthrough. The inbound `chunk-signature`
+/// values are bound to the client's private key, so passthrough would
+/// re-sign with the proxy backend credentials and the chunk signatures
+/// would never validate on the upstream — failing fast avoids pointless
+/// backend traffic.
+///
+/// Pins HTTP 400 + `<Code>UnsupportedSignature</Code>` + zero upstream
+/// contact, so a regression that routes ECDSA back to passthrough flips
+/// all three assertions.
 #[tokio::test]
 #[ignore]
-async fn test_aws_chunked_ecdsa_streaming_routes_to_passthrough() {
+async fn test_aws_chunked_ecdsa_streaming_rejected_as_unsupported_signature() {
     let mock = CapturingMockUpstream::new();
     let mock_endpoint = start_capturing_mock_upstream(mock.clone()).await;
     let cache_dir = tempfile::TempDir::new().expect("cache dir");
@@ -2234,32 +2241,23 @@ async fn test_aws_chunked_ecdsa_streaming_routes_to_passthrough() {
     );
     let mut request_bytes = headers.into_bytes();
     request_bytes.extend_from_slice(&body);
-    let (status, _raw_response) = raw_tcp_request(proxy_host, &request_bytes).await;
-    assert_eq!(status, 200);
-    let captured = mock
-        .last_request()
-        .await
-        .expect("upstream must have received the request");
-    assert_eq!(mock.request_count().await, 1);
-    // Body must reach upstream byte-for-byte — proves passthrough (the
-    // decode path would strip the chunk-signature framing). Note that
-    // passthrough re-signs the outbound request, so we can't rely on
-    // `x-amz-content-sha256` reaching the upstream as-is — the byte
-    // preservation check above is the load-bearing routing signal.
-    assert_eq!(captured.body.as_slice(), body.as_slice());
-    // x-amz-decoded-content-length is preserved by passthrough but the
-    // decode path strips it before forwarding. Use that as a positive
-    // routing signal alongside the body-byte check.
-    let decoded_cl = captured
-        .headers
-        .get("x-amz-decoded-content-length")
-        .expect(
-            "x-amz-decoded-content-length must reach the upstream; if missing, \
-             the request was decoded by the proxy rather than passed through",
-        )
-        .to_str()
-        .unwrap();
-    assert_eq!(decoded_cl, "8");
+    let (status, raw_response) = raw_tcp_request(proxy_host, &request_bytes).await;
+    assert_eq!(
+        status, 400,
+        "ECDSA streaming must be rejected with HTTP 400",
+    );
+    let resp_text = String::from_utf8_lossy(&raw_response);
+    assert!(
+        resp_text.contains("<Code>UnsupportedSignature</Code>"),
+        "expected UnsupportedSignature S3 error code, got: {resp_text}",
+    );
+    // Upstream must not have been contacted: this is the load-bearing
+    // "rejected before backend contact" assertion.
+    assert_eq!(
+        mock.request_count().await,
+        0,
+        "upstream must not be contacted when ECDSA is rejected up front",
+    );
 }
 
 /// A non-trailer aws-chunked PUT whose `x-amz-decoded-content-length` exceeds

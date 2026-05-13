@@ -98,6 +98,13 @@ pub(super) enum WriteBodyRoute {
     DecodeAwsChunked,
     /// Pass the raw request through to the upstream byte-for-byte.
     Passthrough,
+    /// Reject the request up front before any backend contact with the
+    /// `UnsupportedSignature` S3 error. Currently used only for ECDSA-signed
+    /// streaming uploads: the inbound `chunk-signature` values are bound to
+    /// the client's private key, so passthrough would re-sign with the proxy
+    /// backend credentials and the chunk signatures would never validate
+    /// against either side. Failing fast avoids pointless backend traffic.
+    RejectUnsupportedSignature,
 }
 
 /// Granular classification of an aws-chunked upload's mode, derived from the
@@ -119,7 +126,10 @@ pub(super) enum AwsChunkedUploadMode {
     /// `x-amz-trailer`.
     SignedTrailerHmacSha256,
     /// ECDSA-signed streaming (`STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD*`).
-    /// Out of scope; routes to passthrough.
+    /// Out of scope; routes to a fail-fast `UnsupportedSignature` reject. The
+    /// inbound `chunk-signature` values are bound to the client's private
+    /// key, so passthrough would only fail on the upstream after pointless
+    /// backend contact.
     Ecdsa,
     /// Some other `STREAMING-*` sentinel we don't recognise, or a trailer
     /// variant whose `x-amz-trailer` declares an algorithm we don't support.
@@ -296,8 +306,15 @@ pub(super) fn classify_upload_part_body_route(
         return WriteBodyRoute::Passthrough;
     }
     let route = aws_chunked_route_for(raw_headers);
-    if matches!(route, WriteBodyRoute::DecodeAwsChunked) {
-        return WriteBodyRoute::DecodeAwsChunked;
+    // aws-chunked classification is authoritative for both decode AND
+    // explicit-reject routes: the multipart checksum-header gate below must
+    // not override an `UnsupportedSignature` reject by re-routing the ECDSA
+    // request through passthrough.
+    if matches!(
+        route,
+        WriteBodyRoute::DecodeAwsChunked | WriteBodyRoute::RejectUnsupportedSignature,
+    ) {
+        return route;
     }
     if extra_amz.keys().any(|k| {
         WRITE_MODIFYING_BASE.contains(&k.as_str())
@@ -318,9 +335,8 @@ fn aws_chunked_route_for(raw_headers: &http::HeaderMap) -> WriteBodyRoute {
             | AwsChunkedUploadMode::UnsignedTrailer
             | AwsChunkedUploadMode::SignedTrailerHmacSha256,
         ) => WriteBodyRoute::DecodeAwsChunked,
-        Some(AwsChunkedUploadMode::Ecdsa | AwsChunkedUploadMode::OtherStreaming) => {
-            WriteBodyRoute::Passthrough
-        }
+        Some(AwsChunkedUploadMode::Ecdsa) => WriteBodyRoute::RejectUnsupportedSignature,
+        Some(AwsChunkedUploadMode::OtherStreaming) => WriteBodyRoute::Passthrough,
     }
 }
 
@@ -474,10 +490,19 @@ mod tests {
         );
     }
 
-    /// ECDSA-signed streaming with a trailer header still routes to
-    /// passthrough — ECDSA is out of scope (#63) regardless of trailer state.
+    /// ECDSA-signed streaming uploads must be rejected up front with
+    /// `UnsupportedSignature` rather than routed to passthrough. The inbound
+    /// `chunk-signature` values are bound to the client's private key, so
+    /// passthrough would re-sign with the proxy backend credentials and the
+    /// signatures would never validate — failing fast avoids pointless
+    /// backend contact.
+    ///
+    /// Bug-revert reasoning: routing ECDSA back to `Passthrough` here flips
+    /// the assertion to a panic, and the matching integration test (which
+    /// pins HTTP 400 + `UnsupportedSignature` + zero backend hits) flips
+    /// alongside it.
     #[test]
-    fn test_ecdsa_streaming_routes_to_passthrough() {
+    fn test_ecdsa_streaming_rejected_as_unsupported_signature() {
         let mut headers = http::HeaderMap::new();
         headers.insert(
             "x-amz-content-sha256",
@@ -490,7 +515,33 @@ mod tests {
         let extra_amz = std::collections::HashMap::new();
         assert_eq!(
             classify_put_body_route(&extra_amz, &headers),
-            WriteBodyRoute::Passthrough,
+            WriteBodyRoute::RejectUnsupportedSignature,
+        );
+        assert_eq!(
+            classify_upload_part_body_route(&extra_amz, &headers),
+            WriteBodyRoute::RejectUnsupportedSignature,
+        );
+    }
+
+    /// Multipart UploadPart with an ECDSA streaming sentinel plus the kind of
+    /// `x-amz-sdk-checksum-algorithm` side-channel a real SDK would set must
+    /// still route to the `UnsupportedSignature` reject — the multipart
+    /// checksum-header gate must NOT silently convert it back to passthrough.
+    #[test]
+    fn test_upload_part_ecdsa_rejected_even_with_sdk_checksum_header() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-amz-content-sha256",
+            "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD".parse().unwrap(),
+        );
+        let mut extra_amz = std::collections::HashMap::new();
+        extra_amz.insert(
+            "x-amz-sdk-checksum-algorithm".to_string(),
+            "CRC32".to_string(),
+        );
+        assert_eq!(
+            classify_upload_part_body_route(&extra_amz, &headers),
+            WriteBodyRoute::RejectUnsupportedSignature,
         );
     }
 

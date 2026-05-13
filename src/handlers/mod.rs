@@ -260,6 +260,9 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
                 WriteBodyRoute::Passthrough => {
                     route_to_passthrough(&state, &parts, body, &parsed.request_id).await
                 }
+                WriteBodyRoute::RejectUnsupportedSignature => {
+                    reject_unsupported_signature(&parsed.request_id)
+                }
             }
         }
         S3Operation::DeleteObject { key, .. } => {
@@ -309,6 +312,9 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
             WriteBodyRoute::Passthrough => {
                 route_to_passthrough(&state, &parts, body, &parsed.request_id).await
             }
+            WriteBodyRoute::RejectUnsupportedSignature => {
+                reject_unsupported_signature(&parsed.request_id)
+            }
         },
         S3Operation::CompleteMultipartUpload { key, upload_id, .. } => {
             if has_unsupported_multipart_modifiers(&parsed.extra_amz_headers, &parts.headers) {
@@ -357,6 +363,21 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
 
     record_metrics(op_name, &response, start);
     response
+}
+
+/// Emit an `UnsupportedSignature` error response without contacting the
+/// backend. Used by the aws-chunked dispatch path when the routing
+/// classifier returns `RejectUnsupportedSignature` — currently for
+/// ECDSA-signed streaming uploads, whose inbound `chunk-signature` values
+/// are bound to the client's private key and cannot be re-signed or
+/// validated by the proxy.
+fn reject_unsupported_signature(request_id: &str) -> Response<Body> {
+    S3Error::unsupported_signature(
+        "aws-chunked ECDSA streaming uploads (STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD*) \
+         are not supported by this proxy",
+        request_id,
+    )
+    .to_response()
 }
 
 /// Route through raw passthrough, rewriting the bucket in the path.

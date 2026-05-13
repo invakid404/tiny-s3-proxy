@@ -249,6 +249,24 @@ impl S3Error {
         }
     }
 
+    /// Create an UnsupportedSignature error (HTTP 400). AWS surfaces this code
+    /// when a request's signing version or scheme is not supported by the
+    /// service. Used by the aws-chunked dispatch path to reject ECDSA
+    /// (`STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD*`) streaming uploads up
+    /// front: the inbound ECDSA chunk signatures are bound to the client's
+    /// private key, and the proxy can't validate or re-sign them, so silently
+    /// routing through passthrough would only fail on the upstream after
+    /// pointless backend contact.
+    pub fn unsupported_signature(message: &str, request_id: &str) -> Self {
+        S3Error {
+            http_status: StatusCode::BAD_REQUEST,
+            code: "UnsupportedSignature".to_string(),
+            message: message.to_string(),
+            resource: None,
+            request_id: request_id.to_string(),
+        }
+    }
+
     /// Create a NotImplemented error.
     pub fn not_implemented(operation: &str, request_id: &str) -> Self {
         S3Error {
@@ -385,6 +403,16 @@ mod tests {
         assert!(xml.contains("&amp;"));
         assert!(xml.contains("&quot;quotes&quot;"));
         assert!(xml.contains("r&amp;id"));
+    }
+
+    #[test]
+    fn test_unsupported_signature_status_and_code() {
+        let err = S3Error::unsupported_signature("ECDSA streaming not supported", "req-sig");
+        assert_eq!(err.http_status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.code, "UnsupportedSignature");
+        let xml = err.to_xml();
+        assert!(xml.contains("<Code>UnsupportedSignature</Code>"));
+        assert!(xml.contains("ECDSA streaming not supported"));
     }
 
     #[test]

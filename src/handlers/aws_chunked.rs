@@ -1526,6 +1526,41 @@ mod tests {
         );
     }
 
+    /// Defense-in-depth: if an ECDSA streaming sentinel somehow reaches
+    /// `decoder_mode_from_headers` (i.e. the dispatch routing regresses and
+    /// no longer rejects ECDSA up front), the decoder must still refuse to
+    /// build a `DecoderMode` — silently treating it as something we can
+    /// decode would mean accepting a stream we can't validate. Production
+    /// dispatch routes ECDSA to `RejectUnsupportedSignature` before reaching
+    /// here; this test pins the decode-path backstop.
+    ///
+    /// Even with a usable `x-amz-trailer` present (which would otherwise
+    /// short-circuit the missing-trailer guard for trailer-mode sentinels),
+    /// the ECDSA sentinel must still surface as `InvalidRequest` via the
+    /// `unsupported aws-chunked sentinel reached the decode path` branch.
+    ///
+    /// Bug-revert reasoning: replacing the fall-through `Err` branch with a
+    /// permissive ECDSA mapping (e.g. routing it through `DecoderMode::
+    /// SignedTrailer` because the suffix looks similar) flips this assertion
+    /// to a panic on `.unwrap_err()`.
+    #[test]
+    fn test_decoder_mode_from_headers_rejects_ecdsa_sentinel() {
+        let h = make_headers(&[
+            (
+                "x-amz-content-sha256",
+                "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER",
+            ),
+            ("x-amz-trailer", "x-amz-checksum-crc32"),
+        ]);
+        let err = decoder_mode_from_headers(&h, "r").unwrap_err();
+        assert_eq!(err.code, "InvalidRequest");
+        assert!(
+            err.message.to_ascii_lowercase().contains("unsupported"),
+            "error should mention the unsupported sentinel, got: {}",
+            err.message,
+        );
+    }
+
     /// Two `x-amz-decoded-content-length` headers must be rejected. Same
     /// failure mode as `x-amz-content-sha256` duplicates: `.get()` alone
     /// picks the first value, letting a contradictory second declaration
