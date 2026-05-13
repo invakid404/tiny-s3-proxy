@@ -842,7 +842,10 @@ mod tests {
             .unwrap();
         let parsed = parse_request(&req);
         assert_eq!(
-            parsed.content_headers.get("content-encoding").map(String::as_str),
+            parsed
+                .content_headers
+                .get("content-encoding")
+                .map(String::as_str),
             Some("aws-chunked,gzip"),
         );
     }
@@ -868,7 +871,10 @@ mod tests {
             .unwrap();
         let parsed = parse_request(&req);
         assert_eq!(
-            parsed.content_headers.get("content-encoding").map(String::as_str),
+            parsed
+                .content_headers
+                .get("content-encoding")
+                .map(String::as_str),
             Some("aws-chunked, gzip"),
             "repeated Content-Encoding headers must be normalized into a single comma-list",
         );
@@ -888,7 +894,10 @@ mod tests {
             .unwrap();
         let parsed = parse_request(&req);
         assert_eq!(
-            parsed.content_headers.get("content-encoding").map(String::as_str),
+            parsed
+                .content_headers
+                .get("content-encoding")
+                .map(String::as_str),
             Some("gzip, aws-chunked"),
         );
     }
@@ -908,7 +917,10 @@ mod tests {
             .unwrap();
         let parsed = parse_request(&req);
         assert_eq!(
-            parsed.content_headers.get("content-encoding").map(String::as_str),
+            parsed
+                .content_headers
+                .get("content-encoding")
+                .map(String::as_str),
             Some("aws-chunked, gzip, identity"),
         );
     }

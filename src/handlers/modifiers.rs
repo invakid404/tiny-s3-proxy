@@ -178,7 +178,9 @@ pub(super) fn classify_aws_chunked_upload(
         let candidate = if upper == crate::s3::aws_chunked::STREAMING_AWS4_HMAC_SHA256_PAYLOAD {
             Some(AwsChunkedUploadMode::NonTrailerHmacSha256)
         } else if upper.contains("ECDSA") && upper.starts_with("STREAMING-") {
-            // ECDSA streaming is out of scope (#63) regardless of trailer state.
+            // ECDSA streaming is out of scope (#63) regardless of trailer
+            // state: the dispatch layer rejects this mode up front with
+            // `UnsupportedSignature` (HTTP 400) — see `aws_chunked_route_for`.
             Some(AwsChunkedUploadMode::Ecdsa)
         } else if upper == "STREAMING-UNSIGNED-PAYLOAD-TRAILER" {
             if trailer_algo_is_supported {
@@ -199,8 +201,10 @@ pub(super) fn classify_aws_chunked_upload(
         };
         // Conservative escalation: prefer the most restrictive mode if the
         // request happens to advertise more than one. We only "downgrade"
-        // from a recognised non-trailer/trailer mode if we see an Ecdsa or
-        // OtherStreaming variant later (both route to passthrough).
+        // from a recognised non-trailer/trailer mode if we see an Ecdsa
+        // (→ `RejectUnsupportedSignature`) or `OtherStreaming` (→
+        // `Passthrough`) variant later, both of which route away from the
+        // decode path.
         mode = match (mode, candidate) {
             (None, c) => c,
             (

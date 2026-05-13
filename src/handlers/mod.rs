@@ -1670,44 +1670,36 @@ mod tests {
         assert!(body_str.contains("AccessDenied"));
     }
 
-    /// PUT with an aws-chunked variant the in-house decoder does NOT handle
-    /// (here: ECDSA-signed streaming) must bypass the typed PUT path and
-    /// route to passthrough. Was originally written for trailer mode, which
-    /// now goes through the decoder; flipped to ECDSA so the test still pins
-    /// the load-bearing decision: "anything the decoder can't validate must
-    /// reach the upstream byte-for-byte". ECDSA is tracked in #63.
+    /// PUT with an ECDSA-signed aws-chunked streaming sentinel must be
+    /// rejected up front with HTTP 400 `UnsupportedSignature` before the
+    /// typed PUT path OR any upstream contact. The inbound `chunk-signature`
+    /// values are bound to the client's private key, so the previous
+    /// "route to passthrough" behaviour only ever failed on the upstream
+    /// after pointless backend traffic. The handler-level dispatch must
+    /// short-circuit; this test pins that shape.
+    ///
+    /// The companion integration test
+    /// `test_aws_chunked_ecdsa_streaming_rejected_as_unsupported_signature`
+    /// exercises the same routing through the full server stack.
     #[tokio::test]
-    async fn test_aws_chunked_put_routes_to_passthrough() {
+    async fn test_aws_chunked_put_ecdsa_rejected_as_unsupported_signature() {
         use axum::routing::any;
         use std::sync::atomic::{AtomicU32, Ordering};
 
-        // Minimal aws-chunked-style framed body wrapping the literal payload
-        // "hello". The proxy doesn't parse this — it forwards the bytes
-        // verbatim to the upstream, which is exactly what we want to verify.
+        // Well-formed-looking aws-chunked frame for "hello". The bytes never
+        // matter because dispatch rejects before any body parse / forward.
         let framed_body: &[u8] =
             b"5;chunk-signature=deadbeef\r\nhello\r\n0;chunk-signature=cafef00d\r\n\r\n";
 
-        // Mock upstream that captures (method, uri, headers, body) per request.
+        // Mock upstream that bumps a counter on any request received. The
+        // load-bearing assertion is that this counter stays at 0.
         let call_count = std::sync::Arc::new(AtomicU32::new(0));
-        type CapturedRequest = (String, String, http::HeaderMap, bytes::Bytes);
-        let captured: std::sync::Arc<tokio::sync::Mutex<Vec<CapturedRequest>>> =
-            std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let call_count_for_handler = call_count.clone();
-        let captured_for_handler = captured.clone();
-
         let app = axum::Router::new().route(
             "/{*path}",
-            any(move |req: http::Request<Body>| {
+            any(move |_req: http::Request<Body>| {
                 let cc = call_count_for_handler.clone();
-                let cap = captured_for_handler.clone();
                 async move {
-                    let method = req.method().to_string();
-                    let uri = req.uri().to_string();
-                    let headers = req.headers().clone();
-                    let body_bytes = axum::body::to_bytes(req.into_body(), 64 * 1024)
-                        .await
-                        .unwrap_or_default();
-                    cap.lock().await.push((method, uri, headers, body_bytes));
                     cc.fetch_add(1, Ordering::SeqCst);
                     http::Response::builder()
                         .status(200)
@@ -1716,16 +1708,12 @@ mod tests {
                 }
             }),
         );
-
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
 
-        // Build state pointing at the mock upstream. MockBackend has zero
-        // expectations: if dispatch hits the typed PUT path it will return
-        // an error from put_object() and `total_calls` will be non-zero.
         let cache = MockCache::new();
         let mut config = test_config();
         config.backend_endpoint = format!("http://{addr}");
@@ -1760,58 +1748,29 @@ mod tests {
             .unwrap();
 
         let resp = handle_s3_request(State(state), req).await;
-        assert_eq!(resp.status(), 200, "passthrough should return upstream 200");
-
+        assert_eq!(
+            resp.status(),
+            400,
+            "ECDSA streaming must be rejected at dispatch with HTTP 400",
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body_str = String::from_utf8_lossy(&body);
+        assert!(
+            body_str.contains("<Code>UnsupportedSignature</Code>"),
+            "expected UnsupportedSignature S3 error code, got: {body_str}",
+        );
         // Typed PUT path must NOT have been invoked.
         let typed_calls = backend.total_calls.load(Ordering::Relaxed);
         assert_eq!(
             typed_calls, 0,
-            "typed Backend path must not be invoked for aws-chunked PUT (got {typed_calls} calls)"
+            "typed Backend path must not be invoked when ECDSA is rejected (got {typed_calls} calls)",
         );
-
-        // Upstream must have received the framed wire body verbatim and the
-        // streaming-indicator headers preserved.
-        let calls = captured.lock().await;
-        assert_eq!(calls.len(), 1, "upstream should receive exactly 1 request");
-        let (method, uri, hdrs, body) = &calls[0];
-        assert_eq!(method, "PUT");
-        assert!(
-            uri.starts_with("/test-backend/key"),
-            "upstream URI should target rewritten backend bucket, got {uri}"
-        );
-        assert_eq!(
-            body.as_ref(),
-            framed_body,
-            "upstream must receive the original framed body bytes verbatim"
-        );
-        let ce = hdrs
-            .get("content-encoding")
-            .expect("content-encoding forwarded")
-            .to_str()
-            .unwrap();
-        assert!(
-            ce.split(',')
-                .any(|t| t.trim().eq_ignore_ascii_case("aws-chunked")),
-            "content-encoding must preserve aws-chunked token, got {ce}"
-        );
-        assert_eq!(
-            hdrs.get("x-amz-decoded-content-length")
-                .expect("x-amz-decoded-content-length forwarded")
-                .to_str()
-                .unwrap(),
-            "5"
-        );
-        // `x-amz-decoded-content-length` reaching the upstream is the
-        // load-bearing passthrough signal — the typed PUT path and the
-        // decode path both strip it (see `is_streaming_only_amz_header` and
-        // parse.rs). The assertion above on its value (`"5"`) already covers
-        // this. Note that passthrough re-signs the request with SigV4, so
-        // `x-amz-content-sha256` is REPLACED by the SDK before reaching the
-        // upstream — we can't assert on the original ECDSA sentinel here.
+        // Upstream HTTP mock must NOT have been contacted — the
+        // "rejected before backend contact" contract.
         assert_eq!(
             call_count.load(Ordering::SeqCst),
-            1,
-            "upstream handler should be invoked exactly once"
+            0,
+            "upstream handler must not be invoked when ECDSA is rejected up front",
         );
     }
 

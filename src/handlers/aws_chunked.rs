@@ -227,9 +227,11 @@ fn is_streaming_only_amz_header(name: &str) -> bool {
 /// decoded backend request. Drops streaming-only x-amz-* headers that
 /// would be wrong on a normal PUT/UploadPart (see
 /// `is_streaming_only_amz_header`). Production is gated by the dispatch
-/// routing — trailer-mode goes to passthrough — but this filter ensures
-/// that even if dispatch or `parse.rs` regresses, the decoded backend
-/// inputs stay clean.
+/// routing — the trailer-mode parser consumes `x-amz-trailer` inline before
+/// reaching the backend, and `parse.rs` strips `x-amz-content-sha256` and
+/// `x-amz-decoded-content-length` from `extra_amz_headers` — but this
+/// filter ensures that even if dispatch or `parse.rs` regresses, the
+/// decoded backend inputs stay clean.
 ///
 /// `x-amz-checksum-*` headers are explicitly NOT filtered: those are
 /// legitimate non-streaming S3 checksum advertisements that the decoded
@@ -338,11 +340,12 @@ async fn decode_into_spool<B: Backend, C: CacheStore>(
 
 /// Inspect the inbound `x-amz-content-sha256` sentinel plus the
 /// `x-amz-trailer` header on `raw_headers` and produce the matching
-/// `DecoderMode`. The dispatch routing already rejects unsupported sentinels
-/// (ECDSA, unknown) by routing them to passthrough; this helper assumes the
-/// request is going through the decode path and rejects the residual cases
-/// (no sentinel match, trailer-mode without a usable trailer header) with
-/// `InvalidRequest`.
+/// `DecoderMode`. The dispatch routing already diverts unsupported
+/// sentinels off the decode path — ECDSA streams reject up front with
+/// `UnsupportedSignature`, and unknown / contradictory shapes fall through
+/// to passthrough — so this helper assumes the request is going through
+/// the decode path and rejects the residual cases (no sentinel match,
+/// trailer-mode without a usable trailer header) with `InvalidRequest`.
 ///
 /// `x-amz-content-sha256` must appear exactly once with an ASCII, non-empty
 /// value. The dispatch classifier inspects every value defensively, so a
