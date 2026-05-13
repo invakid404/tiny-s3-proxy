@@ -2828,11 +2828,16 @@ fn build_signed_non_trailer_frame_bytes(payload: &[u8]) -> Vec<u8> {
 /// that the aws-chunked decode path actually rewrites the wire body rather
 /// than just routing to it.
 ///
-/// Regression caught: if `RequestChecksumCalculation::WhenRequired` is
-/// flipped back to `WhenSupported` in `S3Backend::put_object_from_path`,
-/// the SDK re-wraps the body in streaming-checksum framing and the GET
-/// returns aws-chunked-framed bytes instead of the original payload — the
-/// final `assert_eq!(body, payload)` fails.
+/// What this test does NOT cover: with aws-sdk-s3 1.132.0 +
+/// aws-smithy-checksums 0.64.7 and the per-algorithm checksum setters
+/// (`.checksum_crc32(...)` etc), the SDK does not re-frame outbound bodies
+/// as aws-chunked — the outbound wire is `Content-Length: N` + raw bytes +
+/// `x-amz-content-sha256: UNSIGNED-PAYLOAD` regardless of the
+/// `RequestChecksumCalculation::WhenRequired` + `disable_payload_signing()`
+/// overrides in `S3Backend::put_object_from_path`. Flipping those
+/// overrides does NOT cause this test to fail today. It stays as a
+/// forward regression guard against a future SDK / smithy revision that
+/// re-introduces outbound aws-chunked framing on the decode path.
 ///
 /// Docker + the pinned `versity/versitygw` image required.
 #[tokio::test]
