@@ -1,3 +1,4 @@
+pub mod aws_chunked;
 pub mod delete;
 pub mod get;
 pub mod head;
@@ -244,10 +245,21 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
             }
         }
         S3Operation::PutObject { key, .. } => {
-            if has_unsupported_write_modifiers(&parsed.extra_amz_headers, &parts.headers) {
-                route_to_passthrough(&state, &parts, body, &parsed.request_id).await
-            } else {
-                put::handle_put(&state, &parsed, key, body).await
+            match classify_put_body_route(&parsed.extra_amz_headers, &parts.headers) {
+                WriteBodyRoute::Typed => put::handle_put(&state, &parsed, key, body).await,
+                WriteBodyRoute::DecodeAwsChunked => {
+                    aws_chunked::handle_put_decode_aws_chunked(
+                        &state,
+                        &parsed,
+                        key,
+                        &parts.headers,
+                        body,
+                    )
+                    .await
+                }
+                WriteBodyRoute::Passthrough => {
+                    route_to_passthrough(&state, &parts, body, &parsed.request_id).await
+                }
             }
         }
         S3Operation::DeleteObject { key, .. } => {
@@ -277,14 +289,27 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
             part_number,
             upload_id,
             ..
-        } => {
-            if has_unsupported_multipart_modifiers(&parsed.extra_amz_headers, &parts.headers) {
-                route_to_passthrough(&state, &parts, body, &parsed.request_id).await
-            } else {
+        } => match classify_upload_part_body_route(&parsed.extra_amz_headers, &parts.headers) {
+            WriteBodyRoute::Typed => {
                 multipart::handle_upload_part(&state, &parsed, key, *part_number, upload_id, body)
                     .await
             }
-        }
+            WriteBodyRoute::DecodeAwsChunked => {
+                aws_chunked::handle_upload_part_decode_aws_chunked(
+                    &state,
+                    &parsed,
+                    key,
+                    *part_number,
+                    upload_id,
+                    &parts.headers,
+                    body,
+                )
+                .await
+            }
+            WriteBodyRoute::Passthrough => {
+                route_to_passthrough(&state, &parts, body, &parsed.request_id).await
+            }
+        },
         S3Operation::CompleteMultipartUpload { key, upload_id, .. } => {
             if has_unsupported_multipart_modifiers(&parsed.extra_amz_headers, &parts.headers) {
                 route_to_passthrough(&state, &parts, body, &parsed.request_id).await
@@ -517,6 +542,8 @@ pub mod test_utils {
         pub get_read_calls: Mutex<Vec<ReadOptions>>,
         pub head_read_calls: Mutex<Vec<ReadOptions>>,
         pub put_calls: Mutex<Vec<PutObjectInput>>,
+        pub put_spool_calls: Mutex<Vec<PutObjectSpoolInput>>,
+        pub upload_part_spool_calls: Mutex<Vec<UploadPartSpoolInput>>,
         pub delete_calls: Mutex<Vec<(String, String)>>,
         /// Total number of Backend trait method invocations.
         pub total_calls: std::sync::atomic::AtomicU32,
@@ -538,6 +565,8 @@ pub mod test_utils {
                 get_read_calls: Mutex::new(Vec::new()),
                 head_read_calls: Mutex::new(Vec::new()),
                 put_calls: Mutex::new(Vec::new()),
+                put_spool_calls: Mutex::new(Vec::new()),
+                upload_part_spool_calls: Mutex::new(Vec::new()),
                 delete_calls: Mutex::new(Vec::new()),
                 total_calls: std::sync::atomic::AtomicU32::new(0),
             }
@@ -666,6 +695,35 @@ pub mod test_utils {
             })
         }
 
+        async fn put_object_from_path(
+            &self,
+            req: PutObjectSpoolInput,
+        ) -> Result<PutObjectOutput, ProxyError> {
+            self.total_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.put_spool_calls
+                .lock()
+                .unwrap()
+                .push(PutObjectSpoolInput {
+                    bucket: req.bucket.clone(),
+                    key: req.key.clone(),
+                    path: req.path.clone(),
+                    len: req.len,
+                    sha256_hex: req.sha256_hex.clone(),
+                    content_type: req.content_type.clone(),
+                    content_md5: req.content_md5.clone(),
+                    metadata: req.metadata.clone(),
+                    extra_amz_headers: req.extra_amz_headers.clone(),
+                    content_headers: req.content_headers.clone(),
+                });
+            self.put_response.lock().unwrap().take().unwrap_or_else(|| {
+                Err(ProxyError::Backend {
+                    source: "no mock response configured".into(),
+                    operation: "put_object_from_path".into(),
+                })
+            })
+        }
+
         async fn delete_object(
             &self,
             req: DeleteObjectInput<'_>,
@@ -735,6 +793,38 @@ pub mod test_utils {
                     Err(ProxyError::Backend {
                         source: "no mock response configured".into(),
                         operation: "upload_part".into(),
+                    })
+                })
+        }
+
+        async fn upload_part_from_path(
+            &self,
+            req: UploadPartSpoolInput,
+        ) -> Result<UploadPartOutput, ProxyError> {
+            self.total_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.upload_part_spool_calls
+                .lock()
+                .unwrap()
+                .push(UploadPartSpoolInput {
+                    bucket: req.bucket.clone(),
+                    key: req.key.clone(),
+                    upload_id: req.upload_id.clone(),
+                    part_number: req.part_number,
+                    path: req.path.clone(),
+                    len: req.len,
+                    sha256_hex: req.sha256_hex.clone(),
+                    content_md5: req.content_md5.clone(),
+                    extra_amz_headers: req.extra_amz_headers.clone(),
+                });
+            self.upload_part_response
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_else(|| {
+                    Err(ProxyError::Backend {
+                        source: "no mock response configured".into(),
+                        operation: "upload_part_from_path".into(),
                     })
                 })
         }

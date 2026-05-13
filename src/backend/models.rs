@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use typed_builder::TypedBuilder;
 
 /// Input for get_object operations.
@@ -206,6 +207,50 @@ pub struct UploadPartInput {
     pub body: Bytes,
     #[builder(default)]
     pub content_md5: Option<String>,
+}
+
+/// Input for `put_object_from_path`. Identical to `PutObjectInput` except the
+/// body is read from a single-owner spool file on disk rather than held in
+/// memory. Used by the aws-chunked decode path so very large decoded bodies
+/// don't need to be buffered in RAM.
+#[derive(Debug, TypedBuilder)]
+#[non_exhaustive]
+pub struct PutObjectSpoolInput {
+    pub bucket: String,
+    pub key: String,
+    pub path: PathBuf,
+    pub len: u64,
+    /// SHA-256 of the decoded body, computed by the aws-chunked decoder.
+    /// Informational for now; strict verification is tracked in #63.
+    pub sha256_hex: String,
+    #[builder(default)]
+    pub content_type: Option<String>,
+    #[builder(default)]
+    pub content_md5: Option<String>,
+    #[builder(default)]
+    pub metadata: HashMap<String, String>,
+    #[builder(default)]
+    pub extra_amz_headers: HashMap<String, String>,
+    #[builder(default)]
+    pub content_headers: HashMap<String, String>,
+}
+
+/// Input for `upload_part_from_path`. Spool-file counterpart to
+/// `UploadPartInput`.
+#[derive(Debug, TypedBuilder)]
+#[non_exhaustive]
+pub struct UploadPartSpoolInput {
+    pub bucket: String,
+    pub key: String,
+    pub upload_id: String,
+    pub part_number: i32,
+    pub path: PathBuf,
+    pub len: u64,
+    pub sha256_hex: String,
+    #[builder(default)]
+    pub content_md5: Option<String>,
+    #[builder(default)]
+    pub extra_amz_headers: HashMap<String, String>,
 }
 
 #[derive(Debug)]

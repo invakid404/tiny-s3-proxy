@@ -799,6 +799,12 @@ mod tests {
         async fn put_object(&self, _req: PutObjectInput) -> Result<PutObjectOutput, ProxyError> {
             unreachable!()
         }
+        async fn put_object_from_path(
+            &self,
+            _req: crate::backend::models::PutObjectSpoolInput,
+        ) -> Result<PutObjectOutput, ProxyError> {
+            unreachable!()
+        }
         async fn delete_object(
             &self,
             _req: DeleteObjectInput<'_>,
@@ -818,6 +824,12 @@ mod tests {
             unreachable!()
         }
         async fn upload_part(&self, _req: UploadPartInput) -> Result<UploadPartOutput, ProxyError> {
+            unreachable!()
+        }
+        async fn upload_part_from_path(
+            &self,
+            _req: crate::backend::models::UploadPartSpoolInput,
+        ) -> Result<UploadPartOutput, ProxyError> {
             unreachable!()
         }
         async fn complete_multipart_upload(
@@ -887,6 +899,12 @@ mod tests {
         async fn put_object(&self, _req: PutObjectInput) -> Result<PutObjectOutput, ProxyError> {
             unreachable!()
         }
+        async fn put_object_from_path(
+            &self,
+            _req: crate::backend::models::PutObjectSpoolInput,
+        ) -> Result<PutObjectOutput, ProxyError> {
+            unreachable!()
+        }
         async fn delete_object(
             &self,
             _req: DeleteObjectInput<'_>,
@@ -906,6 +924,12 @@ mod tests {
             unreachable!()
         }
         async fn upload_part(&self, _req: UploadPartInput) -> Result<UploadPartOutput, ProxyError> {
+            unreachable!()
+        }
+        async fn upload_part_from_path(
+            &self,
+            _req: crate::backend::models::UploadPartSpoolInput,
+        ) -> Result<UploadPartOutput, ProxyError> {
             unreachable!()
         }
         async fn complete_multipart_upload(
@@ -973,6 +997,12 @@ mod tests {
         async fn put_object(&self, _req: PutObjectInput) -> Result<PutObjectOutput, ProxyError> {
             unreachable!()
         }
+        async fn put_object_from_path(
+            &self,
+            _req: crate::backend::models::PutObjectSpoolInput,
+        ) -> Result<PutObjectOutput, ProxyError> {
+            unreachable!()
+        }
         async fn delete_object(
             &self,
             _req: DeleteObjectInput<'_>,
@@ -992,6 +1022,12 @@ mod tests {
             unreachable!()
         }
         async fn upload_part(&self, _req: UploadPartInput) -> Result<UploadPartOutput, ProxyError> {
+            unreachable!()
+        }
+        async fn upload_part_from_path(
+            &self,
+            _req: crate::backend::models::UploadPartSpoolInput,
+        ) -> Result<UploadPartOutput, ProxyError> {
             unreachable!()
         }
         async fn complete_multipart_upload(
@@ -1060,6 +1096,15 @@ mod tests {
                 operation: "put_object".into(),
             })
         }
+        async fn put_object_from_path(
+            &self,
+            _req: crate::backend::models::PutObjectSpoolInput,
+        ) -> Result<PutObjectOutput, ProxyError> {
+            Err(ProxyError::Backend {
+                source: "unexpected put_object_from_path".into(),
+                operation: "put_object_from_path".into(),
+            })
+        }
         async fn delete_object(
             &self,
             _req: DeleteObjectInput<'_>,
@@ -1091,6 +1136,15 @@ mod tests {
             Err(ProxyError::Backend {
                 source: "unexpected upload_part".into(),
                 operation: "upload_part".into(),
+            })
+        }
+        async fn upload_part_from_path(
+            &self,
+            _req: crate::backend::models::UploadPartSpoolInput,
+        ) -> Result<UploadPartOutput, ProxyError> {
+            Err(ProxyError::Backend {
+                source: "unexpected upload_part_from_path".into(),
+                operation: "upload_part_from_path".into(),
             })
         }
         async fn complete_multipart_upload(
