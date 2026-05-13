@@ -326,13 +326,24 @@ pub(super) fn classify_put_body_route(
 /// gating on `MULTIPART_CHECKSUM_HEADERS` here would incorrectly force
 /// passthrough for the very requests the trailer decoder exists to handle.
 ///
-/// Order matters: classify aws-chunked FIRST. The explicit
-/// `RejectUnsupportedSignature` route is authoritative over EVERY
-/// passthrough gate (conditionals, write-modifying base, multipart
-/// checksum) — see `classify_put_body_route` for the reasoning. The
-/// `DecodeAwsChunked` route is authoritative only over the multipart
-/// checksum gate, not over the conditional gate (the typed write path
-/// can't preserve `If-Match` etc., so those still need passthrough).
+/// Gate precedence (each return short-circuits the rest):
+///
+/// 1. `RejectUnsupportedSignature` (ECDSA) wins over every gate — see
+///    `classify_put_body_route` for the reasoning.
+/// 2. HTTP conditionals (`If-Match` / `If-None-Match`) → `Passthrough`:
+///    the decoded backend request can't preserve them.
+/// 3. `WRITE_MODIFYING_BASE` → `Passthrough`: these headers describe
+///    semantics (`x-amz-storage-class`, SSE keys, object-lock, …) that
+///    the decoded backend request also can't preserve, so the
+///    `DecodeAwsChunked` route MUST defer to this gate. Combining
+///    this with the multipart-checksum gate (the old shape) accidentally
+///    let `DecodeAwsChunked` bypass it.
+/// 4. `DecodeAwsChunked` is now safe to return — none of (1)–(3) applied.
+/// 5. `MULTIPART_CHECKSUM_HEADERS` → `Passthrough`: this gate is the one
+///    aws-chunked decoding owns (the trailer is the checksum), so it
+///    sits AFTER the Decode return. Anything still here is non-chunked
+///    UploadPart with a checksum header the typed multipart path can't
+///    forward — passthrough preserves integrity validation.
 pub(super) fn classify_upload_part_body_route(
     extra_amz: &std::collections::HashMap<String, String>,
     raw_headers: &http::HeaderMap,
@@ -344,13 +355,28 @@ pub(super) fn classify_upload_part_body_route(
     if has_unsupported_http_conditionals(raw_headers) {
         return WriteBodyRoute::Passthrough;
     }
+    // `WRITE_MODIFYING_BASE` BEFORE the DecodeAwsChunked early-return:
+    // these headers can't be faithfully preserved through the decoded
+    // backend request and must take passthrough even for aws-chunked.
+    if extra_amz
+        .keys()
+        .any(|k| WRITE_MODIFYING_BASE.contains(&k.as_str()))
+    {
+        return WriteBodyRoute::Passthrough;
+    }
     if matches!(aws_chunked, WriteBodyRoute::DecodeAwsChunked) {
         return WriteBodyRoute::DecodeAwsChunked;
     }
-    if extra_amz.keys().any(|k| {
-        WRITE_MODIFYING_BASE.contains(&k.as_str())
-            || MULTIPART_CHECKSUM_HEADERS.contains(&k.as_str())
-    }) {
+    // `MULTIPART_CHECKSUM_HEADERS` is the gate the decode path is allowed
+    // to skip — the trailer decoder validates the checksum and forwards
+    // via per-algorithm SDK setters. Only reached when the request is
+    // NOT going through Decode, so non-chunked UploadPart with checksum
+    // headers (which the typed multipart path can't forward) still
+    // correctly falls back to passthrough.
+    if extra_amz
+        .keys()
+        .any(|k| MULTIPART_CHECKSUM_HEADERS.contains(&k.as_str()))
+    {
         return WriteBodyRoute::Passthrough;
     }
     aws_chunked
@@ -812,6 +838,66 @@ mod tests {
         assert_eq!(
             classify_upload_part_body_route(&extra_amz, &headers),
             WriteBodyRoute::Passthrough,
+        );
+    }
+
+    /// UploadPart with supported aws-chunked headers PLUS a
+    /// `WRITE_MODIFYING_BASE` header (here: `x-amz-storage-class`) must
+    /// route to `Passthrough`, NOT `DecodeAwsChunked`. The decoded
+    /// backend PUT can't preserve write-modifying semantics like storage
+    /// class / SSE / object-lock — passthrough is the only path that
+    /// forwards those headers faithfully.
+    ///
+    /// Bug-revert reasoning: collapsing the `WRITE_MODIFYING_BASE` check
+    /// back into the combined `WRITE_MODIFYING_BASE || MULTIPART_CHECKSUM_HEADERS`
+    /// gate AFTER the `DecodeAwsChunked` early-return (the pre-fix shape)
+    /// flips this assertion from `Passthrough` to `DecodeAwsChunked`.
+    #[test]
+    fn test_upload_part_aws_chunked_with_write_modifying_header_routes_to_passthrough() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-amz-content-sha256",
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER".parse().unwrap(),
+        );
+        headers.insert("x-amz-trailer", "x-amz-checksum-crc32".parse().unwrap());
+        let mut extra_amz = std::collections::HashMap::new();
+        extra_amz.insert("x-amz-storage-class".to_string(), "STANDARD".to_string());
+        assert_eq!(
+            classify_upload_part_body_route(&extra_amz, &headers),
+            WriteBodyRoute::Passthrough,
+            "aws-chunked UploadPart with a write-modifying header must route to passthrough",
+        );
+    }
+
+    /// UploadPart with supported aws-chunked headers PLUS a multipart
+    /// checksum header (here: `x-amz-sdk-checksum-algorithm`) must STILL
+    /// route to `DecodeAwsChunked`. The trailer decoder owns checksum
+    /// validation and forwards the result via per-algorithm SDK setters,
+    /// so the `MULTIPART_CHECKSUM_HEADERS` passthrough gate is the one
+    /// the decode path is allowed to skip. This test pins the half of
+    /// the contract the gate split must preserve.
+    ///
+    /// Bug-revert reasoning: deleting the `DecodeAwsChunked` early-return
+    /// flips this assertion from `DecodeAwsChunked` to `Passthrough`
+    /// (the request falls through to the multipart-checksum gate, which
+    /// sees `x-amz-sdk-checksum-algorithm` and forces passthrough).
+    #[test]
+    fn test_upload_part_aws_chunked_with_multipart_checksum_header_routes_to_decode() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-amz-content-sha256",
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER".parse().unwrap(),
+        );
+        headers.insert("x-amz-trailer", "x-amz-checksum-crc32".parse().unwrap());
+        let mut extra_amz = std::collections::HashMap::new();
+        extra_amz.insert(
+            "x-amz-sdk-checksum-algorithm".to_string(),
+            "CRC32".to_string(),
+        );
+        assert_eq!(
+            classify_upload_part_body_route(&extra_amz, &headers),
+            WriteBodyRoute::DecodeAwsChunked,
+            "aws-chunked UploadPart must bypass the multipart-checksum gate and decode",
         );
     }
 
