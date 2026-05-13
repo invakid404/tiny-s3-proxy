@@ -8,7 +8,10 @@ use super::scan::{CACHE_HASH_DIR_SCAN_CONCURRENCY, bounded_parallel_scan};
 use crate::cache::entry::CacheEntry;
 use crate::cache::key::CacheKey;
 use crate::cache::metadata::CacheMeta;
-use crate::cache::perms::{create_dir_all_secure, create_dir_secure, open_std_file_secure};
+use crate::cache::perms::{
+    create_dir_all_secure, create_dir_secure, open_std_file_secure, tighten_file_mode,
+    write_file_secure,
+};
 use crate::cache::policy::CachePolicy;
 use crate::cache::{CacheStats, CacheStatsSnapshot, CacheStore, FillGuard, FillId};
 use crate::error::ProxyError;
@@ -409,7 +412,7 @@ impl DiskCache {
         let counter_path = self.fill_id_counter_path();
         let bytes = next_fill_id.to_string().into_bytes();
 
-        if let Err(e) = tokio::fs::write(&tmp_path, &bytes).await {
+        if let Err(e) = write_file_secure(&tmp_path, &bytes).await {
             let _ = tokio::fs::remove_file(&tmp_path).await;
             return Err(ProxyError::Cache {
                 source: Box::new(e),
@@ -1025,7 +1028,7 @@ impl DiskCache {
     async fn write_poison_marker(&self, key: &CacheKey) -> Result<(), ProxyError> {
         let path = self.poison_path_for_key(key);
         if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
+            create_dir_all_secure(parent)
                 .await
                 .map_err(|e| ProxyError::Cache {
                     source: Box::new(e),
@@ -1044,12 +1047,18 @@ impl DiskCache {
             });
         }
 
-        tokio::fs::write(&path, b"")
-            .await
-            .map_err(|e| ProxyError::Cache {
+        // Poison markers are write-once empty files keyed by content hash.
+        // `write_file_secure`'s `create_new` semantics is appropriate — if a
+        // marker already exists the entry is already poisoned, which is the
+        // intended end-state. Treat `AlreadyExists` as success.
+        match write_file_secure(&path, b"").await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(ProxyError::Cache {
                 source: Box::new(e),
                 operation: "write poison marker".into(),
-            })
+            }),
+        }
     }
 
     async fn restore_publish_backup(
@@ -1122,7 +1131,7 @@ impl DiskCache {
                 hash,
                 counter,
             ));
-            if tokio::fs::write(&tmp_path, &bytes).await.is_ok() {
+            if write_file_secure(&tmp_path, &bytes).await.is_ok() {
                 if tokio::fs::rename(&tmp_path, &meta_path).await.is_ok() {
                     let new_len = bytes.len() as u64;
                     match new_len.cmp(&current_len) {
@@ -1191,10 +1200,13 @@ impl DiskCache {
         let mut meta = meta;
         let temp_meta = guard.temp_dir.join(format!("{pid}-{id}.meta.json"));
 
-        // Create parent directories for final location
+        // Create parent directories for final location. Both shard levels
+        // (`objects/{d1}` and `objects/{d1}/{d2}`) must be 0o700; relying on
+        // `create_dir_all` would leave only the deepest level under the
+        // explicit-mode contract on Unix.
         let (final_body, final_meta) = self.paths_for_key(&guard.key);
         if let Some(parent) = final_body.parent()
-            && let Err(e) = tokio::fs::create_dir_all(parent).await
+            && let Err(e) = create_dir_all_secure(parent).await
         {
             let _ = tokio::fs::remove_file(&temp_body_path).await;
             let _ = tokio::fs::remove_file(&temp_meta).await;
@@ -1290,7 +1302,7 @@ impl DiskCache {
                     });
                 }
             };
-            if let Err(e) = tokio::fs::write(&temp_meta, &meta_bytes).await {
+            if let Err(e) = write_file_secure(&temp_meta, &meta_bytes).await {
                 let _ = tokio::fs::remove_file(&temp_body_path).await;
                 let _ = tokio::fs::remove_file(&temp_meta).await;
                 return Err(ProxyError::Cache {
@@ -1340,6 +1352,21 @@ impl DiskCache {
                     operation: "backup existing body".into(),
                 });
             }
+            // Backups inherit the source file's mode across `rename`. Tighten
+            // to 0o600 so a backup created from a body file that pre-dates
+            // this hardening still ends up at the secure default while it
+            // sits in the tmp dir. Best-effort: backup is transient state
+            // and we cannot meaningfully roll back a publish for a chmod
+            // failure on it.
+            if old_body_exists
+                && let Err(e) = tighten_file_mode(&backup_body).await
+            {
+                tracing::warn!(
+                    path = %backup_body.display(),
+                    error = %e,
+                    "failed to tighten backup body permissions after rename",
+                );
+            }
             if old_meta_exists && let Err(e) = tokio::fs::rename(&final_meta, &backup_meta).await {
                 if old_body_exists {
                     Self::restore_publish_backup(&final_body, &backup_body, "body").await;
@@ -1350,6 +1377,15 @@ impl DiskCache {
                     source: Box::new(e),
                     operation: "backup existing metadata".into(),
                 });
+            }
+            if old_meta_exists
+                && let Err(e) = tighten_file_mode(&backup_meta).await
+            {
+                tracing::warn!(
+                    path = %backup_meta.display(),
+                    error = %e,
+                    "failed to tighten backup metadata permissions after rename",
+                );
             }
 
             if let Err(e) = tokio::fs::rename(&temp_body_path, &final_body).await {
@@ -1804,7 +1840,7 @@ impl CacheStore for DiskCache {
         // not justified — the data can be re-learned from the backend on the
         // next miss after an unclean shutdown. commit_fill_inner uses fsync
         // for body data which is more expensive to re-fetch.
-        if let Err(e) = tokio::fs::write(&tmp_path, &meta_bytes).await {
+        if let Err(e) = write_file_secure(&tmp_path, &meta_bytes).await {
             let _ = tokio::fs::remove_file(&tmp_path).await;
             return Err(ProxyError::Cache {
                 source: Box::new(e),

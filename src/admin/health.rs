@@ -4,6 +4,9 @@ use axum::extract::State;
 use axum::response::IntoResponse;
 use http::StatusCode;
 
+use crate::cache::perms::open_file_secure;
+use tokio::io::AsyncWriteExt;
+
 /// Liveness check — always returns 200 if the process is alive.
 pub async fn health_check() -> impl IntoResponse {
     (StatusCode::OK, "ok")
@@ -12,8 +15,22 @@ pub async fn health_check() -> impl IntoResponse {
 /// Readiness check — returns 200 when the cache directory is writable.
 pub async fn ready_check(State(state): State<Arc<super::AdminState>>) -> impl IntoResponse {
     let probe = state.cache_dir.join("tmp").join(".readyz-probe");
-    match tokio::fs::write(&probe, b"ok").await {
-        Ok(_) => {
+    // Open with secure mode (0o600 on Unix). `create(true).truncate(true)`
+    // matches the original `tokio::fs::write` semantics: replace any stale
+    // probe file (e.g. from a previous crash) rather than fail.
+    match open_file_secure(&probe, |o| {
+        o.write(true).create(true).truncate(true);
+    })
+    .await
+    {
+        Ok(mut f) => {
+            if f.write_all(b"ok").await.is_err() {
+                let _ = tokio::fs::remove_file(&probe).await;
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "cache directory not writable",
+                );
+            }
             let _ = tokio::fs::remove_file(&probe).await;
             (StatusCode::OK, "ready")
         }
