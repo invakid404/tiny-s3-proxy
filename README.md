@@ -155,6 +155,16 @@ If you need actual signature verification with per-client secrets, implement a f
 
 Writes (PUT, DELETE, multipart completion) purge the affected key from the on-disk cache. If the purge fails after one retry, a durable `.poisoned` marker file is written next to the cache entry. While the marker exists, `lookup()` treats the key as a miss so stale data is never served. The marker is cleared on successful purge, cache refill, or eviction. The marker survives process restarts.
 
+### Cache directory permissions (Unix)
+
+On Unix, the proxy creates cache files with mode `0600` and cache directories with mode `0700`. Group/other access is never granted to any path the proxy creates inside `CACHE_DIR`, regardless of the process umask. This applies to `<CACHE_DIR>/.lock`, `<CACHE_DIR>/.fill_id_counter`, shard directories (`objects/{d1}/{d2}/`), object body and metadata files, poison markers, the readiness probe, and aws-chunked upload spool files.
+
+If `CACHE_DIR` already exists at startup with looser permissions (e.g. `0755`), the proxy logs a warning and leaves the operator-set permissions intact — it does not silently `chmod` directories you created. Operators who need group access to the cache tree should use filesystem ACLs, dedicated ownership (uid/gid), or pre-create the directory with the intended mode.
+
+Existing cache files written by older proxy versions before this hardening are **not** recursively migrated. Only files created by the current proxy version get the tight modes; older files keep whatever mode the umask granted them at creation. Operators wanting full migration can `chmod -R go-rwx CACHE_DIR` before restarting the proxy.
+
+On non-Unix targets the helpers fall back to the platform default (Windows uses ACLs, a different access-control model).
+
 ## Admin endpoints
 
 The admin listener (default `:9090`) exposes:

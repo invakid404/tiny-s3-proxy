@@ -11,6 +11,7 @@ use crate::backend::{Backend, BoxByteStream};
 use crate::cache::entry::CacheEntry;
 use crate::cache::key::CacheKey;
 use crate::cache::metadata::CacheMeta;
+use crate::cache::perms::open_file_secure;
 use crate::cache::{CacheStore, FlightResult, FlightWaiter};
 use crate::handlers::AppState;
 use crate::s3::errors::S3Error;
@@ -561,7 +562,11 @@ fn spawn_cache_tee<C: CacheStore + 'static>(
         use tokio::io::AsyncWriteExt;
         use tokio_stream::StreamExt;
 
-        let mut file = match tokio::fs::File::create(&temp_path_clone).await {
+        let mut file = match open_file_secure(&temp_path_clone, |o| {
+            o.write(true).create(true).truncate(true);
+        })
+        .await
+        {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!(
