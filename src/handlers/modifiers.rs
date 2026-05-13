@@ -98,6 +98,13 @@ pub(super) enum WriteBodyRoute {
     DecodeAwsChunked,
     /// Pass the raw request through to the upstream byte-for-byte.
     Passthrough,
+    /// Reject the request up front before any backend contact with the
+    /// `UnsupportedSignature` S3 error. Currently used only for ECDSA-signed
+    /// streaming uploads: the inbound `chunk-signature` values are bound to
+    /// the client's private key, so passthrough would re-sign with the proxy
+    /// backend credentials and the chunk signatures would never validate
+    /// against either side. Failing fast avoids pointless backend traffic.
+    RejectUnsupportedSignature,
 }
 
 /// Granular classification of an aws-chunked upload's mode, derived from the
@@ -119,7 +126,10 @@ pub(super) enum AwsChunkedUploadMode {
     /// `x-amz-trailer`.
     SignedTrailerHmacSha256,
     /// ECDSA-signed streaming (`STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD*`).
-    /// Out of scope; routes to passthrough.
+    /// Out of scope; routes to a fail-fast `UnsupportedSignature` reject. The
+    /// inbound `chunk-signature` values are bound to the client's private
+    /// key, so passthrough would only fail on the upstream after pointless
+    /// backend contact.
     Ecdsa,
     /// Some other `STREAMING-*` sentinel we don't recognise, or a trailer
     /// variant whose `x-amz-trailer` declares an algorithm we don't support.
@@ -168,7 +178,9 @@ pub(super) fn classify_aws_chunked_upload(
         let candidate = if upper == crate::s3::aws_chunked::STREAMING_AWS4_HMAC_SHA256_PAYLOAD {
             Some(AwsChunkedUploadMode::NonTrailerHmacSha256)
         } else if upper.contains("ECDSA") && upper.starts_with("STREAMING-") {
-            // ECDSA streaming is out of scope (#63) regardless of trailer state.
+            // ECDSA streaming is out of scope (#63) regardless of trailer
+            // state: the dispatch layer rejects this mode up front with
+            // `UnsupportedSignature` (HTTP 400) — see `aws_chunked_route_for`.
             Some(AwsChunkedUploadMode::Ecdsa)
         } else if upper == "STREAMING-UNSIGNED-PAYLOAD-TRAILER" {
             if trailer_algo_is_supported {
@@ -188,10 +200,25 @@ pub(super) fn classify_aws_chunked_upload(
             None
         };
         // Conservative escalation: prefer the most restrictive mode if the
-        // request happens to advertise more than one. We only "downgrade"
-        // from a recognised non-trailer/trailer mode if we see an Ecdsa or
-        // OtherStreaming variant later (both route to passthrough).
+        // request happens to advertise more than one. Two precedence rules:
+        //
+        // 1. `Ecdsa` dominates: any ECDSA sentinel anywhere in the
+        //    `x-amz-content-sha256` set forces `UnsupportedSignature`
+        //    rejection, independent of header order or what else was seen.
+        //    Without the symmetric Ecdsa arm, an `[OtherStreaming, ECDSA]`
+        //    pair would stick at `OtherStreaming` → `Passthrough`, letting
+        //    an ECDSA upload slip past the dispatch-level reject and
+        //    contact the upstream — exactly what the reject path exists
+        //    to prevent.
+        //
+        // 2. Otherwise an HMAC / unsigned-trailer / signed-trailer mode can
+        //    be "downgraded" to `OtherStreaming` (→ `Passthrough`) by a
+        //    later junk value, so we never decode a stream that advertised
+        //    something we don't model alongside.
         mode = match (mode, candidate) {
+            (Some(AwsChunkedUploadMode::Ecdsa), _) | (_, Some(AwsChunkedUploadMode::Ecdsa)) => {
+                Some(AwsChunkedUploadMode::Ecdsa)
+            }
             (None, c) => c,
             (
                 Some(
@@ -199,8 +226,8 @@ pub(super) fn classify_aws_chunked_upload(
                     | AwsChunkedUploadMode::UnsignedTrailer
                     | AwsChunkedUploadMode::SignedTrailerHmacSha256,
                 ),
-                Some(c @ (AwsChunkedUploadMode::Ecdsa | AwsChunkedUploadMode::OtherStreaming)),
-            ) => Some(c),
+                Some(AwsChunkedUploadMode::OtherStreaming),
+            ) => Some(AwsChunkedUploadMode::OtherStreaming),
             (existing, _) => existing,
         };
     }
@@ -257,10 +284,23 @@ fn trailer_algorithm_supported(raw_headers: &http::HeaderMap) -> bool {
 }
 
 /// Pick the body-handling route for a PUT request.
+///
+/// Order matters: classify aws-chunked FIRST and short-circuit on the
+/// explicit `RejectUnsupportedSignature` route, so the conditional /
+/// write-modifying-header passthrough gates below cannot mask an ECDSA
+/// reject. An ECDSA streaming PUT with `x-amz-storage-class` (or any other
+/// modifying header) must still surface as `UnsupportedSignature` rather
+/// than silently downgrading to passthrough — passthrough re-signs with
+/// the proxy's credentials and the inbound chunk signatures will never
+/// validate on the upstream.
 pub(super) fn classify_put_body_route(
     extra_amz: &std::collections::HashMap<String, String>,
     raw_headers: &http::HeaderMap,
 ) -> WriteBodyRoute {
+    let aws_chunked = aws_chunked_route_for(raw_headers);
+    if matches!(aws_chunked, WriteBodyRoute::RejectUnsupportedSignature) {
+        return WriteBodyRoute::RejectUnsupportedSignature;
+    }
     // HTTP conditional headers (If-Match / If-None-Match) can't be modeled by
     // the typed write path; passthrough is required to preserve semantics.
     if has_unsupported_http_conditionals(raw_headers) {
@@ -274,7 +314,7 @@ pub(super) fn classify_put_body_route(
     {
         return WriteBodyRoute::Passthrough;
     }
-    aws_chunked_route_for(raw_headers)
+    aws_chunked
 }
 
 /// Pick the body-handling route for an UploadPart request. Multipart gating
@@ -286,26 +326,60 @@ pub(super) fn classify_put_body_route(
 /// gating on `MULTIPART_CHECKSUM_HEADERS` here would incorrectly force
 /// passthrough for the very requests the trailer decoder exists to handle.
 ///
-/// Order matters: classify aws-chunked FIRST, then apply the multipart
-/// gate, and skip the gate entirely when the decode path is chosen.
+/// Gate precedence (each return short-circuits the rest):
+///
+/// 1. `RejectUnsupportedSignature` (ECDSA) wins over every gate — see
+///    `classify_put_body_route` for the reasoning.
+/// 2. HTTP conditionals (`If-Match` / `If-None-Match`) → `Passthrough`:
+///    the decoded backend request can't preserve them.
+/// 3. `WRITE_MODIFYING_BASE` → `Passthrough`: these headers describe
+///    semantics (`x-amz-storage-class`, SSE keys, object-lock, …) that
+///    the decoded backend request also can't preserve, so the
+///    `DecodeAwsChunked` route MUST defer to this gate. Combining
+///    this with the multipart-checksum gate (the old shape) accidentally
+///    let `DecodeAwsChunked` bypass it.
+/// 4. `DecodeAwsChunked` is now safe to return — none of (1)–(3) applied.
+/// 5. `MULTIPART_CHECKSUM_HEADERS` → `Passthrough`: this gate is the one
+///    aws-chunked decoding owns (the trailer is the checksum), so it
+///    sits AFTER the Decode return. Anything still here is non-chunked
+///    UploadPart with a checksum header the typed multipart path can't
+///    forward — passthrough preserves integrity validation.
 pub(super) fn classify_upload_part_body_route(
     extra_amz: &std::collections::HashMap<String, String>,
     raw_headers: &http::HeaderMap,
 ) -> WriteBodyRoute {
+    let aws_chunked = aws_chunked_route_for(raw_headers);
+    if matches!(aws_chunked, WriteBodyRoute::RejectUnsupportedSignature) {
+        return WriteBodyRoute::RejectUnsupportedSignature;
+    }
     if has_unsupported_http_conditionals(raw_headers) {
         return WriteBodyRoute::Passthrough;
     }
-    let route = aws_chunked_route_for(raw_headers);
-    if matches!(route, WriteBodyRoute::DecodeAwsChunked) {
-        return WriteBodyRoute::DecodeAwsChunked;
-    }
-    if extra_amz.keys().any(|k| {
-        WRITE_MODIFYING_BASE.contains(&k.as_str())
-            || MULTIPART_CHECKSUM_HEADERS.contains(&k.as_str())
-    }) {
+    // `WRITE_MODIFYING_BASE` BEFORE the DecodeAwsChunked early-return:
+    // these headers can't be faithfully preserved through the decoded
+    // backend request and must take passthrough even for aws-chunked.
+    if extra_amz
+        .keys()
+        .any(|k| WRITE_MODIFYING_BASE.contains(&k.as_str()))
+    {
         return WriteBodyRoute::Passthrough;
     }
-    route
+    if matches!(aws_chunked, WriteBodyRoute::DecodeAwsChunked) {
+        return WriteBodyRoute::DecodeAwsChunked;
+    }
+    // `MULTIPART_CHECKSUM_HEADERS` is the gate the decode path is allowed
+    // to skip — the trailer decoder validates the checksum and forwards
+    // via per-algorithm SDK setters. Only reached when the request is
+    // NOT going through Decode, so non-chunked UploadPart with checksum
+    // headers (which the typed multipart path can't forward) still
+    // correctly falls back to passthrough.
+    if extra_amz
+        .keys()
+        .any(|k| MULTIPART_CHECKSUM_HEADERS.contains(&k.as_str()))
+    {
+        return WriteBodyRoute::Passthrough;
+    }
+    aws_chunked
 }
 
 /// Shared aws-chunked routing decision: maps a classified upload mode to
@@ -318,9 +392,8 @@ fn aws_chunked_route_for(raw_headers: &http::HeaderMap) -> WriteBodyRoute {
             | AwsChunkedUploadMode::UnsignedTrailer
             | AwsChunkedUploadMode::SignedTrailerHmacSha256,
         ) => WriteBodyRoute::DecodeAwsChunked,
-        Some(AwsChunkedUploadMode::Ecdsa | AwsChunkedUploadMode::OtherStreaming) => {
-            WriteBodyRoute::Passthrough
-        }
+        Some(AwsChunkedUploadMode::Ecdsa) => WriteBodyRoute::RejectUnsupportedSignature,
+        Some(AwsChunkedUploadMode::OtherStreaming) => WriteBodyRoute::Passthrough,
     }
 }
 
@@ -474,10 +547,19 @@ mod tests {
         );
     }
 
-    /// ECDSA-signed streaming with a trailer header still routes to
-    /// passthrough — ECDSA is out of scope (#63) regardless of trailer state.
+    /// ECDSA-signed streaming uploads must be rejected up front with
+    /// `UnsupportedSignature` rather than routed to passthrough. The inbound
+    /// `chunk-signature` values are bound to the client's private key, so
+    /// passthrough would re-sign with the proxy backend credentials and the
+    /// signatures would never validate — failing fast avoids pointless
+    /// backend contact.
+    ///
+    /// Bug-revert reasoning: routing ECDSA back to `Passthrough` here flips
+    /// the assertion to a panic, and the matching integration test (which
+    /// pins HTTP 400 + `UnsupportedSignature` + zero backend hits) flips
+    /// alongside it.
     #[test]
-    fn test_ecdsa_streaming_routes_to_passthrough() {
+    fn test_ecdsa_streaming_rejected_as_unsupported_signature() {
         let mut headers = http::HeaderMap::new();
         headers.insert(
             "x-amz-content-sha256",
@@ -490,7 +572,237 @@ mod tests {
         let extra_amz = std::collections::HashMap::new();
         assert_eq!(
             classify_put_body_route(&extra_amz, &headers),
-            WriteBodyRoute::Passthrough,
+            WriteBodyRoute::RejectUnsupportedSignature,
+        );
+        assert_eq!(
+            classify_upload_part_body_route(&extra_amz, &headers),
+            WriteBodyRoute::RejectUnsupportedSignature,
+        );
+    }
+
+    /// ECDSA streaming PUT carrying a `WRITE_MODIFYING_BASE` header (here:
+    /// `x-amz-storage-class`) must STILL route to `RejectUnsupportedSignature`.
+    /// The write-modifying-header passthrough gate runs after the ECDSA
+    /// classifier check; reversing that order silently downgrades ECDSA
+    /// requests to passthrough — which then re-signs with the proxy's
+    /// credentials and ships unverifiable chunk signatures to the upstream.
+    ///
+    /// Same contract for `If-Match` and the other conditional headers: the
+    /// explicit reject must be authoritative.
+    ///
+    /// Bug-revert reasoning: moving the conditional or `WRITE_MODIFYING_BASE`
+    /// gates ahead of `aws_chunked_route_for` in `classify_put_body_route`
+    /// flips this assertion from `RejectUnsupportedSignature` to
+    /// `Passthrough` on both arms.
+    #[test]
+    fn test_ecdsa_streaming_rejected_even_with_write_modifying_headers() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-amz-content-sha256",
+            "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD".parse().unwrap(),
+        );
+        // `extra_amz` carries write-modifying headers (matches what
+        // `parse.rs` would feed in for a real request).
+        let mut extra_amz = std::collections::HashMap::new();
+        extra_amz.insert("x-amz-storage-class".to_string(), "STANDARD".to_string());
+        assert_eq!(
+            classify_put_body_route(&extra_amz, &headers),
+            WriteBodyRoute::RejectUnsupportedSignature,
+            "ECDSA reject must beat the write-modifying-header passthrough gate",
+        );
+
+        // And with an HTTP conditional, separately, so a future refactor
+        // that re-orders the conditional check doesn't regress this contract.
+        let mut headers2 = http::HeaderMap::new();
+        headers2.insert(
+            "x-amz-content-sha256",
+            "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD".parse().unwrap(),
+        );
+        headers2.insert("if-match", "\"some-etag\"".parse().unwrap());
+        let empty_extra: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        assert_eq!(
+            classify_put_body_route(&empty_extra, &headers2),
+            WriteBodyRoute::RejectUnsupportedSignature,
+            "ECDSA reject must beat the HTTP conditional passthrough gate",
+        );
+    }
+
+    /// UploadPart analogue: ECDSA streaming + an HTTP conditional must
+    /// still reject up front. Without the precedence fix, the conditional
+    /// passthrough gate fires first and the request silently routes
+    /// through passthrough.
+    ///
+    /// Bug-revert reasoning: moving the conditional check ahead of the
+    /// `RejectUnsupportedSignature` short-circuit in
+    /// `classify_upload_part_body_route` flips this assertion from
+    /// `RejectUnsupportedSignature` to `Passthrough`.
+    #[test]
+    fn test_upload_part_ecdsa_rejected_even_with_conditional_header() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-amz-content-sha256",
+            "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD".parse().unwrap(),
+        );
+        headers.insert("if-none-match", "*".parse().unwrap());
+        let extra_amz = std::collections::HashMap::new();
+        assert_eq!(
+            classify_upload_part_body_route(&extra_amz, &headers),
+            WriteBodyRoute::RejectUnsupportedSignature,
+            "ECDSA reject must beat the conditional passthrough gate on UploadPart",
+        );
+    }
+
+    /// Multipart UploadPart with an ECDSA streaming sentinel plus the kind of
+    /// `x-amz-sdk-checksum-algorithm` side-channel a real SDK would set must
+    /// still route to the `UnsupportedSignature` reject — the multipart
+    /// checksum-header gate must NOT silently convert it back to passthrough.
+    #[test]
+    fn test_upload_part_ecdsa_rejected_even_with_sdk_checksum_header() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-amz-content-sha256",
+            "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD".parse().unwrap(),
+        );
+        let mut extra_amz = std::collections::HashMap::new();
+        extra_amz.insert(
+            "x-amz-sdk-checksum-algorithm".to_string(),
+            "CRC32".to_string(),
+        );
+        assert_eq!(
+            classify_upload_part_body_route(&extra_amz, &headers),
+            WriteBodyRoute::RejectUnsupportedSignature,
+        );
+    }
+
+    /// `[junk-streaming-sentinel, ECDSA]` in `x-amz-content-sha256` must
+    /// resolve to `Ecdsa` regardless of header order. Without the
+    /// symmetric Ecdsa-dominates arm in the escalation match, the first
+    /// junk sentinel pins the mode to `OtherStreaming`, the later ECDSA
+    /// value falls through the `(existing, _)` arm, and the request
+    /// silently routes to `Passthrough` — defeating the dispatch-level
+    /// reject. The ECDSA chunk-signature values are bound to the client's
+    /// private key, so reaching the upstream at all is the bug.
+    ///
+    /// Bug-revert reasoning: deleting the `Some(Ecdsa)`-on-either-side
+    /// arm flips this assertion from `RejectUnsupportedSignature` to
+    /// `Passthrough`.
+    #[test]
+    fn test_ecdsa_dominates_other_streaming_when_seen_first() {
+        let mut headers = http::HeaderMap::new();
+        // `STREAMING-SOMETHING-UNKNOWN` is not a recognised sentinel and
+        // classifies as `OtherStreaming`. It MUST appear first so the
+        // escalation match starts from `OtherStreaming`.
+        headers.append(
+            "x-amz-content-sha256",
+            "STREAMING-SOMETHING-UNKNOWN".parse().unwrap(),
+        );
+        headers.append(
+            "x-amz-content-sha256",
+            "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD".parse().unwrap(),
+        );
+        assert_eq!(
+            classify_aws_chunked_upload(&headers),
+            Some(AwsChunkedUploadMode::Ecdsa),
+            "ECDSA must dominate even when a junk sentinel was observed first",
+        );
+        let extra_amz = std::collections::HashMap::new();
+        assert_eq!(
+            classify_put_body_route(&extra_amz, &headers),
+            WriteBodyRoute::RejectUnsupportedSignature,
+        );
+    }
+
+    /// Reverse header order of the test above: `[ECDSA, junk]` must also
+    /// resolve to `Ecdsa`. This direction was already protected by the
+    /// old arm (HMAC/trailer → OtherStreaming downgrades did not match
+    /// `Ecdsa` first), but pinning it makes the contract symmetric and
+    /// catches any future refactor that drops the order-independence.
+    #[test]
+    fn test_ecdsa_dominates_other_streaming_when_seen_second() {
+        let mut headers = http::HeaderMap::new();
+        headers.append(
+            "x-amz-content-sha256",
+            "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD".parse().unwrap(),
+        );
+        headers.append(
+            "x-amz-content-sha256",
+            "STREAMING-SOMETHING-UNKNOWN".parse().unwrap(),
+        );
+        assert_eq!(
+            classify_aws_chunked_upload(&headers),
+            Some(AwsChunkedUploadMode::Ecdsa),
+        );
+        let extra_amz = std::collections::HashMap::new();
+        assert_eq!(
+            classify_put_body_route(&extra_amz, &headers),
+            WriteBodyRoute::RejectUnsupportedSignature,
+        );
+    }
+
+    /// `[HMAC-SHA256, ECDSA]` must reject. Mixed-signature input is
+    /// nonsense — a client advertising both signing schemes is either
+    /// confused or smuggling — and the conservative response is the
+    /// reject, not the decode path.
+    ///
+    /// Bug-revert reasoning: the OLD escalation arm only let HMAC
+    /// "downgrade to Ecdsa OR OtherStreaming" when Ecdsa came SECOND, so
+    /// this case happened to work before; the new test pins it so the
+    /// new Ecdsa-dominates arm covers it explicitly. Reverting the new
+    /// arm and ALSO narrowing the old arm to `OtherStreaming`-only flips
+    /// this from `RejectUnsupportedSignature` to `DecodeAwsChunked`.
+    #[test]
+    fn test_ecdsa_dominates_hmac_modes_when_mixed() {
+        let mut headers = http::HeaderMap::new();
+        headers.append(
+            "x-amz-content-sha256",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".parse().unwrap(),
+        );
+        headers.append(
+            "x-amz-content-sha256",
+            "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD".parse().unwrap(),
+        );
+        assert_eq!(
+            classify_aws_chunked_upload(&headers),
+            Some(AwsChunkedUploadMode::Ecdsa),
+        );
+        let extra_amz = std::collections::HashMap::new();
+        assert_eq!(
+            classify_put_body_route(&extra_amz, &headers),
+            WriteBodyRoute::RejectUnsupportedSignature,
+        );
+    }
+
+    /// Reverse order: `[ECDSA, HMAC-SHA256]`. The symmetric Ecdsa-
+    /// dominates arm catches the case where ECDSA is observed first; a
+    /// later HMAC value must not "rescue" the request into the decode
+    /// path — the ECDSA sentinel was advertised, that's the load-bearing
+    /// signal.
+    ///
+    /// Bug-revert reasoning: deleting the `(Some(Ecdsa), _)` half of the
+    /// dominates arm flips this from `RejectUnsupportedSignature` to
+    /// `DecodeAwsChunked` (the later HMAC overwrites the Ecdsa mode via
+    /// the `(existing, _)` fallback, then `aws_chunked_route_for` picks
+    /// `DecodeAwsChunked`).
+    #[test]
+    fn test_ecdsa_dominates_hmac_modes_reverse_order() {
+        let mut headers = http::HeaderMap::new();
+        headers.append(
+            "x-amz-content-sha256",
+            "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD".parse().unwrap(),
+        );
+        headers.append(
+            "x-amz-content-sha256",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".parse().unwrap(),
+        );
+        assert_eq!(
+            classify_aws_chunked_upload(&headers),
+            Some(AwsChunkedUploadMode::Ecdsa),
+        );
+        let extra_amz = std::collections::HashMap::new();
+        assert_eq!(
+            classify_put_body_route(&extra_amz, &headers),
+            WriteBodyRoute::RejectUnsupportedSignature,
         );
     }
 
@@ -526,6 +838,66 @@ mod tests {
         assert_eq!(
             classify_upload_part_body_route(&extra_amz, &headers),
             WriteBodyRoute::Passthrough,
+        );
+    }
+
+    /// UploadPart with supported aws-chunked headers PLUS a
+    /// `WRITE_MODIFYING_BASE` header (here: `x-amz-storage-class`) must
+    /// route to `Passthrough`, NOT `DecodeAwsChunked`. The decoded
+    /// backend PUT can't preserve write-modifying semantics like storage
+    /// class / SSE / object-lock — passthrough is the only path that
+    /// forwards those headers faithfully.
+    ///
+    /// Bug-revert reasoning: collapsing the `WRITE_MODIFYING_BASE` check
+    /// back into the combined `WRITE_MODIFYING_BASE || MULTIPART_CHECKSUM_HEADERS`
+    /// gate AFTER the `DecodeAwsChunked` early-return (the pre-fix shape)
+    /// flips this assertion from `Passthrough` to `DecodeAwsChunked`.
+    #[test]
+    fn test_upload_part_aws_chunked_with_write_modifying_header_routes_to_passthrough() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-amz-content-sha256",
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER".parse().unwrap(),
+        );
+        headers.insert("x-amz-trailer", "x-amz-checksum-crc32".parse().unwrap());
+        let mut extra_amz = std::collections::HashMap::new();
+        extra_amz.insert("x-amz-storage-class".to_string(), "STANDARD".to_string());
+        assert_eq!(
+            classify_upload_part_body_route(&extra_amz, &headers),
+            WriteBodyRoute::Passthrough,
+            "aws-chunked UploadPart with a write-modifying header must route to passthrough",
+        );
+    }
+
+    /// UploadPart with supported aws-chunked headers PLUS a multipart
+    /// checksum header (here: `x-amz-sdk-checksum-algorithm`) must STILL
+    /// route to `DecodeAwsChunked`. The trailer decoder owns checksum
+    /// validation and forwards the result via per-algorithm SDK setters,
+    /// so the `MULTIPART_CHECKSUM_HEADERS` passthrough gate is the one
+    /// the decode path is allowed to skip. This test pins the half of
+    /// the contract the gate split must preserve.
+    ///
+    /// Bug-revert reasoning: deleting the `DecodeAwsChunked` early-return
+    /// flips this assertion from `DecodeAwsChunked` to `Passthrough`
+    /// (the request falls through to the multipart-checksum gate, which
+    /// sees `x-amz-sdk-checksum-algorithm` and forces passthrough).
+    #[test]
+    fn test_upload_part_aws_chunked_with_multipart_checksum_header_routes_to_decode() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-amz-content-sha256",
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER".parse().unwrap(),
+        );
+        headers.insert("x-amz-trailer", "x-amz-checksum-crc32".parse().unwrap());
+        let mut extra_amz = std::collections::HashMap::new();
+        extra_amz.insert(
+            "x-amz-sdk-checksum-algorithm".to_string(),
+            "CRC32".to_string(),
+        );
+        assert_eq!(
+            classify_upload_part_body_route(&extra_amz, &headers),
+            WriteBodyRoute::DecodeAwsChunked,
+            "aws-chunked UploadPart must bypass the multipart-checksum gate and decode",
         );
     }
 

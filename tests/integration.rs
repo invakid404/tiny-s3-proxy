@@ -464,111 +464,6 @@ async fn start_counting_mock_upstream(mock: Arc<CountingMockUpstream>) -> String
     format!("http://{}", addr)
 }
 
-/// A single request captured by `CapturingMockUpstream`. Records the inbound
-/// HTTP shape we need to assert routing — method, the path the proxy chose
-/// when constructing the upstream URL, the forwarded header set, and the
-/// fully-drained body bytes. `method` and `path` are kept for the contract
-/// — tests that need them can downcast — even if no current test reads them.
-#[derive(Clone)]
-struct CapturedRequest {
-    #[allow(dead_code)]
-    method: http::Method,
-    #[allow(dead_code)]
-    path: String,
-    headers: http::HeaderMap,
-    body: Vec<u8>,
-}
-
-/// Capturing mock upstream for routing assertions. Unlike
-/// `CountingMockUpstream` (which intentionally doesn't read the body so it
-/// can prove "upstream was never contacted"), this mock fully drains the
-/// body and stores the entire request shape so the test can assert on
-/// individual headers reaching the upstream. The 200 response carries a
-/// plausible `ETag` so that a regression which routed the request to the
-/// typed PUT path would still parse the upstream response cleanly — the
-/// test then fails on the routing-signal assertion, not on a response-shape
-/// error that would obscure the actual signal.
-struct CapturingMockUpstream {
-    requests: tokio::sync::Mutex<Vec<CapturedRequest>>,
-}
-
-impl CapturingMockUpstream {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            requests: tokio::sync::Mutex::new(Vec::new()),
-        })
-    }
-
-    async fn last_request(&self) -> Option<CapturedRequest> {
-        self.requests.lock().await.last().cloned()
-    }
-
-    async fn request_count(&self) -> usize {
-        self.requests.lock().await.len()
-    }
-}
-
-/// Spawn the capturing mock upstream and return its `http://host:port` URL.
-/// The returned `Arc<CapturingMockUpstream>` lets the caller assert on the
-/// recorded request after sending one through the proxy.
-async fn start_capturing_mock_upstream(mock: Arc<CapturingMockUpstream>) -> String {
-    use axum::routing::any;
-
-    async fn handle(
-        mock: Arc<CapturingMockUpstream>,
-        req: http::Request<axum::body::Body>,
-    ) -> http::Response<axum::body::Body> {
-        let method = req.method().clone();
-        let path = req.uri().path().to_string();
-        let headers = req.headers().clone();
-        let body_bytes = axum::body::to_bytes(req.into_body(), 16 * 1024 * 1024)
-            .await
-            .expect("failed to drain request body for mock capture");
-        mock.requests.lock().await.push(CapturedRequest {
-            method,
-            path,
-            headers,
-            body: body_bytes.to_vec(),
-        });
-        http::Response::builder()
-            .status(200)
-            .header("ETag", "\"mock-etag\"")
-            .body(axum::body::Body::empty())
-            .unwrap()
-    }
-
-    let app = axum::Router::new()
-        .route(
-            "/{*path}",
-            any({
-                let mock = mock.clone();
-                move |req: http::Request<axum::body::Body>| {
-                    let mock = mock.clone();
-                    async move { handle(mock, req).await }
-                }
-            }),
-        )
-        .route(
-            "/",
-            any({
-                let mock = mock.clone();
-                move |req: http::Request<axum::body::Body>| {
-                    let mock = mock.clone();
-                    async move { handle(mock, req).await }
-                }
-            }),
-        );
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("capturing mock upstream bind");
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    format!("http://{}", addr)
-}
-
 async fn wait_for_head_cache_status(
     http_client: &reqwest::Client,
     proxy_endpoint: &str,
@@ -2201,14 +2096,21 @@ async fn test_aws_chunked_unsigned_trailer_upload_part_routes_to_decoder() {
 }
 
 /// ECDSA-signed streaming uploads (`STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD`)
-/// are out of scope for the in-house decoder — they must continue to route
-/// through passthrough. Pins the routing decision so a future change to the
-/// aws-chunked classifier doesn't accidentally swallow ECDSA frames.
+/// must be rejected up front with `UnsupportedSignature` (HTTP 400) rather
+/// than silently routed through passthrough. The inbound `chunk-signature`
+/// values are bound to the client's private key, so passthrough would
+/// re-sign with the proxy backend credentials and the chunk signatures
+/// would never validate on the upstream — failing fast avoids pointless
+/// backend traffic.
+///
+/// Pins HTTP 400 + `<Code>UnsupportedSignature</Code>` + zero upstream
+/// contact, so a regression that routes ECDSA back to passthrough flips
+/// all three assertions.
 #[tokio::test]
 #[ignore]
-async fn test_aws_chunked_ecdsa_streaming_routes_to_passthrough() {
-    let mock = CapturingMockUpstream::new();
-    let mock_endpoint = start_capturing_mock_upstream(mock.clone()).await;
+async fn test_aws_chunked_ecdsa_streaming_rejected_as_unsupported_signature() {
+    let mock = CountingMockUpstream::new();
+    let mock_endpoint = start_counting_mock_upstream(mock.clone()).await;
     let cache_dir = tempfile::TempDir::new().expect("cache dir");
     let (_proxy_client, _http_client, proxy_endpoint, _cache_dir) =
         build_proxy_stack_with_opts(&mock_endpoint, cache_dir, |_cfg| {}).await;
@@ -2234,32 +2136,24 @@ async fn test_aws_chunked_ecdsa_streaming_routes_to_passthrough() {
     );
     let mut request_bytes = headers.into_bytes();
     request_bytes.extend_from_slice(&body);
-    let (status, _raw_response) = raw_tcp_request(proxy_host, &request_bytes).await;
-    assert_eq!(status, 200);
-    let captured = mock
-        .last_request()
-        .await
-        .expect("upstream must have received the request");
-    assert_eq!(mock.request_count().await, 1);
-    // Body must reach upstream byte-for-byte — proves passthrough (the
-    // decode path would strip the chunk-signature framing). Note that
-    // passthrough re-signs the outbound request, so we can't rely on
-    // `x-amz-content-sha256` reaching the upstream as-is — the byte
-    // preservation check above is the load-bearing routing signal.
-    assert_eq!(captured.body.as_slice(), body.as_slice());
-    // x-amz-decoded-content-length is preserved by passthrough but the
-    // decode path strips it before forwarding. Use that as a positive
-    // routing signal alongside the body-byte check.
-    let decoded_cl = captured
-        .headers
-        .get("x-amz-decoded-content-length")
-        .expect(
-            "x-amz-decoded-content-length must reach the upstream; if missing, \
-             the request was decoded by the proxy rather than passed through",
-        )
-        .to_str()
-        .unwrap();
-    assert_eq!(decoded_cl, "8");
+    let (status, raw_response) = raw_tcp_request(proxy_host, &request_bytes).await;
+    assert_eq!(
+        status, 400,
+        "ECDSA streaming must be rejected with HTTP 400",
+    );
+    let resp_text = String::from_utf8_lossy(&raw_response);
+    assert!(
+        resp_text.contains("<Code>UnsupportedSignature</Code>"),
+        "expected UnsupportedSignature S3 error code, got: {resp_text}",
+    );
+    // Upstream must not have been contacted: this is the load-bearing
+    // "rejected before backend contact" assertion.
+    assert_eq!(
+        mock.received_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "upstream must not be contacted when ECDSA is rejected up front",
+    );
 }
 
 /// A non-trailer aws-chunked PUT whose `x-amz-decoded-content-length` exceeds
@@ -2389,6 +2283,227 @@ async fn test_aws_chunked_malformed_frame_returns_error_without_backend_contact(
     }
 }
 
+/// Oversize chunk-header line (above `MAX_CHUNK_HEADER_LINE_BYTES`) is a
+/// framing violation that must fail with `IncompleteBody` (HTTP 400), zero
+/// backend contact, and no spool leak. The decoder bails out as soon as the
+/// header bytes overflow the limit, before any payload is read.
+///
+/// Without the `MAX_CHUNK_HEADER_LINE_BYTES` cap, a misbehaving (or
+/// adversarial) client could send an unbounded chunk-header line — the
+/// `BufReader::read_until` call would buffer the entire line in memory.
+/// This test pins the failure mode end-to-end.
+#[tokio::test]
+#[ignore]
+async fn test_aws_chunked_oversize_chunk_header_rejected_at_decode_path() {
+    let mock = CountingMockUpstream::new();
+    let mock_endpoint = start_counting_mock_upstream(mock.clone()).await;
+    let cache_dir_holder = tempfile::TempDir::new().expect("cache dir");
+    let cache_dir_path = cache_dir_holder.path().to_path_buf();
+    let (_proxy_client, _http_client, proxy_endpoint, _cache_dir) =
+        build_proxy_stack_with_opts(&mock_endpoint, cache_dir_holder, |_cfg| {}).await;
+    let proxy_host = proxy_endpoint.strip_prefix("http://").unwrap();
+
+    // Build a chunk header whose extension byte length exceeds the cap.
+    // The decoder limit is 4096 bytes per line; pad the extension with a
+    // long opaque token after the (valid-shape) `chunk-signature=...` so
+    // the read overruns before the line terminator.
+    let padding = "x".repeat(8192);
+    let oversize_line = format!(
+        "8;chunk-signature=0000000000000000000000000000000000000000000000000000000000000000;\
+         pad={padding}\r\n",
+    );
+    let mut body: Vec<u8> = oversize_line.into_bytes();
+    body.extend_from_slice(b"abcdefgh\r\n");
+    body.extend_from_slice(
+        b"0;chunk-signature=0000000000000000000000000000000000000000000000000000000000000000\r\n\
+        \r\n",
+    );
+
+    let headers = format!(
+        "PUT /{TEST_BUCKET}/aws-chunked-oversize-header HTTP/1.1\r\n\
+         Host: {proxy_host}\r\n\
+         Content-Length: {}\r\n\
+         Content-Encoding: aws-chunked\r\n\
+         x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD\r\n\
+         x-amz-decoded-content-length: 8\r\n\
+         Connection: close\r\n\
+         \r\n",
+        body.len(),
+    );
+    let mut request = headers.into_bytes();
+    request.extend_from_slice(&body);
+    let (status, raw_response) = raw_tcp_request(proxy_host, &request).await;
+    assert_eq!(
+        status, 400,
+        "oversize chunk header must be rejected with 400"
+    );
+    let resp_text = String::from_utf8_lossy(&raw_response);
+    // Match the tag, not the bare substring — proves we're returning an S3
+    // XML error rather than a body that happens to contain the word
+    // `IncompleteBody` (e.g. a passthrough-shaped response).
+    assert!(
+        resp_text.contains("<Code>IncompleteBody</Code>"),
+        "expected <Code>IncompleteBody</Code>, got: {resp_text}",
+    );
+    assert_eq!(
+        mock.received_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "upstream must not be contacted when the decoder rejects oversize chunk headers",
+    );
+    let tmp = cache_dir_path.join("tmp");
+    if tmp.exists() {
+        let mut entries = tokio::fs::read_dir(&tmp).await.unwrap();
+        while let Some(e) = entries.next_entry().await.unwrap() {
+            let name = e.file_name();
+            assert!(
+                !name.to_string_lossy().ends_with(".upload-spool.tmp"),
+                "spool must be cleaned up after decode error, found {name:?}",
+            );
+        }
+    }
+}
+
+/// A signature-mode chunk header whose `chunk-signature=...` value is the
+/// wrong length / contains non-hex bytes is a framing violation. The
+/// decoder must reject it with `IncompleteBody`, never spool, and never
+/// touch the backend.
+///
+/// This pins the structural validation the decoder performs on the
+/// signature field shape — separate from cryptographic signature
+/// verification, which the proxy does not do.
+#[tokio::test]
+#[ignore]
+async fn test_aws_chunked_bad_chunk_signature_shape_rejected_at_decode_path() {
+    let mock = CountingMockUpstream::new();
+    let mock_endpoint = start_counting_mock_upstream(mock.clone()).await;
+    let cache_dir_holder = tempfile::TempDir::new().expect("cache dir");
+    let cache_dir_path = cache_dir_holder.path().to_path_buf();
+    let (_proxy_client, _http_client, proxy_endpoint, _cache_dir) =
+        build_proxy_stack_with_opts(&mock_endpoint, cache_dir_holder, |_cfg| {}).await;
+    let proxy_host = proxy_endpoint.strip_prefix("http://").unwrap();
+
+    // 63 hex chars + 1 non-hex char `Z` → wrong shape on both axes. Either
+    // the length check or the lowercase-hex check fires first; both surface
+    // as a MalformedFrame → IncompleteBody.
+    let body: &[u8] =
+        b"8;chunk-signature=000000000000000000000000000000000000000000000000000000000000000Z\r\n\
+        abcdefgh\r\n\
+        0;chunk-signature=0000000000000000000000000000000000000000000000000000000000000000\r\n\
+        \r\n";
+    let headers = format!(
+        "PUT /{TEST_BUCKET}/aws-chunked-bad-sig-shape HTTP/1.1\r\n\
+         Host: {proxy_host}\r\n\
+         Content-Length: {}\r\n\
+         Content-Encoding: aws-chunked\r\n\
+         x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD\r\n\
+         x-amz-decoded-content-length: 8\r\n\
+         Connection: close\r\n\
+         \r\n",
+        body.len(),
+    );
+    let mut request = headers.into_bytes();
+    request.extend_from_slice(body);
+    let (status, raw_response) = raw_tcp_request(proxy_host, &request).await;
+    assert_eq!(
+        status, 400,
+        "malformed chunk-signature shape must be rejected with 400"
+    );
+    let resp_text = String::from_utf8_lossy(&raw_response);
+    // Match the tag, not the bare substring — proves the response is an
+    // S3 XML error rather than a body that incidentally contains the word.
+    assert!(
+        resp_text.contains("<Code>IncompleteBody</Code>"),
+        "expected <Code>IncompleteBody</Code>, got: {resp_text}",
+    );
+    assert_eq!(
+        mock.received_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "upstream must not be contacted on a malformed chunk-signature",
+    );
+    let tmp = cache_dir_path.join("tmp");
+    if tmp.exists() {
+        let mut entries = tokio::fs::read_dir(&tmp).await.unwrap();
+        while let Some(e) = entries.next_entry().await.unwrap() {
+            let name = e.file_name();
+            assert!(
+                !name.to_string_lossy().ends_with(".upload-spool.tmp"),
+                "spool must be cleaned up after decode error, found {name:?}",
+            );
+        }
+    }
+}
+
+/// A `x-amz-decoded-content-length` that exceeds the actual decoded body
+/// (here: declared 16 bytes, body only delivers an 8-byte chunk before the
+/// terminating zero chunk) is a `DecodedLengthMismatch`. Must surface as
+/// `IncompleteBody`, zero backend contact, no spool leak. Distinct from
+/// `DecodedLengthExceeded` (oversize-during-streaming) and from the
+/// oversize-against-max-config gate.
+#[tokio::test]
+#[ignore]
+async fn test_aws_chunked_decoded_length_mismatch_rejected_at_decode_path() {
+    let mock = CountingMockUpstream::new();
+    let mock_endpoint = start_counting_mock_upstream(mock.clone()).await;
+    let cache_dir_holder = tempfile::TempDir::new().expect("cache dir");
+    let cache_dir_path = cache_dir_holder.path().to_path_buf();
+    let (_proxy_client, _http_client, proxy_endpoint, _cache_dir) =
+        build_proxy_stack_with_opts(&mock_endpoint, cache_dir_holder, |_cfg| {}).await;
+    let proxy_host = proxy_endpoint.strip_prefix("http://").unwrap();
+
+    // Body delivers 8 bytes of payload + terminating zero chunk, but the
+    // header declares 16 bytes — the decoder reaches end-of-stream short
+    // of the declared total and emits DecodedLengthMismatch.
+    let body: &[u8] =
+        b"8;chunk-signature=0000000000000000000000000000000000000000000000000000000000000000\r\n\
+        abcdefgh\r\n\
+        0;chunk-signature=0000000000000000000000000000000000000000000000000000000000000000\r\n\
+        \r\n";
+    let headers = format!(
+        "PUT /{TEST_BUCKET}/aws-chunked-length-mismatch HTTP/1.1\r\n\
+         Host: {proxy_host}\r\n\
+         Content-Length: {}\r\n\
+         Content-Encoding: aws-chunked\r\n\
+         x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD\r\n\
+         x-amz-decoded-content-length: 16\r\n\
+         Connection: close\r\n\
+         \r\n",
+        body.len(),
+    );
+    let mut request = headers.into_bytes();
+    request.extend_from_slice(body);
+    let (status, raw_response) = raw_tcp_request(proxy_host, &request).await;
+    assert_eq!(
+        status, 400,
+        "decoded-length mismatch must be rejected with 400"
+    );
+    let resp_text = String::from_utf8_lossy(&raw_response);
+    // Match the tag, not the bare substring — proves the response is an
+    // S3 XML error rather than a body that incidentally contains the word.
+    assert!(
+        resp_text.contains("<Code>IncompleteBody</Code>"),
+        "expected <Code>IncompleteBody</Code>, got: {resp_text}",
+    );
+    assert_eq!(
+        mock.received_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "upstream must not be contacted when declared and actual decoded lengths disagree",
+    );
+    let tmp = cache_dir_path.join("tmp");
+    if tmp.exists() {
+        let mut entries = tokio::fs::read_dir(&tmp).await.unwrap();
+        while let Some(e) = entries.next_entry().await.unwrap() {
+            let name = e.file_name();
+            assert!(
+                !name.to_string_lossy().ends_with(".upload-spool.tmp"),
+                "spool must be cleaned up after decode error, found {name:?}",
+            );
+        }
+    }
+}
+
 /// The runtime HTTPS guard in `S3Backend::put_object_from_path` must fire
 /// when the decode path tries to upload over an `http://` backend. The
 /// startup config validation is the primary defence; this guard is the
@@ -2423,7 +2538,7 @@ async fn test_aws_chunked_decode_path_rejects_http_backend_via_runtime_guard() {
     let mut request = headers.into_bytes();
     request.extend_from_slice(body);
     let (status, raw_response) = raw_tcp_request(proxy_host, &request).await;
-    // ProxyError::Cache maps to 500 InternalError via S3Error::from_proxy_error.
+    // ProxyError::Internal maps to 500 InternalError via S3Error::from_proxy_error.
     assert_eq!(
         status, 500,
         "HTTPS guard must reject http:// backend with InternalError",

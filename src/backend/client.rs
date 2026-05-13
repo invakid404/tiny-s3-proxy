@@ -97,14 +97,21 @@ impl S3Backend {
         if self.backend_endpoint_is_https {
             return Ok(());
         }
-        Err(ProxyError::Cache {
+        // `ProxyError::Internal` is the right variant for a transport-safety
+        // configuration guard: this isn't a cache I/O failure (which is what
+        // `ProxyError::Cache` is conceptually reserved for in this codebase),
+        // it's the proxy refusing to ship an unsigned body over plaintext.
+        // Both variants render the same wire response (HTTP 500 +
+        // InternalError), so this change is type-accuracy without behaviour
+        // drift — but it stops misclassifying the guard as a cache fault in
+        // logs, metrics, and future error-handling branches.
+        Err(ProxyError::Internal {
             source: format!(
                 "{operation}: refusing to forward UNSIGNED-PAYLOAD body over plaintext HTTP \
                  backend; the aws-chunked decode path requires HTTPS for body integrity. \
                  Use an https:// BACKEND_ENDPOINT.",
             )
             .into(),
-            operation: operation.to_string(),
         })
     }
 }

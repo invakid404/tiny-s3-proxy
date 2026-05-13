@@ -227,9 +227,11 @@ fn is_streaming_only_amz_header(name: &str) -> bool {
 /// decoded backend request. Drops streaming-only x-amz-* headers that
 /// would be wrong on a normal PUT/UploadPart (see
 /// `is_streaming_only_amz_header`). Production is gated by the dispatch
-/// routing — trailer-mode goes to passthrough — but this filter ensures
-/// that even if dispatch or `parse.rs` regresses, the decoded backend
-/// inputs stay clean.
+/// routing — the trailer-mode parser consumes `x-amz-trailer` inline before
+/// reaching the backend, and `parse.rs` strips `x-amz-content-sha256` and
+/// `x-amz-decoded-content-length` from `extra_amz_headers` — but this
+/// filter ensures that even if dispatch or `parse.rs` regresses, the
+/// decoded backend inputs stay clean.
 ///
 /// `x-amz-checksum-*` headers are explicitly NOT filtered: those are
 /// legitimate non-streaming S3 checksum advertisements that the decoded
@@ -338,11 +340,12 @@ async fn decode_into_spool<B: Backend, C: CacheStore>(
 
 /// Inspect the inbound `x-amz-content-sha256` sentinel plus the
 /// `x-amz-trailer` header on `raw_headers` and produce the matching
-/// `DecoderMode`. The dispatch routing already rejects unsupported sentinels
-/// (ECDSA, unknown) by routing them to passthrough; this helper assumes the
-/// request is going through the decode path and rejects the residual cases
-/// (no sentinel match, trailer-mode without a usable trailer header) with
-/// `InvalidRequest`.
+/// `DecoderMode`. The dispatch routing already diverts unsupported
+/// sentinels off the decode path — ECDSA streams reject up front with
+/// `UnsupportedSignature`, and unknown / contradictory shapes fall through
+/// to passthrough — so this helper assumes the request is going through
+/// the decode path and rejects the residual cases (no sentinel match,
+/// trailer-mode without a usable trailer header) with `InvalidRequest`.
 ///
 /// `x-amz-content-sha256` must appear exactly once with an ASCII, non-empty
 /// value. The dispatch classifier inspects every value defensively, so a
@@ -1343,6 +1346,85 @@ mod tests {
         assert!(is_streaming_only_amz_header("X-AMZ-SDK-CHECKSUM-ALGORITHM"));
     }
 
+    // ---- content_encoding_without_aws_chunked ----
+    //
+    // The strip helper is the load-bearing complement to
+    // `header_str_combined` in `parse.rs`: the parser merges repeated
+    // `Content-Encoding` headers into one comma list, and the strip helper
+    // must split that list correctly, drop every `aws-chunked` token
+    // (case-insensitive, including duplicates), and preserve order + spacing
+    // for the remaining tokens. These tests pin each edge case in isolation
+    // so a regression in either side surfaces before the full PUT pipeline.
+
+    /// Already-comma-joined `aws-chunked,gzip` strips down to just `gzip`.
+    /// The classic single-header shape.
+    #[test]
+    fn test_content_encoding_strip_single_header_comma_list() {
+        let stripped = content_encoding_without_aws_chunked("aws-chunked,gzip");
+        assert_eq!(stripped.as_deref(), Some("gzip"));
+    }
+
+    /// The shape produced by `header_str_combined` after merging two
+    /// separate `Content-Encoding` lines: `"aws-chunked, gzip"` (with the
+    /// `", "` separator). Must strip the same way as the comma-only form —
+    /// the trim in `content_encoding_without_aws_chunked` is load-bearing
+    /// here.
+    ///
+    /// Bug-revert reasoning: dropping the `str::trim` from the strip
+    /// helper turns the `" gzip"` token into a non-match for any case of
+    /// `aws-chunked` and leaves it as `" gzip"` (with the leading space),
+    /// so the upstream `Content-Encoding` would contain a phantom space
+    /// token. This assertion (`Some("gzip")`, not `Some(" gzip")`) flips.
+    #[test]
+    fn test_content_encoding_strip_combined_repeated_header_shape() {
+        let stripped = content_encoding_without_aws_chunked("aws-chunked, gzip");
+        assert_eq!(stripped.as_deref(), Some("gzip"));
+    }
+
+    /// Duplicate `aws-chunked, aws-chunked` (a misbehaving client that
+    /// repeated the token) must strip BOTH copies and result in no
+    /// surviving tokens → the caller drops `Content-Encoding` entirely.
+    ///
+    /// Bug-revert reasoning: a strip implementation that only removed the
+    /// first occurrence (`replace_first` style) would leave `"aws-chunked"`
+    /// as the surviving token, and the assertion would flip from `None` to
+    /// `Some("aws-chunked")`.
+    #[test]
+    fn test_content_encoding_strip_drops_all_duplicate_aws_chunked_tokens() {
+        let stripped = content_encoding_without_aws_chunked("aws-chunked, aws-chunked");
+        assert_eq!(
+            stripped, None,
+            "all aws-chunked tokens must strip; nothing left → drop the header",
+        );
+    }
+
+    /// Case-insensitive match: `AWS-CHUNKED, gzip` → `gzip`. AWS docs and
+    /// the SigV4 reference don't fix the case of the encoding token; the
+    /// strip helper must not be lulled into shipping an `AWS-CHUNKED` token
+    /// to the upstream just because the casing differs.
+    #[test]
+    fn test_content_encoding_strip_case_insensitive() {
+        let stripped = content_encoding_without_aws_chunked("AWS-CHUNKED, gzip");
+        assert_eq!(stripped.as_deref(), Some("gzip"));
+    }
+
+    /// Mixed-case repetition: `Aws-Chunked, gzip, AWS-CHUNKED` strips both
+    /// chunked tokens and keeps `gzip`. Combines the case-insensitive and
+    /// duplicate-elimination contracts in one shape.
+    #[test]
+    fn test_content_encoding_strip_mixed_case_duplicates_and_gzip_preserved() {
+        let stripped = content_encoding_without_aws_chunked("Aws-Chunked, gzip, AWS-CHUNKED");
+        assert_eq!(stripped.as_deref(), Some("gzip"));
+    }
+
+    /// Empty input → `None`. A `Content-Encoding: ` empty value or a
+    /// stripped-to-nothing value must not produce a phantom empty header
+    /// on the decoded backend request.
+    #[test]
+    fn test_content_encoding_strip_empty_input_returns_none() {
+        assert_eq!(content_encoding_without_aws_chunked(""), None);
+    }
+
     // ---- decoder_mode_from_headers ----
 
     use crate::s3::aws_chunked::DecoderMode;
@@ -1522,6 +1604,41 @@ mod tests {
         assert!(
             err.message.contains("empty"),
             "error should mention emptiness, got: {}",
+            err.message,
+        );
+    }
+
+    /// Defense-in-depth: if an ECDSA streaming sentinel somehow reaches
+    /// `decoder_mode_from_headers` (i.e. the dispatch routing regresses and
+    /// no longer rejects ECDSA up front), the decoder must still refuse to
+    /// build a `DecoderMode` — silently treating it as something we can
+    /// decode would mean accepting a stream we can't validate. Production
+    /// dispatch routes ECDSA to `RejectUnsupportedSignature` before reaching
+    /// here; this test pins the decode-path backstop.
+    ///
+    /// Even with a usable `x-amz-trailer` present (which would otherwise
+    /// short-circuit the missing-trailer guard for trailer-mode sentinels),
+    /// the ECDSA sentinel must still surface as `InvalidRequest` via the
+    /// `unsupported aws-chunked sentinel reached the decode path` branch.
+    ///
+    /// Bug-revert reasoning: replacing the fall-through `Err` branch with a
+    /// permissive ECDSA mapping (e.g. routing it through `DecoderMode::
+    /// SignedTrailer` because the suffix looks similar) flips this assertion
+    /// to a panic on `.unwrap_err()`.
+    #[test]
+    fn test_decoder_mode_from_headers_rejects_ecdsa_sentinel() {
+        let h = make_headers(&[
+            (
+                "x-amz-content-sha256",
+                "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER",
+            ),
+            ("x-amz-trailer", "x-amz-checksum-crc32"),
+        ]);
+        let err = decoder_mode_from_headers(&h, "r").unwrap_err();
+        assert_eq!(err.code, "InvalidRequest");
+        assert!(
+            err.message.to_ascii_lowercase().contains("unsupported"),
+            "error should mention the unsupported sentinel, got: {}",
             err.message,
         );
     }
