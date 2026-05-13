@@ -1343,6 +1343,85 @@ mod tests {
         assert!(is_streaming_only_amz_header("X-AMZ-SDK-CHECKSUM-ALGORITHM"));
     }
 
+    // ---- content_encoding_without_aws_chunked ----
+    //
+    // The strip helper is the load-bearing complement to
+    // `header_str_combined` in `parse.rs`: the parser merges repeated
+    // `Content-Encoding` headers into one comma list, and the strip helper
+    // must split that list correctly, drop every `aws-chunked` token
+    // (case-insensitive, including duplicates), and preserve order + spacing
+    // for the remaining tokens. These tests pin each edge case in isolation
+    // so a regression in either side surfaces before the full PUT pipeline.
+
+    /// Already-comma-joined `aws-chunked,gzip` strips down to just `gzip`.
+    /// The classic single-header shape.
+    #[test]
+    fn test_content_encoding_strip_single_header_comma_list() {
+        let stripped = content_encoding_without_aws_chunked("aws-chunked,gzip");
+        assert_eq!(stripped.as_deref(), Some("gzip"));
+    }
+
+    /// The shape produced by `header_str_combined` after merging two
+    /// separate `Content-Encoding` lines: `"aws-chunked, gzip"` (with the
+    /// `", "` separator). Must strip the same way as the comma-only form —
+    /// the trim in `content_encoding_without_aws_chunked` is load-bearing
+    /// here.
+    ///
+    /// Bug-revert reasoning: dropping the `str::trim` from the strip
+    /// helper turns the `" gzip"` token into a non-match for any case of
+    /// `aws-chunked` and leaves it as `" gzip"` (with the leading space),
+    /// so the upstream `Content-Encoding` would contain a phantom space
+    /// token. This assertion (`Some("gzip")`, not `Some(" gzip")`) flips.
+    #[test]
+    fn test_content_encoding_strip_combined_repeated_header_shape() {
+        let stripped = content_encoding_without_aws_chunked("aws-chunked, gzip");
+        assert_eq!(stripped.as_deref(), Some("gzip"));
+    }
+
+    /// Duplicate `aws-chunked, aws-chunked` (a misbehaving client that
+    /// repeated the token) must strip BOTH copies and result in no
+    /// surviving tokens → the caller drops `Content-Encoding` entirely.
+    ///
+    /// Bug-revert reasoning: a strip implementation that only removed the
+    /// first occurrence (`replace_first` style) would leave `"aws-chunked"`
+    /// as the surviving token, and the assertion would flip from `None` to
+    /// `Some("aws-chunked")`.
+    #[test]
+    fn test_content_encoding_strip_drops_all_duplicate_aws_chunked_tokens() {
+        let stripped = content_encoding_without_aws_chunked("aws-chunked, aws-chunked");
+        assert_eq!(
+            stripped, None,
+            "all aws-chunked tokens must strip; nothing left → drop the header",
+        );
+    }
+
+    /// Case-insensitive match: `AWS-CHUNKED, gzip` → `gzip`. AWS docs and
+    /// the SigV4 reference don't fix the case of the encoding token; the
+    /// strip helper must not be lulled into shipping an `AWS-CHUNKED` token
+    /// to the upstream just because the casing differs.
+    #[test]
+    fn test_content_encoding_strip_case_insensitive() {
+        let stripped = content_encoding_without_aws_chunked("AWS-CHUNKED, gzip");
+        assert_eq!(stripped.as_deref(), Some("gzip"));
+    }
+
+    /// Mixed-case repetition: `Aws-Chunked, gzip, AWS-CHUNKED` strips both
+    /// chunked tokens and keeps `gzip`. Combines the case-insensitive and
+    /// duplicate-elimination contracts in one shape.
+    #[test]
+    fn test_content_encoding_strip_mixed_case_duplicates_and_gzip_preserved() {
+        let stripped = content_encoding_without_aws_chunked("Aws-Chunked, gzip, AWS-CHUNKED");
+        assert_eq!(stripped.as_deref(), Some("gzip"));
+    }
+
+    /// Empty input → `None`. A `Content-Encoding: ` empty value or a
+    /// stripped-to-nothing value must not produce a phantom empty header
+    /// on the decoded backend request.
+    #[test]
+    fn test_content_encoding_strip_empty_input_returns_none() {
+        assert_eq!(content_encoding_without_aws_chunked(""), None);
+    }
+
     // ---- decoder_mode_from_headers ----
 
     use crate::s3::aws_chunked::DecoderMode;

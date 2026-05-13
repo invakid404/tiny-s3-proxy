@@ -75,6 +75,31 @@ fn header_str<B>(req: &Request<B>, name: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Extract all values of a (possibly repeated) header and join them into a
+/// single comma-separated string in source order. Returns `None` if no
+/// values are present OR if no value decodes as ASCII.
+///
+/// RFC 7230 §3.2.2 says a recipient MAY combine multiple field-line values
+/// of the same field name into one comma-separated list, but a single
+/// `.get()` call returns only the first value. For headers whose semantics
+/// are list-like (`Content-Encoding: aws-chunked` + `Content-Encoding: gzip`
+/// is equivalent to `Content-Encoding: aws-chunked, gzip`), dropping the
+/// trailing values would silently mis-describe the body — the downstream
+/// `aws-chunked` strip logic would forward an upstream PUT that's missing
+/// the `gzip` token, leaving the upstream object tagged as plain bytes.
+fn header_str_combined<B>(req: &Request<B>, name: &str) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    for value in req.headers().get_all(name) {
+        if let Ok(s) = value.to_str() {
+            parts.push(s);
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join(", "))
+}
+
 /// Parse an inbound HTTP request into a classified S3 operation.
 pub fn parse_request<B>(req: &Request<B>) -> ParsedRequest {
     let method = req.method().as_str();
@@ -327,9 +352,19 @@ pub fn parse_request<B>(req: &Request<B>) -> ParsedRequest {
     }
 
     // Capture standard content headers that the typed write path needs to forward.
+    //
+    // Content-Encoding is list-valued: a client may send it as multiple
+    // `Content-Encoding: <token>` lines (RFC 7230 §3.2.2) instead of one
+    // comma-separated value. The strip-aws-chunked logic downstream operates
+    // on a single comma-list, so we normalize repeated headers into one
+    // joined value here. The other headers in this list are single-valued
+    // per their respective RFCs (no "Cache-Control: a" + "Cache-Control: b"
+    // smuggling concern), so `header_str` is enough for them.
     let mut content_headers = HashMap::new();
+    if let Some(val) = header_str_combined(req, "content-encoding") {
+        content_headers.insert("content-encoding".to_string(), val);
+    }
     for name in &[
-        "content-encoding",
         "content-disposition",
         "content-language",
         "cache-control",
@@ -792,5 +827,103 @@ mod tests {
             parsed.content_length, None,
             "negative Content-Length should be treated as absent"
         );
+    }
+
+    /// Single-header `Content-Encoding: aws-chunked,gzip` (already
+    /// comma-joined by the client) must reach `content_headers` verbatim so
+    /// downstream strip logic sees both tokens.
+    #[test]
+    fn test_content_encoding_single_header_comma_list_preserved() {
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/mybucket/mykey")
+            .header("content-encoding", "aws-chunked,gzip")
+            .body(())
+            .unwrap();
+        let parsed = parse_request(&req);
+        assert_eq!(
+            parsed.content_headers.get("content-encoding").map(String::as_str),
+            Some("aws-chunked,gzip"),
+        );
+    }
+
+    /// REPEATED `Content-Encoding` headers (separate field-lines per
+    /// RFC 7230 §3.2.2) must be combined into one comma-joined value.
+    /// Without this, `header_str` would return only the first value and
+    /// the downstream strip-aws-chunked logic would forward an upstream
+    /// PUT missing the `gzip` token — the upstream object would be tagged
+    /// as plain bytes.
+    ///
+    /// Bug-revert reasoning: reverting `parse_request` to use `header_str`
+    /// for `content-encoding` instead of `header_str_combined` returns
+    /// `Some("aws-chunked")` here, and this assertion flips to a panic.
+    #[test]
+    fn test_content_encoding_multiple_headers_combined_into_comma_list() {
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/mybucket/mykey")
+            .header("content-encoding", "aws-chunked")
+            .header("content-encoding", "gzip")
+            .body(())
+            .unwrap();
+        let parsed = parse_request(&req);
+        assert_eq!(
+            parsed.content_headers.get("content-encoding").map(String::as_str),
+            Some("aws-chunked, gzip"),
+            "repeated Content-Encoding headers must be normalized into a single comma-list",
+        );
+    }
+
+    /// Source order must be preserved when combining repeated headers, so
+    /// the strip logic operates on the same token sequence the client
+    /// declared.
+    #[test]
+    fn test_content_encoding_multiple_headers_source_order_preserved() {
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/mybucket/mykey")
+            .header("content-encoding", "gzip")
+            .header("content-encoding", "aws-chunked")
+            .body(())
+            .unwrap();
+        let parsed = parse_request(&req);
+        assert_eq!(
+            parsed.content_headers.get("content-encoding").map(String::as_str),
+            Some("gzip, aws-chunked"),
+        );
+    }
+
+    /// Three-way repetition: combining must produce all tokens in order.
+    /// This is the load-bearing shape for SDKs that emit one header per
+    /// codec (`gzip`, `aws-chunked`, plus another encoding tag).
+    #[test]
+    fn test_content_encoding_three_repeated_headers_combined() {
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/mybucket/mykey")
+            .header("content-encoding", "aws-chunked")
+            .header("content-encoding", "gzip")
+            .header("content-encoding", "identity")
+            .body(())
+            .unwrap();
+        let parsed = parse_request(&req);
+        assert_eq!(
+            parsed.content_headers.get("content-encoding").map(String::as_str),
+            Some("aws-chunked, gzip, identity"),
+        );
+    }
+
+    /// Missing Content-Encoding must result in no entry in `content_headers`,
+    /// not an empty string. Confirms `header_str_combined` returns `None`
+    /// when the header is absent.
+    #[test]
+    fn test_content_encoding_absent_produces_no_entry() {
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/mybucket/mykey")
+            .body(())
+            .unwrap();
+        let parsed = parse_request(&req);
+        assert!(!parsed.content_headers.contains_key("content-encoding"));
     }
 }
