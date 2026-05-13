@@ -100,10 +100,7 @@ pub(crate) async fn create_dir_all_secure(path: &Path) -> io::Result<()> {
 /// Callers that want create-or-open semantics should call `configure` to
 /// set `.create(true)` (umask still drops the listed bits and our explicit
 /// `0o600` mode is honored when the file is freshly created).
-pub(crate) async fn open_file_secure<F>(
-    path: &Path,
-    configure: F,
-) -> io::Result<tokio::fs::File>
+pub(crate) async fn open_file_secure<F>(path: &Path, configure: F) -> io::Result<tokio::fs::File>
 where
     F: FnOnce(&mut tokio::fs::OpenOptions),
 {
@@ -135,10 +132,7 @@ pub(crate) async fn write_file_secure(path: &Path, contents: &[u8]) -> io::Resul
 /// Sync counterpart to `open_file_secure` for blocking call sites like the
 /// `<cache_dir>/.lock` open path (which uses `fs2::FileExt` on a
 /// `std::fs::File`).
-pub(crate) fn open_std_file_secure<F>(
-    path: &Path,
-    configure: F,
-) -> io::Result<std::fs::File>
+pub(crate) fn open_std_file_secure<F>(path: &Path, configure: F) -> io::Result<std::fs::File>
 where
     F: FnOnce(&mut std::fs::OpenOptions),
 {
@@ -159,8 +153,7 @@ where
 pub(crate) async fn tighten_file_mode(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(SECURE_FILE_MODE))
-            .await
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(SECURE_FILE_MODE)).await
     }
     #[cfg(not(unix))]
     {

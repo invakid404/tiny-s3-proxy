@@ -157,9 +157,9 @@ impl CacheDirLock {
             o.read(true).write(true).create(true).truncate(false);
         })
         .map_err(|e| ProxyError::Cache {
-                source: Box::new(e),
-                operation: format!("open cache_dir lock file {}", lock_path.display()),
-            })?;
+            source: Box::new(e),
+            operation: format!("open cache_dir lock file {}", lock_path.display()),
+        })?;
         // Call through the fs2 trait explicitly: std stabilized `File::try_lock`
         // (not `try_lock_exclusive`) and `File::unlock` in Rust 1.89 with
         // different signatures (`try_lock` returns `Result<(), TryLockError>`).
@@ -1358,9 +1358,7 @@ impl DiskCache {
             // sits in the tmp dir. Best-effort: backup is transient state
             // and we cannot meaningfully roll back a publish for a chmod
             // failure on it.
-            if old_body_exists
-                && let Err(e) = tighten_file_mode(&backup_body).await
-            {
+            if old_body_exists && let Err(e) = tighten_file_mode(&backup_body).await {
                 tracing::warn!(
                     path = %backup_body.display(),
                     error = %e,
@@ -1378,9 +1376,7 @@ impl DiskCache {
                     operation: "backup existing metadata".into(),
                 });
             }
-            if old_meta_exists
-                && let Err(e) = tighten_file_mode(&backup_meta).await
-            {
+            if old_meta_exists && let Err(e) = tighten_file_mode(&backup_meta).await {
                 tracing::warn!(
                     path = %backup_meta.display(),
                     error = %e,
@@ -4012,9 +4008,8 @@ mod tests {
             .await
             .unwrap();
 
-        let mode_of = |p: &std::path::Path| {
-            std::fs::metadata(p).unwrap().permissions().mode() & 0o7777
-        };
+        let mode_of =
+            |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode_of(&cache_dir), 0o700, "cache root must be 0700");
         assert_eq!(
             mode_of(&cache_dir.join("objects")),
@@ -4056,5 +4051,215 @@ mod tests {
             logs_contain("cache directory pre-exists with group/other access"),
             "expected warn about pre-existing loose cache dir"
         );
+    }
+
+    /// Mirrors the production fill path: `handlers::get` opens the temp
+    /// body file via `open_file_secure` so the renamed `{hash}.body` ends
+    /// up at 0o600. Tests must use the same helper to faithfully exercise
+    /// the published-file permissions contract.
+    #[cfg(unix)]
+    async fn write_temp_body_secure(cache_dir: &std::path::Path, data: &[u8]) -> PathBuf {
+        use std::sync::atomic::AtomicU64;
+        use tokio::io::AsyncWriteExt;
+        static SECURE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let tmp_dir = cache_dir.join("tmp");
+        let id = SECURE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let temp_path = tmp_dir.join(format!("{pid}-{id}.secure.body"));
+        let mut f = crate::cache::perms::open_file_secure(&temp_path, |o| {
+            o.write(true).create_new(true);
+        })
+        .await
+        .unwrap();
+        f.write_all(data).await.unwrap();
+        f.sync_all().await.unwrap();
+        temp_path
+    }
+
+    #[cfg(unix)]
+    fn assert_mode(path: &std::path::Path, expected: u32, label: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            mode, expected,
+            "{label}: expected {expected:#o}, got {mode:#o}"
+        );
+    }
+
+    /// Pin the per-writer contract for `{hash}.body`: temp body is created
+    /// via `open_file_secure` (mirroring `handlers::get`'s production
+    /// path), `commit_fill` renames it into place, and the final file
+    /// inherits the 0o600 mode from the rename source.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_fill_body_published_with_0o600_mode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = DiskCache::new(tmp.path().to_path_buf(), 1_000_000, test_policy())
+            .await
+            .unwrap();
+
+        let key = test_key();
+        let body = b"payload".to_vec();
+        let temp_path = write_temp_body_secure(tmp.path(), &body).await;
+        let guard = cache.begin_fill(&key).await.unwrap();
+        cache
+            .commit_fill(guard, temp_path, test_meta(body.len()))
+            .await
+            .unwrap();
+
+        let (final_body, _final_meta) = cache.paths_for_key(&key);
+        assert_mode(&final_body, 0o600, "published {hash}.body");
+    }
+
+    /// Pin the per-writer contract for `{hash}.meta.json`. The temp meta
+    /// file is created internally by `commit_fill_inner` via
+    /// `write_file_secure`; the renamed final file must be 0o600.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_fill_meta_published_with_0o600_mode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = DiskCache::new(tmp.path().to_path_buf(), 1_000_000, test_policy())
+            .await
+            .unwrap();
+
+        let key = test_key();
+        let body = b"payload".to_vec();
+        let temp_path = write_temp_body_secure(tmp.path(), &body).await;
+        let guard = cache.begin_fill(&key).await.unwrap();
+        cache
+            .commit_fill(guard, temp_path, test_meta(body.len()))
+            .await
+            .unwrap();
+
+        let (_final_body, final_meta) = cache.paths_for_key(&key);
+        assert_mode(&final_meta, 0o600, "published {hash}.meta.json");
+    }
+
+    /// `.fill_id_counter` is published by `persist_fill_id_counter` via
+    /// the secure write helper. After at least one `commit_fill`, the
+    /// counter file at the cache root must be 0o600.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_fill_id_counter_published_with_0o600_mode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = DiskCache::new(tmp.path().to_path_buf(), 1_000_000, test_policy())
+            .await
+            .unwrap();
+
+        let key = test_key();
+        let body = b"payload".to_vec();
+        let temp_path = write_temp_body_secure(tmp.path(), &body).await;
+        let guard = cache.begin_fill(&key).await.unwrap();
+        cache
+            .commit_fill(guard, temp_path, test_meta(body.len()))
+            .await
+            .unwrap();
+
+        let counter_path = DiskCache::fill_id_counter_path_for(tmp.path());
+        assert_mode(&counter_path, 0o600, ".fill_id_counter");
+    }
+
+    /// Two-level shard dirs `objects/{d1}` and `objects/{d1}/{d2}` are
+    /// created via `create_dir_all_secure`, which steps through each
+    /// missing level with the explicit 0o700 mode rather than relying on
+    /// the umask-respecting `create_dir_all`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_shard_dirs_created_with_0o700_mode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = DiskCache::new(tmp.path().to_path_buf(), 1_000_000, test_policy())
+            .await
+            .unwrap();
+
+        let key = test_key();
+        let body = b"payload".to_vec();
+        let temp_path = write_temp_body_secure(tmp.path(), &body).await;
+        let guard = cache.begin_fill(&key).await.unwrap();
+        cache
+            .commit_fill(guard, temp_path, test_meta(body.len()))
+            .await
+            .unwrap();
+
+        let (final_body, _) = cache.paths_for_key(&key);
+        let d2 = final_body.parent().unwrap();
+        let d1 = d2.parent().unwrap();
+        assert_mode(d1, 0o700, "objects/{d1}");
+        assert_mode(d2, 0o700, "objects/{d1}/{d2}");
+    }
+
+    /// `poison()` writes an empty `.poisoned` marker. The marker carries
+    /// no payload but must still inherit the same 0o600 default — it
+    /// lives in the cache shard tree, and the warn-and-leave contract for
+    /// pre-existing loose state only applies to directories.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_poison_marker_written_with_0o600_mode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = DiskCache::new(tmp.path().to_path_buf(), 1_000_000, test_policy())
+            .await
+            .unwrap();
+
+        let key = test_key();
+        cache.poison(&key).await.unwrap();
+
+        let marker = cache.poison_path_for_key(&key);
+        assert_mode(&marker, 0o600, "{hash}.poisoned marker");
+    }
+
+    /// When `commit_fill` fails the metadata-rename step (here forced via
+    /// the `commit_rename_fail_after_body_for_test` hook), the prior
+    /// snapshot must be restored AND its mode tightened to 0o600 — even
+    /// if the previously published body had a looser mode (e.g. survived
+    /// from a proxy version before this hardening). Pins the post-rename
+    /// `tighten_file_mode` contract on backup body / backup meta.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_backup_body_tightened_after_restore() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = DiskCache::new(tmp.path().to_path_buf(), 1_000_000, test_policy())
+            .await
+            .unwrap();
+
+        // First commit — establishes a published body+meta we can rescue.
+        let key = test_key();
+        let body_v1 = b"first".to_vec();
+        let temp_v1 = write_temp_body_secure(tmp.path(), &body_v1).await;
+        let guard_v1 = cache.begin_fill(&key).await.unwrap();
+        cache
+            .commit_fill(guard_v1, temp_v1, test_meta(body_v1.len()))
+            .await
+            .unwrap();
+
+        // Force the v1 published files to a loose mode to simulate state
+        // left by a proxy version before this hardening.
+        let (final_body, final_meta) = cache.paths_for_key(&key);
+        std::fs::set_permissions(&final_body, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&final_meta, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // Arm the injection so the second commit fails AFTER the body
+        // rename — driving the restore path that renames the backup back
+        // to final_body.
+        cache.arm_commit_rename_fail_after_body_for_test();
+
+        let body_v2 = b"second".to_vec();
+        let temp_v2 = write_temp_body_secure(tmp.path(), &body_v2).await;
+        let guard_v2 = cache.begin_fill(&key).await.unwrap();
+        let result = cache
+            .commit_fill(guard_v2, temp_v2, test_meta(body_v2.len()))
+            .await;
+        assert!(result.is_err(), "injection should make commit fail");
+
+        // Restoration ran: the published files exist again and carry the
+        // tightened 0o600 mode (because tighten_file_mode was applied to
+        // each backup at rename time).
+        assert_mode(&final_body, 0o600, "restored {hash}.body");
+        assert_mode(&final_meta, 0o600, "restored {hash}.meta.json");
+
+        // Body bytes are the v1 snapshot, not the failed v2 payload.
+        let body_bytes = std::fs::read(&final_body).unwrap();
+        assert_eq!(body_bytes, body_v1);
     }
 }
