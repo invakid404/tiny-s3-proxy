@@ -244,6 +244,25 @@ fn map_decode_error(err: AwsChunkedError, request_id: &str) -> S3Error {
         | AwsChunkedError::ChunkHeaderTooLarge { .. } => {
             S3Error::incomplete_body(&err.to_string(), request_id)
         }
+        // Trailer framing / signature errors: malformed structure → InvalidRequest.
+        AwsChunkedError::InvalidTrailer { .. }
+        | AwsChunkedError::MissingTrailer { .. }
+        | AwsChunkedError::InvalidTrailerSignature { .. } => {
+            S3Error::invalid_request(&err.to_string(), request_id)
+        }
+        // The trailer value parsed cleanly but wasn't a valid digest →
+        // InvalidDigest. Distinguished from a mismatch (real checksum failure)
+        // so clients can tell "your trailer is the wrong shape" from "your
+        // trailer doesn't match what we computed".
+        AwsChunkedError::InvalidTrailerChecksum { .. } => {
+            S3Error::invalid_digest(&err.to_string(), request_id)
+        }
+        // The trailer was well-formed and parsed to the right length, but
+        // doesn't match the computed digest. This is the load-bearing
+        // integrity error → BadDigest.
+        AwsChunkedError::TrailerChecksumMismatch { .. } => {
+            S3Error::bad_digest(&err.to_string(), request_id)
+        }
     }
 }
 

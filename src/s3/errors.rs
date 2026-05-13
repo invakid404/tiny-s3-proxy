@@ -207,6 +207,48 @@ impl S3Error {
         }
     }
 
+    /// Create an InvalidRequest error (HTTP 400). AWS's catch-all for
+    /// requests that are syntactically OK but semantically rejected. Used by
+    /// the aws-chunked trailer decoder for malformed trailer / signature
+    /// lines and for the trailer-routing classifier when a trailer header is
+    /// declared but the algorithm isn't one we support.
+    pub fn invalid_request(message: &str, request_id: &str) -> Self {
+        S3Error {
+            http_status: StatusCode::BAD_REQUEST,
+            code: "InvalidRequest".to_string(),
+            message: message.to_string(),
+            resource: None,
+            request_id: request_id.to_string(),
+        }
+    }
+
+    /// Create an InvalidDigest error (HTTP 400). Used when an inbound
+    /// `x-amz-checksum-*` or trailer value isn't a valid digest (bad base64,
+    /// wrong decoded length). Distinct from `BadDigest`, which is for a
+    /// well-formed digest that doesn't match the computed value.
+    pub fn invalid_digest(message: &str, request_id: &str) -> Self {
+        S3Error {
+            http_status: StatusCode::BAD_REQUEST,
+            code: "InvalidDigest".to_string(),
+            message: message.to_string(),
+            resource: None,
+            request_id: request_id.to_string(),
+        }
+    }
+
+    /// Create a BadDigest error (HTTP 400). The load-bearing trailer
+    /// integrity error: the declared checksum was syntactically valid but
+    /// didn't match the digest the proxy computed over the decoded body.
+    pub fn bad_digest(message: &str, request_id: &str) -> Self {
+        S3Error {
+            http_status: StatusCode::BAD_REQUEST,
+            code: "BadDigest".to_string(),
+            message: message.to_string(),
+            resource: None,
+            request_id: request_id.to_string(),
+        }
+    }
+
     /// Create a NotImplemented error.
     pub fn not_implemented(operation: &str, request_id: &str) -> Self {
         S3Error {
