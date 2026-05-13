@@ -46,10 +46,7 @@ pub(crate) async fn create_dir_secure(path: &Path) -> io::Result<()> {
             .await
         {
             Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                warn_if_loose_dir(path).await;
-                Ok(())
-            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => verify_existing_dir(path).await,
             Err(e) => Err(e),
         }
     }
@@ -57,7 +54,18 @@ pub(crate) async fn create_dir_secure(path: &Path) -> io::Result<()> {
     {
         match tokio::fs::create_dir(path).await {
             Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                // Even without mode bits, refuse to silently accept a
+                // non-directory at the expected dir path.
+                let metadata = tokio::fs::metadata(path).await?;
+                if !metadata.is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("path {} exists but is not a directory", path.display()),
+                    ));
+                }
+                Ok(())
+            }
             Err(e) => Err(e),
         }
     }
@@ -67,9 +75,17 @@ pub(crate) async fn create_dir_secure(path: &Path) -> io::Result<()> {
 /// Each newly-created level uses `SECURE_DIR_MODE`. Existing parents are
 /// not chmod'd; loose existing dirs are warned about exactly once each.
 pub(crate) async fn create_dir_all_secure(path: &Path) -> io::Result<()> {
+    // Walk up the chain of missing parents. `Path::parent()` returns
+    // `Some("")` for single-component relative paths like `cache` (the
+    // logical parent is the CWD, which always exists), so the empty-path
+    // case must short-circuit — otherwise `metadata("")` errors out and
+    // the walk loops forever.
     let mut stack: Vec<&Path> = Vec::new();
     let mut current = path.parent();
     while let Some(p) = current {
+        if p.as_os_str().is_empty() {
+            break;
+        }
         match tokio::fs::metadata(p).await {
             Ok(m) if m.is_dir() => break,
             Ok(_) => {
@@ -162,30 +178,35 @@ pub(crate) async fn tighten_file_mode(path: &Path) -> io::Result<()> {
     }
 }
 
+/// `mkdir` returns `AlreadyExists` whenever ANY entry sits at `path`, not
+/// just an existing directory. Stat the path to confirm it really is a
+/// directory before treating the error as benign — a regular file or
+/// symlink-to-file at, say, `<cache_dir>/tmp` would otherwise be accepted
+/// silently and downstream writers would fail with cryptic errors.
+///
+/// If the path is a directory and its mode allows group/other access,
+/// emit a `warn!` so operators see the divergence; the proxy does not
+/// silently chmod operator-owned state.
 #[cfg(unix)]
-async fn warn_if_loose_dir(path: &Path) {
-    match tokio::fs::metadata(path).await {
-        Ok(meta) => {
-            let mode = meta.permissions().mode() & 0o7777;
-            if mode & GROUP_OTHER_BITS != 0 {
-                tracing::warn!(
-                    path = %path.display(),
-                    mode = format!("{:#o}", mode),
-                    "cache directory pre-exists with group/other access; \
-                     leaving operator-set permissions intact — proxy will \
-                     not silently chmod operator-owned state"
-                );
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %e,
-                "cache directory pre-exists but stat failed; cannot check \
-                 permissions"
-            );
-        }
+async fn verify_existing_dir(path: &Path) -> io::Result<()> {
+    let metadata = tokio::fs::metadata(path).await?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("path {} exists but is not a directory", path.display()),
+        ));
     }
+    let mode = metadata.permissions().mode() & 0o7777;
+    if mode & GROUP_OTHER_BITS != 0 {
+        tracing::warn!(
+            path = %path.display(),
+            mode = format!("{:#o}", mode),
+            "cache directory pre-exists with group/other access; \
+             leaving operator-set permissions intact — proxy will \
+             not silently chmod operator-owned state"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(all(test, unix))]
@@ -231,6 +252,59 @@ mod tests {
         create_dir_secure(&target).await.unwrap();
         assert_eq!(mode_of(&target), 0o700);
     }
+
+    /// `mkdir` returns `AlreadyExists` for any pre-existing path, including
+    /// regular files. The helper must stat the path and surface an error
+    /// when the entry is not a directory — otherwise downstream writers
+    /// would fail with cryptic errors when, e.g., `<cache_dir>/tmp` had
+    /// been left as a regular file by operator error.
+    #[tokio::test]
+    async fn test_create_dir_secure_rejects_non_directory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("regular-file");
+        std::fs::write(&target, b"not a dir").unwrap();
+        let err = create_dir_secure(&target).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(
+            err.to_string().contains("not a directory"),
+            "error message must explain the type mismatch, got: {err}"
+        );
+    }
+
+    /// `Path::parent()` returns `Some("")` for single-component relative
+    /// paths like `cache` (the logical parent is the CWD, which exists).
+    /// Pre-fix, `create_dir_all_secure` would `metadata("")` and error
+    /// out. Pin that single-component relative inputs succeed.
+    ///
+    /// Uses `std::env::set_current_dir`, which is process-wide; serialize
+    /// via the module-level `CWD_LOCK` so cargo's parallel test runner
+    /// can't have two CWD-mutating tests interleave. `tokio::sync::Mutex`
+    /// is used so the await inside `create_dir_all_secure` does not
+    /// trigger clippy's `await_holding_lock` warning.
+    #[tokio::test]
+    async fn test_create_dir_all_secure_handles_single_component_relative_path() {
+        let _guard = CWD_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev_cwd = std::env::current_dir().unwrap();
+        struct RestoreCwd(std::path::PathBuf);
+        impl Drop for RestoreCwd {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+        let _restore = RestoreCwd(prev_cwd);
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        create_dir_all_secure(Path::new("perms-relative-test-cache"))
+            .await
+            .unwrap();
+        assert_eq!(
+            mode_of(&tmp.path().join("perms-relative-test-cache")),
+            0o700
+        );
+    }
+
+    static CWD_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[tokio::test]
     async fn test_create_dir_all_secure_creates_each_level_with_0700() {

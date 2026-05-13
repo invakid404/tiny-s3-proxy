@@ -112,6 +112,25 @@ async fn measure_unreclaimed_orphan_bytes(
 }
 
 /// Check if a path exists, distinguishing NotFound from real I/O errors.
+/// Create the two-level shard parent dirs (`objects/{d1}` and
+/// `objects/{d1}/{d2}`) for a cache body or marker path, each via its
+/// own `create_dir_secure` call so the warn-and-leave contract applies
+/// independently at every level. `final_path` is expected to be a file
+/// path inside `<cache_dir>/objects/{d1}/{d2}/`; if the path is
+/// shallower (no grandparent) the helper falls back to a single
+/// `create_dir_all_secure` so it still creates whatever parent exists.
+async fn ensure_shard_dirs_secure(final_path: &std::path::Path) -> std::io::Result<()> {
+    let Some(d2) = final_path.parent() else {
+        return Ok(());
+    };
+    if let Some(d1) = d2.parent() {
+        create_dir_secure(d1).await?;
+        create_dir_secure(d2).await
+    } else {
+        create_dir_all_secure(d2).await
+    }
+}
+
 async fn check_exists(path: &std::path::Path, operation: &str) -> Result<bool, ProxyError> {
     match tokio::fs::try_exists(path).await {
         Ok(exists) => Ok(exists),
@@ -1027,14 +1046,12 @@ impl DiskCache {
 
     async fn write_poison_marker(&self, key: &CacheKey) -> Result<(), ProxyError> {
         let path = self.poison_path_for_key(key);
-        if let Some(parent) = path.parent() {
-            create_dir_all_secure(parent)
-                .await
-                .map_err(|e| ProxyError::Cache {
-                    source: Box::new(e),
-                    operation: "create poison marker dir".into(),
-                })?;
-        }
+        ensure_shard_dirs_secure(&path)
+            .await
+            .map_err(|e| ProxyError::Cache {
+                source: Box::new(e),
+                operation: "create poison marker dir".into(),
+            })?;
 
         #[cfg(test)]
         if self
@@ -1201,13 +1218,12 @@ impl DiskCache {
         let temp_meta = guard.temp_dir.join(format!("{pid}-{id}.meta.json"));
 
         // Create parent directories for final location. Both shard levels
-        // (`objects/{d1}` and `objects/{d1}/{d2}`) must be 0o700; relying on
-        // `create_dir_all` would leave only the deepest level under the
-        // explicit-mode contract on Unix.
+        // (`objects/{d1}` and `objects/{d1}/{d2}`) must independently go
+        // through `create_dir_secure` so each gets the warn-and-leave
+        // policy for an existing loose dir — `create_dir_all_secure`
+        // would only warn on the deepest missing level.
         let (final_body, final_meta) = self.paths_for_key(&guard.key);
-        if let Some(parent) = final_body.parent()
-            && let Err(e) = create_dir_all_secure(parent).await
-        {
+        if let Err(e) = ensure_shard_dirs_secure(&final_body).await {
             let _ = tokio::fs::remove_file(&temp_body_path).await;
             let _ = tokio::fs::remove_file(&temp_meta).await;
             return Err(ProxyError::Cache {
@@ -4161,9 +4177,9 @@ mod tests {
     }
 
     /// Two-level shard dirs `objects/{d1}` and `objects/{d1}/{d2}` are
-    /// created via `create_dir_all_secure`, which steps through each
-    /// missing level with the explicit 0o700 mode rather than relying on
-    /// the umask-respecting `create_dir_all`.
+    /// created via two independent `create_dir_secure` calls (in
+    /// `ensure_shard_dirs_secure`), so the warn-and-leave contract for
+    /// pre-existing loose dirs applies independently at each level.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_shard_dirs_created_with_0o700_mode() {
@@ -4261,5 +4277,68 @@ mod tests {
         // Body bytes are the v1 snapshot, not the failed v2 payload.
         let body_bytes = std::fs::read(&final_body).unwrap();
         assert_eq!(body_bytes, body_v1);
+    }
+
+    /// Pin the per-writer contract for `<cache_dir>/.lock`: created via
+    /// `open_std_file_secure` in `CacheDirLock::acquire` and must end up
+    /// at 0o600 on Unix regardless of umask. The lock file is freshly
+    /// created on a brand-new cache dir, so the explicit mode applies.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_disk_cache_new_creates_lock_file_with_0o600_mode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_dir = tmp.path().join("cache");
+
+        let _cache = DiskCache::new(cache_dir.clone(), 1_000_000, test_policy())
+            .await
+            .unwrap();
+
+        assert_mode(&cache_dir.join(".lock"), 0o600, "<cache_dir>/.lock");
+    }
+
+    /// Pin the per-writer contract for the metadata-rewrite path. Driving
+    /// `update_metadata_if_unchanged` writes a `meta.tmp` under tmp/ via
+    /// `write_file_secure` and renames it onto the live `{hash}.meta.json`.
+    /// The final file must end up at 0o600 even if a pre-hardening proxy
+    /// had originally published the metadata at a looser mode.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_metadata_rewrite_publishes_final_with_0o600_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = DiskCache::new(tmp.path().to_path_buf(), 1_000_000, test_policy())
+            .await
+            .unwrap();
+
+        // Seed an entry the rewrite path can target.
+        let key = test_key();
+        let body = b"payload".to_vec();
+        let temp_path = write_temp_body_secure(tmp.path(), &body).await;
+        let guard = cache.begin_fill(&key).await.unwrap();
+        cache
+            .commit_fill(guard, temp_path, test_meta(body.len()))
+            .await
+            .unwrap();
+
+        let (_, meta_path) = cache.paths_for_key(&key);
+        // Simulate a meta.json that was published by an older proxy at
+        // 0o644 so the rewrite path is the thing that has to tighten it.
+        std::fs::set_permissions(&meta_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let current = cache.lookup(&key).await.unwrap().unwrap().meta;
+        let mut updated = (*current).clone();
+        updated
+            .extra_headers
+            .insert("x-amz-checksum-sha256".into(), "abc-rewrite-target".into());
+        let expected_fill_id = updated.fill_id;
+        assert!(
+            cache
+                .update_metadata_if_unchanged(&key, expected_fill_id, updated)
+                .await
+                .unwrap()
+        );
+
+        assert_mode(&meta_path, 0o600, "rewritten {hash}.meta.json");
     }
 }
