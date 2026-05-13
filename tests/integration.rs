@@ -218,6 +218,22 @@ fn aws_http_client_trusting(ca_pem: &str) -> aws_sdk_s3::config::SharedHttpClien
         .build_https()
 }
 
+/// Build a `reqwest::Client` that trusts the supplied CA PEM as a root.
+/// Used for the proxy's OUTBOUND passthrough client in the HTTPS fixture —
+/// `passthrough::handle_passthrough` issues requests via
+/// `state.http_client` (a `reqwest::Client`), so without this the
+/// passthrough route would fail TLS verification against the
+/// self-signed test leaf even though the typed/decode path's AWS-SDK
+/// client trusts it just fine.
+fn reqwest_client_trusting(ca_pem: &str) -> reqwest::Client {
+    let cert =
+        reqwest::Certificate::from_pem(ca_pem.as_bytes()).expect("parse test CA PEM for reqwest");
+    reqwest::Client::builder()
+        .add_root_certificate(cert)
+        .build()
+        .expect("build reqwest client trusting test CA")
+}
+
 /// Build the default test `Config` aimed at `backend_endpoint`, using the
 /// given auth mode / allowed keys and rooting the cache at `cache_dir`. Pulled
 /// out so tests that need a non-default Config (e.g. a small
@@ -426,10 +442,11 @@ async fn build_proxy_stack_with_https_backend(
         cache_dir.path(),
     );
 
-    let http_client = aws_http_client_trusting(ca_pem);
-    let s3_backend = backend::client::S3Backend::from_config_with_http_client(&config, http_client)
-        .await
-        .expect("build S3 backend (HTTPS)");
+    let aws_http_client = aws_http_client_trusting(ca_pem);
+    let s3_backend =
+        backend::client::S3Backend::from_config_with_http_client(&config, aws_http_client)
+            .await
+            .expect("build S3 backend (HTTPS)");
 
     let cache_policy = cache::policy::CachePolicy::new(
         config.cacheable_prefixes.clone(),
@@ -446,6 +463,12 @@ async fn build_proxy_stack_with_https_backend(
     let singleflight = Arc::new(cache::SingleFlight::new());
     let authenticator = Arc::from(auth::create_request_gate(&config));
 
+    // Passthrough handler issues outbound requests via `state.http_client`
+    // against the same HTTPS backend, so this reqwest client must also
+    // trust the self-signed test CA — a default `reqwest::Client::new()`
+    // would fail TLS verification on every passthrough request.
+    let passthrough_http_client = reqwest_client_trusting(ca_pem);
+
     let state = Arc::new(handlers::AppState {
         backend: Arc::new(s3_backend),
         cache: Arc::new(disk_cache),
@@ -455,7 +478,7 @@ async fn build_proxy_stack_with_https_backend(
         config: Arc::new(config),
         frontend_bucket: Arc::from(TEST_BUCKET),
         backend_bucket: Arc::from(TEST_BUCKET),
-        http_client: reqwest::Client::new(),
+        http_client: passthrough_http_client,
     });
 
     let app = axum::Router::new()
@@ -473,9 +496,12 @@ async fn build_proxy_stack_with_https_backend(
 
     let proxy_endpoint = format!("http://127.0.0.1:{}", addr.port());
     let proxy_client = build_raw_s3_client(&proxy_endpoint, TEST_ACCESS_KEY, TEST_SECRET_KEY).await;
-    let http_client = reqwest::Client::new();
+    // Test-facing client talks to the proxy over plain HTTP — it does NOT
+    // need to trust the test CA. Distinct from the `passthrough_http_client`
+    // stored inside `AppState`, which DOES need the CA pinned.
+    let test_http_client = reqwest::Client::new();
 
-    (proxy_client, http_client, proxy_endpoint, cache_dir)
+    (proxy_client, test_http_client, proxy_endpoint, cache_dir)
 }
 
 /// Helper: PUT an object through the given S3 client.
@@ -2994,5 +3020,80 @@ async fn test_aws_chunked_signed_non_trailer_full_https_backend_round_trip() {
         body.as_ref(),
         payload,
         "decoded body on HTTPS VersityGW must match the original payload",
+    );
+}
+
+/// Passthrough smoke test against a REAL HTTPS-backed VersityGW. A
+/// `Range:` header on a GET forces the request through
+/// `route_to_passthrough` (see `has_unsupported_get_modifiers`), which
+/// issues outbound requests via `state.http_client` — a `reqwest::Client`.
+/// That client must trust the test CA, otherwise every passthrough
+/// request to the HTTPS backend fails TLS verification.
+///
+/// Bug-revert signal: swap `AppState.http_client` back to
+/// `reqwest::Client::new()` and this test fails with a `Backend`-mapped
+/// error (TLS handshake failure surfaces as HTTP 5xx from the proxy with
+/// an `InternalError` / `connection/dispatch failure` body referencing
+/// certificate trust).
+///
+/// Docker + the pinned `versity/versitygw` image required.
+#[tokio::test]
+#[ignore]
+async fn test_passthrough_range_get_full_https_backend_round_trip() {
+    let tls = generate_test_tls();
+    let (_container, backend_endpoint) = start_versitygw_https(&tls).await;
+
+    // Direct (trust-pinned) SDK client for bucket setup + seeding.
+    let direct_client = build_raw_s3_client_with_http_client(
+        &backend_endpoint,
+        TEST_ACCESS_KEY,
+        TEST_SECRET_KEY,
+        aws_http_client_trusting(&tls.ca_pem),
+    )
+    .await;
+    direct_client
+        .create_bucket()
+        .bucket(TEST_BUCKET)
+        .send()
+        .await
+        .expect("create_bucket on HTTPS VersityGW");
+
+    let key = "passthrough/range-test.bin";
+    let payload: &[u8] = b"hello https passthrough world";
+    direct_client
+        .put_object()
+        .bucket(TEST_BUCKET)
+        .key(key)
+        .body(aws_sdk_s3::primitives::ByteStream::from(payload.to_vec()))
+        .send()
+        .await
+        .expect("seed object on HTTPS VersityGW");
+
+    let (_proxy_client, test_http_client, proxy_endpoint, _cache_dir) =
+        build_proxy_stack_with_https_backend(&backend_endpoint, &tls.ca_pem).await;
+
+    let url = format!("{proxy_endpoint}/{TEST_BUCKET}/{key}");
+    let resp = test_http_client
+        .get(&url)
+        .header("Range", "bytes=0-4")
+        .send()
+        .await
+        .expect("Range GET via proxy passthrough");
+    let status = resp.status().as_u16();
+    let body = resp
+        .bytes()
+        .await
+        .expect("read passthrough response body")
+        .to_vec();
+    assert_eq!(
+        status,
+        206,
+        "Range GET through proxy passthrough must return 206 Partial Content from HTTPS VersityGW; got status {status} with body: {}",
+        String::from_utf8_lossy(&body),
+    );
+    assert_eq!(
+        body.as_slice(),
+        &payload[0..5],
+        "passthrough response body must equal the first 5 bytes of the seeded payload",
     );
 }
