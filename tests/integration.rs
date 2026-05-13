@@ -2338,9 +2338,12 @@ async fn test_aws_chunked_oversize_chunk_header_rejected_at_decode_path() {
         "oversize chunk header must be rejected with 400"
     );
     let resp_text = String::from_utf8_lossy(&raw_response);
+    // Match the tag, not the bare substring — proves we're returning an S3
+    // XML error rather than a body that happens to contain the word
+    // `IncompleteBody` (e.g. a passthrough-shaped response).
     assert!(
-        resp_text.contains("IncompleteBody"),
-        "expected IncompleteBody, got: {resp_text}",
+        resp_text.contains("<Code>IncompleteBody</Code>"),
+        "expected <Code>IncompleteBody</Code>, got: {resp_text}",
     );
     assert_eq!(
         mock.received_count
@@ -2407,9 +2410,11 @@ async fn test_aws_chunked_bad_chunk_signature_shape_rejected_at_decode_path() {
         "malformed chunk-signature shape must be rejected with 400"
     );
     let resp_text = String::from_utf8_lossy(&raw_response);
+    // Match the tag, not the bare substring — proves the response is an
+    // S3 XML error rather than a body that incidentally contains the word.
     assert!(
-        resp_text.contains("IncompleteBody"),
-        "expected IncompleteBody, got: {resp_text}",
+        resp_text.contains("<Code>IncompleteBody</Code>"),
+        "expected <Code>IncompleteBody</Code>, got: {resp_text}",
     );
     assert_eq!(
         mock.received_count
@@ -2474,9 +2479,11 @@ async fn test_aws_chunked_decoded_length_mismatch_rejected_at_decode_path() {
         "decoded-length mismatch must be rejected with 400"
     );
     let resp_text = String::from_utf8_lossy(&raw_response);
+    // Match the tag, not the bare substring — proves the response is an
+    // S3 XML error rather than a body that incidentally contains the word.
     assert!(
-        resp_text.contains("IncompleteBody"),
-        "expected IncompleteBody, got: {resp_text}",
+        resp_text.contains("<Code>IncompleteBody</Code>"),
+        "expected <Code>IncompleteBody</Code>, got: {resp_text}",
     );
     assert_eq!(
         mock.received_count

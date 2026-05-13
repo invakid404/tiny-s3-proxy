@@ -13,7 +13,13 @@
 //! decode before any backend contact happens.
 //!
 //! ECDSA streaming variants (`STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD*`)
-//! remain out of scope and must be routed to passthrough by the caller.
+//! are out of scope: the inbound `chunk-signature` values are bound to the
+//! client's private key, so the proxy can neither validate them nor have
+//! the upstream re-validate them after re-signing. The dispatch layer
+//! rejects these requests outright with `UnsupportedSignature` (HTTP 400)
+//! — they never reach this decoder. See
+//! `handlers::modifiers::WriteBodyRoute::RejectUnsupportedSignature` and
+//! issue #63.
 
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
