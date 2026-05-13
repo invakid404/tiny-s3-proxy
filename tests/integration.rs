@@ -75,6 +75,149 @@ async fn build_raw_s3_client(
     aws_sdk_s3::Client::from_conf(config)
 }
 
+/// Variant of `build_raw_s3_client` that uses a caller-supplied
+/// `SharedHttpClient`. Used to talk DIRECTLY to the HTTPS VersityGW
+/// fixture with a TLS trust store that pins the test CA.
+async fn build_raw_s3_client_with_http_client(
+    endpoint: &str,
+    access_key: &str,
+    secret_key: &str,
+    http_client: aws_sdk_s3::config::SharedHttpClient,
+) -> aws_sdk_s3::Client {
+    let creds = aws_credential_types::Credentials::new(access_key, secret_key, None, None, "test");
+    let config = aws_sdk_s3::config::Builder::new()
+        .endpoint_url(endpoint)
+        .region(aws_sdk_s3::config::Region::new("us-east-1"))
+        .credentials_provider(creds)
+        .force_path_style(true)
+        .http_client(http_client)
+        .behavior_version_latest()
+        .build();
+    aws_sdk_s3::Client::from_conf(config)
+}
+
+/// Test TLS material: a self-signed CA and a leaf certificate signed by
+/// that CA with SANs for `127.0.0.1` and `localhost`. Generated fresh for
+/// each fixture invocation — short-lived, never persisted.
+struct TestTls {
+    /// CA certificate PEM. Loaded into the SDK trust store on both the
+    /// test-direct and proxy-outbound clients.
+    ca_pem: String,
+    /// Leaf cert followed by the CA cert (PEM concatenation), suitable for
+    /// VersityGW's `--cert` flag.
+    server_chain_pem: String,
+    /// Leaf key PEM for VersityGW's `--key` flag.
+    server_key_pem: String,
+}
+
+/// Generate a fresh self-signed CA + leaf cert for the HTTPS VersityGW
+/// fixture. Uses rcgen's default ECDSA-P256 + SHA256, which both rustls
+/// (test SDK) and Go's crypto/tls (VersityGW server) accept out of the
+/// box.
+fn generate_test_tls() -> TestTls {
+    use rcgen::{
+        BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
+        KeyPair, KeyUsagePurpose, SanType,
+    };
+    use std::net::IpAddr;
+
+    let mut ca_params =
+        CertificateParams::new(Vec::<String>::new()).expect("CA params: empty SAN cannot fail");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "tiny-s3-proxy test CA");
+    ca_params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+    ca_params.key_usages.push(KeyUsagePurpose::CrlSign);
+    let ca_key = KeyPair::generate().expect("generate CA key");
+    let ca_cert = ca_params.self_signed(&ca_key).expect("self-sign CA");
+    let issuer = Issuer::new(ca_params, ca_key);
+
+    let mut leaf_params = CertificateParams::new(vec!["localhost".to_string()])
+        .expect("leaf params: known-good SAN");
+    leaf_params
+        .distinguished_name
+        .push(DnType::CommonName, "127.0.0.1");
+    leaf_params.subject_alt_names = vec![
+        SanType::DnsName("localhost".try_into().expect("localhost is valid IA5")),
+        SanType::IpAddress("127.0.0.1".parse::<IpAddr>().expect("127.0.0.1 is valid")),
+    ];
+    leaf_params
+        .key_usages
+        .push(KeyUsagePurpose::DigitalSignature);
+    leaf_params
+        .extended_key_usages
+        .push(ExtendedKeyUsagePurpose::ServerAuth);
+    let leaf_key = KeyPair::generate().expect("generate leaf key");
+    let leaf_cert = leaf_params
+        .signed_by(&leaf_key, &issuer)
+        .expect("sign leaf cert");
+
+    let ca_pem = ca_cert.pem();
+    let server_chain_pem = format!("{}{}", leaf_cert.pem(), ca_pem);
+    let server_key_pem = leaf_key.serialize_pem();
+    TestTls {
+        ca_pem,
+        server_chain_pem,
+        server_key_pem,
+    }
+}
+
+/// Start a VersityGW container speaking native TLS via the `--cert`/`--key`
+/// flags. The supplied chain and key are copied into the container at
+/// `/tls/server.pem` and `/tls/server.key`, then VersityGW is launched
+/// listening on container port 10000. Returns the container handle (must
+/// be held to keep the container alive) and the `https://127.0.0.1:<port>`
+/// endpoint URL.
+async fn start_versitygw_https(
+    tls: &TestTls,
+) -> (testcontainers::ContainerAsync<GenericImage>, String) {
+    let container = GenericImage::new(
+        "versity/versitygw",
+        "latest@sha256:a86791b684a1dd3c5a255ca755bb51783a72696cf1b5a843f800b08bfd6f921c",
+    )
+    .with_entrypoint("sh")
+    .with_exposed_port(10000.into())
+    .with_wait_for(WaitFor::message_on_stdout("listening on"))
+    .with_env_var("ROOT_ACCESS_KEY", TEST_ACCESS_KEY)
+    .with_env_var("ROOT_SECRET_KEY", TEST_SECRET_KEY)
+    .with_copy_to("/tls/server.pem", tls.server_chain_pem.as_bytes().to_vec())
+    .with_copy_to("/tls/server.key", tls.server_key_pem.as_bytes().to_vec())
+    .with_cmd([
+        "-c",
+        "mkdir -p /tmp/data /tmp/iam && \
+         versitygw --port :10000 --cert /tls/server.pem --key /tls/server.key \
+         --iam-dir /tmp/iam posix /tmp/data",
+    ])
+    .start()
+    .await
+    .expect("Failed to start HTTPS VersityGW container");
+
+    let port = container.get_host_port_ipv4(10000).await.unwrap();
+    let endpoint = format!("https://127.0.0.1:{}", port);
+    (container, endpoint)
+}
+
+/// Build an AWS SDK `SharedHttpClient` whose rustls (aws-lc) backend
+/// trusts ONLY the supplied CA PEM. Native roots are disabled so a real
+/// CA can never silently substitute for the test trust anchor.
+fn aws_http_client_trusting(ca_pem: &str) -> aws_sdk_s3::config::SharedHttpClient {
+    use aws_smithy_http_client::Builder;
+    use aws_smithy_http_client::tls::{self, TlsContext, TrustStore, rustls_provider::CryptoMode};
+
+    let trust_store = TrustStore::empty()
+        .with_native_roots(false)
+        .with_pem_certificate(ca_pem.as_bytes().to_vec());
+    let tls_context = TlsContext::builder()
+        .with_trust_store(trust_store)
+        .build()
+        .expect("build TLS context");
+    Builder::new()
+        .tls_provider(tls::Provider::Rustls(CryptoMode::AwsLc))
+        .tls_context(tls_context)
+        .build_https()
+}
+
 /// Build the default test `Config` aimed at `backend_endpoint`, using the
 /// given auth mode / allowed keys and rooting the cache at `cache_dir`. Pulled
 /// out so tests that need a non-default Config (e.g. a small
@@ -259,6 +402,80 @@ where
         mutate_config,
     )
     .await
+}
+
+/// Variant of `build_proxy_stack_with_opts` that points the proxy at an
+/// `https://` backend and supplies a trusting `SharedHttpClient` (CA-pinned
+/// rustls) so the SDK can validate the test fixture's self-signed leaf.
+/// Mirrors `build_proxy_stack_inner` line-for-line aside from the
+/// `from_config_with_http_client` swap.
+async fn build_proxy_stack_with_https_backend(
+    backend_endpoint: &str,
+    ca_pem: &str,
+) -> (
+    aws_sdk_s3::Client,
+    reqwest::Client,
+    String,
+    tempfile::TempDir,
+) {
+    let cache_dir = tempfile::TempDir::new().expect("create temp cache dir");
+    let config = default_proxy_test_config(
+        backend_endpoint,
+        AuthMode::TrustedInternal,
+        vec![],
+        cache_dir.path(),
+    );
+
+    let http_client = aws_http_client_trusting(ca_pem);
+    let s3_backend = backend::client::S3Backend::from_config_with_http_client(&config, http_client)
+        .await
+        .expect("build S3 backend (HTTPS)");
+
+    let cache_policy = cache::policy::CachePolicy::new(
+        config.cacheable_prefixes.clone(),
+        config.cache_max_object_bytes,
+    );
+    let disk_cache = cache::DiskCache::new(
+        config.cache_dir.clone(),
+        config.cache_max_bytes,
+        cache_policy.clone(),
+    )
+    .await
+    .expect("build disk cache");
+
+    let singleflight = Arc::new(cache::SingleFlight::new());
+    let authenticator = Arc::from(auth::create_request_gate(&config));
+
+    let state = Arc::new(handlers::AppState {
+        backend: Arc::new(s3_backend),
+        cache: Arc::new(disk_cache),
+        singleflight,
+        auth: authenticator,
+        policy: cache_policy,
+        config: Arc::new(config),
+        frontend_bucket: Arc::from(TEST_BUCKET),
+        backend_bucket: Arc::from(TEST_BUCKET),
+        http_client: reqwest::Client::new(),
+    });
+
+    let app = axum::Router::new()
+        .fallback(handlers::handle_s3_request)
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let proxy_endpoint = format!("http://127.0.0.1:{}", addr.port());
+    let proxy_client = build_raw_s3_client(&proxy_endpoint, TEST_ACCESS_KEY, TEST_SECRET_KEY).await;
+    let http_client = reqwest::Client::new();
+
+    (proxy_client, http_client, proxy_endpoint, cache_dir)
 }
 
 /// Helper: PUT an object through the given S3 client.
