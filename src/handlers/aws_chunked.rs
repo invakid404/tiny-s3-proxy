@@ -273,6 +273,14 @@ fn map_decode_error(err: AwsChunkedError, request_id: &str) -> S3Error {
         AwsChunkedError::TrailerChecksumMismatch { .. } => {
             S3Error::bad_digest(&err.to_string(), request_id)
         }
+        // Strict-mode signature verification failed. These map to the
+        // standard SigV4 `SignatureDoesNotMatch` (HTTP 403) so clients
+        // get the same response shape they would for a tampered
+        // header-level signature.
+        AwsChunkedError::ChunkSignatureMismatch { .. }
+        | AwsChunkedError::TrailerSignatureMismatch => {
+            S3Error::signature_does_not_match(&err.to_string(), request_id)
+        }
     }
 }
 
