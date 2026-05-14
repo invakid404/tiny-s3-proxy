@@ -103,6 +103,8 @@ use metrics::{counter, gauge, histogram};
 
 use crate::auth::RequestGate;
 use crate::auth::sigv4::SigV4Verifier;
+use crate::auth::sigv4::VerifiedRequest;
+use crate::auth::sigv4::payload::PayloadHashForSigning;
 use crate::backend::Backend;
 use crate::cache::policy::CachePolicy;
 use crate::cache::{CacheStore, SingleFlight};
@@ -299,24 +301,31 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
             }
         }
         S3Operation::PutObject { key, .. } => {
-            match classify_put_body_route(&parsed.extra_amz_headers, &parts.headers) {
-                WriteBodyRoute::Typed => put::handle_put(&state, &parsed, key, body).await,
-                WriteBodyRoute::DecodeAwsChunked => {
-                    aws_chunked::handle_put_decode_aws_chunked(
-                        &state,
-                        &parsed,
-                        key,
-                        &parts.headers,
-                        verified.as_ref(),
-                        body,
-                    )
-                    .await
-                }
-                WriteBodyRoute::Passthrough => {
-                    route_to_passthrough(&state, &parts, body, &parsed.request_id).await
-                }
-                WriteBodyRoute::RejectUnsupportedSignature => {
-                    reject_unsupported_signature(&parsed.request_id)
+            let route = classify_put_body_route(&parsed.extra_amz_headers, &parts.headers);
+            if let Err(resp) =
+                enforce_signed_streaming_decode_route(verified.as_ref(), route, &parsed.request_id)
+            {
+                resp
+            } else {
+                match route {
+                    WriteBodyRoute::Typed => put::handle_put(&state, &parsed, key, body).await,
+                    WriteBodyRoute::DecodeAwsChunked => {
+                        aws_chunked::handle_put_decode_aws_chunked(
+                            &state,
+                            &parsed,
+                            key,
+                            &parts.headers,
+                            verified.as_ref(),
+                            body,
+                        )
+                        .await
+                    }
+                    WriteBodyRoute::Passthrough => {
+                        route_to_passthrough(&state, &parts, body, &parsed.request_id).await
+                    }
+                    WriteBodyRoute::RejectUnsupportedSignature => {
+                        reject_unsupported_signature(&parsed.request_id)
+                    }
                 }
             }
         }
@@ -347,31 +356,47 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
             part_number,
             upload_id,
             ..
-        } => match classify_upload_part_body_route(&parsed.extra_amz_headers, &parts.headers) {
-            WriteBodyRoute::Typed => {
-                multipart::handle_upload_part(&state, &parsed, key, *part_number, upload_id, body)
-                    .await
+        } => {
+            let route = classify_upload_part_body_route(&parsed.extra_amz_headers, &parts.headers);
+            if let Err(resp) =
+                enforce_signed_streaming_decode_route(verified.as_ref(), route, &parsed.request_id)
+            {
+                resp
+            } else {
+                match route {
+                    WriteBodyRoute::Typed => {
+                        multipart::handle_upload_part(
+                            &state,
+                            &parsed,
+                            key,
+                            *part_number,
+                            upload_id,
+                            body,
+                        )
+                        .await
+                    }
+                    WriteBodyRoute::DecodeAwsChunked => {
+                        aws_chunked::handle_upload_part_decode_aws_chunked(
+                            &state,
+                            &parsed,
+                            key,
+                            *part_number,
+                            upload_id,
+                            &parts.headers,
+                            verified.as_ref(),
+                            body,
+                        )
+                        .await
+                    }
+                    WriteBodyRoute::Passthrough => {
+                        route_to_passthrough(&state, &parts, body, &parsed.request_id).await
+                    }
+                    WriteBodyRoute::RejectUnsupportedSignature => {
+                        reject_unsupported_signature(&parsed.request_id)
+                    }
+                }
             }
-            WriteBodyRoute::DecodeAwsChunked => {
-                aws_chunked::handle_upload_part_decode_aws_chunked(
-                    &state,
-                    &parsed,
-                    key,
-                    *part_number,
-                    upload_id,
-                    &parts.headers,
-                    verified.as_ref(),
-                    body,
-                )
-                .await
-            }
-            WriteBodyRoute::Passthrough => {
-                route_to_passthrough(&state, &parts, body, &parsed.request_id).await
-            }
-            WriteBodyRoute::RejectUnsupportedSignature => {
-                reject_unsupported_signature(&parsed.request_id)
-            }
-        },
+        }
         S3Operation::CompleteMultipartUpload { key, upload_id, .. } => {
             if has_unsupported_multipart_modifiers(&parsed.extra_amz_headers, &parts.headers) {
                 route_to_passthrough(&state, &parts, body, &parsed.request_id).await
@@ -434,6 +459,56 @@ fn reject_unsupported_signature(request_id: &str) -> Response<Body> {
         request_id,
     )
     .to_response()
+}
+
+/// Strict-mode fail-closed gate for signed HMAC aws-chunked uploads.
+///
+/// PR 1 fail-closed the request-level classifier for any
+/// `STREAMING-AWS4-HMAC-SHA256-PAYLOAD*` sentinel; PR 2 lifted that
+/// rejection so the aws-chunked decoder can verify each chunk's HMAC.
+/// But the decoder is only reached via `WriteBodyRoute::DecodeAwsChunked`.
+/// The body-route classifier can still downgrade a signed HMAC streaming
+/// request to `Passthrough` when the wire-format shape is something the
+/// decoder doesn't model — e.g. an unsupported `x-amz-trailer` algorithm
+/// on a `-TRAILER` sentinel, or a `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`
+/// (non-trailer) sentinel paired with an `x-amz-trailer` header. Without
+/// this gate, the passthrough handler re-signs the inbound request with
+/// the proxy's outbound credentials and the inbound chunk chain is never
+/// checked — exactly the fail-open hole PR 1 closed at the request level.
+///
+/// In strict mode, if the verifier classified the payload as one of the
+/// HMAC streaming sentinels AND the body-route classifier didn't reach
+/// `DecodeAwsChunked`, reject the request up front with
+/// `UnsupportedSignature` — the same code PR 1 used for unsupported
+/// streaming shapes. ECDSA's explicit `RejectUnsupportedSignature` route
+/// short-circuits ahead of this check (it already produces the right
+/// response, and we want its bespoke message).
+fn enforce_signed_streaming_decode_route(
+    verified: Option<&VerifiedRequest>,
+    route: WriteBodyRoute,
+    request_id: &str,
+) -> Result<(), Response<Body>> {
+    let Some(v) = verified else {
+        return Ok(());
+    };
+    let is_signed_hmac_streaming = matches!(
+        v.payload,
+        PayloadHashForSigning::StreamingAws4HmacSha256Payload
+            | PayloadHashForSigning::StreamingAws4HmacSha256PayloadTrailer
+    );
+    if !is_signed_hmac_streaming {
+        return Ok(());
+    }
+    match route {
+        WriteBodyRoute::DecodeAwsChunked | WriteBodyRoute::RejectUnsupportedSignature => Ok(()),
+        WriteBodyRoute::Typed | WriteBodyRoute::Passthrough => Err(S3Error::unsupported_signature(
+            "strict-mode signed aws-chunked upload could not be routed to the chunk-verifying \
+             decoder; the wire-format shape (e.g. unsupported x-amz-trailer algorithm, or a \
+             sentinel/trailer combination this proxy does not model) is unsupported",
+            request_id,
+        )
+        .to_response()),
+    }
 }
 
 /// Route through raw passthrough, rewriting the bucket in the path.

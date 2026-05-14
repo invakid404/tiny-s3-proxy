@@ -276,6 +276,31 @@ mod tests {
     #[test]
     #[ignore]
     fn debug_generate_vectors() {
+        // Verify the AWS-published seed signature reproduces against the
+        // slash-secret. If it does, all the published chunk and trailer
+        // signatures should reproduce too.
+        use hmac::{Hmac, KeyInit, Mac};
+        type HmacSha256 = Hmac<Sha256>;
+        fn h(k: &[u8], d: &[u8]) -> Vec<u8> {
+            let mut m = HmacSha256::new_from_slice(k).unwrap();
+            m.update(d);
+            m.finalize().into_bytes().to_vec()
+        }
+        let slash_k_date = h(b"AWS4wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", b"20130524");
+        let slash_k_region = h(&slash_k_date, b"us-east-1");
+        let slash_k_service = h(&slash_k_region, b"s3");
+        let slash_k_signing = h(&slash_k_service, b"aws4_request");
+        let seed_canonical_hash =
+            "cee3fed04b70f867d036f722359b0b1f2f0e5dc0efadbc082b76c4c60e316455";
+        let seed_sts = format!(
+            "AWS4-HMAC-SHA256\n20130524T000000Z\n20130524/us-east-1/s3/aws4_request\n{seed_canonical_hash}"
+        );
+        let slash_seed_sig = hex_lower(&h(&slash_k_signing, seed_sts.as_bytes()));
+        eprintln!("slash seed sig:    {slash_seed_sig}");
+        eprintln!(
+            "expected non-trailer seed: 4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9"
+        );
+
         let seed = "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9";
         let chunk1_sha = "bf718b6f653bebc184e1479f1935b8da974d701b893afcf49e701f3e2f9f9c5a";
         let chunk2_sha = "2edc986847e209b4016e141a6dc8716d3207350f416969382d431539bf292e4a";

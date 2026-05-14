@@ -4169,3 +4169,109 @@ async fn test_strict_sigv4_unsigned_trailer_still_works() {
         .into_bytes();
     assert_eq!(body.as_ref(), payload);
 }
+
+/// Strict mode + `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER` paired with
+/// an `x-amz-trailer` header whose algorithm the decoder doesn't model
+/// (e.g. `x-amz-checksum-md5`) must NOT be routed to passthrough — the
+/// body-route classifier downgrades the upload to `OtherStreaming →
+/// Passthrough`, and passthrough re-signs with the proxy's outbound
+/// credentials without verifying the inbound chunk chain. Under strict
+/// mode we reject up front with `UnsupportedSignature` rather than
+/// silently leaking a signed-aws-chunked upload past the chunk verifier.
+///
+/// Bug-revert reasoning: deleting `enforce_signed_streaming_decode_route`
+/// (or removing the strict gate at the PUT dispatch site) flips this
+/// from HTTP 400 `UnsupportedSignature` to passthrough-eventual-error
+/// (likely 4xx/5xx from VersityGW after the re-signed body arrives).
+/// The test would no longer find `UnsupportedSignature` in the body.
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4_rejects_signed_streaming_with_unsupported_trailer_algo() {
+    let (_container, backend_endpoint) = start_versitygw().await;
+    ensure_test_bucket(&backend_endpoint).await;
+    let (_strict, _wrong, proxy_endpoint, _cache, _creds) =
+        build_strict_proxy_stack(&backend_endpoint).await;
+    let proxy_host = proxy_endpoint.strip_prefix("http://").unwrap();
+
+    // Build a SigV4-signed envelope using STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER
+    // and an unsupported trailer algorithm. The body content doesn't
+    // matter — the dispatch-time strict gate fails closed before the
+    // decoder reads a single byte.
+    let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let date_yyyymmdd = &amz_date[..8];
+    let scope = format!("{date_yyyymmdd}/us-east-1/s3/aws4_request");
+    let body_hash = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER";
+    let bucket = TEST_BUCKET;
+    let key = "strict/signed-streaming-unsupported-trailer.bin";
+    let body_bytes = b"AAAAAAAA".to_vec();
+    let content_length = body_bytes.len();
+    let decoded_len = 0u64;
+
+    let canonical = format!(
+        "PUT\n/{bucket}/{key}\n\n\
+         content-encoding:aws-chunked\n\
+         content-length:{content_length}\n\
+         host:{proxy_host}\n\
+         x-amz-content-sha256:{body_hash}\n\
+         x-amz-date:{amz_date}\n\
+         x-amz-decoded-content-length:{decoded_len}\n\
+         x-amz-trailer:x-amz-checksum-md5\n\n\
+         content-encoding;content-length;host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length;x-amz-trailer\n\
+         {body_hash}",
+    );
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::{Digest, Sha256};
+    type HmacSha256 = Hmac<Sha256>;
+    fn h(k: &[u8], d: &[u8]) -> Vec<u8> {
+        let mut m = HmacSha256::new_from_slice(k).unwrap();
+        m.update(d);
+        m.finalize().into_bytes().to_vec()
+    }
+    let creq_hex = hex::encode({
+        let mut hash = Sha256::new();
+        hash.update(canonical.as_bytes());
+        hash.finalize()
+    });
+    let sts = format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{creq_hex}");
+    let k_date = h(
+        format!("AWS4{STRICT_INBOUND_SECRET}").as_bytes(),
+        date_yyyymmdd.as_bytes(),
+    );
+    let k_region = h(&k_date, b"us-east-1");
+    let k_service = h(&k_region, b"s3");
+    let k_signing = h(&k_service, b"aws4_request");
+    let signature = hex::encode(h(&k_signing, sts.as_bytes()));
+    let auth = format!(
+        "AWS4-HMAC-SHA256 Credential={STRICT_INBOUND_KEY}/{scope}, \
+         SignedHeaders=content-encoding;content-length;host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length;x-amz-trailer, \
+         Signature={signature}"
+    );
+
+    let headers = format!(
+        "PUT /{bucket}/{key} HTTP/1.1\r\n\
+         Host: {proxy_host}\r\n\
+         Content-Length: {content_length}\r\n\
+         Content-Encoding: aws-chunked\r\n\
+         x-amz-content-sha256: {body_hash}\r\n\
+         x-amz-date: {amz_date}\r\n\
+         x-amz-decoded-content-length: {decoded_len}\r\n\
+         x-amz-trailer: x-amz-checksum-md5\r\n\
+         authorization: {auth}\r\n\
+         Connection: close\r\n\
+         \r\n",
+    );
+    let mut request_bytes = headers.into_bytes();
+    request_bytes.extend_from_slice(&body_bytes);
+
+    let (status, raw_response) = raw_tcp_request(proxy_host, &request_bytes).await;
+    let resp_text = String::from_utf8_lossy(&raw_response);
+    assert_eq!(
+        status, 400,
+        "signed-streaming + unsupported trailer must reject with HTTP 400 in strict mode; \
+         got {status} body: {resp_text}",
+    );
+    assert!(
+        resp_text.contains("<Code>UnsupportedSignature</Code>"),
+        "expected UnsupportedSignature, got: {resp_text}",
+    );
+}
