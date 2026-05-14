@@ -41,6 +41,34 @@ pub const MAX_PRESIGNED_EXPIRES_SECS: u64 = 604_800;
 const ALGORITHM: &str = "AWS4-HMAC-SHA256";
 const ECDSA_ALGORITHM_PREFIX: &str = "AWS4-ECDSA-";
 
+/// Canonical (AWS-documented) casing for every `X-Amz-*` query parameter
+/// the parser cares about. The parser does case-insensitive matching to
+/// decide whether a key is "an auth param" but then enforces the *exact*
+/// casing — a mis-cased auth key cannot be silently accepted as an
+/// ordinary signed query param, which is what the detection layer is
+/// meant to prevent.
+const PRESIGNED_AUTH_NAMES: &[&str] = &[
+    "X-Amz-Algorithm",
+    "X-Amz-Credential",
+    "X-Amz-Date",
+    "X-Amz-Expires",
+    "X-Amz-SignedHeaders",
+    "X-Amz-Signature",
+    "X-Amz-Security-Token",
+    "X-Amz-Content-Sha256",
+];
+
+/// If `decoded_key` ASCII-case-insensitively matches one of the
+/// recognised presigned-auth parameter names, return that canonical
+/// (correctly-cased) name. Used by the parser to fail closed on
+/// `x-amz-signature` and friends.
+fn classify_presigned_auth_key(decoded_key: &str) -> Option<&'static str> {
+    PRESIGNED_AUTH_NAMES
+        .iter()
+        .find(|name| name.eq_ignore_ascii_case(decoded_key))
+        .copied()
+}
+
 /// Output of a successful presigned-URL auth parse. Shape matches what the
 /// header path produces in `SigV4Authorization`, plus the request time and
 /// validity window from `X-Amz-Date` / `X-Amz-Expires`.
@@ -108,38 +136,76 @@ pub fn parse_presigned_authorization(
 
         let decoded_key = percent_decode_for_query(raw_k);
         // Required-auth field names are ASCII; anything that isn't valid
-        // UTF-8 can't match any required name and is therefore just a
+        // UTF-8 can't match any recognised name and is therefore just a
         // non-auth query param.
         let key_str = match std::str::from_utf8(&decoded_key) {
             Ok(s) => s,
             Err(_) => continue,
         };
 
-        let slot = match key_str {
+        // Case-insensitive recognition; an exact-case mismatch fails
+        // closed so that e.g. `?X-Amz-Signature=A&x-amz-signature=B`
+        // can't be smuggled past the parser by treating the lowercase
+        // form as an ordinary signed query param.
+        let canonical_name = match classify_presigned_auth_key(key_str) {
+            Some(name) => name,
+            None => continue,
+        };
+        if key_str != canonical_name {
+            return Err(S3Error::authorization_header_malformed(
+                &format!(
+                    "presigned auth parameter {canonical_name} must be sent with the AWS canonical \
+                     casing"
+                ),
+                request_id,
+            ));
+        }
+
+        // `X-Amz-Content-Sha256` is a payload marker, not an auth field;
+        // `check_presigned_payload_marker` reads it from the raw query
+        // after parsing. The parser only enforces its canonical casing.
+        if canonical_name == "X-Amz-Content-Sha256" {
+            continue;
+        }
+        if canonical_name == "X-Amz-Security-Token" {
+            security_token_seen = true;
+            continue;
+        }
+
+        let slot = match canonical_name {
             "X-Amz-Algorithm" => &mut algorithm,
             "X-Amz-Credential" => &mut credential,
             "X-Amz-Date" => &mut amz_date,
             "X-Amz-Expires" => &mut expires_raw,
             "X-Amz-SignedHeaders" => &mut signed_headers_raw,
             "X-Amz-Signature" => &mut signature_raw,
-            "X-Amz-Security-Token" => {
-                security_token_seen = true;
-                continue;
-            }
-            _ => continue,
+            other => unreachable!("classify_presigned_auth_key emitted {other}"),
         };
 
         let decoded_value = percent_decode_for_query(raw_v);
         let value_str = std::str::from_utf8(&decoded_value).map_err(|_| {
             S3Error::authorization_header_malformed(
-                &format!("presigned auth field '{key_str}' is not valid UTF-8"),
+                &format!("presigned auth field {canonical_name} is not valid UTF-8"),
                 request_id,
             )
         })?;
+        // The SigV4 grammar is ASCII-only for each of these fields.
+        // Reject any byte >= 0x80 before storing the value — otherwise a
+        // non-ASCII credential / signed-headers / algorithm value would
+        // flow into `parse_credential` / `parse_signed_headers` and then
+        // into HMAC computation. Only the canonical six required auth
+        // values get this ASCII enforcement; ordinary signed query params
+        // are unaffected.
+        if value_str.bytes().any(|b| b >= 0x80) {
+            return Err(S3Error::authorization_header_malformed(
+                &format!("presigned auth field {canonical_name} contains non-ASCII bytes"),
+                request_id,
+            ));
+        }
 
         if slot.is_some() {
             return Err(S3Error::authorization_header_malformed(
-                &format!("presigned auth has duplicate {key_str}"),
+                &format!("presigned auth has duplicate {canonical_name}"),
                 request_id,
             ));
         }
@@ -643,6 +709,36 @@ mod tests {
             "",
         );
         let err = parse_presigned_authorization(&q, rid()).expect_err("missing signature");
+        assert_eq!(err.code, "AuthorizationHeaderMalformed");
+    }
+
+    #[test]
+    fn test_parse_lowercase_signature_alongside_canonical_rejected_as_duplicate() {
+        // Both a canonical `X-Amz-Signature` (with a syntactically valid
+        // hex blob) and a lowercase `x-amz-signature=<other>` are present.
+        // Previously the parser would silently treat the lowercase key as
+        // an ordinary signed query param, letting the request through with
+        // the canonical signature. After the case-insensitive recognition
+        // fix it now fails closed with `AuthorizationHeaderMalformed`.
+        // Deleting the `classify_presigned_auth_key` casing check flips
+        // this back to Ok.
+        let q = format!("{}&x-amz-signature=other-value", aws_doc_presigned_query());
+        let err = parse_presigned_authorization(&q, rid()).expect_err("mis-cased duplicate");
+        assert_eq!(err.code, "AuthorizationHeaderMalformed");
+    }
+
+    #[test]
+    fn test_parse_non_ascii_credential_rejected() {
+        // `%C3%89` decodes to U+00C9 (É) — valid UTF-8, but not ASCII.
+        // The SigV4 grammar is ASCII for the credential field; deleting
+        // the `b >= 0x80` enforcement would let this value flow into
+        // `parse_credential` / signing-key derivation and surface as a
+        // signature mismatch instead of the documented malformed error.
+        let q = aws_doc_presigned_query().replace(
+            "X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request",
+            "X-Amz-Credential=AKIA%C3%89%2F20130524%2Fus-east-1%2Fs3%2Faws4_request",
+        );
+        let err = parse_presigned_authorization(&q, rid()).expect_err("non-ASCII credential");
         assert_eq!(err.code, "AuthorizationHeaderMalformed");
     }
 
