@@ -183,7 +183,12 @@ pub fn parse_presigned_authorization(
 
         // STS session token gets the same shape rules as the other auth
         // params (single occurrence, non-empty, UTF-8 ASCII string) but
-        // is stored on its own slot since it's optional.
+        // is stored on its own slot since it's optional. "Opaque token"
+        // means no case-folding / trimming / form-decoding — base64-ish
+        // bytes like `+`, `/`, `=` MUST round-trip — but it doesn't mean
+        // accepting arbitrary Unicode. AWS STS tokens are ASCII, and the
+        // header-auth path already rejects non-ASCII via `HeaderValue::to_str`;
+        // matching that here keeps the two auth paths symmetric.
         if canonical_name == "X-Amz-Security-Token" {
             if security_token.is_some() {
                 return Err(S3Error::authorization_header_malformed(
@@ -201,6 +206,12 @@ pub fn parse_presigned_authorization(
             if value_str.is_empty() {
                 return Err(S3Error::authorization_header_malformed(
                     "presigned auth field X-Amz-Security-Token is empty",
+                    request_id,
+                ));
+            }
+            if value_str.bytes().any(|b| b >= 0x80) {
+                return Err(S3Error::authorization_header_malformed(
+                    "presigned auth field X-Amz-Security-Token is not valid ASCII",
                     request_id,
                 ));
             }
@@ -927,6 +938,26 @@ mod tests {
     fn test_parse_security_token_empty_rejected() {
         let q = format!("{}&X-Amz-Security-Token=", aws_doc_presigned_query());
         let err = parse_presigned_authorization(&q, rid()).expect_err("empty STS token");
+        assert_eq!(err.code, "AuthorizationHeaderMalformed");
+    }
+
+    #[test]
+    fn test_parse_security_token_non_ascii_rejected() {
+        // `%C3%A9` decodes to U+00E9 (é): valid UTF-8 but not ASCII. AWS
+        // STS tokens are ASCII bearer strings, and the header-auth path
+        // already rejects non-ASCII via `HeaderValue::to_str`. The other
+        // six presigned required auth fields enforce this same
+        // `b >= 0x80` check; deleting the matching enforcement here would
+        // let non-ASCII token bytes flow into the resolver's
+        // `subtle::ConstantTimeEq` compare and create an unnecessary
+        // asymmetry between the two auth paths. `+`, `/`, `=` are still
+        // accepted (covered by the round-trip / decoding tests above) —
+        // this only rejects bytes outside the ASCII range.
+        let q = format!(
+            "{}&X-Amz-Security-Token=tok%C3%A9",
+            aws_doc_presigned_query()
+        );
+        let err = parse_presigned_authorization(&q, rid()).expect_err("non-ASCII STS token");
         assert_eq!(err.code, "AuthorizationHeaderMalformed");
     }
 
