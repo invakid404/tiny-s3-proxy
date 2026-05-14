@@ -560,7 +560,21 @@ fn signature_policy_for_decode(
                 request_id,
             )),
         },
-        DecoderMode::UnsignedTrailer { .. } => Ok(ChunkSignaturePolicy::ShapeOnly),
+        DecoderMode::UnsignedTrailer { .. } => {
+            // Unsigned trailer has no chunk HMAC, so the eventual policy
+            // is `ShapeOnly`. But strict mode still requires that the
+            // request envelope was verified before the decoder runs;
+            // arriving here without a `VerifiedRequest` is the same
+            // dispatch-invariant violation we fail-closed on for the
+            // signed-mode arms.
+            if verified.is_none() {
+                return Err(S3Error::internal_error(
+                    "strict-mode aws-chunked decode reached without a VerifiedRequest",
+                    request_id,
+                ));
+            }
+            Ok(ChunkSignaturePolicy::ShapeOnly)
+        }
     }
 }
 
@@ -1668,6 +1682,53 @@ mod tests {
             "error should mention emptiness, got: {}",
             err.message,
         );
+    }
+
+    // ---- signature_policy_for_decode ----
+
+    /// Strict mode with an unsigned-trailer decoder mode but no
+    /// `VerifiedRequest` is the same dispatch-invariant violation as
+    /// strict-without-verified for the signed-mode arms. The eventual
+    /// policy is still `ShapeOnly` (unsigned trailer has no chunk HMAC),
+    /// but the verifier has to have run on the request envelope first;
+    /// silently returning `Ok(ShapeOnly)` here would mask the upstream
+    /// regression. Mirrors the NonTrailer / SignedTrailer arms.
+    ///
+    /// Bug-revert reasoning: dropping the `verified.is_none()` guard in
+    /// the UnsignedTrailer arm of `signature_policy_for_decode` flips
+    /// this from `Err(InternalError)` to `Ok(ShapeOnly)`.
+    #[test]
+    fn test_signature_policy_unsigned_trailer_strict_without_verified_internal_errors() {
+        let mode = DecoderMode::UnsignedTrailer {
+            expected_trailer_name: "x-amz-checksum-crc32".to_string(),
+            algorithm: ChecksumAlgorithm::Crc32,
+        };
+        match signature_policy_for_decode(&mode, None, true, "r") {
+            Ok(_) => {
+                panic!("strict-mode unsigned-trailer without verified must reject");
+            }
+            Err(err) => {
+                assert_eq!(err.code, "InternalError");
+            }
+        }
+    }
+
+    /// Companion: trust mode + unsigned-trailer is a legitimate combination
+    /// and must produce `ShapeOnly` regardless of whether a
+    /// `VerifiedRequest` is present (it never will be in trust mode).
+    /// This pins the trust-mode branch so the strict-mode invariant check
+    /// doesn't accidentally widen.
+    #[test]
+    fn test_signature_policy_unsigned_trailer_trust_mode_yields_shape_only() {
+        let mode = DecoderMode::UnsignedTrailer {
+            expected_trailer_name: "x-amz-checksum-crc32".to_string(),
+            algorithm: ChecksumAlgorithm::Crc32,
+        };
+        match signature_policy_for_decode(&mode, None, false, "r") {
+            Ok(ChunkSignaturePolicy::ShapeOnly) => {}
+            Ok(_) => panic!("trust-mode unsigned-trailer must produce ShapeOnly"),
+            Err(e) => panic!("trust-mode unsigned-trailer must succeed: {e:?}"),
+        }
     }
 
     /// Defense-in-depth: if an ECDSA streaming sentinel somehow reaches
