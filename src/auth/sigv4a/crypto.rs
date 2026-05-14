@@ -214,21 +214,53 @@ pub fn parse_der_signature_hex(signature_hex: &str) -> Result<Vec<u8>, SigV4aCry
 
 /// Parse a SigV4A streaming chunk / trailer signature.
 ///
-/// AWS CRT right-pads chunk and trailer signatures with `*` to the full
-/// 144-hex width so chunk frames can be parsed with a fixed-width
-/// signature field. The padding is **outside** the signature and is
-/// stripped before hex decoding; the trimmed bytes must be a valid DER
-/// ECDSA signature (validation happens inside [`parse_der_signature_hex`]).
+/// AWS CRT emits two shapes on the wire:
+///
+/// - **Unpadded:** lowercase hex of a valid DER ECDSA signature, no
+///   `*`, length ≤ `MAX_SIGV4A_DER_SIGNATURE_HEX_LEN` (144).
+/// - **Full-width padded:** lowercase hex of a valid DER ECDSA
+///   signature followed by `*` characters bringing the TOTAL length
+///   to exactly `MAX_SIGV4A_DER_SIGNATURE_HEX_LEN`. Every byte from
+///   the first `*` to the end must be `*` (no interspersed stars,
+///   no partial padding).
+///
+/// Partial trailing padding (`<der-hex>` + a handful of stars to a
+/// total length below 144) and interspersed `*` are explicitly
+/// rejected as `InvalidSignatureHex` — both are nonsensical wire
+/// shapes and have never appeared in a legitimate AWS CRT stream.
+///
+/// The accepted prefix is then DER-validated via
+/// [`parse_der_signature_hex`] (which calls `Signature::from_der`
+/// inline), so a successful return means the bytes are both a valid
+/// hex shape and a structurally valid ECDSA P-256 signature.
 pub fn parse_streaming_der_signature_hex_padded(
     signature_hex_with_optional_padding: &str,
 ) -> Result<Vec<u8>, SigV4aCryptoError> {
-    // Padded form must be exactly the max width (144), or unpadded must
-    // fit within that bound. Anything longer is malformed.
-    if signature_hex_with_optional_padding.len() > MAX_SIGV4A_DER_SIGNATURE_HEX_LEN {
+    let s = signature_hex_with_optional_padding;
+
+    if s.len() > MAX_SIGV4A_DER_SIGNATURE_HEX_LEN {
         return Err(SigV4aCryptoError::InvalidSignatureHex);
     }
-    let trimmed = signature_hex_with_optional_padding.trim_end_matches('*');
-    parse_der_signature_hex(trimmed)
+
+    if let Some(first_star) = s.find('*') {
+        // Padding present → strict AWS CRT shape: total width must be
+        // exactly the fixed-width max, and every byte from the first
+        // `*` through the end must be `*`. This forbids partial
+        // padding (`<der><*-run shorter than 144>`) and interspersed
+        // stars (`30*44...`) explicitly, rather than letting them
+        // fall into the indirect lowercase-hex check inside
+        // `parse_der_signature_hex`.
+        if s.len() != MAX_SIGV4A_DER_SIGNATURE_HEX_LEN {
+            return Err(SigV4aCryptoError::InvalidSignatureHex);
+        }
+        if !s.as_bytes()[first_star..].iter().all(|b| *b == b'*') {
+            return Err(SigV4aCryptoError::InvalidSignatureHex);
+        }
+        parse_der_signature_hex(&s[..first_star])
+    } else {
+        // No padding — accept any valid DER hex up to MAX.
+        parse_der_signature_hex(s)
+    }
 }
 
 /// Verify an ECDSA-P256/SHA-256 signature over `string_to_sign`.
@@ -458,6 +490,76 @@ mod tests {
         let over = "a".repeat(MAX_SIGV4A_DER_SIGNATURE_HEX_LEN + 1);
         let err = parse_streaming_der_signature_hex_padded(&over).expect_err("over-max");
         assert!(matches!(err, SigV4aCryptoError::InvalidSignatureHex));
+    }
+
+    /// `<valid-DER-hex>` followed by `*` characters that DON'T bring
+    /// the total length to exactly `MAX_SIGV4A_DER_SIGNATURE_HEX_LEN`
+    /// must reject. AWS CRT padding is either absent or fixed-width
+    /// to 144; partial trailing padding is nonsensical wire shape
+    /// and has never appeared in a legitimate stream. Without the
+    /// explicit length-equality guard, the trim-and-DER-validate
+    /// path would accept this input — not a crypto bypass (the
+    /// trimmed DER still verifies) but wire-format laxness that
+    /// hides real client bugs.
+    ///
+    /// Bug-revert reasoning: removing the
+    /// `s.len() != MAX_SIGV4A_DER_SIGNATURE_HEX_LEN` guard inside
+    /// the `Some(first_star) = s.find('*')` branch flips this from
+    /// `InvalidSignatureHex` to `Ok(_)`.
+    #[test]
+    fn test_streaming_padding_partial_rejected() {
+        // The partial-padding rejection fires BEFORE DER validation
+        // (`s.len() != MAX_SIGV4A_DER_SIGNATURE_HEX_LEN` is checked
+        // inside the `Some(first_star)` branch up front), so a short
+        // hex prefix + a few stars suffices as a fixture — there's
+        // no need to construct a real DER signature first. Pick a
+        // total length well below 144 so the partial-padding
+        // condition is unambiguous.
+        let padded = format!("{}{}", "deadbeef", "*".repeat(4));
+        assert!(padded.len() < MAX_SIGV4A_DER_SIGNATURE_HEX_LEN);
+        let err = parse_streaming_der_signature_hex_padded(&padded)
+            .expect_err("partial padding must reject");
+        assert!(matches!(err, SigV4aCryptoError::InvalidSignatureHex));
+    }
+
+    /// A `*` interspersed in the middle of the hex (so non-trailing)
+    /// must reject as `InvalidSignatureHex`. The check fires
+    /// explicitly via the "every byte from first_star through end
+    /// must be `*`" rule, NOT indirectly through
+    /// `parse_der_signature_hex`'s lowercase-hex failure on the
+    /// trimmed prefix. Explicit rejection makes the contract clearer
+    /// and keeps the error variant on the padding-shape path.
+    #[test]
+    fn test_streaming_padding_interspersed_star_rejected() {
+        // First star at byte 4, total length exactly 144, but byte 5
+        // is hex (not `*`) — so the trailing-only rule fails.
+        let mut buf = String::with_capacity(MAX_SIGV4A_DER_SIGNATURE_HEX_LEN);
+        buf.push_str("3044");
+        buf.push('*');
+        // Fill the rest with hex digits then a star — proves the
+        // explicit "all-stars-from-first-star" check fires.
+        let remaining = MAX_SIGV4A_DER_SIGNATURE_HEX_LEN - buf.len();
+        buf.push_str(&"a".repeat(remaining - 1));
+        buf.push('*');
+        assert_eq!(buf.len(), MAX_SIGV4A_DER_SIGNATURE_HEX_LEN);
+        let err = parse_streaming_der_signature_hex_padded(&buf)
+            .expect_err("interspersed star must reject");
+        assert!(matches!(err, SigV4aCryptoError::InvalidSignatureHex));
+    }
+
+    /// `<valid-DER-hex>` with NO padding (length < 144) is the
+    /// "unpadded" wire shape and must continue to be accepted. Pins
+    /// the no-padding branch so a future refactor that requires
+    /// padding doesn't accidentally reject unpadded clients.
+    #[test]
+    fn test_streaming_no_padding_accepted() {
+        let scalar = aws_reference_scalar(EXAMPLE_AKID, EXAMPLE_SECRET);
+        let signing_key = SigningKey::from_bytes(&scalar).expect("signing key");
+        let sig: Signature = signing_key.sign(b"some-message");
+        let der_hex = hex::encode(sig.to_der().as_ref());
+        assert!(der_hex.len() < MAX_SIGV4A_DER_SIGNATURE_HEX_LEN);
+        let parsed = parse_streaming_der_signature_hex_padded(&der_hex).expect("unpadded ok");
+        assert_eq!(parsed, hex::decode(&der_hex).unwrap());
     }
 
     #[test]
