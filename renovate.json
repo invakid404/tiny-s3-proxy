@@ -2,5 +2,12 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "local>invakid404/renovate-config"
+  ],
+  "packageRules": [
+    {
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["/^metrics($|-)/"],
+      "groupName": "metrics crates"
+    }
   ]
 }
