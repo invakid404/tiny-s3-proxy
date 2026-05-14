@@ -17,6 +17,7 @@
 pub mod crypto;
 pub mod parser;
 pub mod presigned;
+pub mod streaming;
 
 use crate::auth::credentials::InboundCredentialResolver;
 use crate::auth::sigv4::canonical::{

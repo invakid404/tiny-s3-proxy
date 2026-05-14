@@ -310,7 +310,9 @@ impl SigV4Verifier {
             PayloadHashForSigning::UnsignedPayload
             | PayloadHashForSigning::StreamingUnsignedPayloadTrailer
             | PayloadHashForSigning::StreamingAws4HmacSha256Payload
-            | PayloadHashForSigning::StreamingAws4HmacSha256PayloadTrailer => Ok(()),
+            | PayloadHashForSigning::StreamingAws4HmacSha256PayloadTrailer
+            | PayloadHashForSigning::StreamingAws4EcdsaP256Sha256Payload
+            | PayloadHashForSigning::StreamingAws4EcdsaP256Sha256PayloadTrailer => Ok(()),
         }
     }
 }

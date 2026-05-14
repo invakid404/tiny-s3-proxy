@@ -447,42 +447,42 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
 }
 
 /// Emit an `UnsupportedSignature` error response without contacting the
-/// backend. Used by the aws-chunked dispatch path when the routing
-/// classifier returns `RejectUnsupportedSignature` — currently for
-/// ECDSA-signed streaming uploads, whose inbound `chunk-signature` values
-/// are bound to the client's private key and cannot be re-signed or
-/// validated by the proxy.
+/// backend. The `WriteBodyRoute::RejectUnsupportedSignature` enum
+/// variant is currently kept for forward-compatibility with future
+/// genuinely-unsupported signature shapes — PR 5 of #63 lifted the
+/// previous ECDSA streaming reject (those uploads now decode via
+/// `auth::sigv4a::streaming`), so today no production call site
+/// reaches this function. Left in place so a future addition (e.g. a
+/// new signature algorithm AWS adds and we don't yet model) has a
+/// drop-in landing spot.
 fn reject_unsupported_signature(request_id: &str) -> Response<Body> {
     S3Error::unsupported_signature(
-        "aws-chunked ECDSA streaming uploads (STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD*) \
-         are not supported by this proxy",
+        "aws-chunked streaming upload uses a signature algorithm this proxy does not support",
         request_id,
     )
     .to_response()
 }
 
-/// Strict-mode fail-closed gate for signed HMAC aws-chunked uploads.
+/// Strict-mode fail-closed gate for signed aws-chunked uploads (HMAC
+/// AND ECDSA).
 ///
-/// PR 1 fail-closed the request-level classifier for any
-/// `STREAMING-AWS4-HMAC-SHA256-PAYLOAD*` sentinel; PR 2 lifted that
-/// rejection so the aws-chunked decoder can verify each chunk's HMAC.
+/// PR 1 fail-closed the request-level classifier for HMAC streaming
+/// sentinels; PR 2 lifted that for HMAC so the aws-chunked decoder
+/// could verify each chunk's HMAC. PR 5 lifted the same for ECDSA.
 /// But the decoder is only reached via `WriteBodyRoute::DecodeAwsChunked`.
-/// The body-route classifier can still downgrade a signed HMAC streaming
+/// The body-route classifier can still downgrade a signed-streaming
 /// request to `Passthrough` when the wire-format shape is something the
 /// decoder doesn't model — e.g. an unsupported `x-amz-trailer` algorithm
-/// on a `-TRAILER` sentinel, or a `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`
-/// (non-trailer) sentinel paired with an `x-amz-trailer` header. Without
-/// this gate, the passthrough handler re-signs the inbound request with
-/// the proxy's outbound credentials and the inbound chunk chain is never
-/// checked — exactly the fail-open hole PR 1 closed at the request level.
+/// on a `-TRAILER` sentinel, or a non-trailer streaming sentinel paired
+/// with an `x-amz-trailer` header. Without this gate, the passthrough
+/// handler re-signs the inbound request with the proxy's outbound
+/// credentials and the inbound chunk chain is never checked — exactly
+/// the fail-open hole PR 1 closed at the request level.
 ///
-/// In strict mode, if the verifier classified the payload as one of the
-/// HMAC streaming sentinels AND the body-route classifier didn't reach
-/// `DecodeAwsChunked`, reject the request up front with
-/// `UnsupportedSignature` — the same code PR 1 used for unsupported
-/// streaming shapes. ECDSA's explicit `RejectUnsupportedSignature` route
-/// short-circuits ahead of this check (it already produces the right
-/// response, and we want its bespoke message).
+/// In strict mode, if the verifier classified the payload as a signed
+/// streaming sentinel (HMAC or ECDSA) AND the body-route classifier
+/// didn't reach `DecodeAwsChunked`, reject the request up front with
+/// `UnsupportedSignature`.
 fn enforce_signed_streaming_decode_route(
     verified: Option<&VerifiedRequest>,
     route: WriteBodyRoute,
@@ -491,12 +491,14 @@ fn enforce_signed_streaming_decode_route(
     let Some(v) = verified else {
         return Ok(());
     };
-    let is_signed_hmac_streaming = matches!(
+    let is_signed_streaming = matches!(
         v.payload,
         PayloadHashForSigning::StreamingAws4HmacSha256Payload
             | PayloadHashForSigning::StreamingAws4HmacSha256PayloadTrailer
+            | PayloadHashForSigning::StreamingAws4EcdsaP256Sha256Payload
+            | PayloadHashForSigning::StreamingAws4EcdsaP256Sha256PayloadTrailer
     );
-    if !is_signed_hmac_streaming {
+    if !is_signed_streaming {
         return Ok(());
     }
     match route {
@@ -1804,56 +1806,43 @@ mod tests {
         assert!(body_str.contains("AccessDenied"));
     }
 
-    /// PUT with an ECDSA-signed aws-chunked streaming sentinel must be
-    /// rejected up front with HTTP 400 `UnsupportedSignature` before the
-    /// typed PUT path OR any upstream contact. The inbound `chunk-signature`
-    /// values are bound to the client's private key, so the previous
-    /// "route to passthrough" behaviour only ever failed on the upstream
-    /// after pointless backend traffic. The handler-level dispatch must
-    /// short-circuit; this test pins that shape.
+    /// PR 5 of #63 lifts ECDSA streaming from a dispatch-level reject
+    /// to a normal `DecodeAwsChunked` route. The handler now routes
+    /// ECDSA-signed aws-chunked PUTs into the typed Backend path with a
+    /// decoded body, just like HMAC streaming. This test pins that
+    /// routing: trust mode hits the decoder, the decoded bytes reach
+    /// the typed `put_object_from_path` call, and no
+    /// `UnsupportedSignature` error is emitted.
     ///
-    /// The companion integration test
-    /// `test_aws_chunked_ecdsa_streaming_rejected_as_unsupported_signature`
-    /// exercises the same routing through the full server stack.
+    /// Bug-revert reasoning: re-mapping
+    /// `AwsChunkedUploadMode::NonTrailerEcdsaP256` to
+    /// `WriteBodyRoute::RejectUnsupportedSignature` in
+    /// `aws_chunked_route_for` flips this back to the previous HTTP
+    /// 400 dispatch-level reject and the assertions below fail.
     #[tokio::test]
-    async fn test_aws_chunked_put_ecdsa_rejected_as_unsupported_signature() {
-        use axum::routing::any;
-        use std::sync::atomic::{AtomicU32, Ordering};
+    async fn test_aws_chunked_put_ecdsa_routes_to_decoder() {
+        use std::sync::atomic::Ordering;
 
-        // Well-formed-looking aws-chunked frame for "hello". The bytes never
-        // matter because dispatch rejects before any body parse / forward.
+        // Well-formed aws-chunked frame for "hello". Shape-only
+        // (trust-mode) ECDSA signature validation accepts variable-
+        // width DER hex, so `deadbeef` (8 chars) passes the shape
+        // check.
         let framed_body: &[u8] =
             b"5;chunk-signature=deadbeef\r\nhello\r\n0;chunk-signature=cafef00d\r\n\r\n";
 
-        // Mock upstream that bumps a counter on any request received. The
-        // load-bearing assertion is that this counter stays at 0.
-        let call_count = std::sync::Arc::new(AtomicU32::new(0));
-        let call_count_for_handler = call_count.clone();
-        let app = axum::Router::new().route(
-            "/{*path}",
-            any(move |_req: http::Request<Body>| {
-                let cc = call_count_for_handler.clone();
-                async move {
-                    cc.fetch_add(1, Ordering::SeqCst);
-                    http::Response::builder()
-                        .status(200)
-                        .body(Body::from("ok"))
-                        .unwrap()
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
         let cache = MockCache::new();
         let mut config = test_config();
-        config.backend_endpoint = format!("http://{addr}");
+        // No upstream HTTP path needed — the typed path goes through
+        // the MockBackend directly.
         config.cache_dir = cache.temp_dir.path().to_path_buf();
         let _ = std::fs::create_dir_all(cache.temp_dir.path().join("tmp"));
-        let backend = std::sync::Arc::new(MockBackend::new());
+        let backend = std::sync::Arc::new(MockBackend::new().with_put(Ok(
+            crate::backend::models::PutObjectOutput {
+                etag: Some("\"e\"".into()),
+                version_id: None,
+                extra_headers: Default::default(),
+            },
+        )));
         let state = std::sync::Arc::new(AppState {
             backend: backend.clone(),
             cache: std::sync::Arc::new(cache),
@@ -1885,27 +1874,20 @@ mod tests {
         let resp = handle_s3_request(State(state), req).await;
         assert_eq!(
             resp.status(),
-            400,
-            "ECDSA streaming must be rejected at dispatch with HTTP 400",
+            200,
+            "ECDSA streaming must route to the decoder under trust mode",
         );
         let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let body_str = String::from_utf8_lossy(&body);
         assert!(
-            body_str.contains("<Code>UnsupportedSignature</Code>"),
-            "expected UnsupportedSignature S3 error code, got: {body_str}",
+            !body_str.contains("UnsupportedSignature"),
+            "must not emit UnsupportedSignature; got: {body_str}",
         );
-        // Typed PUT path must NOT have been invoked.
+        // Typed Backend path took the call (one put_object_from_path).
         let typed_calls = backend.total_calls.load(Ordering::Relaxed);
-        assert_eq!(
-            typed_calls, 0,
-            "typed Backend path must not be invoked when ECDSA is rejected (got {typed_calls} calls)",
-        );
-        // Upstream HTTP mock must NOT have been contacted — the
-        // "rejected before backend contact" contract.
-        assert_eq!(
-            call_count.load(Ordering::SeqCst),
-            0,
-            "upstream handler must not be invoked when ECDSA is rejected up front",
+        assert!(
+            typed_calls >= 1,
+            "typed Backend put_object_from_path must be invoked (got {typed_calls} calls)",
         );
     }
 

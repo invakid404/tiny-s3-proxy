@@ -2347,20 +2347,24 @@ async fn test_aws_chunked_unsigned_trailer_upload_part_routes_to_decoder() {
     );
 }
 
-/// ECDSA-signed streaming uploads (`STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD`)
-/// must be rejected up front with `UnsupportedSignature` (HTTP 400) rather
-/// than silently routed through passthrough. The inbound `chunk-signature`
-/// values are bound to the client's private key, so passthrough would
-/// re-sign with the proxy backend credentials and the chunk signatures
-/// would never validate on the upstream — failing fast avoids pointless
-/// backend traffic.
+/// PR 5 of #63 turned `STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD` from a
+/// dispatch-level reject into a normal decoded route: the aws-chunked
+/// decoder shape-validates the variable-width ECDSA `chunk-signature=`
+/// (HMAC's strict 64-hex check would have rejected `deadbeef`-style
+/// short signatures), strips the streaming framing, and ships the
+/// decoded body to the upstream as a typed PUT. Trust mode here means
+/// no strict-mode SigV4A verification runs; the decoder still has to
+/// accept the shape and produce a body that the typed upload path
+/// forwards.
 ///
-/// Pins HTTP 400 + `<Code>UnsupportedSignature</Code>` + zero upstream
-/// contact, so a regression that routes ECDSA back to passthrough flips
-/// all three assertions.
+/// Bug-revert reasoning: re-mapping
+/// `AwsChunkedUploadMode::NonTrailerEcdsaP256` to
+/// `WriteBodyRoute::RejectUnsupportedSignature` flips this from an
+/// `2xx` to HTTP 400 `UnsupportedSignature` and the upstream-contact
+/// assertion (`received_count >= 1`) fails.
 #[tokio::test]
 #[ignore]
-async fn test_aws_chunked_ecdsa_streaming_rejected_as_unsupported_signature() {
+async fn test_aws_chunked_ecdsa_streaming_routes_to_decoder() {
     let mock = CountingMockUpstream::new();
     let mock_endpoint = start_counting_mock_upstream(mock.clone()).await;
     let cache_dir = tempfile::TempDir::new().expect("cache dir");
@@ -2368,13 +2372,13 @@ async fn test_aws_chunked_ecdsa_streaming_rejected_as_unsupported_signature() {
         build_proxy_stack_with_opts(&mock_endpoint, cache_dir, |_cfg| {}).await;
     let proxy_host = proxy_endpoint.strip_prefix("http://").unwrap();
 
-    // Single-chunk framed body, same shape as the trailer-mode test.
-    let body: Vec<u8> =
-        b"8;chunk-signature=0000000000000000000000000000000000000000000000000000000000000000\r\n\
+    // Single-chunk framed body. Trust mode shape-only check accepts
+    // variable-width DER hex (here a short 8-char placeholder).
+    let body: Vec<u8> = b"8;chunk-signature=deadbeefdeadbeef\r\n\
         abcdefgh\r\n\
-        0;chunk-signature=0000000000000000000000000000000000000000000000000000000000000000\r\n\
+        0;chunk-signature=cafef00dcafef00d\r\n\
         \r\n"
-            .to_vec();
+        .to_vec();
     let headers = format!(
         "PUT /{TEST_BUCKET}/cold-review/aws-chunked-ecdsa-routing HTTP/1.1\r\n\
          Host: {proxy_host}\r\n\
@@ -2389,22 +2393,22 @@ async fn test_aws_chunked_ecdsa_streaming_rejected_as_unsupported_signature() {
     let mut request_bytes = headers.into_bytes();
     request_bytes.extend_from_slice(&body);
     let (status, raw_response) = raw_tcp_request(proxy_host, &request_bytes).await;
-    assert_eq!(
-        status, 400,
-        "ECDSA streaming must be rejected with HTTP 400",
-    );
     let resp_text = String::from_utf8_lossy(&raw_response);
     assert!(
-        resp_text.contains("<Code>UnsupportedSignature</Code>"),
-        "expected UnsupportedSignature S3 error code, got: {resp_text}",
+        !resp_text.contains("<Code>UnsupportedSignature</Code>"),
+        "ECDSA streaming must NOT be rejected as UnsupportedSignature; got: {resp_text}",
     );
-    // Upstream must not have been contacted: this is the load-bearing
-    // "rejected before backend contact" assertion.
-    assert_eq!(
+    assert!(
+        (200..400).contains(&status),
+        "ECDSA streaming PUT through the decoder should succeed (status={status}); resp={resp_text}",
+    );
+    // Upstream MUST have been contacted exactly once with the decoded
+    // body — the load-bearing "ECDSA is decoded, not rejected" check.
+    assert!(
         mock.received_count
-            .load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "upstream must not be contacted when ECDSA is rejected up front",
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= 1,
+        "upstream must be contacted exactly once with the decoded body",
     );
 }
 
