@@ -14,6 +14,7 @@
 pub mod canonical;
 pub mod parser;
 pub mod payload;
+pub mod presigned;
 pub mod streaming;
 
 use crate::auth::credentials::InboundCredentialResolver;

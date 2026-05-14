@@ -114,7 +114,7 @@ fn aws_uri_encode_bytes(bytes: &[u8]) -> String {
 /// values may contain arbitrary bytes (e.g., a binary value carried via
 /// `%FF`). Converting through `String::from_utf8_lossy` would replace those
 /// bytes with U+FFFD and corrupt the canonical request.
-fn percent_decode_for_query(s: &str) -> Vec<u8> {
+pub(crate) fn percent_decode_for_query(s: &str) -> Vec<u8> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
