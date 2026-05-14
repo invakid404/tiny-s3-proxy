@@ -40,8 +40,8 @@ pub use crate::auth::verified::VerifiedRequest;
 
 use self::canonical::build_canonical_request;
 use self::parser::{
-    CredentialScope, enforce_skew, ensure_scope_date_matches, parse_authorization,
-    resolve_request_time,
+    AuthorizationAlgorithm, CredentialScope, classify_authorization_algorithm, enforce_skew,
+    ensure_scope_date_matches, parse_authorization, resolve_request_time,
 };
 use self::payload::{PayloadHashForSigning, classify_payload_header, verify_payload_matches_hash};
 
@@ -126,7 +126,32 @@ impl SigV4Verifier {
             (false, true) => {
                 presigned::verify_presigned_request(parts, self.resolver.as_ref(), request_id, now)
             }
-            (true, false) => self.verify_authorization_header_at(parts, request_id, now),
+            (true, false) => {
+                // Cheap algorithm sniff so SigV4A (`AWS4-ECDSA-P256-SHA256`)
+                // requests are routed to their own parser/verifier; HMAC
+                // requests stay on the existing path. Unknown algorithms
+                // fall through to the HMAC parser, which surfaces a
+                // structured `AuthorizationHeaderMalformed` for them.
+                let raw = parts
+                    .headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                match classify_authorization_algorithm(raw) {
+                    AuthorizationAlgorithm::SigV4aEcdsaP256Sha256 => {
+                        crate::auth::sigv4a::verify_authorization_header_at(
+                            parts,
+                            self.resolver.as_ref(),
+                            self.max_skew,
+                            request_id,
+                            now,
+                        )
+                    }
+                    AuthorizationAlgorithm::SigV4HmacSha256 | AuthorizationAlgorithm::Other => {
+                        self.verify_authorization_header_at(parts, request_id, now)
+                    }
+                }
+            }
             (false, false) => Err(S3Error::missing_authentication_token(
                 "request is missing the Authorization header or X-Amz-Signature query parameter",
                 request_id,
