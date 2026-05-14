@@ -79,16 +79,19 @@ impl StreamingSigV4Context {
     /// Seed a streaming context from the request-level verification result.
     /// The seed signature for the first chunk is the request's own signature
     /// (`request_signature_hex`); subsequent chunks chain forward from there.
-    pub fn from_verified(verified: &VerifiedRequest) -> Self {
-        Self {
-            signing_key: verified.signing_key.0.clone(),
+    ///
+    /// Returns `None` for SigV4A requests; their per-chunk verification
+    /// uses ECDSA, not HMAC, and is built by
+    /// [`crate::auth::sigv4a::streaming::StreamingSigV4aContext::from_verified`]
+    /// instead (added in a follow-up commit).
+    pub fn from_verified(verified: &VerifiedRequest) -> Option<Self> {
+        let signing_key = verified.hmac_signing_key()?;
+        Some(Self {
+            signing_key: signing_key.clone_bytes(),
             amz_date: verified.amz_date.clone(),
-            scope: format!(
-                "{}/{}/{}/aws4_request",
-                verified.scope.date_yyyymmdd, verified.scope.region, verified.scope.service,
-            ),
+            scope: verified.credential_scope.credential_scope_string(),
             previous_signature_hex: verified.request_signature_hex.clone(),
-        }
+        })
     }
 
     /// Testing seam: build a context from raw inputs. Production callers

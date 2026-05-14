@@ -27,6 +27,7 @@ pub mod streaming;
 use crate::auth::credentials::{
     CredentialResolveError, InboundCredential, InboundCredentialResolver,
 };
+use crate::auth::verified::{VerifiedCredentialScope, VerifiedSigningContext};
 use crate::s3::errors::S3Error;
 use chrono::{DateTime, Utc};
 use http::HeaderName;
@@ -34,6 +35,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
+
+pub use crate::auth::verified::VerifiedRequest;
 
 use self::canonical::build_canonical_request;
 use self::parser::{
@@ -44,14 +47,23 @@ use self::payload::{PayloadHashForSigning, classify_payload_header, verify_paylo
 
 /// SigV4 signing key (HMAC-SHA256 output, 32 bytes), zeroized on drop.
 ///
-/// PR 2 will reuse this for chunk-by-chunk verification of aws-chunked
-/// uploads; keeping it in `Zeroizing` from the start avoids leaving HMAC
-/// keys lingering in memory after a request finishes.
+/// Reused for chunk-by-chunk verification of aws-chunked uploads (see
+/// [`streaming::StreamingSigV4Context`]); keeping it in `Zeroizing` from
+/// the start avoids leaving HMAC keys lingering in memory after a request
+/// finishes.
 pub struct SigningKey(Zeroizing<[u8; 32]>);
 
 impl SigningKey {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0[..]
+    }
+
+    /// Clone the underlying 32-byte HMAC key into a fresh `Zeroizing`
+    /// buffer. Used by the streaming verifier to carry a private copy of
+    /// the signing key across chunk boundaries without exposing it
+    /// through the public API.
+    pub(crate) fn clone_bytes(&self) -> Zeroizing<[u8; 32]> {
+        self.0.clone()
     }
 }
 
@@ -59,21 +71,6 @@ impl std::fmt::Debug for SigningKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("SigningKey(<32 bytes>)")
     }
-}
-
-/// Output of a successful header/canonical-request verification. The
-/// signature itself has matched; the payload-hash check is separate (see
-/// `verify_payload_hash`) so callers can avoid buffering bodies for requests
-/// that don't sign them.
-#[derive(Debug)]
-pub struct VerifiedRequest {
-    pub access_key_id: Arc<str>,
-    pub scope: CredentialScope,
-    pub signed_headers: Vec<HeaderName>,
-    pub request_signature_hex: String,
-    pub signing_key: SigningKey,
-    pub amz_date: String,
-    pub payload: PayloadHashForSigning,
 }
 
 /// Top-level verifier. One instance is shared via `Arc` across all requests.
@@ -239,10 +236,10 @@ impl SigV4Verifier {
 
         Ok(VerifiedRequest {
             access_key_id: credential.access_key_id.clone(),
-            scope: auth.scope,
+            credential_scope: VerifiedCredentialScope::SigV4(auth.scope),
             signed_headers: auth.signed_headers,
             request_signature_hex: auth.signature_hex,
-            signing_key,
+            signing_context: VerifiedSigningContext::HmacSha256(signing_key),
             amz_date,
             payload,
         })

@@ -38,6 +38,7 @@ use crate::auth::sigv4::{
     VerifiedRequest, build_string_to_sign, derive_signing_key, parse_hex32,
     resolve_credential_for_sigv4,
 };
+use crate::auth::verified::{VerifiedCredentialScope, VerifiedSigningContext};
 use crate::s3::errors::S3Error;
 use chrono::{DateTime, Utc};
 use http::HeaderName;
@@ -447,10 +448,10 @@ pub fn verify_presigned_request(
 
     Ok(VerifiedRequest {
         access_key_id: credential.access_key_id.clone(),
-        scope: pres.scope,
+        credential_scope: VerifiedCredentialScope::SigV4(pres.scope),
         signed_headers: pres.signed_headers,
         request_signature_hex: pres.signature_hex,
-        signing_key,
+        signing_context: VerifiedSigningContext::HmacSha256(signing_key),
         amz_date: pres.amz_date,
         payload,
     })

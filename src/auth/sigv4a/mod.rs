@@ -15,4 +15,19 @@
 
 pub mod crypto;
 
+use chrono::NaiveDate;
+
 pub const SIGV4A_ALGORITHM: &str = "AWS4-ECDSA-P256-SHA256";
+
+/// Credential scope for SigV4A header / presigned auth.
+///
+/// Differs from [`crate::auth::sigv4::parser::CredentialScope`] in the
+/// absence of a region component — SigV4A scopes are regionless, and the
+/// signed region set lives in `x-amz-region-set` (header) or
+/// `X-Amz-Region-Set` (query) instead.
+#[derive(Debug, Clone)]
+pub struct SigV4aCredentialScope {
+    pub date: NaiveDate,
+    pub date_yyyymmdd: String,
+    pub service: String,
+}

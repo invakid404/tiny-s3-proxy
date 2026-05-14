@@ -552,9 +552,21 @@ fn signature_policy_for_decode(
     }
     match mode {
         DecoderMode::NonTrailer | DecoderMode::SignedTrailer { .. } => match verified {
-            Some(v) => Ok(ChunkSignaturePolicy::Verify(
-                StreamingSigV4Context::from_verified(v),
-            )),
+            Some(v) => {
+                // PR 5 introduces SigV4A streaming with a separate ECDSA
+                // context. For now (commit 2 of PR 5), all signed-streaming
+                // routes go through HMAC; if a future regression lets an
+                // ECDSA-shaped `VerifiedRequest` reach here we'd rather
+                // fail closed with `InternalError` than silently downgrade.
+                match StreamingSigV4Context::from_verified(v) {
+                    Some(ctx) => Ok(ChunkSignaturePolicy::Verify(ctx)),
+                    None => Err(S3Error::internal_error(
+                        "strict-mode aws-chunked decode reached with a \
+                         non-HMAC VerifiedRequest",
+                        request_id,
+                    )),
+                }
+            }
             None => Err(S3Error::internal_error(
                 "strict-mode aws-chunked decode reached without a VerifiedRequest",
                 request_id,
