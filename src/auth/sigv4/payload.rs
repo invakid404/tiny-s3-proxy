@@ -24,7 +24,10 @@ use sha2::{Digest, Sha256};
 /// context for downstream code to know whether the body still needs hashing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PayloadHashForSigning {
-    SignedSha256 { hex: String, bytes: [u8; 32] },
+    SignedSha256 {
+        hex: String,
+        bytes: [u8; 32],
+    },
     UnsignedPayload,
     StreamingUnsignedPayloadTrailer,
     /// `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` — signed chunks, no trailer.

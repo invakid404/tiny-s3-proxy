@@ -124,12 +124,17 @@ impl StreamingSigV4Context {
         chunk_sha256_hex: &str,
         supplied_signature_hex: &str,
     ) -> Result<(), StreamingSigV4Error> {
-        let supplied_bytes = parse_hex32(supplied_signature_hex)
-            .ok_or_else(|| StreamingSigV4Error::InvalidSignatureHex(supplied_signature_hex.into()))?;
+        let supplied_bytes = parse_hex32(supplied_signature_hex).ok_or_else(|| {
+            StreamingSigV4Error::InvalidSignatureHex(supplied_signature_hex.into())
+        })?;
 
         let sts = format!(
             "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{}\n{}",
-            self.amz_date, self.scope, self.previous_signature_hex, EMPTY_SHA256_HEX, chunk_sha256_hex,
+            self.amz_date,
+            self.scope,
+            self.previous_signature_hex,
+            EMPTY_SHA256_HEX,
+            chunk_sha256_hex,
         );
         let computed = hmac_sha256(&self.signing_key[..], sts.as_bytes());
 
@@ -151,8 +156,9 @@ impl StreamingSigV4Context {
         canonical_trailer_bytes: &[u8],
         supplied_signature_hex: &str,
     ) -> Result<(), StreamingSigV4Error> {
-        let supplied_bytes = parse_hex32(supplied_signature_hex)
-            .ok_or_else(|| StreamingSigV4Error::InvalidSignatureHex(supplied_signature_hex.into()))?;
+        let supplied_bytes = parse_hex32(supplied_signature_hex).ok_or_else(|| {
+            StreamingSigV4Error::InvalidSignatureHex(supplied_signature_hex.into())
+        })?;
 
         let mut hasher = Sha256::new();
         hasher.update(canonical_trailer_bytes);
@@ -296,9 +302,8 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(canonical);
         let trailer_hash = hex_lower(&hasher.finalize());
-        let sts_t = format!(
-            "AWS4-HMAC-SHA256-TRAILER\n{amz_date}\n{scope}\n{sig_zero}\n{trailer_hash}",
-        );
+        let sts_t =
+            format!("AWS4-HMAC-SHA256-TRAILER\n{amz_date}\n{scope}\n{sig_zero}\n{trailer_hash}",);
         let sig_t = hex_lower(&hmac_sha256(&key, sts_t.as_bytes()));
         eprintln!("trailer_sig = {sig_t}");
     }

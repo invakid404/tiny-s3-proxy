@@ -3663,45 +3663,459 @@ async fn test_strict_sigv4_rejects_sts_token_as_invalid_token() {
     );
 }
 
-#[tokio::test]
-#[ignore]
-async fn test_strict_sigv4_rejects_signed_aws_chunked_as_unsupported_signature() {
-    let (_container, backend_endpoint) = start_versitygw().await;
-    ensure_test_bucket(&backend_endpoint).await;
-    let (_strict, _wrong, proxy_endpoint, _cache, _creds) =
-        build_strict_proxy_stack(&backend_endpoint).await;
+// ---------------------------------------------------------------------------
+// Strict-mode aws-chunked signature verification (PR 2 of #63)
+// ---------------------------------------------------------------------------
 
-    // Drive a raw signed aws-chunked PUT. We just need the
-    // x-amz-content-sha256 sentinel to be STREAMING-AWS4-HMAC-SHA256-PAYLOAD;
-    // the verifier rejects it before reading the body, so we don't need
-    // to actually emit valid chunked framing.
-    let http_client = reqwest::Client::new();
-    let url = format!("{proxy_endpoint}/{TEST_BUCKET}/chunked.txt");
-    let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-    let date_yyyymmdd = &amz_date[..8];
-    let body_hash = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
-    let host = proxy_endpoint
-        .trim_start_matches("http://")
-        .trim_end_matches('/');
-    let canonical = format!(
-        "PUT\n/{TEST_BUCKET}/chunked.txt\n\nhost:{host}\nx-amz-content-sha256:{body_hash}\nx-amz-date:{amz_date}\n\nhost;x-amz-content-sha256;x-amz-date\n{body_hash}"
+/// Build a strict-mode proxy stack against an HTTPS-backed VersityGW. Same
+/// shape as `build_strict_proxy_stack` + `build_proxy_stack_with_https_backend`
+/// — needed for the signed-aws-chunked round-trip tests where the SDK we
+/// hand-roll the request for needs an HTTPS upstream the proxy can forward
+/// the decoded body to.
+async fn build_strict_proxy_stack_with_https_backend(
+    backend_endpoint: &str,
+    ca_pem: &str,
+) -> (String, tempfile::TempDir, tempfile::NamedTempFile) {
+    use std::io::Write;
+
+    let mut creds_file =
+        tempfile::NamedTempFile::new().expect("create strict-mode credentials tempfile");
+    let creds_json = serde_json::json!({
+        "version": 1,
+        "credentials": [
+            { "access_key_id": STRICT_INBOUND_KEY, "secret_access_key": STRICT_INBOUND_SECRET }
+        ]
+    });
+    creds_file
+        .write_all(creds_json.to_string().as_bytes())
+        .expect("write strict-mode credentials");
+
+    let cache_dir = tempfile::TempDir::new().expect("create temp cache dir");
+    let mut config = default_proxy_test_config(
+        backend_endpoint,
+        AuthMode::TrustedInternal,
+        vec![],
+        cache_dir.path(),
     );
+    config.inbound_auth_verify_signatures = true;
+    config.inbound_credentials_path = Some(creds_file.path().to_path_buf());
+
+    let aws_http_client = aws_http_client_trusting(ca_pem);
+    let s3_backend =
+        backend::client::S3Backend::from_config_with_http_client(&config, aws_http_client)
+            .await
+            .expect("build S3 backend (strict + HTTPS)");
+
+    let cache_policy = cache::policy::CachePolicy::new(
+        config.cacheable_prefixes.clone(),
+        config.cache_max_object_bytes,
+    );
+    let disk_cache = cache::DiskCache::new(
+        config.cache_dir.clone(),
+        config.cache_max_bytes,
+        cache_policy.clone(),
+    )
+    .await
+    .expect("build disk cache");
+
+    let singleflight = Arc::new(cache::SingleFlight::new());
+    let authenticator = Arc::from(auth::create_request_gate(&config));
+
+    let store = auth::credentials::StaticInboundCredentials::load_from_file(creds_file.path())
+        .expect("load strict-mode credentials");
+    let resolver: Arc<dyn auth::credentials::InboundCredentialResolver> = Arc::new(store);
+    let verifier = Arc::new(auth::sigv4::SigV4Verifier::new(
+        resolver,
+        std::time::Duration::from_secs(config.inbound_auth_max_skew_secs),
+    ));
+
+    let passthrough_http_client = reqwest_client_trusting(ca_pem);
+
+    let state = Arc::new(handlers::AppState {
+        backend: Arc::new(s3_backend),
+        cache: Arc::new(disk_cache),
+        singleflight,
+        auth: authenticator,
+        inbound_sigv4: Some(verifier),
+        policy: cache_policy,
+        config: Arc::new(config),
+        frontend_bucket: Arc::from(TEST_BUCKET),
+        backend_bucket: Arc::from(TEST_BUCKET),
+        http_client: passthrough_http_client,
+    });
+
+    let app = axum::Router::new()
+        .fallback(handlers::handle_s3_request)
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let proxy_endpoint = format!("http://127.0.0.1:{}", addr.port());
+
+    (proxy_endpoint, cache_dir, creds_file)
+}
+
+/// Inputs for a manually-constructed signed aws-chunked PUT. Used so the
+/// strict-mode tests can mint a request whose chunk signatures actually
+/// validate against the strict verifier, AND so they can mutate the
+/// emitted bytes (corrupt a chunk signature) to exercise the
+/// `SignatureDoesNotMatch` rejection path.
+struct SignedChunkedPut {
+    request_bytes: Vec<u8>,
+    payload_len: usize,
+}
+
+/// Sign + frame a `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` PUT request against
+/// the strict-mode credentials. Returns the full HTTP/1.1 request bytes
+/// suitable for `raw_tcp_request`. `chunks` is the split of the payload
+/// into wire-level chunks; the helper appends the zero terminator chunk.
+///
+/// If `tamper_chunk_index` is `Some(i)`, the i-th chunk's signature byte
+/// is flipped so the wire-level signature no longer chains. This is the
+/// `expect_err`-style hook for the mismatch tests.
+fn build_signed_aws_chunked_put_non_trailer(
+    proxy_host: &str,
+    bucket: &str,
+    key: &str,
+    chunks: &[&[u8]],
+    tamper_chunk_index: Option<usize>,
+) -> SignedChunkedPut {
     use hmac::{Hmac, KeyInit, Mac};
     use sha2::{Digest, Sha256};
     type HmacSha256 = Hmac<Sha256>;
     fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
-        let mut mac = HmacSha256::new_from_slice(key).unwrap();
-        mac.update(data);
-        mac.finalize().into_bytes().to_vec()
+        let mut m = HmacSha256::new_from_slice(key).unwrap();
+        m.update(data);
+        m.finalize().into_bytes().to_vec()
     }
+
+    let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let date_yyyymmdd = amz_date[..8].to_string();
+    let scope = format!("{date_yyyymmdd}/us-east-1/s3/aws4_request");
+    let body_hash = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+
+    let payload_len: usize = chunks.iter().map(|c| c.len()).sum();
+    // Worked out content-length: sum of (hex-size + ";chunk-signature=" + 64 +
+    // "\r\n" + chunk_len + "\r\n") for each data chunk, plus the same for
+    // the zero terminator (size "0", empty payload, trailing "\r\n").
+    let mut content_length: usize = 0;
+    for c in chunks {
+        let hex_size = format!("{:x}", c.len());
+        content_length += hex_size.len() + ";chunk-signature=".len() + 64 + 2 + c.len() + 2;
+    }
+    // Zero chunk: "0" + ";chunk-signature=" + 64 + "\r\n" + "\r\n"
+    content_length += 1 + ";chunk-signature=".len() + 64 + 2 + 2;
+
+    // Build the canonical request. Signed headers (alphabetical):
+    // content-encoding, content-length, host, x-amz-content-sha256,
+    // x-amz-date, x-amz-decoded-content-length.
+    let canonical = format!(
+        "PUT\n/{bucket}/{key}\n\n\
+         content-encoding:aws-chunked\n\
+         content-length:{content_length}\n\
+         host:{proxy_host}\n\
+         x-amz-content-sha256:{body_hash}\n\
+         x-amz-date:{amz_date}\n\
+         x-amz-decoded-content-length:{payload_len}\n\n\
+         content-encoding;content-length;host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length\n\
+         {body_hash}"
+    );
     let creq_hex = hex::encode({
         let mut h = Sha256::new();
         h.update(canonical.as_bytes());
         h.finalize()
     });
-    let sts = format!(
-        "AWS4-HMAC-SHA256\n{amz_date}\n{date_yyyymmdd}/us-east-1/s3/aws4_request\n{creq_hex}"
+    let sts = format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{creq_hex}");
+    let k_date = hmac(
+        format!("AWS4{STRICT_INBOUND_SECRET}").as_bytes(),
+        date_yyyymmdd.as_bytes(),
     );
+    let k_region = hmac(&k_date, b"us-east-1");
+    let k_service = hmac(&k_region, b"s3");
+    let k_signing = hmac(&k_service, b"aws4_request");
+    let seed_signature = hex::encode(hmac(&k_signing, sts.as_bytes()));
+    let auth_header = format!(
+        "AWS4-HMAC-SHA256 Credential={STRICT_INBOUND_KEY}/{scope}, \
+         SignedHeaders=content-encoding;content-length;host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length, \
+         Signature={seed_signature}"
+    );
+
+    // Build the body: each chunk's signature is HMAC-SHA256(kSigning, STS)
+    // chained from the previous signature, with `EMPTY_SHA256_HEX` for the
+    // "empty" line and the chunk SHA-256 for the "current chunk" line.
+    const EMPTY_SHA256_HEX: &str =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    fn chunk_sig(
+        k_signing: &[u8],
+        amz_date: &str,
+        scope: &str,
+        prev_sig: &str,
+        chunk_hash_hex: &str,
+    ) -> String {
+        use hmac::{Hmac, KeyInit, Mac};
+        use sha2::Sha256;
+        type HmacSha256 = Hmac<Sha256>;
+        let sts = format!(
+            "AWS4-HMAC-SHA256-PAYLOAD\n{amz_date}\n{scope}\n{prev_sig}\n{EMPTY_SHA256_HEX}\n{chunk_hash_hex}",
+        );
+        let mut m = HmacSha256::new_from_slice(k_signing).unwrap();
+        m.update(sts.as_bytes());
+        hex::encode(m.finalize().into_bytes())
+    }
+
+    let mut body = Vec::with_capacity(content_length);
+    let mut prev = seed_signature.clone();
+    for (i, c) in chunks.iter().enumerate() {
+        let chunk_hash = hex::encode(Sha256::digest(c));
+        let mut sig = chunk_sig(&k_signing, &amz_date, &scope, &prev, &chunk_hash);
+        if tamper_chunk_index == Some(i) {
+            // Flip one hex char so the signature no longer matches.
+            let mut sig_bytes = sig.into_bytes();
+            sig_bytes[0] = if sig_bytes[0] == b'0' { b'1' } else { b'0' };
+            sig = String::from_utf8(sig_bytes).unwrap();
+        }
+        body.extend_from_slice(format!("{:x};chunk-signature={sig}\r\n", c.len()).as_bytes());
+        body.extend_from_slice(c);
+        body.extend_from_slice(b"\r\n");
+        prev = sig;
+    }
+    // Zero terminator chunk.
+    let zero_sig = chunk_sig(&k_signing, &amz_date, &scope, &prev, EMPTY_SHA256_HEX);
+    body.extend_from_slice(format!("0;chunk-signature={zero_sig}\r\n\r\n").as_bytes());
+    assert_eq!(
+        body.len(),
+        content_length,
+        "computed content-length mismatch"
+    );
+
+    let headers = format!(
+        "PUT /{bucket}/{key} HTTP/1.1\r\n\
+         Host: {proxy_host}\r\n\
+         Content-Length: {content_length}\r\n\
+         Content-Encoding: aws-chunked\r\n\
+         x-amz-content-sha256: {body_hash}\r\n\
+         x-amz-date: {amz_date}\r\n\
+         x-amz-decoded-content-length: {payload_len}\r\n\
+         authorization: {auth_header}\r\n\
+         Connection: close\r\n\
+         \r\n",
+    );
+    let mut request_bytes = headers.into_bytes();
+    request_bytes.extend_from_slice(&body);
+    SignedChunkedPut {
+        request_bytes,
+        payload_len,
+    }
+}
+
+/// SDK signs a real PUT under strict mode. With `aws-sdk-s3` 1.132.0 and
+/// `RequestChecksumCalculation::WhenRequired` + `disable_payload_signing()`
+/// the outbound body is NOT aws-chunked, but the INBOUND request from the
+/// SDK to the proxy IS signed with `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`
+/// when the body is bigger than the SDK's threshold. We use a manually
+/// signed request instead because the SDK behaviour around inbound
+/// streaming is version-dependent — driving the wire format ourselves
+/// pins exactly what the strict-mode decode path is being asked to
+/// validate.
+///
+/// Asserts: signed aws-chunked PUT decodes + uploads, GET back from
+/// VersityGW returns the same bytes the test sent.
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4_signed_non_trailer_full_https_backend_round_trip() {
+    let tls = generate_test_tls();
+    let (_container, backend_endpoint) = start_versitygw_https(&tls).await;
+
+    let direct_http_client = aws_http_client_trusting(&tls.ca_pem);
+    let direct_client = build_raw_s3_client_with_http_client(
+        &backend_endpoint,
+        TEST_ACCESS_KEY,
+        TEST_SECRET_KEY,
+        direct_http_client,
+    )
+    .await;
+    direct_client
+        .create_bucket()
+        .bucket(TEST_BUCKET)
+        .send()
+        .await
+        .expect("create_bucket on HTTPS VersityGW");
+
+    let (proxy_endpoint, _cache_dir, _creds_file) =
+        build_strict_proxy_stack_with_https_backend(&backend_endpoint, &tls.ca_pem).await;
+    let proxy_host = proxy_endpoint.strip_prefix("http://").unwrap();
+
+    let key = "strict/signed-non-trailer.bin";
+    let payload: &[u8] = b"strict-mode signed aws-chunked round trip payload";
+    let request =
+        build_signed_aws_chunked_put_non_trailer(proxy_host, TEST_BUCKET, key, &[payload], None);
+
+    let (status, raw_response) = raw_tcp_request(proxy_host, &request.request_bytes).await;
+    let resp_text = String::from_utf8_lossy(&raw_response);
+    assert_eq!(
+        status, 200,
+        "strict signed aws-chunked PUT must succeed; got {status} with body: {resp_text}",
+    );
+
+    // Verify the decoded bytes landed on VersityGW.
+    let get_resp = direct_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key(key)
+        .send()
+        .await
+        .expect("get_object after strict signed PUT");
+    let body = get_resp
+        .body
+        .collect()
+        .await
+        .expect("read body")
+        .into_bytes();
+    assert_eq!(body.as_ref(), payload);
+    assert_eq!(payload.len(), request.payload_len);
+}
+
+/// Same as the round-trip test but the first chunk's `chunk-signature=`
+/// is corrupted. The decoder MUST reject with `SignatureDoesNotMatch`
+/// rather than silently uploading the body.
+///
+/// Bug-revert reasoning: routing strict-mode signed aws-chunked through
+/// `ChunkSignaturePolicy::ShapeOnly` (instead of `Verify`) flips this
+/// assertion — the corrupt signature still passes the lowercase-hex
+/// shape check, the body decodes, and the backend gets contacted.
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4_rejects_signed_aws_chunked_with_bad_chunk_signature() {
+    let tls = generate_test_tls();
+    let (_container, backend_endpoint) = start_versitygw_https(&tls).await;
+
+    let direct_http_client = aws_http_client_trusting(&tls.ca_pem);
+    let direct_client = build_raw_s3_client_with_http_client(
+        &backend_endpoint,
+        TEST_ACCESS_KEY,
+        TEST_SECRET_KEY,
+        direct_http_client,
+    )
+    .await;
+    direct_client
+        .create_bucket()
+        .bucket(TEST_BUCKET)
+        .send()
+        .await
+        .expect("create_bucket on HTTPS VersityGW");
+
+    let (proxy_endpoint, _cache_dir, _creds_file) =
+        build_strict_proxy_stack_with_https_backend(&backend_endpoint, &tls.ca_pem).await;
+    let proxy_host = proxy_endpoint.strip_prefix("http://").unwrap();
+
+    let key = "strict/bad-chunk-signature.bin";
+    let payload: &[u8] = b"strict-mode signed aws-chunked tampered chunk signature";
+    let request =
+        build_signed_aws_chunked_put_non_trailer(proxy_host, TEST_BUCKET, key, &[payload], Some(0));
+
+    let (status, raw_response) = raw_tcp_request(proxy_host, &request.request_bytes).await;
+    let resp_text = String::from_utf8_lossy(&raw_response);
+    assert_eq!(
+        status, 403,
+        "tampered chunk signature must produce HTTP 403; got {status} with body: {resp_text}",
+    );
+    assert!(
+        resp_text.contains("SignatureDoesNotMatch"),
+        "expected SignatureDoesNotMatch in response body; got: {resp_text}",
+    );
+
+    // Object must NOT have been written to the backend.
+    let head = direct_client
+        .head_object()
+        .bucket(TEST_BUCKET)
+        .key(key)
+        .send()
+        .await;
+    assert!(
+        head.is_err(),
+        "object must not exist on the backend after a tampered-signature PUT was rejected"
+    );
+}
+
+/// Strict mode + unsigned-trailer (`STREAMING-UNSIGNED-PAYLOAD-TRAILER`)
+/// still works: chunk signatures aren't part of the wire format, so the
+/// decoder runs with `ChunkSignaturePolicy::ShapeOnly` regardless of
+/// strict mode, and the existing trailer checksum validation continues
+/// to gate integrity.
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4_unsigned_trailer_still_works() {
+    use tiny_s3_proxy::s3::checksum::ChecksumAlgorithm;
+
+    let tls = generate_test_tls();
+    let (_container, backend_endpoint) = start_versitygw_https(&tls).await;
+
+    let direct_http_client = aws_http_client_trusting(&tls.ca_pem);
+    let direct_client = build_raw_s3_client_with_http_client(
+        &backend_endpoint,
+        TEST_ACCESS_KEY,
+        TEST_SECRET_KEY,
+        direct_http_client,
+    )
+    .await;
+    direct_client
+        .create_bucket()
+        .bucket(TEST_BUCKET)
+        .send()
+        .await
+        .expect("create_bucket on HTTPS VersityGW");
+
+    let (proxy_endpoint, _cache_dir, _creds_file) =
+        build_strict_proxy_stack_with_https_backend(&backend_endpoint, &tls.ca_pem).await;
+    let proxy_host = proxy_endpoint.strip_prefix("http://").unwrap();
+
+    // Sign the request envelope with the unsigned-trailer sentinel as the
+    // payload hash. Strict-mode verification will accept this because the
+    // sentinel is in the canonical request and matches what we signed.
+    let key = "strict/unsigned-trailer.bin";
+    let payload: &[u8] = b"strict-mode unsigned trailer crc32 payload";
+    let value = compute_smithy_checksum_b64(ChecksumAlgorithm::Crc32, payload);
+    let frame = build_unsigned_trailer_frame_bytes(payload, "x-amz-checksum-crc32", &value);
+
+    let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let date_yyyymmdd = &amz_date[..8];
+    let scope = format!("{date_yyyymmdd}/us-east-1/s3/aws4_request");
+    let body_hash = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
+
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::{Digest, Sha256};
+    type HmacSha256 = Hmac<Sha256>;
+    fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut m = HmacSha256::new_from_slice(key).unwrap();
+        m.update(data);
+        m.finalize().into_bytes().to_vec()
+    }
+
+    let content_length = frame.len();
+    let canonical = format!(
+        "PUT\n/{TEST_BUCKET}/{key}\n\n\
+         content-encoding:aws-chunked\n\
+         content-length:{content_length}\n\
+         host:{proxy_host}\n\
+         x-amz-content-sha256:{body_hash}\n\
+         x-amz-date:{amz_date}\n\
+         x-amz-decoded-content-length:{payload_len}\n\
+         x-amz-trailer:x-amz-checksum-crc32\n\n\
+         content-encoding;content-length;host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length;x-amz-trailer\n\
+         {body_hash}",
+        payload_len = payload.len(),
+    );
+    let creq_hex = hex::encode({
+        let mut h = Sha256::new();
+        h.update(canonical.as_bytes());
+        h.finalize()
+    });
+    let sts = format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{creq_hex}");
     let k_date = hmac(
         format!("AWS4{STRICT_INBOUND_SECRET}").as_bytes(),
         date_yyyymmdd.as_bytes(),
@@ -3711,22 +4125,47 @@ async fn test_strict_sigv4_rejects_signed_aws_chunked_as_unsupported_signature()
     let k_signing = hmac(&k_service, b"aws4_request");
     let signature = hex::encode(hmac(&k_signing, sts.as_bytes()));
     let auth = format!(
-        "AWS4-HMAC-SHA256 Credential={STRICT_INBOUND_KEY}/{date_yyyymmdd}/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={signature}"
+        "AWS4-HMAC-SHA256 Credential={STRICT_INBOUND_KEY}/{scope}, \
+         SignedHeaders=content-encoding;content-length;host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length;x-amz-trailer, \
+         Signature={signature}"
     );
 
-    let resp = http_client
-        .put(&url)
-        .header("x-amz-date", &amz_date)
-        .header("x-amz-content-sha256", body_hash)
-        .header("authorization", &auth)
-        .body(Vec::<u8>::new())
+    let headers = format!(
+        "PUT /{TEST_BUCKET}/{key} HTTP/1.1\r\n\
+         Host: {proxy_host}\r\n\
+         Content-Length: {content_length}\r\n\
+         Content-Encoding: aws-chunked\r\n\
+         x-amz-content-sha256: {body_hash}\r\n\
+         x-amz-date: {amz_date}\r\n\
+         x-amz-decoded-content-length: {payload_len}\r\n\
+         x-amz-trailer: x-amz-checksum-crc32\r\n\
+         authorization: {auth}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        payload_len = payload.len(),
+    );
+    let mut request_bytes = headers.into_bytes();
+    request_bytes.extend_from_slice(&frame);
+
+    let (status, raw_response) = raw_tcp_request(proxy_host, &request_bytes).await;
+    let resp_text = String::from_utf8_lossy(&raw_response);
+    assert_eq!(
+        status, 200,
+        "strict-mode unsigned-trailer must succeed; got {status} with body: {resp_text}",
+    );
+
+    let get_resp = direct_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key(key)
         .send()
         .await
-        .expect("send chunked request");
-    assert_eq!(resp.status().as_u16(), 400);
-    let body = String::from_utf8_lossy(&resp.bytes().await.unwrap()).to_string();
-    assert!(
-        body.contains("UnsupportedSignature"),
-        "expected UnsupportedSignature, got: {body}"
-    );
+        .expect("get_object after strict unsigned-trailer PUT");
+    let body = get_resp
+        .body
+        .collect()
+        .await
+        .expect("read body")
+        .into_bytes();
+    assert_eq!(body.as_ref(), payload);
 }

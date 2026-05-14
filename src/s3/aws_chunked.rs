@@ -392,7 +392,9 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
                     }
                     Err(StreamingSigV4Error::TrailerSignatureMismatch) => {
                         // verify_payload_chunk never produces this variant.
-                        unreachable!("verify_payload_chunk does not produce TrailerSignatureMismatch");
+                        unreachable!(
+                            "verify_payload_chunk does not produce TrailerSignatureMismatch"
+                        );
                     }
                 }
             }
@@ -427,16 +429,13 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
         // returns `signature_hex: None` there, and there's nothing for the
         // streaming context to verify against.
         let expects_signature = self.mode.expects_chunk_signature();
-        if expects_signature
-            && let ChunkSignaturePolicy::Verify(ctx) = &mut self.signature_policy
-        {
+        if expects_signature && let ChunkSignaturePolicy::Verify(ctx) = &mut self.signature_policy {
             let supplied = zero_chunk_signature_hex
                 .as_deref()
                 .expect("signed mode guarantees final chunk-signature is present");
-            match ctx.verify_payload_chunk(
-                crate::auth::sigv4::streaming::EMPTY_SHA256_HEX,
-                supplied,
-            ) {
+            match ctx
+                .verify_payload_chunk(crate::auth::sigv4::streaming::EMPTY_SHA256_HEX, supplied)
+            {
                 Ok(()) => {}
                 Err(StreamingSigV4Error::ChunkSignatureMismatch) => {
                     return Err(AwsChunkedError::ChunkSignatureMismatch {
@@ -477,7 +476,8 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
                     // trailer bytes are `<lowercase-name>:<value>\n` — the
                     // `x-amz-trailer-signature` line itself is NOT included.
                     if let ChunkSignaturePolicy::Verify(ctx) = &self.signature_policy {
-                        let mut canonical = Vec::with_capacity(parsed.name.len() + parsed.value.len() + 2);
+                        let mut canonical =
+                            Vec::with_capacity(parsed.name.len() + parsed.value.len() + 2);
                         canonical.extend_from_slice(parsed.name.to_ascii_lowercase().as_bytes());
                         canonical.push(b':');
                         canonical.extend_from_slice(parsed.value.as_bytes());
@@ -494,7 +494,9 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
                                 });
                             }
                             Err(StreamingSigV4Error::ChunkSignatureMismatch) => {
-                                unreachable!("verify_trailer does not produce ChunkSignatureMismatch");
+                                unreachable!(
+                                    "verify_trailer does not produce ChunkSignatureMismatch"
+                                );
                             }
                         }
                     }
@@ -1775,8 +1777,7 @@ mod tests {
 
     const TEST_AMZ_DATE: &str = "20130524T000000Z";
     const TEST_SCOPE: &str = "20130524/us-east-1/s3/aws4_request";
-    const TEST_SEED_SIG: &str =
-        "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9";
+    const TEST_SEED_SIG: &str = "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9";
 
     fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
         use hmac::{Hmac, KeyInit, Mac};
@@ -1880,14 +1881,10 @@ mod tests {
         policy: ChunkSignaturePolicy,
     ) -> Result<(Vec<u8>, DecodedSummary), AwsChunkedError> {
         let mut sink: BufWriter<Vec<u8>> = BufWriter::new(Vec::new());
-        let summary = AwsChunkedDecoder::with_mode_and_signature_policy(
-            frame,
-            declared_len,
-            mode,
-            policy,
-        )
-        .decode_to_writer(&mut sink)
-        .await?;
+        let summary =
+            AwsChunkedDecoder::with_mode_and_signature_policy(frame, declared_len, mode, policy)
+                .decode_to_writer(&mut sink)
+                .await?;
         sink.flush().await.unwrap();
         Ok((sink.into_inner(), summary))
     }
@@ -1920,12 +1917,12 @@ mod tests {
         let payload = b"hello-trailer";
         let algo = ChecksumAlgorithm::Crc32;
         let value = compute_trailer_value(algo, payload);
-        let frame =
-            build_signed_trailer_stream(&key, &[payload], algo.header_name(), &value);
+        let frame = build_signed_trailer_stream(&key, &[payload], algo.header_name(), &value);
         let mode = signed_mode(algo);
-        let (decoded, summary) = decode_with_policy(&frame, payload.len() as u64, mode, verify_ctx())
-            .await
-            .expect("valid signed trailer stream must verify");
+        let (decoded, summary) =
+            decode_with_policy(&frame, payload.len() as u64, mode, verify_ctx())
+                .await
+                .expect("valid signed trailer stream must verify");
         assert_eq!(decoded, payload);
         let t = summary.trailer.unwrap();
         assert_eq!(t.value, value);
@@ -1983,7 +1980,11 @@ mod tests {
             .filter_map(|(i, w)| (w == b"chunk-signature=").then_some(i))
             .collect();
         let zero_sig_idx = *occurrences.last().unwrap() + b"chunk-signature=".len();
-        frame[zero_sig_idx] = if frame[zero_sig_idx] == b'0' { b'1' } else { b'0' };
+        frame[zero_sig_idx] = if frame[zero_sig_idx] == b'0' {
+            b'1'
+        } else {
+            b'0'
+        };
         let err = decode_with_policy(
             &frame,
             payload.len() as u64,
@@ -2012,16 +2013,23 @@ mod tests {
         let payload = b"hello-trailer";
         let algo = ChecksumAlgorithm::Crc32;
         let value = compute_trailer_value(algo, payload);
-        let mut frame =
-            build_signed_trailer_stream(&key, &[payload], algo.header_name(), &value);
+        let mut frame = build_signed_trailer_stream(&key, &[payload], algo.header_name(), &value);
         // Tamper the x-amz-trailer-signature value.
         let needle = b"x-amz-trailer-signature:";
-        let idx = frame.windows(needle.len()).position(|w| w == needle).unwrap()
+        let idx = frame
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .unwrap()
             + needle.len();
         frame[idx] = if frame[idx] == b'0' { b'1' } else { b'0' };
-        let err = decode_with_policy(&frame, payload.len() as u64, signed_mode(algo), verify_ctx())
-            .await
-            .expect_err("tampered trailer signature must fail");
+        let err = decode_with_policy(
+            &frame,
+            payload.len() as u64,
+            signed_mode(algo),
+            verify_ctx(),
+        )
+        .await
+        .expect_err("tampered trailer signature must fail");
         assert!(
             matches!(err, AwsChunkedError::TrailerSignatureMismatch),
             "got {err:?}",

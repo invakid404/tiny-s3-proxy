@@ -307,6 +307,7 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
                         &parsed,
                         key,
                         &parts.headers,
+                        verified.as_ref(),
                         body,
                     )
                     .await
@@ -359,6 +360,7 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
                     *part_number,
                     upload_id,
                     &parts.headers,
+                    verified.as_ref(),
                     body,
                 )
                 .await
