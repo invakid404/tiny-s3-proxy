@@ -889,6 +889,7 @@ mod tests {
             cache: state.cache.clone(),
             singleflight: state.singleflight.clone(),
             auth: state.auth.clone(),
+            inbound_sigv4: None,
             policy: state.policy.clone(),
             config: Arc::new(config),
             frontend_bucket: state.frontend_bucket.clone(),

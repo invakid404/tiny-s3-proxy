@@ -278,6 +278,9 @@ fn default_proxy_test_config(
         upstream_request_timeout_ms: 30000,
         max_request_body_bytes: 268_435_456,
         passthrough_unsigned_payload: false,
+        inbound_auth_verify_signatures: false,
+        inbound_credentials_path: None,
+        inbound_auth_max_skew_secs: 900,
     }
 }
 
@@ -329,6 +332,7 @@ where
         cache: Arc::new(disk_cache),
         singleflight,
         auth: authenticator,
+        inbound_sigv4: None,
         policy: cache_policy,
         config: Arc::new(config),
         frontend_bucket: Arc::from(TEST_BUCKET),
@@ -478,6 +482,7 @@ async fn build_proxy_stack_with_https_backend(
         cache: Arc::new(disk_cache),
         singleflight,
         auth: authenticator,
+        inbound_sigv4: None,
         policy: cache_policy,
         config: Arc::new(config),
         frontend_bucket: Arc::from(TEST_BUCKET),
@@ -3099,5 +3104,629 @@ async fn test_passthrough_range_get_full_https_backend_round_trip() {
         body.as_slice(),
         &payload[0..5],
         "passthrough response body must equal the first 5 bytes of the seeded payload",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Strict inbound SigV4 verification (issue #63, PR 1 of 5).
+// ---------------------------------------------------------------------------
+//
+// These tests exercise the full pipeline: a real AWS SDK client signs a
+// request, the proxy verifies it with the same key material, and the
+// request hits a real VersityGW backend. Each negative path tampers with
+// exactly one piece of the signed payload so the failure mode is
+// unambiguous.
+
+/// Frontend (inbound) credential pair used by strict-mode tests. Distinct
+/// from `TEST_ACCESS_KEY`/`TEST_SECRET_KEY` (backend credentials), so a bug
+/// that mixes them up surfaces as `InvalidAccessKeyId` instead of silently
+/// passing.
+const STRICT_INBOUND_KEY: &str = "AKID-FRONTEND";
+const STRICT_INBOUND_SECRET: &str = "frontend-secret-do-not-leak";
+
+/// Build a strict-mode proxy stack rooted at `backend_endpoint`. Returns
+/// `(strict_sdk_client, wrong_creds_sdk_client, proxy_endpoint,
+/// cache_dir_guard, creds_file_guard)`. The two SDK clients exist so each
+/// test can pick the right keys for what it's exercising without having to
+/// rebuild a config.
+async fn build_strict_proxy_stack(
+    backend_endpoint: &str,
+) -> (
+    aws_sdk_s3::Client,
+    aws_sdk_s3::Client,
+    String,
+    tempfile::TempDir,
+    tempfile::NamedTempFile,
+) {
+    use std::io::Write;
+
+    let mut creds_file =
+        tempfile::NamedTempFile::new().expect("create strict-mode credentials tempfile");
+    let creds_json = serde_json::json!({
+        "version": 1,
+        "credentials": [
+            { "access_key_id": STRICT_INBOUND_KEY, "secret_access_key": STRICT_INBOUND_SECRET }
+        ]
+    });
+    creds_file
+        .write_all(creds_json.to_string().as_bytes())
+        .expect("write strict-mode credentials");
+
+    let cache_dir = tempfile::TempDir::new().expect("create temp cache dir");
+    let mut config = default_proxy_test_config(
+        backend_endpoint,
+        AuthMode::TrustedInternal,
+        vec![],
+        cache_dir.path(),
+    );
+    config.inbound_auth_verify_signatures = true;
+    config.inbound_credentials_path = Some(creds_file.path().to_path_buf());
+
+    let s3_backend = backend::client::S3Backend::from_config(&config)
+        .await
+        .expect("build S3 backend (strict mode)");
+
+    let cache_policy = cache::policy::CachePolicy::new(
+        config.cacheable_prefixes.clone(),
+        config.cache_max_object_bytes,
+    );
+    let disk_cache = cache::DiskCache::new(
+        config.cache_dir.clone(),
+        config.cache_max_bytes,
+        cache_policy.clone(),
+    )
+    .await
+    .expect("build disk cache");
+
+    let singleflight = Arc::new(cache::SingleFlight::new());
+    let authenticator = Arc::from(auth::create_request_gate(&config));
+
+    let store = auth::credentials::StaticInboundCredentials::load_from_file(creds_file.path())
+        .expect("load strict-mode credentials");
+    let resolver: Arc<dyn auth::credentials::InboundCredentialResolver> = Arc::new(store);
+    let verifier = Arc::new(auth::sigv4::SigV4Verifier::new(
+        resolver,
+        std::time::Duration::from_secs(config.inbound_auth_max_skew_secs),
+    ));
+
+    let state = Arc::new(handlers::AppState {
+        backend: Arc::new(s3_backend),
+        cache: Arc::new(disk_cache),
+        singleflight,
+        auth: authenticator,
+        inbound_sigv4: Some(verifier),
+        policy: cache_policy,
+        config: Arc::new(config),
+        frontend_bucket: Arc::from(TEST_BUCKET),
+        backend_bucket: Arc::from(TEST_BUCKET),
+        http_client: reqwest::Client::new(),
+    });
+
+    let app = axum::Router::new()
+        .fallback(handlers::handle_s3_request)
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let proxy_endpoint = format!("http://127.0.0.1:{}", addr.port());
+
+    let strict_client =
+        build_raw_s3_client(&proxy_endpoint, STRICT_INBOUND_KEY, STRICT_INBOUND_SECRET).await;
+    let wrong_client = build_raw_s3_client(&proxy_endpoint, "BOGUS-KEY", "bogus-secret").await;
+
+    (
+        strict_client,
+        wrong_client,
+        proxy_endpoint,
+        cache_dir,
+        creds_file,
+    )
+}
+
+/// Pre-create the bucket on the backend; strict-mode tests don't care
+/// about its contents until they PUT/GET.
+async fn ensure_test_bucket(backend_endpoint: &str) {
+    let backend_client =
+        build_raw_s3_client(backend_endpoint, TEST_ACCESS_KEY, TEST_SECRET_KEY).await;
+    let _ = backend_client
+        .create_bucket()
+        .bucket(TEST_BUCKET)
+        .send()
+        .await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4_accepts_valid_sdk_get() {
+    let (_container, backend_endpoint) = start_versitygw().await;
+    ensure_test_bucket(&backend_endpoint).await;
+
+    // Seed an object via the backend so the GET has something to return.
+    let backend_client =
+        build_raw_s3_client(&backend_endpoint, TEST_ACCESS_KEY, TEST_SECRET_KEY).await;
+    backend_client
+        .put_object()
+        .bucket(TEST_BUCKET)
+        .key("strict-get.txt")
+        .body(b"strict-mode payload".to_vec().into())
+        .send()
+        .await
+        .expect("seed object");
+
+    let (strict_client, _wrong, _ep, _cache, _creds) =
+        build_strict_proxy_stack(&backend_endpoint).await;
+
+    let resp = strict_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key("strict-get.txt")
+        .send()
+        .await
+        .expect("strict GET should succeed");
+    let body = resp.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), b"strict-mode payload");
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4_accepts_valid_sdk_put_with_signed_payload() {
+    let (_container, backend_endpoint) = start_versitygw().await;
+    ensure_test_bucket(&backend_endpoint).await;
+    let (strict_client, _wrong, _ep, _cache, _creds) =
+        build_strict_proxy_stack(&backend_endpoint).await;
+
+    // The SDK signs PUTs with a real SHA-256 of the body by default. This
+    // exercises the SignedSha256 → verify_payload_hash path end-to-end.
+    strict_client
+        .put_object()
+        .bucket(TEST_BUCKET)
+        .key("strict-put.txt")
+        .body(b"signed-payload-body".to_vec().into())
+        .send()
+        .await
+        .expect("strict PUT with signed payload should succeed");
+
+    // Round-trip: read it back.
+    let backend_client =
+        build_raw_s3_client(&backend_endpoint, TEST_ACCESS_KEY, TEST_SECRET_KEY).await;
+    let resp = backend_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key("strict-put.txt")
+        .send()
+        .await
+        .expect("get_object after strict PUT");
+    let body = resp.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), b"signed-payload-body");
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4_rejects_unknown_access_key() {
+    let (_container, backend_endpoint) = start_versitygw().await;
+    ensure_test_bucket(&backend_endpoint).await;
+    let (_strict, wrong_client, _ep, _cache, _creds) =
+        build_strict_proxy_stack(&backend_endpoint).await;
+
+    let err = wrong_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key("any.txt")
+        .send()
+        .await
+        .expect_err("wrong credentials must fail");
+
+    let dbg = format!("{err:?}");
+    assert!(
+        dbg.contains("InvalidAccessKeyId"),
+        "expected InvalidAccessKeyId, got: {dbg}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4_rejects_tampered_signed_header() {
+    // The SDK signs the request normally; we replay it via raw HTTP with
+    // one signed header value mutated so the canonical request — and
+    // therefore the signature — diverges from what the proxy computes.
+    let (_container, backend_endpoint) = start_versitygw().await;
+    ensure_test_bucket(&backend_endpoint).await;
+    let (strict_client, _wrong, proxy_endpoint, _cache, _creds) =
+        build_strict_proxy_stack(&backend_endpoint).await;
+
+    // Use a presign so we get to inspect the full signed request shape.
+    // Actually, presigned URLs are fail-closed in strict mode, so instead
+    // we drive a real PUT via the SDK and rely on the SDK adding x-amz-meta
+    // headers. To produce a tamper, we make a raw request whose
+    // Authorization header was signed for a different value of host.
+    //
+    // The simplest tamper that's robust to SDK choices: drive an unsigned
+    // raw HTTP request that carries an Authorization header copied from a
+    // legitimate signed request, then mutate `host`.
+    let _ = strict_client; // Keep the SDK live until the proxy is fully torn down.
+
+    let http_client = reqwest::Client::new();
+    let url = format!("{proxy_endpoint}/{TEST_BUCKET}/tamper.txt");
+
+    // Build a manually-signed PUT request, then rewrite the host header
+    // before sending. The signature was computed for the original host;
+    // changing it must produce SignatureDoesNotMatch.
+    let body_bytes = b"tamper-test-body".to_vec();
+    let body_hash = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&body_bytes);
+        let digest = h.finalize();
+        let mut out = String::with_capacity(64);
+        for b in digest.iter() {
+            out.push_str(&format!("{b:02x}"));
+        }
+        out
+    };
+    let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let date_yyyymmdd = &amz_date[..8];
+    let original_host = format!(
+        "127.0.0.1:{}",
+        proxy_endpoint
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .trim_end_matches('/')
+    );
+    let canonical = format!(
+        "PUT\n/{TEST_BUCKET}/tamper.txt\n\nhost:{original_host}\nx-amz-content-sha256:{body_hash}\nx-amz-date:{amz_date}\n\nhost;x-amz-content-sha256;x-amz-date\n{body_hash}"
+    );
+
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::{Digest, Sha256};
+    type HmacSha256 = Hmac<Sha256>;
+    fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut mac = HmacSha256::new_from_slice(key).unwrap();
+        mac.update(data);
+        mac.finalize().into_bytes().to_vec()
+    }
+    let creq_hex = {
+        let mut h = Sha256::new();
+        h.update(canonical.as_bytes());
+        let d = h.finalize();
+        let mut out = String::with_capacity(64);
+        for b in d.iter() {
+            out.push_str(&format!("{b:02x}"));
+        }
+        out
+    };
+    let sts = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{date_yyyymmdd}/us-east-1/s3/aws4_request\n{creq_hex}"
+    );
+    let k_date = hmac(
+        format!("AWS4{STRICT_INBOUND_SECRET}").as_bytes(),
+        date_yyyymmdd.as_bytes(),
+    );
+    let k_region = hmac(&k_date, b"us-east-1");
+    let k_service = hmac(&k_region, b"s3");
+    let k_signing = hmac(&k_service, b"aws4_request");
+    let signature_bytes = hmac(&k_signing, sts.as_bytes());
+    let signature_hex = signature_bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let auth = format!(
+        "AWS4-HMAC-SHA256 Credential={STRICT_INBOUND_KEY}/{date_yyyymmdd}/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={signature_hex}"
+    );
+
+    // Now send with the WRONG host header — same Authorization line, but
+    // proxy will canonicalize using the actual host header value.
+    let resp = http_client
+        .put(&url)
+        .header("host", "evil.example")
+        .header("x-amz-date", &amz_date)
+        .header("x-amz-content-sha256", &body_hash)
+        .header("authorization", &auth)
+        .body(body_bytes)
+        .send()
+        .await
+        .expect("send tampered request");
+    assert_eq!(resp.status().as_u16(), 403);
+    let body = resp.bytes().await.unwrap().to_vec();
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        body.contains("SignatureDoesNotMatch"),
+        "expected SignatureDoesNotMatch, got: {body}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4_rejects_stale_date() {
+    let (_container, backend_endpoint) = start_versitygw().await;
+    ensure_test_bucket(&backend_endpoint).await;
+    let (_strict, _wrong, proxy_endpoint, _cache, _creds) =
+        build_strict_proxy_stack(&backend_endpoint).await;
+
+    let http_client = reqwest::Client::new();
+    // Manually craft a request signed for a date well outside the skew
+    // window (default 900s). The proxy must reject with
+    // RequestTimeTooSkewed before doing the body hash check.
+    let amz_date = "20200101T000000Z";
+    let date_yyyymmdd = "20200101";
+    let body_hash = "UNSIGNED-PAYLOAD";
+    let host = proxy_endpoint
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    let canonical = format!(
+        "GET\n/{TEST_BUCKET}/stale.txt\n\nhost:{host}\nx-amz-content-sha256:{body_hash}\nx-amz-date:{amz_date}\n\nhost;x-amz-content-sha256;x-amz-date\n{body_hash}"
+    );
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::{Digest, Sha256};
+    type HmacSha256 = Hmac<Sha256>;
+    fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut mac = HmacSha256::new_from_slice(key).unwrap();
+        mac.update(data);
+        mac.finalize().into_bytes().to_vec()
+    }
+    let creq_hex = {
+        let mut h = Sha256::new();
+        h.update(canonical.as_bytes());
+        hex::encode(h.finalize())
+    };
+    let sts = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{date_yyyymmdd}/us-east-1/s3/aws4_request\n{creq_hex}"
+    );
+    let k_date = hmac(
+        format!("AWS4{STRICT_INBOUND_SECRET}").as_bytes(),
+        date_yyyymmdd.as_bytes(),
+    );
+    let k_region = hmac(&k_date, b"us-east-1");
+    let k_service = hmac(&k_region, b"s3");
+    let k_signing = hmac(&k_service, b"aws4_request");
+    let signature = hex::encode(hmac(&k_signing, sts.as_bytes()));
+    let auth = format!(
+        "AWS4-HMAC-SHA256 Credential={STRICT_INBOUND_KEY}/{date_yyyymmdd}/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={signature}"
+    );
+
+    let resp = http_client
+        .get(format!("{proxy_endpoint}/{TEST_BUCKET}/stale.txt"))
+        .header("x-amz-date", amz_date)
+        .header("x-amz-content-sha256", body_hash)
+        .header("authorization", &auth)
+        .send()
+        .await
+        .expect("stale request");
+    assert_eq!(resp.status().as_u16(), 403);
+    let body = String::from_utf8_lossy(&resp.bytes().await.unwrap()).to_string();
+    assert!(
+        body.contains("RequestTimeTooSkewed"),
+        "expected RequestTimeTooSkewed, got: {body}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4_rejects_body_under_signed_payload() {
+    let (_container, backend_endpoint) = start_versitygw().await;
+    ensure_test_bucket(&backend_endpoint).await;
+    let (_strict, _wrong, proxy_endpoint, _cache, _creds) =
+        build_strict_proxy_stack(&backend_endpoint).await;
+
+    // Sign a request for body "good", then send body "bad-tampered".
+    let http_client = reqwest::Client::new();
+    let url = format!("{proxy_endpoint}/{TEST_BUCKET}/bad-body.txt");
+    let signed_body = b"good";
+    let actual_body = b"bad-tampered";
+
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::{Digest, Sha256};
+    type HmacSha256 = Hmac<Sha256>;
+    fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut mac = HmacSha256::new_from_slice(key).unwrap();
+        mac.update(data);
+        mac.finalize().into_bytes().to_vec()
+    }
+    let body_hash = hex::encode({
+        let mut h = Sha256::new();
+        h.update(signed_body);
+        h.finalize()
+    });
+    let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let date_yyyymmdd = &amz_date[..8];
+    let host = proxy_endpoint
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    let canonical = format!(
+        "PUT\n/{TEST_BUCKET}/bad-body.txt\n\nhost:{host}\nx-amz-content-sha256:{body_hash}\nx-amz-date:{amz_date}\n\nhost;x-amz-content-sha256;x-amz-date\n{body_hash}"
+    );
+    let creq_hex = hex::encode({
+        let mut h = Sha256::new();
+        h.update(canonical.as_bytes());
+        h.finalize()
+    });
+    let sts = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{date_yyyymmdd}/us-east-1/s3/aws4_request\n{creq_hex}"
+    );
+    let k_date = hmac(
+        format!("AWS4{STRICT_INBOUND_SECRET}").as_bytes(),
+        date_yyyymmdd.as_bytes(),
+    );
+    let k_region = hmac(&k_date, b"us-east-1");
+    let k_service = hmac(&k_region, b"s3");
+    let k_signing = hmac(&k_service, b"aws4_request");
+    let signature = hex::encode(hmac(&k_signing, sts.as_bytes()));
+    let auth = format!(
+        "AWS4-HMAC-SHA256 Credential={STRICT_INBOUND_KEY}/{date_yyyymmdd}/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={signature}"
+    );
+
+    let resp = http_client
+        .put(&url)
+        .header("x-amz-date", &amz_date)
+        .header("x-amz-content-sha256", &body_hash)
+        .header("authorization", &auth)
+        .body(actual_body.to_vec())
+        .send()
+        .await
+        .expect("send tampered body");
+    assert_eq!(resp.status().as_u16(), 403);
+    let body = String::from_utf8_lossy(&resp.bytes().await.unwrap()).to_string();
+    assert!(
+        body.contains("SignatureDoesNotMatch"),
+        "expected SignatureDoesNotMatch, got: {body}"
+    );
+    assert!(
+        body.contains("x-amz-content-sha256 mismatch"),
+        "expected payload mismatch message, got: {body}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4_rejects_presigned_url_as_missing_token() {
+    let (_container, backend_endpoint) = start_versitygw().await;
+    ensure_test_bucket(&backend_endpoint).await;
+    let (strict_client, _wrong, proxy_endpoint, _cache, _creds) =
+        build_strict_proxy_stack(&backend_endpoint).await;
+
+    // Use the SDK to presign a GET so we have a real X-Amz-Signature query
+    // parameter on the URL — our raw HTTP call below replays it.
+    let presigning =
+        aws_sdk_s3::presigning::PresigningConfig::expires_in(std::time::Duration::from_secs(60))
+            .expect("presigning config");
+    let presigned = strict_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key("presigned.txt")
+        .presigned(presigning)
+        .await
+        .expect("presign GET");
+    let uri = presigned.uri().to_string();
+    // The presigned URI may point at the SDK's hostname rather than our
+    // proxy; rewrite host:port portion so the request actually reaches the
+    // proxy. The query string carries the X-Amz-Signature.
+    let query = uri.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let url = format!("{proxy_endpoint}/{TEST_BUCKET}/presigned.txt?{query}");
+
+    let http_client = reqwest::Client::new();
+    let resp = http_client
+        .get(&url)
+        .send()
+        .await
+        .expect("send presigned request");
+    assert_eq!(resp.status().as_u16(), 403);
+    let body = String::from_utf8_lossy(&resp.bytes().await.unwrap()).to_string();
+    assert!(
+        body.contains("MissingAuthenticationToken"),
+        "expected MissingAuthenticationToken, got: {body}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4_rejects_sts_token_as_invalid_token() {
+    let (_container, backend_endpoint) = start_versitygw().await;
+    ensure_test_bucket(&backend_endpoint).await;
+    let (_strict, _wrong, proxy_endpoint, _cache, _creds) =
+        build_strict_proxy_stack(&backend_endpoint).await;
+
+    // Build an SDK client with a session-token credential. The SDK will
+    // include `x-amz-security-token` in SignedHeaders, which strict mode
+    // rejects up front.
+    let creds = aws_credential_types::Credentials::new(
+        STRICT_INBOUND_KEY,
+        STRICT_INBOUND_SECRET,
+        Some("session-token-value".to_string()),
+        None,
+        "test",
+    );
+    let cfg = aws_sdk_s3::config::Builder::new()
+        .endpoint_url(&proxy_endpoint)
+        .region(aws_sdk_s3::config::Region::new("us-east-1"))
+        .credentials_provider(creds)
+        .force_path_style(true)
+        .behavior_version_latest()
+        .build();
+    let sts_client = aws_sdk_s3::Client::from_conf(cfg);
+
+    let err = sts_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key("sts.txt")
+        .send()
+        .await
+        .expect_err("STS token must reject");
+    let dbg = format!("{err:?}");
+    assert!(
+        dbg.contains("InvalidToken"),
+        "expected InvalidToken, got: {dbg}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4_rejects_signed_aws_chunked_as_unsupported_signature() {
+    let (_container, backend_endpoint) = start_versitygw().await;
+    ensure_test_bucket(&backend_endpoint).await;
+    let (_strict, _wrong, proxy_endpoint, _cache, _creds) =
+        build_strict_proxy_stack(&backend_endpoint).await;
+
+    // Drive a raw signed aws-chunked PUT. We just need the
+    // x-amz-content-sha256 sentinel to be STREAMING-AWS4-HMAC-SHA256-PAYLOAD;
+    // the verifier rejects it before reading the body, so we don't need
+    // to actually emit valid chunked framing.
+    let http_client = reqwest::Client::new();
+    let url = format!("{proxy_endpoint}/{TEST_BUCKET}/chunked.txt");
+    let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let date_yyyymmdd = &amz_date[..8];
+    let body_hash = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+    let host = proxy_endpoint
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    let canonical = format!(
+        "PUT\n/{TEST_BUCKET}/chunked.txt\n\nhost:{host}\nx-amz-content-sha256:{body_hash}\nx-amz-date:{amz_date}\n\nhost;x-amz-content-sha256;x-amz-date\n{body_hash}"
+    );
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::{Digest, Sha256};
+    type HmacSha256 = Hmac<Sha256>;
+    fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut mac = HmacSha256::new_from_slice(key).unwrap();
+        mac.update(data);
+        mac.finalize().into_bytes().to_vec()
+    }
+    let creq_hex = hex::encode({
+        let mut h = Sha256::new();
+        h.update(canonical.as_bytes());
+        h.finalize()
+    });
+    let sts = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{date_yyyymmdd}/us-east-1/s3/aws4_request\n{creq_hex}"
+    );
+    let k_date = hmac(
+        format!("AWS4{STRICT_INBOUND_SECRET}").as_bytes(),
+        date_yyyymmdd.as_bytes(),
+    );
+    let k_region = hmac(&k_date, b"us-east-1");
+    let k_service = hmac(&k_region, b"s3");
+    let k_signing = hmac(&k_service, b"aws4_request");
+    let signature = hex::encode(hmac(&k_signing, sts.as_bytes()));
+    let auth = format!(
+        "AWS4-HMAC-SHA256 Credential={STRICT_INBOUND_KEY}/{date_yyyymmdd}/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={signature}"
+    );
+
+    let resp = http_client
+        .put(&url)
+        .header("x-amz-date", &amz_date)
+        .header("x-amz-content-sha256", body_hash)
+        .header("authorization", &auth)
+        .body(Vec::<u8>::new())
+        .send()
+        .await
+        .expect("send chunked request");
+    assert_eq!(resp.status().as_u16(), 400);
+    let body = String::from_utf8_lossy(&resp.bytes().await.unwrap()).to_string();
+    assert!(
+        body.contains("UnsupportedSignature"),
+        "expected UnsupportedSignature, got: {body}"
     );
 }

@@ -47,6 +47,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Create auth
     let auth = Arc::from(auth::create_request_gate(&config));
 
+    // 3b. Optional: strict inbound SigV4 verifier. When enabled, replaces
+    // the RequestGate auth check inside `handle_s3_request` and validates
+    // every request's signature against credentials loaded from a JSON
+    // file. Loading is intentionally synchronous and fail-fast: a bad
+    // credentials file should crash the rollout rather than degrade silent
+    // (every request would be rejected anyway).
+    let inbound_sigv4 = if config.inbound_auth_verify_signatures {
+        let path = config
+            .inbound_credentials_path
+            .as_ref()
+            .expect("validated at config load");
+        let store =
+            auth::credentials::StaticInboundCredentials::load_from_file(path).map_err(|e| {
+                format!(
+                    "failed to load inbound credentials from {}: {e}",
+                    path.display()
+                )
+            })?;
+        let count = store.len();
+        let resolver: Arc<dyn auth::credentials::InboundCredentialResolver> = Arc::new(store);
+        let max_skew = std::time::Duration::from_secs(config.inbound_auth_max_skew_secs);
+        let verifier = Arc::new(auth::sigv4::SigV4Verifier::new(resolver, max_skew));
+        tracing::info!(
+            credential_count = count,
+            max_skew_secs = config.inbound_auth_max_skew_secs,
+            "inbound SigV4 strict verification enabled"
+        );
+        Some(verifier)
+    } else {
+        None
+    };
+
     // 4. Create backend
     let backend = backend::client::S3Backend::from_config(&config).await?;
     tracing::info!("backend S3 client initialized");
@@ -76,6 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cache: disk_cache.clone(),
         singleflight: singleflight.clone(),
         auth,
+        inbound_sigv4,
         policy: cache_policy,
         config: config.clone(),
         frontend_bucket: Arc::from(config.frontend_bucket.as_str()),
@@ -288,6 +321,9 @@ mod tests {
             upstream_request_timeout_ms: 30000,
             max_request_body_bytes: 268_435_456,
             passthrough_unsigned_payload: false,
+            inbound_auth_verify_signatures: false,
+            inbound_credentials_path: None,
+            inbound_auth_max_skew_secs: 900,
         }
     }
 

@@ -1,4 +1,6 @@
 pub mod allowlist;
+pub mod credentials;
+pub mod sigv4;
 pub mod trusted_internal;
 
 use crate::config::{AuthMode, Config};
@@ -85,6 +87,9 @@ mod tests {
             upstream_request_timeout_ms: 30000,
             max_request_body_bytes: 268_435_456,
             passthrough_unsigned_payload: false,
+            inbound_auth_verify_signatures: false,
+            inbound_credentials_path: None,
+            inbound_auth_max_skew_secs: 900,
         }
     }
 

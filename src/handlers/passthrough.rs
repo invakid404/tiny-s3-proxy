@@ -738,6 +738,9 @@ mod tests {
             upstream_request_timeout_ms: 30000,
             max_request_body_bytes: 268_435_456,
             passthrough_unsigned_payload: false,
+            inbound_auth_verify_signatures: false,
+            inbound_credentials_path: None,
+            inbound_auth_max_skew_secs: 900,
         }
     }
 
@@ -748,6 +751,7 @@ mod tests {
             cache: Arc::new(cache),
             singleflight: Arc::new(SingleFlight::new()),
             auth: Arc::new(MockAuth::allow_all()),
+            inbound_sigv4: None,
             policy: CachePolicy::new(
                 config.cacheable_prefixes.clone(),
                 config.cache_max_object_bytes,

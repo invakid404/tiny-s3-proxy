@@ -2263,6 +2263,7 @@ mod tests {
             cache: Arc::new(cache),
             singleflight: Arc::new(crate::cache::SingleFlight::new()),
             auth: Arc::new(auth),
+            inbound_sigv4: None,
             policy: crate::cache::policy::CachePolicy::new(
                 config.cacheable_prefixes.clone(),
                 config.cache_max_object_bytes,
