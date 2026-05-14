@@ -24,7 +24,8 @@ use crate::auth::sigv4::canonical::{
     CanonicalQueryMode, build_canonical_request_from_signed_headers, percent_decode_for_query,
 };
 use crate::auth::sigv4::parser::{
-    CredentialScope, parse_amz_date, parse_credential, parse_signature_hex, parse_signed_headers,
+    CredentialScope, ensure_scope_date_matches, parse_amz_date, parse_credential,
+    parse_signature_hex, parse_signed_headers,
 };
 use crate::auth::sigv4::payload::PayloadHashForSigning;
 use crate::auth::sigv4::{VerifiedRequest, build_string_to_sign, derive_signing_key, parse_hex32};
@@ -288,6 +289,12 @@ pub fn verify_presigned_request(
 
     let raw_query = parts.uri.query().unwrap_or("");
     let pres = parse_presigned_authorization(raw_query, request_id)?;
+
+    // The credential scope date must match the UTC date in X-Amz-Date —
+    // otherwise the canonical request the client signed is dated against
+    // one day and our signing-key derivation against another. Header auth
+    // enforces the same invariant via `ensure_scope_date_matches`.
+    ensure_scope_date_matches(&pres.scope, pres.request_time, request_id)?;
 
     enforce_presigned_validity(&pres, now, request_id)?;
     check_presigned_payload_marker(parts, request_id)?;
@@ -955,6 +962,25 @@ mod verify_tests {
         let err = verify_presigned_request(&parts, &other, rid(), aws_doc_now())
             .expect_err("unknown akid");
         assert_eq!(err.code, "InvalidAccessKeyId");
+    }
+
+    #[test]
+    fn test_credential_scope_date_mismatch_with_amz_date_rejected() {
+        // X-Amz-Credential scope says 20130525, X-Amz-Date says 20130524.
+        // Without the `ensure_scope_date_matches` call the verifier would
+        // continue all the way to the HMAC compare and surface
+        // SignatureDoesNotMatch — but the AWS spec wants a structural
+        // AuthorizationHeaderMalformed first, mirroring the header-auth
+        // `ensure_scope_date_matches` invariant. Deleting that call flips
+        // this assertion to `SignatureDoesNotMatch`.
+        let q = aws_doc_query().replace(
+            "X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request",
+            "X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130525%2Fus-east-1%2Fs3%2Faws4_request",
+        );
+        let parts = aws_doc_parts(&q);
+        let err = verify_presigned_request(&parts, &aws_doc_resolver(), rid(), aws_doc_now())
+            .expect_err("scope-date mismatch");
+        assert_eq!(err.code, "AuthorizationHeaderMalformed");
     }
 
     // ── Validity-window edges ───────────────────────────────────────────
