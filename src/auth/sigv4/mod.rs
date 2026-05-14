@@ -14,6 +14,7 @@
 pub mod canonical;
 pub mod parser;
 pub mod payload;
+pub mod streaming;
 
 use crate::auth::credentials::InboundCredentialResolver;
 use crate::s3::errors::S3Error;
@@ -221,11 +222,15 @@ impl SigV4Verifier {
             PayloadHashForSigning::SignedSha256 { hex, .. } => {
                 verify_payload_matches_hash(body_bytes, hex, request_id)
             }
-            // Calling verify_payload_hash on an unsigned payload is a caller
-            // bug, but we treat it as a no-op rather than panicking so a
-            // future refactor can't accidentally break a request.
+            // Calling verify_payload_hash on a payload whose body isn't a
+            // single buffered SHA-256 is a caller bug, but we treat it as
+            // a no-op rather than panicking so a future refactor can't
+            // accidentally break a request. The HMAC streaming variants
+            // are verified by the aws-chunked decoder, not here.
             PayloadHashForSigning::UnsignedPayload
-            | PayloadHashForSigning::StreamingUnsignedPayloadTrailer => Ok(()),
+            | PayloadHashForSigning::StreamingUnsignedPayloadTrailer
+            | PayloadHashForSigning::StreamingAws4HmacSha256Payload
+            | PayloadHashForSigning::StreamingAws4HmacSha256PayloadTrailer => Ok(()),
         }
     }
 }

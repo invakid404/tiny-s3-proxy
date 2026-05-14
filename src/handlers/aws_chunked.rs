@@ -16,6 +16,8 @@ use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio_util::io::StreamReader;
 
+use crate::auth::sigv4::VerifiedRequest;
+use crate::auth::sigv4::streaming::StreamingSigV4Context;
 use crate::backend::Backend;
 use crate::backend::models::{PutObjectSpoolInput, UploadPartSpoolInput};
 use crate::cache::CacheStore;
@@ -23,7 +25,7 @@ use crate::cache::key::CacheKey;
 use crate::cache::perms::{create_dir_secure, open_file_secure};
 use crate::handlers::AppState;
 use crate::s3::aws_chunked::{
-    AwsChunkedDecoder, AwsChunkedError, DecodedSummary, DecoderMode,
+    AwsChunkedDecoder, AwsChunkedError, ChunkSignaturePolicy, DecodedSummary, DecoderMode,
     STREAMING_AWS4_HMAC_SHA256_PAYLOAD, STREAMING_AWS4_HMAC_SHA256_PAYLOAD_TRAILER,
     STREAMING_UNSIGNED_PAYLOAD_TRAILER,
 };
@@ -273,6 +275,14 @@ fn map_decode_error(err: AwsChunkedError, request_id: &str) -> S3Error {
         AwsChunkedError::TrailerChecksumMismatch { .. } => {
             S3Error::bad_digest(&err.to_string(), request_id)
         }
+        // Strict-mode signature verification failed. These map to the
+        // standard SigV4 `SignatureDoesNotMatch` (HTTP 403) so clients
+        // get the same response shape they would for a tampered
+        // header-level signature.
+        AwsChunkedError::ChunkSignatureMismatch { .. }
+        | AwsChunkedError::TrailerSignatureMismatch => {
+            S3Error::signature_does_not_match(&err.to_string(), request_id)
+        }
     }
 }
 
@@ -286,6 +296,7 @@ async fn decode_into_spool<B: Backend, C: CacheStore>(
     body: Body,
     declared_len: u64,
     mode: DecoderMode,
+    signature_policy: ChunkSignaturePolicy,
 ) -> Result<(UploadSpoolGuard, DecodedSummary), S3Error> {
     use futures_compat::body_to_io_stream;
 
@@ -300,10 +311,15 @@ async fn decode_into_spool<B: Backend, C: CacheStore>(
 
     let reader = StreamReader::new(body_to_io_stream(body));
     let mut writer = BufWriter::new(file);
-    let summary = AwsChunkedDecoder::with_mode(reader, declared_len, mode)
-        .decode_to_writer(&mut writer)
-        .await
-        .map_err(|e| map_decode_error(e, &parsed.request_id))?;
+    let summary = AwsChunkedDecoder::with_mode_and_signature_policy(
+        reader,
+        declared_len,
+        mode,
+        signature_policy,
+    )
+    .decode_to_writer(&mut writer)
+    .await
+    .map_err(|e| map_decode_error(e, &parsed.request_id))?;
 
     if let Err(e) = writer.flush().await {
         return Err(S3Error::internal_error(
@@ -510,12 +526,65 @@ fn reject_if_oversized<B: Backend, C: CacheStore>(
     None
 }
 
+/// Pick the chunk-signature verification policy for a decode-path
+/// request.
+///
+/// - Strict mode (`state.inbound_sigv4.is_some()`) plus a signed mode
+///   yields [`ChunkSignaturePolicy::Verify`] seeded from the request's
+///   [`VerifiedRequest`].
+/// - Strict mode plus unsigned-trailer yields
+///   [`ChunkSignaturePolicy::ShapeOnly`]: the wire format carries no
+///   chunk signatures to verify (the trailer integrity check stays via
+///   the existing CRC/sha2 trailer validation).
+/// - Trust mode always yields [`ChunkSignaturePolicy::ShapeOnly`].
+///
+/// Strict mode without a `VerifiedRequest` is a dispatch invariant
+/// violation (the verifier runs before this code) and surfaces as
+/// `InternalError` rather than silently downgrading to ShapeOnly.
+fn signature_policy_for_decode(
+    mode: &DecoderMode,
+    verified: Option<&VerifiedRequest>,
+    strict_sigv4: bool,
+    request_id: &str,
+) -> Result<ChunkSignaturePolicy, S3Error> {
+    if !strict_sigv4 {
+        return Ok(ChunkSignaturePolicy::ShapeOnly);
+    }
+    match mode {
+        DecoderMode::NonTrailer | DecoderMode::SignedTrailer { .. } => match verified {
+            Some(v) => Ok(ChunkSignaturePolicy::Verify(
+                StreamingSigV4Context::from_verified(v),
+            )),
+            None => Err(S3Error::internal_error(
+                "strict-mode aws-chunked decode reached without a VerifiedRequest",
+                request_id,
+            )),
+        },
+        DecoderMode::UnsignedTrailer { .. } => {
+            // Unsigned trailer has no chunk HMAC, so the eventual policy
+            // is `ShapeOnly`. But strict mode still requires that the
+            // request envelope was verified before the decoder runs;
+            // arriving here without a `VerifiedRequest` is the same
+            // dispatch-invariant violation we fail-closed on for the
+            // signed-mode arms.
+            if verified.is_none() {
+                return Err(S3Error::internal_error(
+                    "strict-mode aws-chunked decode reached without a VerifiedRequest",
+                    request_id,
+                ));
+            }
+            Ok(ChunkSignaturePolicy::ShapeOnly)
+        }
+    }
+}
+
 /// Run the aws-chunked PUT pipeline: decode → spool → upload → purge cache.
 pub async fn handle_put_decode_aws_chunked<B: Backend, C: CacheStore>(
     state: &Arc<AppState<B, C>>,
     parsed: &ParsedRequest,
     key: &str,
     raw_headers: &http::HeaderMap,
+    verified: Option<&VerifiedRequest>,
     body: Body,
 ) -> Response<Body> {
     let declared_len = match read_declared_decoded_length(raw_headers, &parsed.request_id) {
@@ -531,10 +600,21 @@ pub async fn handle_put_decode_aws_chunked<B: Backend, C: CacheStore>(
         Err(e) => return e.to_response(),
     };
 
-    let (guard, summary) = match decode_into_spool(state, parsed, body, declared_len, mode).await {
-        Ok(v) => v,
+    let signature_policy = match signature_policy_for_decode(
+        &mode,
+        verified,
+        state.inbound_sigv4.is_some(),
+        &parsed.request_id,
+    ) {
+        Ok(p) => p,
         Err(e) => return e.to_response(),
     };
+
+    let (guard, summary) =
+        match decode_into_spool(state, parsed, body, declared_len, mode, signature_policy).await {
+            Ok(v) => v,
+            Err(e) => return e.to_response(),
+        };
     let decoded_len = summary.decoded_len;
 
     let input = PutObjectSpoolInput {
@@ -616,6 +696,7 @@ pub async fn handle_put_decode_aws_chunked<B: Backend, C: CacheStore>(
 }
 
 /// Run the aws-chunked UploadPart pipeline.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_upload_part_decode_aws_chunked<B: Backend, C: CacheStore>(
     state: &Arc<AppState<B, C>>,
     parsed: &ParsedRequest,
@@ -623,6 +704,7 @@ pub async fn handle_upload_part_decode_aws_chunked<B: Backend, C: CacheStore>(
     part_number: i32,
     upload_id: &str,
     raw_headers: &http::HeaderMap,
+    verified: Option<&VerifiedRequest>,
     body: Body,
 ) -> Response<Body> {
     if !(1..=10000).contains(&part_number) {
@@ -646,10 +728,21 @@ pub async fn handle_upload_part_decode_aws_chunked<B: Backend, C: CacheStore>(
         Err(e) => return e.to_response(),
     };
 
-    let (guard, summary) = match decode_into_spool(state, parsed, body, declared_len, mode).await {
-        Ok(v) => v,
+    let signature_policy = match signature_policy_for_decode(
+        &mode,
+        verified,
+        state.inbound_sigv4.is_some(),
+        &parsed.request_id,
+    ) {
+        Ok(p) => p,
         Err(e) => return e.to_response(),
     };
+
+    let (guard, summary) =
+        match decode_into_spool(state, parsed, body, declared_len, mode, signature_policy).await {
+            Ok(v) => v,
+            Err(e) => return e.to_response(),
+        };
     let decoded_len = summary.decoded_len;
 
     let input = UploadPartSpoolInput {
@@ -780,7 +873,7 @@ mod tests {
         headers.insert("content-encoding", "aws-chunked".parse().unwrap());
 
         let body = Body::from(aws_chunked_single_chunk(b"abcdefgh"));
-        let resp = handle_put_decode_aws_chunked(&state, &parsed, key, &headers, body).await;
+        let resp = handle_put_decode_aws_chunked(&state, &parsed, key, &headers, None, body).await;
 
         assert_eq!(resp.status(), 200);
         assert_eq!(
@@ -838,7 +931,7 @@ mod tests {
         );
         headers.insert("content-encoding", "gzip, aws-chunked".parse().unwrap());
         let body = Body::from(aws_chunked_single_chunk(b"abcdefgh"));
-        let resp = handle_put_decode_aws_chunked(&state, &parsed, key, &headers, body).await;
+        let resp = handle_put_decode_aws_chunked(&state, &parsed, key, &headers, None, body).await;
         assert_eq!(resp.status(), 200);
 
         let calls = state.backend.put_spool_calls.lock().unwrap();
@@ -857,7 +950,7 @@ mod tests {
         let parsed = make_parsed(key);
         let headers = http::HeaderMap::new();
         let body = Body::from(aws_chunked_single_chunk(b"abcdefgh"));
-        let resp = handle_put_decode_aws_chunked(&state, &parsed, key, &headers, body).await;
+        let resp = handle_put_decode_aws_chunked(&state, &parsed, key, &headers, None, body).await;
         assert_eq!(resp.status(), 400);
 
         let body_bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
@@ -904,7 +997,7 @@ mod tests {
             "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".parse().unwrap(),
         );
         let body = Body::from(aws_chunked_single_chunk(b"abcdefgh"));
-        let resp = handle_put_decode_aws_chunked(&state, &parsed, key, &headers, body).await;
+        let resp = handle_put_decode_aws_chunked(&state, &parsed, key, &headers, None, body).await;
         assert_eq!(resp.status(), 400);
         let body_bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let body_str = String::from_utf8_lossy(&body_bytes);
@@ -947,7 +1040,7 @@ mod tests {
         );
         // Truncated frame: header says 8 bytes but body has 3 and then EOF.
         let body = Body::from(format!("8;chunk-signature={SIG}\r\nabc").into_bytes());
-        let resp = handle_put_decode_aws_chunked(&state, &parsed, key, &headers, body).await;
+        let resp = handle_put_decode_aws_chunked(&state, &parsed, key, &headers, None, body).await;
         assert_eq!(resp.status(), 400);
         let body_bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let body_str = String::from_utf8_lossy(&body_bytes);
@@ -1008,7 +1101,7 @@ mod tests {
         frame.extend_from_slice(format!("0;chunk-signature={SIG}\r\n\r\n").as_bytes());
 
         let body = Body::from(frame);
-        let resp = handle_put_decode_aws_chunked(&state, &parsed, key, &headers, body).await;
+        let resp = handle_put_decode_aws_chunked(&state, &parsed, key, &headers, None, body).await;
         assert_eq!(resp.status(), 400);
         let body_bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let body_str = String::from_utf8_lossy(&body_bytes);
@@ -1039,7 +1132,7 @@ mod tests {
             "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".parse().unwrap(),
         );
         let body = Body::from(aws_chunked_single_chunk(b"abcdefgh"));
-        let resp = handle_put_decode_aws_chunked(&state, &parsed, key, &headers, body).await;
+        let resp = handle_put_decode_aws_chunked(&state, &parsed, key, &headers, None, body).await;
         assert_eq!(resp.status(), 200);
 
         let cached = state.cache.lookup(&cache_key).await.unwrap();
@@ -1062,7 +1155,7 @@ mod tests {
             "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".parse().unwrap(),
         );
         let body = Body::from(aws_chunked_single_chunk(b"abcdefgh"));
-        let resp = handle_put_decode_aws_chunked(&state, &parsed, key, &headers, body).await;
+        let resp = handle_put_decode_aws_chunked(&state, &parsed, key, &headers, None, body).await;
         assert_eq!(resp.status(), 502);
 
         let tmp = state.config.cache_dir.join("tmp");
@@ -1103,9 +1196,10 @@ mod tests {
         );
         let body = Body::from(aws_chunked_single_chunk(b"abcdefgh"));
 
-        let resp =
-            handle_upload_part_decode_aws_chunked(&state, &parsed, key, 3, "u", &headers, body)
-                .await;
+        let resp = handle_upload_part_decode_aws_chunked(
+            &state, &parsed, key, 3, "u", &headers, None, body,
+        )
+        .await;
         assert_eq!(resp.status(), 200);
         let calls = state.backend.upload_part_spool_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
@@ -1590,6 +1684,53 @@ mod tests {
         );
     }
 
+    // ---- signature_policy_for_decode ----
+
+    /// Strict mode with an unsigned-trailer decoder mode but no
+    /// `VerifiedRequest` is the same dispatch-invariant violation as
+    /// strict-without-verified for the signed-mode arms. The eventual
+    /// policy is still `ShapeOnly` (unsigned trailer has no chunk HMAC),
+    /// but the verifier has to have run on the request envelope first;
+    /// silently returning `Ok(ShapeOnly)` here would mask the upstream
+    /// regression. Mirrors the NonTrailer / SignedTrailer arms.
+    ///
+    /// Bug-revert reasoning: dropping the `verified.is_none()` guard in
+    /// the UnsignedTrailer arm of `signature_policy_for_decode` flips
+    /// this from `Err(InternalError)` to `Ok(ShapeOnly)`.
+    #[test]
+    fn test_signature_policy_unsigned_trailer_strict_without_verified_internal_errors() {
+        let mode = DecoderMode::UnsignedTrailer {
+            expected_trailer_name: "x-amz-checksum-crc32".to_string(),
+            algorithm: ChecksumAlgorithm::Crc32,
+        };
+        match signature_policy_for_decode(&mode, None, true, "r") {
+            Ok(_) => {
+                panic!("strict-mode unsigned-trailer without verified must reject");
+            }
+            Err(err) => {
+                assert_eq!(err.code, "InternalError");
+            }
+        }
+    }
+
+    /// Companion: trust mode + unsigned-trailer is a legitimate combination
+    /// and must produce `ShapeOnly` regardless of whether a
+    /// `VerifiedRequest` is present (it never will be in trust mode).
+    /// This pins the trust-mode branch so the strict-mode invariant check
+    /// doesn't accidentally widen.
+    #[test]
+    fn test_signature_policy_unsigned_trailer_trust_mode_yields_shape_only() {
+        let mode = DecoderMode::UnsignedTrailer {
+            expected_trailer_name: "x-amz-checksum-crc32".to_string(),
+            algorithm: ChecksumAlgorithm::Crc32,
+        };
+        match signature_policy_for_decode(&mode, None, false, "r") {
+            Ok(ChunkSignaturePolicy::ShapeOnly) => {}
+            Ok(_) => panic!("trust-mode unsigned-trailer must produce ShapeOnly"),
+            Err(e) => panic!("trust-mode unsigned-trailer must succeed: {e:?}"),
+        }
+    }
+
     /// Defense-in-depth: if an ECDSA streaming sentinel somehow reaches
     /// `decoder_mode_from_headers` (i.e. the dispatch routing regresses and
     /// no longer rejects ECDSA up front), the decoder must still refuse to
@@ -1694,7 +1835,8 @@ mod tests {
         headers.insert("x-amz-trailer", "x-amz-checksum-crc32".parse().unwrap());
 
         let resp =
-            handle_put_decode_aws_chunked(&state, &parsed, key, &headers, Body::from(frame)).await;
+            handle_put_decode_aws_chunked(&state, &parsed, key, &headers, None, Body::from(frame))
+                .await;
         assert_eq!(resp.status(), 200);
 
         let calls = state.backend.put_spool_calls.lock().unwrap();
@@ -1750,7 +1892,8 @@ mod tests {
         headers.insert("x-amz-trailer", "x-amz-checksum-crc32".parse().unwrap());
 
         let resp =
-            handle_put_decode_aws_chunked(&state, &parsed, key, &headers, Body::from(frame)).await;
+            handle_put_decode_aws_chunked(&state, &parsed, key, &headers, None, Body::from(frame))
+                .await;
         assert_eq!(resp.status(), 400);
         let body_bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let body_str = String::from_utf8_lossy(&body_bytes);

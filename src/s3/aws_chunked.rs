@@ -5,8 +5,16 @@
 //! - `STREAMING-UNSIGNED-PAYLOAD-TRAILER`: bare-size chunk headers (no
 //!   signature), followed by a single `x-amz-checksum-*` trailer line.
 //! - `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`: signed chunks PLUS a
-//!   trailer line PLUS an `x-amz-trailer-signature` line. Trailer-signature
-//!   is shape-validated only (64 hex chars); the crypto check is #63.
+//!   trailer line PLUS an `x-amz-trailer-signature` line. The
+//!   trailer-signature is shape-validated (64 lowercase hex chars) AND,
+//!   under [`ChunkSignaturePolicy::Verify`], cryptographically verified
+//!   against the trailer's canonical bytes.
+//!
+//! For HMAC-signed chunk modes the decoder additionally verifies each
+//! chunk's `chunk-signature=` against the chained HMAC when
+//! [`ChunkSignaturePolicy::Verify`] is supplied; trust-mode callers stay
+//! on [`ChunkSignaturePolicy::ShapeOnly`] and only shape-check the
+//! signature value. See `crate::auth::sigv4::streaming` for the math.
 //!
 //! For trailer modes the decoder ALSO validates that the declared checksum
 //! matches the computed checksum over the decoded body. A mismatch fails the
@@ -24,6 +32,7 @@
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
+use crate::auth::sigv4::streaming::{StreamingSigV4Context, StreamingSigV4Error};
 use crate::s3::checksum::{ChecksumAlgorithm, ChecksumHeader};
 
 /// The non-trailer SigV4 streaming sentinel.
@@ -185,10 +194,41 @@ pub enum AwsChunkedError {
     TrailerChecksumMismatch { name: String },
 
     /// `x-amz-trailer-signature` line was missing or malformed on a signed
-    /// trailer upload. Shape-validation only; crypto verification is #63.
+    /// trailer upload. Shape-validation only; the cryptographic
+    /// comparison surfaces as [`Self::TrailerSignatureMismatch`] instead.
     /// Maps to 400 `InvalidRequest`.
     #[error("invalid trailer signature: {message}")]
     InvalidTrailerSignature { message: String },
+
+    /// Strict-mode chunk signature verification failed: the supplied
+    /// `chunk-signature=` value did not match the HMAC computed from the
+    /// chained kSigning + string-to-sign. `chunk_index` identifies the
+    /// failing chunk (0-based, counting payload chunks). Maps to 403
+    /// `SignatureDoesNotMatch` at the handler boundary.
+    #[error("aws-chunked chunk signature mismatch at chunk {chunk_index}")]
+    ChunkSignatureMismatch { chunk_index: u64 },
+
+    /// Strict-mode trailer signature verification failed: the
+    /// `x-amz-trailer-signature` value did not match the HMAC computed
+    /// from the final zero-chunk signature + canonical trailer hash.
+    /// Maps to 403 `SignatureDoesNotMatch` at the handler boundary.
+    #[error("aws-chunked trailer signature mismatch")]
+    TrailerSignatureMismatch,
+}
+
+/// What the decoder should do with each chunk's (and the trailer's)
+/// signature when shape-parsing has succeeded.
+///
+/// - [`ChunkSignaturePolicy::ShapeOnly`] preserves the trust-mode shape
+///   check: the signature has to be 64 lowercase hex chars, but its
+///   value isn't compared against anything. Used when strict-mode SigV4
+///   isn't configured.
+/// - [`ChunkSignaturePolicy::Verify`] additionally verifies each chunk
+///   signature (and the trailer signature on signed-trailer mode) against
+///   the chained HMAC seeded from the request's verified signature.
+pub enum ChunkSignaturePolicy {
+    ShapeOnly,
+    Verify(StreamingSigV4Context),
 }
 
 /// Streaming aws-chunked decoder. Reads frames from `inner`, validates them,
@@ -221,6 +261,10 @@ pub struct AwsChunkedDecoder<R> {
     /// for non-trailer mode and for SHA256 trailers (the body SHA256 we
     /// always compute satisfies that case directly).
     algo_hasher: Option<Box<dyn aws_smithy_checksums::http::HttpChecksum>>,
+    /// Per-chunk + trailer signature verification policy. Owned by the
+    /// decoder so the [`StreamingSigV4Context`] (with its kSigning) is
+    /// dropped — and zeroized — when the decode completes.
+    signature_policy: ChunkSignaturePolicy,
 }
 
 impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
@@ -230,8 +274,32 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
         Self::with_mode(inner, declared_decoded_len, DecoderMode::NonTrailer)
     }
 
-    /// Build a decoder for the specified wire-format mode.
+    /// Build a decoder for the specified wire-format mode in trust mode
+    /// (signatures are shape-validated but not cryptographically
+    /// verified). Equivalent to
+    /// [`AwsChunkedDecoder::with_mode_and_signature_policy`] with
+    /// [`ChunkSignaturePolicy::ShapeOnly`].
     pub fn with_mode(inner: R, declared_decoded_len: u64, mode: DecoderMode) -> Self {
+        Self::with_mode_and_signature_policy(
+            inner,
+            declared_decoded_len,
+            mode,
+            ChunkSignaturePolicy::ShapeOnly,
+        )
+    }
+
+    /// Build a decoder for the specified wire-format mode AND chunk-
+    /// signature policy. Strict-mode callers pass
+    /// [`ChunkSignaturePolicy::Verify`] with a [`StreamingSigV4Context`]
+    /// seeded from the request's verified signature so each chunk (and,
+    /// for signed-trailer mode, the trailer signature) is verified
+    /// against the chained HMAC before the decoded bytes are released.
+    pub fn with_mode_and_signature_policy(
+        inner: R,
+        declared_decoded_len: u64,
+        mode: DecoderMode,
+        signature_policy: ChunkSignaturePolicy,
+    ) -> Self {
         let algo_hasher = match mode.trailer_info() {
             Some((_, ChecksumAlgorithm::Sha256, _)) | None => None,
             Some((_, algo, _)) => Some(algo.into_smithy_impl()),
@@ -245,6 +313,7 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
             previous_data_chunk_size: None,
             mode,
             algo_hasher,
+            signature_policy,
         }
     }
 
@@ -263,10 +332,13 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
 
         loop {
             let header = self.read_chunk_header_line().await?;
-            let chunk_size = parse_chunk_header(&header, expects_signature)?;
+            let parsed = parse_chunk_header(&header, expects_signature)?;
+            let chunk_size = parsed.size;
 
             if chunk_size == 0 {
-                return self.finalize(writer).await;
+                return self
+                    .finalize(writer, parsed.signature_hex.map(str::to_owned))
+                    .await;
             }
 
             // A previous data chunk that was below the minimum is only an
@@ -292,7 +364,51 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
                 });
             }
 
-            self.copy_chunk_payload(writer, chunk_size).await?;
+            let chunk_sha = self.copy_chunk_payload(writer, chunk_size).await?;
+
+            // Strict-mode verification: each chunk's signature must match
+            // the chained HMAC. Run BEFORE consuming the post-payload CRLF
+            // so a tampered signature surfaces as `ChunkSignatureMismatch`
+            // even when the post-payload framing is also malformed —
+            // otherwise a request with both faults would surface as the
+            // framing error and mask the signature failure, and the read
+            // cursor would advance past bytes the verifier didn't need.
+            // Gated on `expects_signature` so unsigned-trailer mode never
+            // tries to verify a signature the wire format doesn't carry.
+            if expects_signature
+                && let ChunkSignaturePolicy::Verify(ctx) = &mut self.signature_policy
+            {
+                let supplied = parsed.signature_hex.expect(
+                    "signed mode guarantees chunk-signature is present (parse_chunk_header would \
+                     have errored otherwise)",
+                );
+                let chunk_sha_hex = hex_encode_lower(&chunk_sha);
+                match ctx.verify_payload_chunk(&chunk_sha_hex, supplied) {
+                    Ok(()) => {}
+                    Err(StreamingSigV4Error::ChunkSignatureMismatch) => {
+                        return Err(AwsChunkedError::ChunkSignatureMismatch {
+                            chunk_index: self.chunk_index,
+                        });
+                    }
+                    Err(StreamingSigV4Error::InvalidSignatureHex(_)) => {
+                        // `parse_chunk_header` already validated lowercase + 64-char.
+                        // Reaching this arm would indicate a shape regression there.
+                        return Err(AwsChunkedError::MalformedFrame {
+                            message: format!(
+                                "chunk-signature failed hex validation at chunk {}",
+                                self.chunk_index,
+                            ),
+                        });
+                    }
+                    Err(StreamingSigV4Error::TrailerSignatureMismatch) => {
+                        // verify_payload_chunk never produces this variant.
+                        unreachable!(
+                            "verify_payload_chunk does not produce TrailerSignatureMismatch"
+                        );
+                    }
+                }
+            }
+
             self.expect_crlf().await?;
 
             self.decoded_len += chunk_size;
@@ -304,10 +420,51 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
     /// Final-chunk handling. Validates the decoded length, consumes any
     /// trailer line(s) the mode requires, verifies the trailer checksum
     /// against the computed digest, and returns the summary.
-    async fn finalize<W>(mut self, _writer: &mut W) -> Result<DecodedSummary, AwsChunkedError>
+    ///
+    /// `zero_chunk_signature_hex` is the value from the
+    /// `0;chunk-signature=...` header (when the mode expects one).
+    /// Strict-mode verification of the zero-chunk signature happens here
+    /// rather than inline in the loop because the zero chunk has no
+    /// payload to hash — `EMPTY_SHA256_HEX` substitutes for both the
+    /// "empty" line and the "current chunk" line of the STS.
+    async fn finalize<W>(
+        mut self,
+        _writer: &mut W,
+        zero_chunk_signature_hex: Option<String>,
+    ) -> Result<DecodedSummary, AwsChunkedError>
     where
         W: AsyncWrite + Unpin,
     {
+        // Verify the zero-chunk signature before anything else: a tampered
+        // final chunk should fail-closed even if trailers are well-formed.
+        // Skip when the mode is unsigned-trailer — `parse_chunk_header`
+        // returns `signature_hex: None` there, and there's nothing for the
+        // streaming context to verify against.
+        let expects_signature = self.mode.expects_chunk_signature();
+        if expects_signature && let ChunkSignaturePolicy::Verify(ctx) = &mut self.signature_policy {
+            let supplied = zero_chunk_signature_hex
+                .as_deref()
+                .expect("signed mode guarantees final chunk-signature is present");
+            match ctx
+                .verify_payload_chunk(crate::auth::sigv4::streaming::EMPTY_SHA256_HEX, supplied)
+            {
+                Ok(()) => {}
+                Err(StreamingSigV4Error::ChunkSignatureMismatch) => {
+                    return Err(AwsChunkedError::ChunkSignatureMismatch {
+                        chunk_index: self.chunk_index,
+                    });
+                }
+                Err(StreamingSigV4Error::InvalidSignatureHex(_)) => {
+                    return Err(AwsChunkedError::MalformedFrame {
+                        message: "final chunk-signature failed hex validation".to_string(),
+                    });
+                }
+                Err(StreamingSigV4Error::TrailerSignatureMismatch) => {
+                    unreachable!("verify_payload_chunk does not produce TrailerSignatureMismatch");
+                }
+            }
+        }
+
         let algo_hasher = self.algo_hasher.take();
         // The trailer info needs to be cloned out before we move chunks of
         // `self` into helper methods.
@@ -326,7 +483,35 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
             Some((expected_name, algo, signed)) => {
                 let parsed = self.read_and_validate_trailer(&expected_name, algo).await?;
                 if signed {
-                    self.read_and_validate_trailer_signature().await?;
+                    let trailer_sig = self.read_and_validate_trailer_signature().await?;
+                    // Strict-mode trailer signature verification. The canonical
+                    // trailer bytes are `<lowercase-name>:<value>\n` — the
+                    // `x-amz-trailer-signature` line itself is NOT included.
+                    if let ChunkSignaturePolicy::Verify(ctx) = &self.signature_policy {
+                        let mut canonical =
+                            Vec::with_capacity(parsed.name.len() + parsed.value.len() + 2);
+                        canonical.extend_from_slice(parsed.name.to_ascii_lowercase().as_bytes());
+                        canonical.push(b':');
+                        canonical.extend_from_slice(parsed.value.as_bytes());
+                        canonical.push(b'\n');
+                        match ctx.verify_trailer(&canonical, &trailer_sig) {
+                            Ok(()) => {}
+                            Err(StreamingSigV4Error::TrailerSignatureMismatch) => {
+                                return Err(AwsChunkedError::TrailerSignatureMismatch);
+                            }
+                            Err(StreamingSigV4Error::InvalidSignatureHex(_)) => {
+                                return Err(AwsChunkedError::InvalidTrailerSignature {
+                                    message: "x-amz-trailer-signature failed hex validation"
+                                        .to_string(),
+                                });
+                            }
+                            Err(StreamingSigV4Error::ChunkSignatureMismatch) => {
+                                unreachable!(
+                                    "verify_trailer does not produce ChunkSignatureMismatch"
+                                );
+                            }
+                        }
+                    }
                 }
                 self.expect_crlf().await?;
                 self.expect_eof().await?;
@@ -444,16 +629,20 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
     }
 
     /// Copy `chunk_size` bytes of payload from the inner reader to `writer`,
-    /// updating both the running SHA-256 hasher and (for trailer modes) the
-    /// algorithm-specific side-channel hasher along the way.
+    /// updating the running body SHA-256 hasher, (for trailer modes) the
+    /// algorithm-specific side-channel hasher, AND a per-chunk SHA-256
+    /// hasher whose digest is returned. Strict-mode callers use the
+    /// per-chunk digest as the `current-chunk-data` line of the chunk
+    /// signature string-to-sign without re-reading the bytes.
     async fn copy_chunk_payload<W>(
         &mut self,
         writer: &mut W,
         chunk_size: u64,
-    ) -> Result<(), AwsChunkedError>
+    ) -> Result<[u8; 32], AwsChunkedError>
     where
         W: AsyncWrite + Unpin,
     {
+        let mut chunk_hasher = Sha256::new();
         let mut remaining = chunk_size;
         let mut buf = [0u8; 16 * 1024];
         while remaining > 0 {
@@ -467,6 +656,7 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
                 return Err(AwsChunkedError::Truncated);
             }
             self.hasher.update(&buf[..n]);
+            chunk_hasher.update(&buf[..n]);
             if let Some(h) = self.algo_hasher.as_deref_mut() {
                 aws_smithy_checksums::Checksum::update(h, &buf[..n]);
             }
@@ -476,7 +666,9 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
                 .map_err(|source| AwsChunkedError::SpoolIo { source })?;
             remaining -= n as u64;
         }
-        Ok(())
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&chunk_hasher.finalize());
+        Ok(out)
     }
 
     /// Read the post-final-chunk trailer line and validate it.
@@ -534,10 +726,11 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
     }
 
     /// Read the `x-amz-trailer-signature:<64 hex>` line that follows the
-    /// declared trailer on signed-trailer uploads. Shape-validation only;
-    /// crypto verification is tracked in #63. The trailing line terminator
-    /// (CRLF or bare LF) is consumed.
-    async fn read_and_validate_trailer_signature(&mut self) -> Result<(), AwsChunkedError> {
+    /// declared trailer on signed-trailer uploads. Shape-validates the
+    /// 64-lowercase-hex form and returns the value so a strict-mode
+    /// caller can drive [`StreamingSigV4Context::verify_trailer`] over it.
+    /// The trailing line terminator (CRLF or bare LF) is consumed.
+    async fn read_and_validate_trailer_signature(&mut self) -> Result<String, AwsChunkedError> {
         let line = self
             .read_trailer_line("x-amz-trailer-signature")
             .await
@@ -574,7 +767,7 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
                 message: "x-amz-trailer-signature must be lowercase hex".to_string(),
             });
         }
-        Ok(())
+        Ok(sig.to_string())
     }
 
     /// Read one trailer line. Accepts either `\r\n` or bare `\n` as terminator;
@@ -676,13 +869,26 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
     }
 }
 
+/// A parsed chunk-header line. `signature_hex` is borrowed from the
+/// supplied `line` so callers can hand it to the verification context
+/// without re-allocating; it's only `Some` when the mode expected a
+/// signature AND the header carried a syntactically valid one.
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedChunkHeader<'a> {
+    size: u64,
+    signature_hex: Option<&'a str>,
+}
+
 /// Parse a chunk header line.
 ///
 /// When `expects_signature` is true (non-trailer and signed-trailer modes),
 /// the form is `<hex-size>;chunk-signature=<64 hex>`. When false (unsigned
 /// trailer mode), the form is the bare `<hex-size>` with no extensions; any
 /// `;`-extension is rejected.
-fn parse_chunk_header(line: &str, expects_signature: bool) -> Result<u64, AwsChunkedError> {
+fn parse_chunk_header(
+    line: &str,
+    expects_signature: bool,
+) -> Result<ParsedChunkHeader<'_>, AwsChunkedError> {
     if expects_signature {
         // Split on the first `;`. Anything before is the hex size; the
         // remainder must be exactly `chunk-signature=<64 hex>`.
@@ -716,7 +922,10 @@ fn parse_chunk_header(line: &str, expects_signature: bool) -> Result<u64, AwsChu
                 message: "chunk-signature must be lowercase hex".to_string(),
             });
         }
-        Ok(size)
+        Ok(ParsedChunkHeader {
+            size,
+            signature_hex: Some(sig_hex),
+        })
     } else {
         // Unsigned trailer mode: bare `<hex-size>`. Any extension — including
         // a spurious `chunk-signature` — is a framing violation. Rejecting
@@ -731,7 +940,10 @@ fn parse_chunk_header(line: &str, expects_signature: bool) -> Result<u64, AwsChu
                 ),
             });
         }
-        parse_chunk_size(line)
+        Ok(ParsedChunkHeader {
+            size: parse_chunk_size(line)?,
+            signature_hex: None,
+        })
     }
 }
 
@@ -1444,8 +1656,9 @@ mod tests {
         );
     }
 
-    /// Signed-trailer with a non-hex `x-amz-trailer-signature` value. Catches
-    /// regressions in the shape-check (which is the only check we do until #63).
+    /// Signed-trailer with a non-hex `x-amz-trailer-signature` value.
+    /// Caught at the shape-check stage before the cryptographic compare
+    /// runs (`Verify` runs `verify_trailer` only on a hex-valid value).
     #[tokio::test]
     async fn test_signed_trailer_non_hex_signature_rejected() {
         let payload = b"abcdefgh";
@@ -1533,5 +1746,434 @@ mod tests {
             matches!(err, AwsChunkedError::MalformedFrame { .. }),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn test_parse_header_returns_signature_hex() {
+        let line = format!("8;chunk-signature={SIG}");
+        let parsed = parse_chunk_header(&line, true).expect("valid signed header");
+        assert_eq!(parsed.size, 8);
+        assert_eq!(parsed.signature_hex, Some(SIG));
+    }
+
+    #[test]
+    fn test_parse_header_unsigned_has_no_signature() {
+        let parsed = parse_chunk_header("8", false).expect("valid unsigned header");
+        assert_eq!(parsed.size, 8);
+        assert_eq!(parsed.signature_hex, None);
+    }
+
+    // ---- strict-mode chunk-signature verification coverage ----
+
+    use crate::auth::sigv4::streaming::{EMPTY_SHA256_HEX, StreamingSigV4Context};
+
+    /// Test signing key shared across the verification tests below. Same
+    /// derivation as `streaming.rs::tests::example_signing_key` — the AWS
+    /// S3 streaming docs secret with the SLASH before `bPx` (the plus
+    /// variant is the EC2 example secret and does NOT reproduce the
+    /// AWS-published streaming vectors). Kept inline so the verification
+    /// tests don't depend on a `#[cfg(test)]` import from another module.
+    fn test_signing_key() -> [u8; 32] {
+        use hmac::{Hmac, KeyInit, Mac};
+        type HmacSha256 = Hmac<Sha256>;
+        fn h(k: &[u8], d: &[u8]) -> Vec<u8> {
+            let mut m = HmacSha256::new_from_slice(k).unwrap();
+            m.update(d);
+            m.finalize().into_bytes().to_vec()
+        }
+        let k_date = h(b"AWS4wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", b"20130524");
+        let k_region = h(&k_date, b"us-east-1");
+        let k_service = h(&k_region, b"s3");
+        let k_signing = h(&k_service, b"aws4_request");
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&k_signing);
+        out
+    }
+
+    const TEST_AMZ_DATE: &str = "20130524T000000Z";
+    const TEST_SCOPE: &str = "20130524/us-east-1/s3/aws4_request";
+    const TEST_SEED_SIG: &str = "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9";
+
+    fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+        use hmac::{Hmac, KeyInit, Mac};
+        type HmacSha256 = Hmac<Sha256>;
+        let mut m = HmacSha256::new_from_slice(key).unwrap();
+        m.update(data);
+        let r = m.finalize().into_bytes();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&r);
+        out
+    }
+
+    /// Compute the expected chunk signature for the given chunk payload
+    /// chained from `prev_sig`. Returns `(sig_hex, sig_chain_next)` where
+    /// `sig_chain_next` is just the same hex, surfaced for ergonomics so
+    /// the caller can thread it into the next chunk's seed.
+    fn compute_chunk_sig(key: &[u8; 32], prev_sig: &str, chunk: &[u8]) -> String {
+        let chunk_hash = sha2::Sha256::digest(chunk);
+        let chunk_hash_hex = hex_encode_lower(&chunk_hash);
+        let sts = format!(
+            "AWS4-HMAC-SHA256-PAYLOAD\n{TEST_AMZ_DATE}\n{TEST_SCOPE}\n{prev_sig}\n{EMPTY_SHA256_HEX}\n{chunk_hash_hex}",
+        );
+        hex_encode_lower(&hmac_sha256(key, sts.as_bytes()))
+    }
+
+    fn compute_zero_chunk_sig(key: &[u8; 32], prev_sig: &str) -> String {
+        let sts = format!(
+            "AWS4-HMAC-SHA256-PAYLOAD\n{TEST_AMZ_DATE}\n{TEST_SCOPE}\n{prev_sig}\n{EMPTY_SHA256_HEX}\n{EMPTY_SHA256_HEX}",
+        );
+        hex_encode_lower(&hmac_sha256(key, sts.as_bytes()))
+    }
+
+    fn compute_trailer_sig(key: &[u8; 32], prev_sig: &str, canonical_bytes: &[u8]) -> String {
+        let trailer_hash = sha2::Sha256::digest(canonical_bytes);
+        let trailer_hash_hex = hex_encode_lower(&trailer_hash);
+        let sts = format!(
+            "AWS4-HMAC-SHA256-TRAILER\n{TEST_AMZ_DATE}\n{TEST_SCOPE}\n{prev_sig}\n{trailer_hash_hex}",
+        );
+        hex_encode_lower(&hmac_sha256(key, sts.as_bytes()))
+    }
+
+    /// Build a non-trailer signed chunk stream with valid chained
+    /// signatures over `chunks` (data) plus the terminating zero chunk.
+    fn build_signed_non_trailer_stream(key: &[u8; 32], chunks: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut prev = TEST_SEED_SIG.to_string();
+        for c in chunks {
+            let sig = compute_chunk_sig(key, &prev, c);
+            out.extend_from_slice(format!("{:x};chunk-signature={sig}\r\n", c.len()).as_bytes());
+            out.extend_from_slice(c);
+            out.extend_from_slice(b"\r\n");
+            prev = sig;
+        }
+        let zero_sig = compute_zero_chunk_sig(key, &prev);
+        out.extend_from_slice(format!("0;chunk-signature={zero_sig}\r\n\r\n").as_bytes());
+        out
+    }
+
+    /// Build a signed-trailer stream including a valid trailer line +
+    /// trailer signature.
+    fn build_signed_trailer_stream(
+        key: &[u8; 32],
+        chunks: &[&[u8]],
+        trailer_name: &str,
+        trailer_value: &str,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut prev = TEST_SEED_SIG.to_string();
+        for c in chunks {
+            let sig = compute_chunk_sig(key, &prev, c);
+            out.extend_from_slice(format!("{:x};chunk-signature={sig}\r\n", c.len()).as_bytes());
+            out.extend_from_slice(c);
+            out.extend_from_slice(b"\r\n");
+            prev = sig;
+        }
+        let zero_sig = compute_zero_chunk_sig(key, &prev);
+        out.extend_from_slice(format!("0;chunk-signature={zero_sig}\r\n").as_bytes());
+
+        let canonical = format!("{}:{}\n", trailer_name.to_ascii_lowercase(), trailer_value);
+        let trailer_sig = compute_trailer_sig(key, &zero_sig, canonical.as_bytes());
+
+        out.extend_from_slice(format!("{trailer_name}:{trailer_value}\r\n").as_bytes());
+        out.extend_from_slice(format!("x-amz-trailer-signature:{trailer_sig}\r\n").as_bytes());
+        out.extend_from_slice(b"\r\n");
+        out
+    }
+
+    fn verify_ctx() -> ChunkSignaturePolicy {
+        ChunkSignaturePolicy::Verify(StreamingSigV4Context::from_parts(
+            test_signing_key(),
+            TEST_AMZ_DATE,
+            TEST_SCOPE,
+            TEST_SEED_SIG,
+        ))
+    }
+
+    async fn decode_with_policy(
+        frame: &[u8],
+        declared_len: u64,
+        mode: DecoderMode,
+        policy: ChunkSignaturePolicy,
+    ) -> Result<(Vec<u8>, DecodedSummary), AwsChunkedError> {
+        let mut sink: BufWriter<Vec<u8>> = BufWriter::new(Vec::new());
+        let summary =
+            AwsChunkedDecoder::with_mode_and_signature_policy(frame, declared_len, mode, policy)
+                .decode_to_writer(&mut sink)
+                .await?;
+        sink.flush().await.unwrap();
+        Ok((sink.into_inner(), summary))
+    }
+
+    /// A well-formed signed non-trailer stream decodes cleanly under
+    /// `Verify`. The 8 KiB minimum applies to non-final chunks so a
+    /// single-chunk stream uses a small payload.
+    #[tokio::test]
+    async fn test_decoder_verifies_signed_non_trailer_chunks() {
+        let key = test_signing_key();
+        let payload = b"hello-streaming";
+        let frame = build_signed_non_trailer_stream(&key, &[payload]);
+        let (decoded, summary) = decode_with_policy(
+            &frame,
+            payload.len() as u64,
+            DecoderMode::NonTrailer,
+            verify_ctx(),
+        )
+        .await
+        .expect("valid signed chunks must verify");
+        assert_eq!(decoded, payload);
+        assert_eq!(summary.decoded_len, payload.len() as u64);
+    }
+
+    /// Well-formed signed-trailer stream + valid trailer signature decodes
+    /// cleanly under `Verify`.
+    #[tokio::test]
+    async fn test_decoder_verifies_signed_trailer_chunks_and_trailer() {
+        let key = test_signing_key();
+        let payload = b"hello-trailer";
+        let algo = ChecksumAlgorithm::Crc32;
+        let value = compute_trailer_value(algo, payload);
+        let frame = build_signed_trailer_stream(&key, &[payload], algo.header_name(), &value);
+        let mode = signed_mode(algo);
+        let (decoded, summary) =
+            decode_with_policy(&frame, payload.len() as u64, mode, verify_ctx())
+                .await
+                .expect("valid signed trailer stream must verify");
+        assert_eq!(decoded, payload);
+        let t = summary.trailer.unwrap();
+        assert_eq!(t.value, value);
+    }
+
+    /// Corrupting a payload chunk's signature must surface
+    /// `ChunkSignatureMismatch` with the right chunk index.
+    ///
+    /// Bug-revert reasoning: removing the `Verify(...)` branch in the
+    /// decoder loop OR forgetting to propagate `verify_payload_chunk`'s
+    /// error makes this test pass with `Ok(...)`. Validated by
+    /// temporarily commenting out the verification branch — the test
+    /// fails with "expected error, got Ok(_)".
+    #[tokio::test]
+    async fn test_decoder_rejects_chunk_signature_mismatch() {
+        let key = test_signing_key();
+        let payload = b"hello-streaming";
+        let mut frame = build_signed_non_trailer_stream(&key, &[payload]);
+        // Locate the chunk header and flip one hex char of the signature.
+        let sig_idx = frame
+            .windows(b"chunk-signature=".len())
+            .position(|w| w == b"chunk-signature=")
+            .unwrap()
+            + b"chunk-signature=".len();
+        // Bump the byte if it's '0' to '1', else swap to '0'.
+        frame[sig_idx] = if frame[sig_idx] == b'0' { b'1' } else { b'0' };
+        let err = decode_with_policy(
+            &frame,
+            payload.len() as u64,
+            DecoderMode::NonTrailer,
+            verify_ctx(),
+        )
+        .await
+        .expect_err("tampered chunk signature must fail");
+        match err {
+            AwsChunkedError::ChunkSignatureMismatch { chunk_index } => {
+                assert_eq!(chunk_index, 0, "first chunk's signature was tampered");
+            }
+            other => panic!("expected ChunkSignatureMismatch, got {other:?}"),
+        }
+    }
+
+    /// A request with BOTH a bad chunk signature AND a malformed
+    /// post-payload CRLF must surface `ChunkSignatureMismatch`, not the
+    /// framing error. The signature check has to run before the CRLF
+    /// terminator is consumed — otherwise a tampered chunk paired with
+    /// any post-payload framing fault would mask the signature failure
+    /// and advance the read cursor past bytes the verifier didn't need
+    /// to look at.
+    ///
+    /// Bug-revert reasoning: swapping `expect_crlf()` to run BEFORE the
+    /// `Verify` branch (the pre-fix shape) flips this assertion to
+    /// `AwsChunkedError::MalformedFrame` — the CRLF check fires first
+    /// and never gets to the signature comparison.
+    #[tokio::test]
+    async fn test_decoder_rejects_bad_signature_before_post_payload_crlf() {
+        let payload: &[u8] = b"hello-streaming";
+        // Hand-build the frame so the post-payload terminator is `XX`
+        // (not `\r\n`) AND the chunk-signature is one of pure zeros
+        // (which can't match the chained HMAC for any non-empty payload).
+        const BAD_SIG: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+        let mut frame = Vec::new();
+        frame.extend_from_slice(
+            format!("{:x};chunk-signature={BAD_SIG}\r\n", payload.len()).as_bytes(),
+        );
+        frame.extend_from_slice(payload);
+        // Malformed post-payload terminator.
+        frame.extend_from_slice(b"XX");
+        // Append a valid-shape zero chunk so the loop has somewhere to
+        // continue if the framing check were to fire first.
+        frame.extend_from_slice(format!("0;chunk-signature={BAD_SIG}\r\n\r\n").as_bytes());
+
+        let err = decode_with_policy(
+            &frame,
+            payload.len() as u64,
+            DecoderMode::NonTrailer,
+            verify_ctx(),
+        )
+        .await
+        .expect_err("must error");
+        assert!(
+            matches!(
+                err,
+                AwsChunkedError::ChunkSignatureMismatch { chunk_index: 0 }
+            ),
+            "signature check must fire before the CRLF check; got {err:?}",
+        );
+    }
+
+    /// Valid data chunks but corrupted zero-chunk signature must surface
+    /// `ChunkSignatureMismatch` (the zero chunk is still a signed payload
+    /// chunk from the protocol's perspective).
+    #[tokio::test]
+    async fn test_decoder_rejects_zero_chunk_signature_mismatch() {
+        let key = test_signing_key();
+        let payload = b"hello-streaming";
+        let mut frame = build_signed_non_trailer_stream(&key, &[payload]);
+        // Find the zero chunk's `chunk-signature=` (the LAST occurrence).
+        let occurrences: Vec<usize> = frame
+            .windows(b"chunk-signature=".len())
+            .enumerate()
+            .filter_map(|(i, w)| (w == b"chunk-signature=").then_some(i))
+            .collect();
+        let zero_sig_idx = *occurrences.last().unwrap() + b"chunk-signature=".len();
+        frame[zero_sig_idx] = if frame[zero_sig_idx] == b'0' {
+            b'1'
+        } else {
+            b'0'
+        };
+        let err = decode_with_policy(
+            &frame,
+            payload.len() as u64,
+            DecoderMode::NonTrailer,
+            verify_ctx(),
+        )
+        .await
+        .expect_err("tampered zero-chunk signature must fail");
+        assert!(
+            matches!(err, AwsChunkedError::ChunkSignatureMismatch { .. }),
+            "got {err:?}",
+        );
+    }
+
+    /// Valid chunks + trailer line, but corrupted
+    /// `x-amz-trailer-signature` value must surface
+    /// `TrailerSignatureMismatch`.
+    ///
+    /// Bug-revert reasoning: dropping the trailer-signature verification
+    /// in `finalize()` (i.e. ignoring the return of
+    /// `read_and_validate_trailer_signature`) lets this test pass with
+    /// `Ok(...)` — the assertion flips.
+    #[tokio::test]
+    async fn test_decoder_rejects_trailer_signature_mismatch() {
+        let key = test_signing_key();
+        let payload = b"hello-trailer";
+        let algo = ChecksumAlgorithm::Crc32;
+        let value = compute_trailer_value(algo, payload);
+        let mut frame = build_signed_trailer_stream(&key, &[payload], algo.header_name(), &value);
+        // Tamper the x-amz-trailer-signature value.
+        let needle = b"x-amz-trailer-signature:";
+        let idx = frame
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .unwrap()
+            + needle.len();
+        frame[idx] = if frame[idx] == b'0' { b'1' } else { b'0' };
+        let err = decode_with_policy(
+            &frame,
+            payload.len() as u64,
+            signed_mode(algo),
+            verify_ctx(),
+        )
+        .await
+        .expect_err("tampered trailer signature must fail");
+        assert!(
+            matches!(err, AwsChunkedError::TrailerSignatureMismatch),
+            "got {err:?}",
+        );
+    }
+
+    /// A second chunk whose signature does NOT chain from the first
+    /// chunk's signature must reject. The helper signs each chunk
+    /// correctly, so we tamper by swapping in a signature computed
+    /// against the SEED (wrong previous-sig).
+    #[tokio::test]
+    async fn test_decoder_rejects_mid_chain_signature_mismatch() {
+        let key = test_signing_key();
+        let c1 = vec![b'A'; 10_000];
+        let c2 = vec![b'B'; 10_000];
+        // Build the legitimate stream, then replace chunk 2's signature
+        // with one computed against the SEED instead of chunk 1's sig.
+        let mut frame = build_signed_non_trailer_stream(&key, &[&c1, &c2]);
+        // Wrong "previous" — the seed signature — so the chain breaks.
+        let wrong_c2_sig = compute_chunk_sig(&key, TEST_SEED_SIG, &c2);
+
+        // Find chunk 2's `chunk-signature=` (the SECOND occurrence).
+        let occurrences: Vec<usize> = frame
+            .windows(b"chunk-signature=".len())
+            .enumerate()
+            .filter_map(|(i, w)| (w == b"chunk-signature=").then_some(i))
+            .collect();
+        let target = occurrences[1] + b"chunk-signature=".len();
+        frame[target..target + 64].copy_from_slice(wrong_c2_sig.as_bytes());
+
+        let total = (c1.len() + c2.len()) as u64;
+        let err = decode_with_policy(&frame, total, DecoderMode::NonTrailer, verify_ctx())
+            .await
+            .expect_err("broken chain must fail");
+        match err {
+            AwsChunkedError::ChunkSignatureMismatch { chunk_index } => {
+                assert_eq!(chunk_index, 1);
+            }
+            other => panic!("expected ChunkSignatureMismatch on chunk 1, got {other:?}"),
+        }
+    }
+
+    /// `ShapeOnly` (trust mode) accepts a stream whose `chunk-signature=`
+    /// values are all-zeros — exactly the behavior before strict mode
+    /// existed. Ensures we didn't accidentally couple verification to
+    /// shape-validation.
+    #[tokio::test]
+    async fn test_decoder_shape_only_still_accepts_dummy_signatures() {
+        let payload = b"hello-streaming";
+        let frame = build_frame(&[payload]);
+        let (decoded, _) = decode_with_policy(
+            &frame,
+            payload.len() as u64,
+            DecoderMode::NonTrailer,
+            ChunkSignaturePolicy::ShapeOnly,
+        )
+        .await
+        .expect("shape-only mode must accept dummy signatures");
+        assert_eq!(decoded, payload);
+    }
+
+    /// Unsigned-trailer mode has no chunk signatures to verify. Even
+    /// when a `Verify` policy is supplied, the decoder must NOT touch the
+    /// streaming context — there's nothing to verify per-chunk, and
+    /// trailer-signature isn't part of the unsigned-trailer wire format.
+    #[tokio::test]
+    async fn test_unsigned_trailer_unaffected_by_chunk_policy() {
+        let payload = b"unsigned-trailer-payload";
+        let algo = ChecksumAlgorithm::Crc32;
+        let value = compute_trailer_value(algo, payload);
+        let frame = build_unsigned_trailer_frame(&[payload], algo.header_name(), &value);
+        // `Verify` policy is supplied, but unsigned-trailer mode never
+        // calls verify_*, so the context is harmless and the decode
+        // succeeds.
+        let (_decoded, summary) = decode_with_policy(
+            &frame,
+            payload.len() as u64,
+            unsigned_mode(algo),
+            verify_ctx(),
+        )
+        .await
+        .expect("unsigned trailer must decode even with Verify policy");
+        assert!(summary.trailer.is_some());
     }
 }
