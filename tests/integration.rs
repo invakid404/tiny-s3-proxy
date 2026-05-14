@@ -3138,16 +3138,36 @@ async fn build_strict_proxy_stack(
     tempfile::TempDir,
     tempfile::NamedTempFile,
 ) {
+    build_strict_proxy_stack_with_creds(
+        backend_endpoint,
+        &serde_json::json!({
+            "version": 1,
+            "credentials": [
+                { "access_key_id": STRICT_INBOUND_KEY, "secret_access_key": STRICT_INBOUND_SECRET }
+            ]
+        }),
+    )
+    .await
+}
+
+/// Same shape as `build_strict_proxy_stack` but lets the caller supply an
+/// arbitrary credentials-file JSON document. The STS round-trip tests use
+/// this to write a v2 file with a `session_token` + `expires_at` entry,
+/// while still keeping the v1 fixture path covered by the no-arg helper.
+async fn build_strict_proxy_stack_with_creds(
+    backend_endpoint: &str,
+    creds_json: &serde_json::Value,
+) -> (
+    aws_sdk_s3::Client,
+    aws_sdk_s3::Client,
+    String,
+    tempfile::TempDir,
+    tempfile::NamedTempFile,
+) {
     use std::io::Write;
 
     let mut creds_file =
         tempfile::NamedTempFile::new().expect("create strict-mode credentials tempfile");
-    let creds_json = serde_json::json!({
-        "version": 1,
-        "credentials": [
-            { "access_key_id": STRICT_INBOUND_KEY, "secret_access_key": STRICT_INBOUND_SECRET }
-        ]
-    });
     creds_file
         .write_all(creds_json.to_string().as_bytes())
         .expect("write strict-mode credentials");
@@ -3909,85 +3929,263 @@ async fn test_strict_sigv4_rejects_dual_auth_header_and_presigned_query() {
     );
 }
 
-/// A presigned URL that carries an `X-Amz-Security-Token` query param
-/// must fail closed with `InvalidToken` — STS support is scoped to PR 4.
-#[tokio::test]
-#[ignore]
-async fn test_strict_sigv4_rejects_presigned_security_token_query() {
-    let (_container, backend_endpoint) = start_versitygw().await;
-    ensure_test_bucket(&backend_endpoint).await;
-    let (strict_client, _wrong, proxy_endpoint, _cache, _creds) =
-        build_strict_proxy_stack(&backend_endpoint).await;
+// ── STS / temporary-credential round trips (PR 4 of #63) ───────────────
 
-    let presigning =
-        aws_sdk_s3::presigning::PresigningConfig::expires_in(std::time::Duration::from_secs(60))
-            .expect("presigning config");
-    let presigned = strict_client
-        .get_object()
-        .bucket(TEST_BUCKET)
-        .key("sts-token.txt")
-        .presigned(presigning)
-        .await
-        .expect("presign GET");
-    let original_url = presigned.uri().to_string();
-    let query = original_url.split_once('?').map(|(_, q)| q).unwrap_or("");
-    // Tack on an unsigned STS token query param. The proxy must reject
-    // before reaching the canonical-request HMAC.
-    let url =
-        format!("{proxy_endpoint}/{TEST_BUCKET}/sts-token.txt?{query}&X-Amz-Security-Token=FQoG");
+const STRICT_STS_TOKEN: &str = "FQoGZXIvYXdzEXAMPLE-session-token-value";
 
-    let http_client = reqwest::Client::new();
-    let resp = http_client
-        .get(&url)
-        .send()
-        .await
-        .expect("send STS-token presigned request");
-    assert_eq!(resp.status().as_u16(), 400);
-    let body = String::from_utf8_lossy(&resp.bytes().await.unwrap()).to_string();
-    assert!(
-        body.contains("InvalidToken"),
-        "expected InvalidToken, got: {body}"
-    );
+/// Inbound credentials file with a long-lived entry *and* a v2
+/// token-bearing entry sharing the same access-key id. The two namespaces
+/// are disjoint at the resolver, so a request without a token resolves
+/// to the long-lived entry and a request with the token resolves to the
+/// temporary entry.
+fn strict_creds_with_token() -> serde_json::Value {
+    serde_json::json!({
+        "version": 2,
+        "credentials": [
+            {
+                "access_key_id": STRICT_INBOUND_KEY,
+                "secret_access_key": STRICT_INBOUND_SECRET,
+            },
+            {
+                "access_key_id": STRICT_INBOUND_KEY,
+                "secret_access_key": STRICT_INBOUND_SECRET,
+                "session_token": STRICT_STS_TOKEN,
+                // Far enough in the future that any test run will see it
+                // as valid; the dedicated "expired" test below uses a
+                // different file with a past `expires_at`.
+                "expires_at": "2099-01-01T00:00:00Z",
+            },
+        ],
+    })
 }
 
-#[tokio::test]
-#[ignore]
-async fn test_strict_sigv4_rejects_sts_token_as_invalid_token() {
-    let (_container, backend_endpoint) = start_versitygw().await;
-    ensure_test_bucket(&backend_endpoint).await;
-    let (_strict, _wrong, proxy_endpoint, _cache, _creds) =
-        build_strict_proxy_stack(&backend_endpoint).await;
-
-    // Build an SDK client with a session-token credential. The SDK will
-    // include `x-amz-security-token` in SignedHeaders, which strict mode
-    // rejects up front.
-    let creds = aws_credential_types::Credentials::new(
-        STRICT_INBOUND_KEY,
-        STRICT_INBOUND_SECRET,
-        Some("session-token-value".to_string()),
-        None,
-        "test",
-    );
+fn sdk_client_with_session_token(
+    proxy_endpoint: &str,
+    akid: &str,
+    secret: &str,
+    token: &str,
+) -> aws_sdk_s3::Client {
+    let creds =
+        aws_credential_types::Credentials::new(akid, secret, Some(token.to_string()), None, "test");
     let cfg = aws_sdk_s3::config::Builder::new()
-        .endpoint_url(&proxy_endpoint)
+        .endpoint_url(proxy_endpoint)
         .region(aws_sdk_s3::config::Region::new("us-east-1"))
         .credentials_provider(creds)
         .force_path_style(true)
         .behavior_version_latest()
         .build();
-    let sts_client = aws_sdk_s3::Client::from_conf(cfg);
+    aws_sdk_s3::Client::from_conf(cfg)
+}
+
+/// Reverts PR 3's `test_strict_sigv4_rejects_presigned_security_token_query`.
+/// A presigned URL generated by an SDK client using STS-issued temporary
+/// credentials must now verify end-to-end: the SDK adds
+/// `X-Amz-Security-Token` to the signed query, the proxy decodes it,
+/// the resolver matches the `(akid, token)` tuple, and the canonical
+/// query (which includes the token) re-signs to the same signature.
+/// Re-adding the parser-level `InvalidToken` reject for
+/// `X-Amz-Security-Token` would flip this test back to a 400.
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4_accepts_presigned_get_with_sts_session_token() {
+    let (_container, backend_endpoint) = start_versitygw().await;
+    ensure_test_bucket(&backend_endpoint).await;
+    let (_strict, _wrong, proxy_endpoint, _cache, _creds) =
+        build_strict_proxy_stack_with_creds(&backend_endpoint, &strict_creds_with_token()).await;
+
+    // Seed the object on the backend.
+    let backend_client =
+        build_raw_s3_client(&backend_endpoint, TEST_ACCESS_KEY, TEST_SECRET_KEY).await;
+    backend_client
+        .put_object()
+        .bucket(TEST_BUCKET)
+        .key("sts-presigned.txt")
+        .body(b"sts-presigned-payload".to_vec().into())
+        .send()
+        .await
+        .expect("seed object");
+
+    let sts_client = sdk_client_with_session_token(
+        &proxy_endpoint,
+        STRICT_INBOUND_KEY,
+        STRICT_INBOUND_SECRET,
+        STRICT_STS_TOKEN,
+    );
+
+    let presigning =
+        aws_sdk_s3::presigning::PresigningConfig::expires_in(std::time::Duration::from_secs(60))
+            .expect("presigning config");
+    let presigned = sts_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key("sts-presigned.txt")
+        .presigned(presigning)
+        .await
+        .expect("presign GET");
+    let url = presigned.uri().to_string();
+    // Sanity: the SDK actually emitted the security-token query param.
+    assert!(
+        url.contains("X-Amz-Security-Token="),
+        "presigned URL did not include STS token: {url}"
+    );
+
+    let http_client = reqwest::Client::new();
+    let resp = http_client.get(&url).send().await.expect("send presigned");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "presigned STS GET should succeed; got status={} body={}",
+        resp.status().as_u16(),
+        String::from_utf8_lossy(&resp.bytes().await.unwrap_or_default()),
+    );
+}
+
+/// Reverts PR 1's `test_strict_sigv4_rejects_sts_token_as_invalid_token`.
+/// An SDK client built with `Credentials::new(..., Some(token), ...)`
+/// signs every request with `x-amz-security-token` in SignedHeaders;
+/// strict mode now resolves the `(akid, token)` tuple and accepts. Adding
+/// back the `x-amz-security-token` reject in `parse_signed_headers`
+/// flips this test back to `InvalidToken`.
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4_accepts_header_auth_with_sts_session_token() {
+    let (_container, backend_endpoint) = start_versitygw().await;
+    ensure_test_bucket(&backend_endpoint).await;
+    let (_strict, _wrong, proxy_endpoint, _cache, _creds) =
+        build_strict_proxy_stack_with_creds(&backend_endpoint, &strict_creds_with_token()).await;
+
+    // Seed the object on the backend.
+    let backend_client =
+        build_raw_s3_client(&backend_endpoint, TEST_ACCESS_KEY, TEST_SECRET_KEY).await;
+    backend_client
+        .put_object()
+        .bucket(TEST_BUCKET)
+        .key("sts-header.txt")
+        .body(b"sts-header-payload".to_vec().into())
+        .send()
+        .await
+        .expect("seed object");
+
+    let sts_client = sdk_client_with_session_token(
+        &proxy_endpoint,
+        STRICT_INBOUND_KEY,
+        STRICT_INBOUND_SECRET,
+        STRICT_STS_TOKEN,
+    );
+    let resp = sts_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key("sts-header.txt")
+        .send()
+        .await
+        .expect("STS GET should now succeed");
+    let body = resp.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), b"sts-header-payload");
+}
+
+/// A wrong session token must surface as `InvalidAccessKeyId` (tuple
+/// miss), not `InvalidToken` — the response intentionally doesn't tell
+/// the client whether the access-key exists in another token namespace.
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4_rejects_wrong_sts_session_token() {
+    let (_container, backend_endpoint) = start_versitygw().await;
+    ensure_test_bucket(&backend_endpoint).await;
+    let (_strict, _wrong, proxy_endpoint, _cache, _creds) =
+        build_strict_proxy_stack_with_creds(&backend_endpoint, &strict_creds_with_token()).await;
+
+    let sts_client = sdk_client_with_session_token(
+        &proxy_endpoint,
+        STRICT_INBOUND_KEY,
+        STRICT_INBOUND_SECRET,
+        "wrong-token-value",
+    );
 
     let err = sts_client
         .get_object()
         .bucket(TEST_BUCKET)
-        .key("sts.txt")
+        .key("any.txt")
         .send()
         .await
-        .expect_err("STS token must reject");
+        .expect_err("wrong STS token must fail");
     let dbg = format!("{err:?}");
     assert!(
-        dbg.contains("InvalidToken"),
-        "expected InvalidToken, got: {dbg}"
+        dbg.contains("InvalidAccessKeyId"),
+        "expected InvalidAccessKeyId, got: {dbg}"
+    );
+}
+
+/// A token whose static-file `expires_at` is in the past must surface as
+/// `ExpiredToken`. `InvalidAccessKeyId` (the response for a tuple miss)
+/// is the wrong code here — the client needs to know to refresh, not to
+/// rotate keys.
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4_rejects_expired_sts_session_token() {
+    let (_container, backend_endpoint) = start_versitygw().await;
+    ensure_test_bucket(&backend_endpoint).await;
+    let expired_creds = serde_json::json!({
+        "version": 2,
+        "credentials": [
+            {
+                "access_key_id": STRICT_INBOUND_KEY,
+                "secret_access_key": STRICT_INBOUND_SECRET,
+                "session_token": STRICT_STS_TOKEN,
+                "expires_at": "2000-01-01T00:00:00Z",
+            },
+        ],
+    });
+    let (_strict, _wrong, proxy_endpoint, _cache, _creds) =
+        build_strict_proxy_stack_with_creds(&backend_endpoint, &expired_creds).await;
+
+    let sts_client = sdk_client_with_session_token(
+        &proxy_endpoint,
+        STRICT_INBOUND_KEY,
+        STRICT_INBOUND_SECRET,
+        STRICT_STS_TOKEN,
+    );
+    let err = sts_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key("any.txt")
+        .send()
+        .await
+        .expect_err("expired STS token must fail");
+    let dbg = format!("{err:?}");
+    assert!(
+        dbg.contains("ExpiredToken"),
+        "expected ExpiredToken, got: {dbg}"
+    );
+}
+
+/// Token present but the resolver only knows the long-lived credential
+/// under that access key. Namespace miss → `InvalidAccessKeyId`.
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4_rejects_sts_token_when_only_long_lived_credential_configured() {
+    let (_container, backend_endpoint) = start_versitygw().await;
+    ensure_test_bucket(&backend_endpoint).await;
+    // Default fixture is v1 / long-lived only.
+    let (_strict, _wrong, proxy_endpoint, _cache, _creds) =
+        build_strict_proxy_stack(&backend_endpoint).await;
+
+    let sts_client = sdk_client_with_session_token(
+        &proxy_endpoint,
+        STRICT_INBOUND_KEY,
+        STRICT_INBOUND_SECRET,
+        STRICT_STS_TOKEN,
+    );
+    let err = sts_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key("any.txt")
+        .send()
+        .await
+        .expect_err("token-bearing request with only no-token creds must fail");
+    let dbg = format!("{err:?}");
+    assert!(
+        dbg.contains("InvalidAccessKeyId"),
+        "expected InvalidAccessKeyId, got: {dbg}"
     );
 }
 

@@ -66,9 +66,11 @@ pub struct Config {
     // Inbound SigV4 verification (strict mode). When `inbound_auth_verify_signatures`
     // is true, normal requests are required to carry a valid SigV4
     // `Authorization` header or a presigned-URL `X-Amz-*` query signature
-    // backed by one of the credentials in `inbound_credentials_path`. STS,
-    // SigV4A, and presigned-aws-chunked flows remain fail-closed in this
-    // mode (rejected up front; tracked in follow-up PRs of issue #63).
+    // backed by one of the credentials in `inbound_credentials_path`. STS
+    // temporary credentials are supported via the v2 credentials-file
+    // schema (`session_token` + `expires_at`). SigV4A and
+    // presigned-aws-chunked flows remain fail-closed in this mode
+    // (rejected up front; tracked in PR 5 of issue #63).
     pub inbound_auth_verify_signatures: bool,
     pub inbound_credentials_path: Option<PathBuf>,
     pub inbound_auth_max_skew_secs: u64,

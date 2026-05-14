@@ -506,6 +506,61 @@ mod tests {
     }
 
     #[test]
+    fn test_canonical_headers_include_x_amz_security_token() {
+        // STS support (PR 4 of #63): when the client signs
+        // `x-amz-security-token`, the canonical headers section must
+        // contain the token value. Re-adding the parser-level reject of
+        // the token in `parse_signed_headers` would make this path
+        // unreachable, but the canonicalizer itself stays generic.
+        let parts = parts_with(
+            "/b",
+            "GET",
+            &[("host", "h"), ("x-amz-security-token", "tok-abc")],
+        );
+        let auth = auth_with_signed_headers(&["host", "x-amz-security-token"]);
+        let payload = PayloadHashForSigning::UnsignedPayload;
+        let cr = build_canonical_request(&parts, &auth, &payload, "rid").unwrap();
+        let lines: Vec<&str> = cr.canonical_request.split('\n').collect();
+        assert_eq!(lines[3], "host:h");
+        assert_eq!(lines[4], "x-amz-security-token:tok-abc");
+        assert_eq!(lines[6], "host;x-amz-security-token");
+    }
+
+    #[test]
+    fn test_presigned_canonical_query_includes_security_token_excludes_only_signature() {
+        // Presigned + STS: every auth param (including the token)
+        // participates in the canonical query because the verifier only
+        // excludes `X-Amz-Signature`. Token bytes containing `+`, `/`,
+        // `=` re-encode to `%2B`, `%2F`, `%3D` — pin all three so a
+        // future change to form-decoding (`+` → space) would surface
+        // here rather than only via signature-mismatch downstream.
+        let parts = parts_with(
+            "/b?X-Amz-Algorithm=AWS4-HMAC-SHA256\
+              &X-Amz-Security-Token=tok%2Babc%2Fdef%3D\
+              &X-Amz-Signature=abc",
+            "GET",
+            &[("host", "h")],
+        );
+        let signed = vec![HeaderName::from_static("host")];
+        let payload = PayloadHashForSigning::UnsignedPayload;
+        let cr = build_canonical_request_from_signed_headers(
+            &parts,
+            &signed,
+            &payload,
+            CanonicalQueryMode::ExcludePresignedSignature,
+            "rid",
+        )
+        .unwrap();
+        let lines: Vec<&str> = cr.canonical_request.split('\n').collect();
+        // `+`, `/`, `=` must all re-encode (uppercase hex). `X-Amz-Signature`
+        // is excluded; no other auth param is.
+        assert_eq!(
+            lines[2],
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Security-Token=tok%2Babc%2Fdef%3D"
+        );
+    }
+
+    #[test]
     fn test_hashed_payload_section() {
         let parts = parts_with("/b", "GET", &[("host", "h")]);
         let auth = auth_with_signed_headers(&["host"]);

@@ -18,6 +18,12 @@
 //!   signature key therefore makes the parser surface
 //!   `AuthorizationHeaderMalformed`, rather than silently ignoring the
 //!   request's signing intent.
+//!
+//! STS-issued temporary credentials are supported: the parser percent-
+//! decodes `X-Amz-Security-Token` and the verifier forwards it to the
+//! resolver. The canonical query already includes `X-Amz-Security-Token`
+//! because the only excluded auth parameter is `X-Amz-Signature` (the
+//! signature itself).
 
 use crate::auth::credentials::InboundCredentialResolver;
 use crate::auth::sigv4::canonical::{
@@ -28,7 +34,10 @@ use crate::auth::sigv4::parser::{
     parse_signature_hex, parse_signed_headers,
 };
 use crate::auth::sigv4::payload::PayloadHashForSigning;
-use crate::auth::sigv4::{VerifiedRequest, build_string_to_sign, derive_signing_key, parse_hex32};
+use crate::auth::sigv4::{
+    VerifiedRequest, build_string_to_sign, derive_signing_key, parse_hex32,
+    resolve_credential_for_sigv4,
+};
 use crate::s3::errors::S3Error;
 use chrono::{DateTime, Utc};
 use http::HeaderName;
@@ -82,6 +91,10 @@ pub struct PresignedAuthorization {
     pub amz_date: String,
     pub request_time: DateTime<Utc>,
     pub expires: Duration,
+    /// Percent-decoded `X-Amz-Security-Token` value, when the URL was
+    /// generated from STS-issued temporary credentials. `None` for
+    /// long-lived presigned URLs.
+    pub session_token: Option<String>,
 }
 
 /// Cheap precheck for "is this a presigned URL request?". Compares decoded
@@ -109,10 +122,10 @@ pub fn has_presigned_signature_query(raw_query: &str) -> bool {
 /// Parse the `X-Amz-*` query auth parameters carried by a presigned URL.
 ///
 /// Each required field is matched on its exact percent-decoded name. STS
-/// (`X-Amz-Security-Token`) and SigV4A (`AWS4-ECDSA-*`) presigned URLs are
-/// scoped to follow-up PRs of issue #63, so they get their own fail-closed
-/// error codes (`InvalidToken` / `UnsupportedSignature`) before any
-/// credential lookup or HMAC math.
+/// (`X-Amz-Security-Token`) credentials are accepted and verified — the
+/// token is percent-decoded and stored on the returned
+/// [`PresignedAuthorization`]. SigV4A (`AWS4-ECDSA-*`) presigned URLs stay
+/// fail-closed with `UnsupportedSignature` (PR 5 of #63).
 pub fn parse_presigned_authorization(
     raw_query: &str,
     request_id: &str,
@@ -123,7 +136,7 @@ pub fn parse_presigned_authorization(
     let mut expires_raw: Option<String> = None;
     let mut signed_headers_raw: Option<String> = None;
     let mut signature_raw: Option<String> = None;
-    let mut security_token_seen = false;
+    let mut security_token: Option<String> = None;
 
     for chunk in raw_query.split('&') {
         if chunk.is_empty() {
@@ -167,8 +180,42 @@ pub fn parse_presigned_authorization(
         if canonical_name == "X-Amz-Content-Sha256" {
             continue;
         }
+
+        // STS session token gets the same shape rules as the other auth
+        // params (single occurrence, non-empty, UTF-8 ASCII string) but
+        // is stored on its own slot since it's optional. "Opaque token"
+        // means no case-folding / trimming / form-decoding — base64-ish
+        // bytes like `+`, `/`, `=` MUST round-trip — but it doesn't mean
+        // accepting arbitrary Unicode. AWS STS tokens are ASCII, and the
+        // header-auth path already rejects non-ASCII via `HeaderValue::to_str`;
+        // matching that here keeps the two auth paths symmetric.
         if canonical_name == "X-Amz-Security-Token" {
-            security_token_seen = true;
+            if security_token.is_some() {
+                return Err(S3Error::authorization_header_malformed(
+                    "presigned auth has duplicate X-Amz-Security-Token",
+                    request_id,
+                ));
+            }
+            let decoded_value = percent_decode_for_query(raw_v);
+            let value_str = std::str::from_utf8(&decoded_value).map_err(|_| {
+                S3Error::authorization_header_malformed(
+                    "presigned auth field X-Amz-Security-Token is not valid UTF-8",
+                    request_id,
+                )
+            })?;
+            if value_str.is_empty() {
+                return Err(S3Error::authorization_header_malformed(
+                    "presigned auth field X-Amz-Security-Token is empty",
+                    request_id,
+                ));
+            }
+            if value_str.bytes().any(|b| b >= 0x80) {
+                return Err(S3Error::authorization_header_malformed(
+                    "presigned auth field X-Amz-Security-Token is not valid ASCII",
+                    request_id,
+                ));
+            }
+            security_token = Some(value_str.to_string());
             continue;
         }
 
@@ -210,17 +257,6 @@ pub fn parse_presigned_authorization(
             ));
         }
         *slot = Some(value_str.to_string());
-    }
-
-    // STS session tokens go on a separate compatibility path; fail closed
-    // before any credential lookup. Mirrors the parser-level rejection for
-    // STS tokens carried in the Authorization header's SignedHeaders.
-    if security_token_seen {
-        return Err(S3Error::invalid_token(
-            "temporary credentials (X-Amz-Security-Token) are not supported in strict mode; \
-             tracked in PR 4 of issue #63",
-            request_id,
-        ));
     }
 
     // SigV4A presigned URLs use `AWS4-ECDSA-*`. The signing keys are ECDSA,
@@ -316,6 +352,7 @@ pub fn parse_presigned_authorization(
         amz_date: amz_date_v,
         request_time,
         expires: Duration::from_secs(expires_secs),
+        session_token: security_token,
     })
 }
 
@@ -365,18 +402,17 @@ pub fn verify_presigned_request(
     enforce_presigned_validity(&pres, now, request_id)?;
     check_presigned_payload_marker(parts, request_id)?;
 
-    // Resolve the access key. A miss → InvalidAccessKeyId; a store error →
-    // InternalError. PR 3 always passes `None` for the session token —
-    // STS-issued temporary credentials are rejected earlier by the parser.
-    let credential = resolver
-        .resolve(&pres.access_key_id, None)
-        .map_err(|e| {
-            tracing::error!(error = %e, "credential resolver failed");
-            S3Error::internal_error("credential resolver failed", request_id)
-        })?
-        .ok_or_else(|| {
-            S3Error::invalid_access_key_id("access-key id is not configured", request_id)
-        })?;
+    // Resolve the access key. Tuple miss → InvalidAccessKeyId, expired →
+    // ExpiredToken, resolver-classified malformed token → InvalidToken,
+    // store error → InternalError. The session token (if any) is part of
+    // the canonical query and is now also part of the lookup key.
+    let credential = resolve_credential_for_sigv4(
+        resolver,
+        &pres.access_key_id,
+        pres.session_token.as_deref(),
+        now,
+        request_id,
+    )?;
 
     let payload = PayloadHashForSigning::UnsignedPayload;
     let canonical = build_canonical_request_from_signed_headers(
@@ -861,10 +897,82 @@ mod tests {
     // ── Parse: STS / SigV4A deferrals ───────────────────────────────────
 
     #[test]
-    fn test_parse_security_token_rejected_as_invalid_token() {
-        let q = format!("{}&X-Amz-Security-Token=FQoG…", aws_doc_presigned_query());
-        let err = parse_presigned_authorization(&q, rid()).expect_err("STS token");
-        assert_eq!(err.code, "InvalidToken");
+    fn test_parse_security_token_now_parsed_and_percent_decoded() {
+        // Reverts PR 3's `InvalidToken` parser-level reject. A presigned
+        // URL with `X-Amz-Security-Token` now parses and the percent-
+        // decoded value lands on `PresignedAuthorization::session_token`.
+        // Re-adding the `InvalidToken` short-circuit in the parser flips
+        // this back to an error.
+        //
+        // The token value here covers two things at once: percent-decoded
+        // `%2F` becomes `/`, and the bare `+` stays a literal plus (no
+        // form decoding). Real STS tokens use base64-ish alphabets so
+        // both bytes appear in the wild.
+        let q = format!(
+            "{}&X-Amz-Security-Token=FQoG%2FAAa+EXAMPLE",
+            aws_doc_presigned_query()
+        );
+        let pres = parse_presigned_authorization(&q, rid()).expect("STS token now parses");
+        assert_eq!(
+            pres.session_token.as_deref(),
+            Some("FQoG/AAa+EXAMPLE"),
+            "session_token must be percent-decoded; `+` stays literal"
+        );
+    }
+
+    #[test]
+    fn test_parse_security_token_duplicate_rejected() {
+        // Duplicate `X-Amz-Security-Token` query params are malformed —
+        // we never join token values for resolver lookup (STS tokens are
+        // not a comma-mergeable list), so accepting the duplicate would
+        // make resolver behavior position-dependent.
+        let q = format!(
+            "{}&X-Amz-Security-Token=tok1&X-Amz-Security-Token=tok2",
+            aws_doc_presigned_query()
+        );
+        let err = parse_presigned_authorization(&q, rid()).expect_err("duplicate STS token");
+        assert_eq!(err.code, "AuthorizationHeaderMalformed");
+    }
+
+    #[test]
+    fn test_parse_security_token_empty_rejected() {
+        let q = format!("{}&X-Amz-Security-Token=", aws_doc_presigned_query());
+        let err = parse_presigned_authorization(&q, rid()).expect_err("empty STS token");
+        assert_eq!(err.code, "AuthorizationHeaderMalformed");
+    }
+
+    #[test]
+    fn test_parse_security_token_non_ascii_rejected() {
+        // `%C3%A9` decodes to U+00E9 (é): valid UTF-8 but not ASCII. AWS
+        // STS tokens are ASCII bearer strings, and the header-auth path
+        // already rejects non-ASCII via `HeaderValue::to_str`. The other
+        // six presigned required auth fields enforce this same
+        // `b >= 0x80` check; deleting the matching enforcement here would
+        // let non-ASCII token bytes flow into the resolver's
+        // `subtle::ConstantTimeEq` compare and create an unnecessary
+        // asymmetry between the two auth paths. `+`, `/`, `=` are still
+        // accepted (covered by the round-trip / decoding tests above) —
+        // this only rejects bytes outside the ASCII range.
+        let q = format!(
+            "{}&X-Amz-Security-Token=tok%C3%A9",
+            aws_doc_presigned_query()
+        );
+        let err = parse_presigned_authorization(&q, rid()).expect_err("non-ASCII STS token");
+        assert_eq!(err.code, "AuthorizationHeaderMalformed");
+    }
+
+    #[test]
+    fn test_parse_security_token_mis_cased_query_key_still_rejected() {
+        // The canonical-casing rule for presigned auth params is enforced
+        // for every recognised name, including `X-Amz-Security-Token`.
+        // Lowercase variants get classified by the case-insensitive
+        // matcher but then fail the exact-case check; without that check
+        // a client could smuggle in an STS token under `x-amz-security-token`
+        // (an ordinary signed query param shape) and bypass the dedicated
+        // token slot.
+        let q = format!("{}&x-amz-security-token=tok", aws_doc_presigned_query());
+        let err = parse_presigned_authorization(&q, rid()).expect_err("mis-cased STS token");
+        assert_eq!(err.code, "AuthorizationHeaderMalformed");
     }
 
     #[test]
@@ -934,15 +1042,25 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_signed_headers_security_token_rejected() {
-        // STS via SignedHeaders should be rejected the same way the
-        // header-path parser does it; routed through `parse_signed_headers`.
+    fn test_parse_signed_headers_security_token_now_accepted_at_parser_level() {
+        // The shared `parse_signed_headers` used to reject
+        // `x-amz-security-token` outright (PR 1 behavior). PR 4 lifts that
+        // because the canonical request includes the token header (and the
+        // canonical query includes the `X-Amz-Security-Token` parameter)
+        // when the client presents STS credentials. Re-adding the
+        // parser-level reject in `parse_signed_headers` flips this back
+        // to an `InvalidToken` error.
         let q = aws_doc_presigned_query().replace(
             "&X-Amz-SignedHeaders=host",
             "&X-Amz-SignedHeaders=host%3Bx-amz-security-token",
         );
-        let err = parse_presigned_authorization(&q, rid()).expect_err("STS in signed headers");
-        assert_eq!(err.code, "InvalidToken");
+        let pres =
+            parse_presigned_authorization(&q, rid()).expect("STS in signed headers now parses");
+        assert!(
+            pres.signed_headers
+                .iter()
+                .any(|n| n.as_str() == "x-amz-security-token")
+        );
     }
 
     #[test]
@@ -968,6 +1086,7 @@ mod verify_tests {
     use super::*;
     use crate::auth::credentials::{
         CredentialResolveError, InboundCredential, InboundCredentialResolver, InboundSecret,
+        SessionToken,
     };
     use chrono::{TimeZone, Utc};
     use http::Request;
@@ -977,16 +1096,39 @@ mod verify_tests {
         "rid"
     }
 
+    /// Test resolver shared with the header-auth tests. Configurable with
+    /// an optional no-token credential AND an optional token-bearing
+    /// credential under the same access-key id so each test pins its own
+    /// namespace shape.
     struct FixedResolver {
         akid: Arc<str>,
-        secret: InboundSecret,
+        no_token_secret: Option<InboundSecret>,
+        token: Option<(SessionToken, InboundSecret, Option<DateTime<Utc>>)>,
     }
 
     impl FixedResolver {
         fn new(akid: &str, secret: &str) -> Self {
             Self {
                 akid: Arc::from(akid),
-                secret: InboundSecret::new(secret.to_string()),
+                no_token_secret: Some(InboundSecret::new(secret.to_string())),
+                token: None,
+            }
+        }
+
+        fn with_token(
+            akid: &str,
+            token: &str,
+            secret: &str,
+            expires_at: Option<DateTime<Utc>>,
+        ) -> Self {
+            Self {
+                akid: Arc::from(akid),
+                no_token_secret: None,
+                token: Some((
+                    SessionToken::new(token.to_string()),
+                    InboundSecret::new(secret.to_string()),
+                    expires_at,
+                )),
             }
         }
     }
@@ -995,17 +1137,40 @@ mod verify_tests {
         fn resolve(
             &self,
             access_key_id: &str,
-            _session_token: Option<&str>,
+            session_token: Option<&str>,
+            now: DateTime<Utc>,
         ) -> Result<Option<Arc<InboundCredential>>, CredentialResolveError> {
-            if access_key_id == self.akid.as_ref() {
-                Ok(Some(Arc::new(InboundCredential {
-                    access_key_id: self.akid.clone(),
-                    secret_access_key: self.secret.clone(),
-                    session_token: None,
-                    expires_at: None,
-                })))
-            } else {
-                Ok(None)
+            if access_key_id != self.akid.as_ref() {
+                return Ok(None);
+            }
+            match session_token {
+                None => Ok(self.no_token_secret.as_ref().map(|secret| {
+                    Arc::new(InboundCredential {
+                        access_key_id: self.akid.clone(),
+                        secret_access_key: secret.clone(),
+                        session_token: None,
+                        expires_at: None,
+                    })
+                })),
+                Some(t) => {
+                    let Some((stored, secret, expires_at)) = self.token.as_ref() else {
+                        return Ok(None);
+                    };
+                    if stored.expose() != t {
+                        return Ok(None);
+                    }
+                    if let Some(exp) = expires_at
+                        && now >= *exp
+                    {
+                        return Err(CredentialResolveError::Expired { expires_at: *exp });
+                    }
+                    Ok(Some(Arc::new(InboundCredential {
+                        access_key_id: self.akid.clone(),
+                        secret_access_key: secret.clone(),
+                        session_token: Some(stored.clone()),
+                        expires_at: *expires_at,
+                    })))
+                }
             }
         }
     }
@@ -1379,6 +1544,294 @@ mod verify_tests {
         let parts = aws_doc_parts(&q);
         let err = verify_presigned_request(&parts, &aws_doc_resolver(), rid(), aws_doc_now())
             .expect_err("streaming via query");
+        assert_eq!(err.code, "UnsupportedSignature");
+    }
+
+    // ── Presigned + STS (PR 4 of #63) ───────────────────────────────────
+
+    /// Build a fresh presigned-URL query that signs `host` and includes a
+    /// `X-Amz-Security-Token` query parameter. Returns the query string —
+    /// the verifier rebuilds the canonical request from `parts` and the
+    /// signed headers, so the same self-contained signing we already trust
+    /// for the no-token reference vector applies here.
+    fn build_sts_presigned_query(
+        akid: &str,
+        secret: &str,
+        host: &str,
+        amz_date: &str,
+        token: &str,
+    ) -> String {
+        use hmac::{Hmac, KeyInit, Mac};
+        use sha2::{Digest, Sha256};
+        type HmacSha256 = Hmac<Sha256>;
+
+        let date_yyyymmdd = &amz_date[..8];
+        // AWS uri-encode the token for the query: `+`, `/`, `=` go to
+        // their %-escapes, everything else (alnum, `-_.~`) stays. The
+        // proxy decodes the same way on input.
+        let encoded_token: String = token
+            .bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect();
+        let encoded_credential =
+            format!("{akid}%2F{date_yyyymmdd}%2Fus-east-1%2Fs3%2Faws4_request");
+
+        // Canonical query: sort by encoded key. The request URL we'll
+        // send keeps fields in any order — the verifier sorts them — so
+        // we only need to compute the canonical form for the signature.
+        let mut params: Vec<(String, String)> = vec![
+            (
+                "X-Amz-Algorithm".to_string(),
+                "AWS4-HMAC-SHA256".to_string(),
+            ),
+            ("X-Amz-Credential".to_string(), encoded_credential.clone()),
+            ("X-Amz-Date".to_string(), amz_date.to_string()),
+            ("X-Amz-Expires".to_string(), "60".to_string()),
+            ("X-Amz-Security-Token".to_string(), encoded_token.clone()),
+            ("X-Amz-SignedHeaders".to_string(), "host".to_string()),
+        ];
+        params.sort();
+        let canonical_query = params
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("&");
+
+        let canonical_request =
+            format!("GET\n/test.txt\n{canonical_query}\nhost:{host}\n\nhost\nUNSIGNED-PAYLOAD");
+        let mut hasher = Sha256::new();
+        hasher.update(canonical_request.as_bytes());
+        let creq_hex = hex::encode(hasher.finalize());
+
+        let scope = format!("{date_yyyymmdd}/us-east-1/s3/aws4_request");
+        let sts = format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{creq_hex}");
+
+        fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
+            let mut mac = HmacSha256::new_from_slice(key).unwrap();
+            mac.update(data);
+            mac.finalize().into_bytes().to_vec()
+        }
+        let k_date = hmac(format!("AWS4{secret}").as_bytes(), date_yyyymmdd.as_bytes());
+        let k_region = hmac(&k_date, b"us-east-1");
+        let k_service = hmac(&k_region, b"s3");
+        let k_signing = hmac(&k_service, b"aws4_request");
+        let signature = hex::encode(hmac(&k_signing, sts.as_bytes()));
+
+        // Emit the URL in the same order params were sorted; sticking
+        // with the canonical order keeps the test query mirror the
+        // canonical query for easy diffing.
+        format!("{canonical_query}&X-Amz-Signature={signature}")
+    }
+
+    fn sts_parts(query: &str) -> http::request::Parts {
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/test.txt?{query}"))
+            .header("host", AWS_DOC_HOST)
+            .body(())
+            .unwrap();
+        req.into_parts().0
+    }
+
+    fn sts_now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn test_presigned_sts_round_trip_verifies() {
+        // Reverts PR 3's `InvalidToken` rejection for presigned URLs that
+        // carry `X-Amz-Security-Token`. The canonical query includes the
+        // token because only `X-Amz-Signature` is excluded; the resolver
+        // accepts the `(akid, token)` tuple. Removing the
+        // `pres.session_token.as_deref()` argument to the resolver in
+        // `verify_presigned_request` would flip this to `InvalidAccessKeyId`
+        // because the resolver would look up the no-token namespace.
+        let q = build_sts_presigned_query(
+            AWS_DOC_AKID,
+            AWS_DOC_SECRET,
+            AWS_DOC_HOST,
+            "20260101T120000Z",
+            "tok-abc",
+        );
+        let parts = sts_parts(&q);
+        let resolver = FixedResolver::with_token(
+            AWS_DOC_AKID,
+            "tok-abc",
+            AWS_DOC_SECRET,
+            Some(Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap()),
+        );
+        let verified =
+            verify_presigned_request(&parts, &resolver, rid(), sts_now()).expect("verifies");
+        assert_eq!(&*verified.access_key_id, AWS_DOC_AKID);
+    }
+
+    #[test]
+    fn test_presigned_sts_token_with_special_bytes_round_trip() {
+        // Real STS tokens contain `+`, `/`, `=`. The token must round-trip
+        // through percent-decoding (the resolver sees the same bytes the
+        // signer used) and the canonical query must encode them back to
+        // their byte-canonical forms. Pinning a token with all three
+        // characters catches any drift to form-decoding (`+` → space).
+        let q = build_sts_presigned_query(
+            AWS_DOC_AKID,
+            AWS_DOC_SECRET,
+            AWS_DOC_HOST,
+            "20260101T120000Z",
+            "abc+def/ghi==",
+        );
+        let parts = sts_parts(&q);
+        let resolver = FixedResolver::with_token(
+            AWS_DOC_AKID,
+            "abc+def/ghi==",
+            AWS_DOC_SECRET,
+            Some(Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap()),
+        );
+        verify_presigned_request(&parts, &resolver, rid(), sts_now())
+            .expect("special-byte token round-trips");
+    }
+
+    #[test]
+    fn test_presigned_sts_wrong_token_returns_invalid_access_key_id() {
+        // Resolver has token "right-token"; the URL was signed with the
+        // wrong token. The signature itself would have matched if the
+        // resolver picked any credential — but with no `(akid, token)`
+        // match we surface `InvalidAccessKeyId` before reaching HMAC.
+        let q = build_sts_presigned_query(
+            AWS_DOC_AKID,
+            AWS_DOC_SECRET,
+            AWS_DOC_HOST,
+            "20260101T120000Z",
+            "wrong-token",
+        );
+        let parts = sts_parts(&q);
+        let resolver = FixedResolver::with_token(
+            AWS_DOC_AKID,
+            "right-token",
+            AWS_DOC_SECRET,
+            Some(Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap()),
+        );
+        let err =
+            verify_presigned_request(&parts, &resolver, rid(), sts_now()).expect_err("wrong token");
+        assert_eq!(err.code, "InvalidAccessKeyId");
+    }
+
+    #[test]
+    fn test_presigned_sts_expired_token_returns_expired_token() {
+        let q = build_sts_presigned_query(
+            AWS_DOC_AKID,
+            AWS_DOC_SECRET,
+            AWS_DOC_HOST,
+            "20260101T120000Z",
+            "tok-abc",
+        );
+        let parts = sts_parts(&q);
+        // `expires_at` is in the past relative to `sts_now()`.
+        let resolver = FixedResolver::with_token(
+            AWS_DOC_AKID,
+            "tok-abc",
+            AWS_DOC_SECRET,
+            Some(Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()),
+        );
+        let err = verify_presigned_request(&parts, &resolver, rid(), sts_now())
+            .expect_err("expired token");
+        assert_eq!(err.code, "ExpiredToken");
+    }
+
+    #[test]
+    fn test_presigned_sts_token_when_only_no_token_credential_configured() {
+        // URL carries (akid, token) but the resolver only knows a
+        // long-lived credential under the same akid. Token namespace
+        // miss → `InvalidAccessKeyId`.
+        let q = build_sts_presigned_query(
+            AWS_DOC_AKID,
+            AWS_DOC_SECRET,
+            AWS_DOC_HOST,
+            "20260101T120000Z",
+            "tok-abc",
+        );
+        let parts = sts_parts(&q);
+        let resolver = FixedResolver::new(AWS_DOC_AKID, AWS_DOC_SECRET);
+        let err = verify_presigned_request(&parts, &resolver, rid(), sts_now())
+            .expect_err("namespace miss");
+        assert_eq!(err.code, "InvalidAccessKeyId");
+    }
+
+    #[test]
+    fn test_presigned_no_token_when_only_token_credential_configured() {
+        // Inverse: the URL has no `X-Amz-Security-Token`, but the
+        // resolver only knows a token-bearing credential under that akid.
+        // No-token namespace miss → `InvalidAccessKeyId`.
+        let parts = aws_doc_parts(&aws_doc_query());
+        let resolver = FixedResolver::with_token(
+            AWS_DOC_AKID,
+            "tok-abc",
+            AWS_DOC_SECRET,
+            Some(Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap()),
+        );
+        let err = verify_presigned_request(&parts, &resolver, rid(), aws_doc_now())
+            .expect_err("no-token namespace miss");
+        assert_eq!(err.code, "InvalidAccessKeyId");
+    }
+
+    #[test]
+    fn test_presigned_sts_with_aws_chunked_still_rejected() {
+        // Presigned + aws-chunked stays fail-closed regardless of STS —
+        // the rejection runs before the parser, so adding a session
+        // token can't open a path that was deliberately closed.
+        let q = build_sts_presigned_query(
+            AWS_DOC_AKID,
+            AWS_DOC_SECRET,
+            AWS_DOC_HOST,
+            "20260101T120000Z",
+            "tok-abc",
+        );
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/test.txt?{q}"))
+            .header("host", AWS_DOC_HOST)
+            .header("x-amz-decoded-content-length", "100")
+            .body(())
+            .unwrap();
+        let (parts, _) = req.into_parts();
+        let resolver = FixedResolver::with_token(
+            AWS_DOC_AKID,
+            "tok-abc",
+            AWS_DOC_SECRET,
+            Some(Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap()),
+        );
+        let err = verify_presigned_request(&parts, &resolver, rid(), sts_now())
+            .expect_err("aws-chunked + STS");
+        assert_eq!(err.code, "UnsupportedSignature");
+    }
+
+    #[test]
+    fn test_presigned_sts_with_sigv4a_still_rejected() {
+        // SigV4A rejection happens before STS handling too.
+        let amz_date = "20260101T120000Z";
+        let date_yyyymmdd = &amz_date[..8];
+        let q = format!(
+            "X-Amz-Algorithm=AWS4-ECDSA-P256-SHA256\
+             &X-Amz-Credential={AWS_DOC_AKID}%2F{date_yyyymmdd}%2Fus-east-1%2Fs3%2Faws4_request\
+             &X-Amz-Date={amz_date}\
+             &X-Amz-Expires=60\
+             &X-Amz-Security-Token=tok-abc\
+             &X-Amz-SignedHeaders=host\
+             &X-Amz-Signature=0000000000000000000000000000000000000000000000000000000000000000"
+        );
+        let parts = sts_parts(&q);
+        let resolver = FixedResolver::with_token(
+            AWS_DOC_AKID,
+            "tok-abc",
+            AWS_DOC_SECRET,
+            Some(Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap()),
+        );
+        let err = verify_presigned_request(&parts, &resolver, rid(), sts_now())
+            .expect_err("SigV4A + STS");
         assert_eq!(err.code, "UnsupportedSignature");
     }
 }

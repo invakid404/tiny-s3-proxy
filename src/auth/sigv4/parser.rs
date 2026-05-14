@@ -3,8 +3,10 @@
 //!
 //! Every malformed input here maps to `S3Error::authorization_header_malformed`
 //! (HTTP 400, AWS code `AuthorizationHeaderMalformed`) unless explicitly noted
-//! otherwise: ECDSA → `UnsupportedSignature`, x-amz-security-token in
-//! signed-headers → `InvalidToken` (deferred to PR 4 of #63).
+//! otherwise: ECDSA → `UnsupportedSignature`. STS-issued temporary
+//! credentials (`x-amz-security-token` in `SignedHeaders`) are now accepted
+//! and verified by the resolver — see the header-auth path in
+//! [`super::SigV4Verifier`].
 //!
 //! The grammar we accept follows the AWS SigV4 documentation:
 //!
@@ -276,16 +278,6 @@ pub(crate) fn parse_signed_headers(
         if part.chars().any(|c| c.is_ascii_uppercase()) {
             return Err(S3Error::authorization_header_malformed(
                 "SignedHeaders entries must be lowercase",
-                request_id,
-            ));
-        }
-        // The signed-header for STS-issued temporary credentials. We refuse
-        // to verify these in PR 1 — they need expiry checks the static
-        // resolver doesn't perform. PR 4 of #63 lifts this.
-        if *part == "x-amz-security-token" {
-            return Err(S3Error::invalid_token(
-                "temporary credentials (x-amz-security-token) are not supported in strict mode; \
-                 tracked in PR 4 of issue #63",
                 request_id,
             ));
         }
@@ -594,10 +586,22 @@ mod tests {
     }
 
     #[test]
-    fn test_sts_session_token_rejected_as_invalid_token() {
-        let h = "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-security-token, Signature=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let err = parse_authorization(h, rid()).expect_err("STS token");
-        assert_eq!(err.code, "InvalidToken");
+    fn test_sts_session_token_signed_header_accepted() {
+        // Reverts PR 1's parser-level `InvalidToken` rejection. A request
+        // with `x-amz-security-token` in `SignedHeaders` is now a
+        // structurally valid SigV4 header; expiry and credential lookup
+        // happen later in the verifier. Re-adding the `*part ==
+        // "x-amz-security-token"` reject in `parse_signed_headers` flips
+        // this test back to an `InvalidToken` error.
+        let h = "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/s3/aws4_request, \
+                 SignedHeaders=host;x-amz-security-token, \
+                 Signature=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let auth = parse_authorization(h, rid()).expect("STS token now parses");
+        assert!(
+            auth.signed_headers
+                .iter()
+                .any(|n| n.as_str() == "x-amz-security-token")
+        );
     }
 
     #[test]

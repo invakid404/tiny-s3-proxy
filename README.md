@@ -95,7 +95,7 @@ All configuration is via environment variables.
 | `AUTH_MODE` | `trusted_internal` | Access control mode: `trusted_internal` (allow all) or `access_key_allowlist` (check access-key ID against allowlist — does NOT verify SigV4 signatures) |
 | `ALLOWED_FRONTEND_KEYS` | | Comma-separated access key IDs for allowlist mode. NOTE: only the key ID is checked, not the signature — see security section below |
 | `INBOUND_AUTH_VERIFY_SIGNATURES` | `false` | Opt-in strict SigV4 verification for inbound requests. Replaces the `AUTH_MODE` gate. See "Strict inbound SigV4 verification" below |
-| `INBOUND_CREDENTIALS_PATH` | | Path to a JSON file with the inbound access-key id / secret pairs. Required when `INBOUND_AUTH_VERIFY_SIGNATURES=true`; the file is loaded once at startup and a missing or malformed file fails the rollout |
+| `INBOUND_CREDENTIALS_PATH` | | Path to a JSON file with the inbound access-key id / secret pairs (v1) or STS-capable tuples (v2 — see "Strict inbound SigV4 verification" below). Required when `INBOUND_AUTH_VERIFY_SIGNATURES=true`; the file is loaded once at startup and a missing or malformed file fails the rollout |
 | `INBOUND_AUTH_MAX_SKEW_SECS` | `900` | Maximum permitted clock skew (seconds) between the request `x-amz-date` and the proxy's wall clock in strict mode. Requests outside the window return `RequestTimeTooSkewed` |
 
 ### Backend
@@ -156,9 +156,9 @@ If you need actual signature verification with per-client secrets, set `INBOUND_
 
 ### Strict inbound SigV4 verification
 
-`INBOUND_AUTH_VERIFY_SIGNATURES=true` enables cryptographic SigV4 verification of inbound requests. When this flag is set, the legacy `AUTH_MODE` gate is bypassed entirely — every normal (non-streaming, non-presigned) request must carry a valid `AWS4-HMAC-SHA256` `Authorization` header signed with a credential listed in `INBOUND_CREDENTIALS_PATH`, and signed payloads must match the actual body bytes.
+`INBOUND_AUTH_VERIFY_SIGNATURES=true` enables cryptographic SigV4 verification of inbound requests. When this flag is set, the legacy `AUTH_MODE` gate is bypassed entirely — every normal (non-streaming) request must carry a valid `AWS4-HMAC-SHA256` `Authorization` header (or presigned `X-Amz-*` query parameters) signed with a credential listed in `INBOUND_CREDENTIALS_PATH`, and signed payloads must match the actual body bytes.
 
-The credentials file is a versioned JSON document:
+The credentials file is a versioned JSON document. Both **v1** (long-lived credentials only) and **v2** (long-lived + STS-issued temporary credentials) are supported:
 
 ```json
 {
@@ -170,26 +170,58 @@ The credentials file is a versioned JSON document:
 }
 ```
 
-- `version` must be `1`. Unknown fields and unknown top-level keys are rejected at load time (typos fail the rollout).
-- Both `access_key_id` and `secret_access_key` must be non-empty and free of leading/trailing whitespace.
-- Duplicate access-key ids are rejected.
-- Secrets are zeroized in memory on the final drop (`Zeroizing<String>` behind an `Arc`); the raw file contents are wiped immediately after parsing.
+```json
+{
+  "version": 2,
+  "credentials": [
+    {
+      "access_key_id": "AKID-LONG",
+      "secret_access_key": "long-lived-secret"
+    },
+    {
+      "access_key_id": "ASIA-TEMP",
+      "secret_access_key": "temporary-secret",
+      "session_token": "FQoGZXIvYXdzE...",
+      "expires_at": "2026-05-14T18:30:00Z"
+    }
+  ]
+}
+```
 
-Scope and fail-closed behavior (issue #63 PR 1 of 5):
+- `version` must be `1` or `2`. Unknown fields and unknown top-level keys are rejected at load time (typos fail the rollout).
+- Both `access_key_id` and `secret_access_key` must be non-empty and free of leading/trailing whitespace.
+- v1 files must not carry `session_token` or `expires_at`; use v2 if you need STS support.
+- In v2, the logical credential identity is `(access_key_id, session_token)` — a request without a token never matches a token-bearing entry, and vice versa. Sharing one access-key id across a long-lived and a token-bearing entry is allowed because they occupy disjoint namespaces.
+- `session_token`, when present, must be non-empty. The proxy treats the token as an opaque byte string (no `+` → space translation, no case folding) and compares with `subtle::ConstantTimeEq`.
+- `expires_at` (RFC 3339) is **required** when `session_token` is set; it is **optional** on no-token entries and, when present, is enforced (useful for planned key retirement).
+- Duplicate `(access_key_id, session_token)` tuples are rejected without echoing the token value in the validation error.
+- Secrets and session tokens are zeroized in memory on the final drop (`Zeroizing<String>` behind an `Arc`); the raw file contents are wiped immediately after parsing.
+
+Strict-mode behavior:
 
 | Inbound flow | Strict-mode behavior |
 |---|---|
 | Normal signed requests (`UNSIGNED-PAYLOAD`, signed SHA-256) | Verified end-to-end (header, scope, date, canonical request, body hash if signed) |
 | `STREAMING-UNSIGNED-PAYLOAD-TRAILER` | Verified for the request header; chunk framing handled by the existing decoder |
-| `STREAMING-AWS4-HMAC-SHA256-PAYLOAD*` (signed aws-chunked) | `UnsupportedSignature` 400 (lands in PR 2 of #63) |
-| Presigned URLs (`X-Amz-Signature` query parameter) | `MissingAuthenticationToken` 403 (lands in PR 3 of #63) |
-| STS / temporary credentials (`x-amz-security-token`) | `InvalidToken` 400 (lands in PR 4 of #63) |
+| `STREAMING-AWS4-HMAC-SHA256-PAYLOAD*` (signed aws-chunked) | Verified chunk-by-chunk (PR 2 of #63) |
+| Presigned URLs (`X-Amz-Signature` query parameter) | Verified including validity window and canonical query (PR 3 of #63) |
+| STS / temporary credentials (`x-amz-security-token`, `X-Amz-Security-Token`) | Verified against v2 token-bearing entries (PR 4 of #63) |
 | `AWS4-ECDSA-P256-SHA256` (SigV4A) | `UnsupportedSignature` 400 (lands in PR 5 of #63) |
+
+STS-specific error mapping (PR 4 of #63):
+
+| Condition | Error |
+|---|---|
+| `(access_key_id, session_token)` matches but the entry's `expires_at` is in the past | `ExpiredToken` 400 |
+| Access key not configured, or tuple miss in either namespace | `InvalidAccessKeyId` 403 |
+| Header-auth: `x-amz-security-token` header present but not in `SignedHeaders` | `AuthorizationHeaderMalformed` 400 |
+| Duplicate `x-amz-security-token` header or duplicate `X-Amz-Security-Token` query parameter | `AuthorizationHeaderMalformed` 400 |
+| Empty token value (header or query) | `AuthorizationHeaderMalformed` 400 |
 
 Other strict-mode behavior worth noting:
 - Signature comparison uses a constant-time compare (`subtle::ConstantTimeEq`) to avoid timing side-channels on byte mismatches.
-- The verifier reuses S3's standard error codes (`SignatureDoesNotMatch`, `RequestTimeTooSkewed`, `InvalidAccessKeyId`, `AuthorizationHeaderMalformed`) so existing AWS SDK clients surface clear errors.
-- The proxy still re-signs outbound backend requests with `BACKEND_ACCESS_KEY_ID` / `BACKEND_SECRET_ACCESS_KEY`; client-side auth headers are stripped before forwarding.
+- The verifier reuses S3's standard error codes (`SignatureDoesNotMatch`, `RequestTimeTooSkewed`, `InvalidAccessKeyId`, `AuthorizationHeaderMalformed`, `ExpiredToken`) so existing AWS SDK clients surface clear errors.
+- The proxy still re-signs outbound backend requests with `BACKEND_ACCESS_KEY_ID` / `BACKEND_SECRET_ACCESS_KEY`; client-side auth headers (including `x-amz-security-token`) are stripped before forwarding.
 
 ### Cache invalidation
 
