@@ -195,7 +195,7 @@ impl SigV4Verifier {
         // S3 response for an unknown key); a store error → InternalError.
         let credential = self
             .resolver
-            .resolve(&auth.access_key_id, None)
+            .resolve(&auth.access_key_id, None, now)
             .map_err(|e| {
                 tracing::error!(error = %e, "credential resolver failed");
                 S3Error::internal_error("credential resolver failed", request_id)
@@ -382,6 +382,7 @@ mod tests {
             &self,
             access_key_id: &str,
             _session_token: Option<&str>,
+            _now: DateTime<Utc>,
         ) -> Result<Option<Arc<InboundCredential>>, CredentialResolveError> {
             if access_key_id == self.akid.as_ref() {
                 Ok(Some(Arc::new(InboundCredential {

@@ -369,7 +369,7 @@ pub fn verify_presigned_request(
     // InternalError. PR 3 always passes `None` for the session token —
     // STS-issued temporary credentials are rejected earlier by the parser.
     let credential = resolver
-        .resolve(&pres.access_key_id, None)
+        .resolve(&pres.access_key_id, None, now)
         .map_err(|e| {
             tracing::error!(error = %e, "credential resolver failed");
             S3Error::internal_error("credential resolver failed", request_id)
@@ -996,6 +996,7 @@ mod verify_tests {
             &self,
             access_key_id: &str,
             _session_token: Option<&str>,
+            _now: DateTime<Utc>,
         ) -> Result<Option<Arc<InboundCredential>>, CredentialResolveError> {
             if access_key_id == self.akid.as_ref() {
                 Ok(Some(Arc::new(InboundCredential {
