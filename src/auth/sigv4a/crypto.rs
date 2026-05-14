@@ -131,10 +131,17 @@ pub fn derive_sigv4a_private_scalar(
         let mut mac =
             HmacSha256::new_from_slice(&input_key[..]).expect("HMAC accepts any key size");
         mac.update(&message);
-        let tag = mac.finalize().into_bytes();
-
-        let mut k0 = Zeroizing::new([0u8; 32]);
-        k0.copy_from_slice(&tag);
+        // Convert the HMAC output directly into a Zeroizing<[u8; 32]>
+        // buffer. The KDF tag is sensitive: for the accepted-counter
+        // case it's `k0`, one `+1` away from the actual ECDSA signing
+        // scalar; even rejected-counter outputs are secret derivation
+        // material that an attacker with memory access could combine
+        // with the access-key id to narrow the secret. Zeroizing-on-
+        // drop matches the discipline in `auth::sigv4::derive_signing_key`
+        // for HMAC kSigning. Without the wrapper, the un-zeroized
+        // `GenericArray` temporary from `into_bytes()` would land on
+        // the stack and only be released when the frame is overwritten.
+        let k0: Zeroizing<[u8; 32]> = Zeroizing::new(mac.finalize().into_bytes().into());
 
         if be_less_or_equal(&k0[..], &N_MINUS_2_BE) {
             return Ok(be_add_one(&k0));
