@@ -3493,6 +3493,8 @@ dependencies = [
  "bytes",
  "chrono",
  "fs2",
+ "hex",
+ "hmac 0.13.0",
  "http 1.4.0",
  "http-body-util",
  "httpdate",
