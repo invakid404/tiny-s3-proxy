@@ -1822,7 +1822,6 @@ mod tests {
     #[tokio::test]
     async fn test_aws_chunked_put_ecdsa_routes_to_decoder() {
         use p256::ecdsa::{Signature, SigningKey, signature::Signer};
-        use std::sync::atomic::Ordering;
 
         // The aws-chunked decoder now DER-validates the
         // `chunk-signature=` hex even in trust mode (commit 10 of
@@ -1893,11 +1892,40 @@ mod tests {
             !body_str.contains("UnsupportedSignature"),
             "must not emit UnsupportedSignature; got: {body_str}",
         );
-        // Typed Backend path took the call (one put_object_from_path).
-        let typed_calls = backend.total_calls.load(Ordering::Relaxed);
+
+        // Method-specific assertion: the decoder/spool path goes
+        // through `put_object_from_path`, which pushes onto
+        // `put_spool_calls`. The earlier `total_calls >= 1` check was
+        // too weak — a regression that routed this PUT through
+        // ordinary `put_object` (the typed non-streaming path) would
+        // still return HTTP 200 from `with_put(...)` and bump
+        // `total_calls`, so this test would keep passing while no
+        // decoder ran. Pinning the method-specific vector + the
+        // empty siblings catches that regression precisely.
+        //
+        // Bug-revert reasoning: a refactor that routes ECDSA
+        // streaming PUTs through `Backend::put_object` (rather than
+        // `put_object_from_path`) flips
+        // `put_spool_calls.len() == 1` to 0 and
+        // `put_calls.is_empty()` to false — both assertions fail.
+        let spool_calls = backend.put_spool_calls.lock().unwrap();
+        assert_eq!(
+            spool_calls.len(),
+            1,
+            "expected exactly one put_object_from_path call",
+        );
+        assert_eq!(spool_calls[0].bucket, "test-backend");
+        assert_eq!(spool_calls[0].key, "key");
+        assert_eq!(spool_calls[0].len, 5);
+        drop(spool_calls);
+
         assert!(
-            typed_calls >= 1,
-            "typed Backend put_object_from_path must be invoked (got {typed_calls} calls)",
+            backend.put_calls.lock().unwrap().is_empty(),
+            "ordinary Backend::put_object must not run on the decoder path",
+        );
+        assert!(
+            backend.upload_part_spool_calls.lock().unwrap().is_empty(),
+            "multipart spool path must not run on a single-object PUT",
         );
     }
 
