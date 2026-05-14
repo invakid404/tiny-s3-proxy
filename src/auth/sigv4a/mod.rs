@@ -504,4 +504,36 @@ mod tests {
         .expect_err("missing region set");
         assert_eq!(err.code, "AuthorizationHeaderMalformed");
     }
+
+    /// Empty `x-amz-region-set` after signing must be rejected by the
+    /// verifier (not by the canonicalizer's eventual signature
+    /// mismatch). Pins the end-to-end behavior of commit 12: an
+    /// attacker who can override the header value with `""` after the
+    /// signer has committed to a real region intent must surface
+    /// `AuthorizationHeaderMalformed` before any ECDSA verify.
+    #[test]
+    fn test_sigv4a_header_empty_region_set_rejected_by_verifier() {
+        let resolver = build_resolver("AKID", "SECRET");
+        let (auth, mut headers) = sign_sigv4a_request(
+            "GET",
+            "/bucket/key",
+            "example.com",
+            "20260101T120000Z",
+            "UNSIGNED-PAYLOAD",
+            "AKID",
+            "SECRET",
+            "us-east-1",
+        );
+        headers.insert("x-amz-region-set", "".parse().unwrap());
+        let parts = parts_for("GET", "/bucket/key", headers, &auth);
+        let err = verify_authorization_header_at(
+            &parts,
+            &resolver,
+            Duration::from_secs(900),
+            "rid",
+            now(),
+        )
+        .expect_err("empty region set");
+        assert_eq!(err.code, "AuthorizationHeaderMalformed");
+    }
 }

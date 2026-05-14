@@ -240,18 +240,43 @@ pub(crate) fn parse_sigv4a_credential(
     ))
 }
 
-/// Confirm `x-amz-region-set` is present in the request and listed in
-/// `SignedHeaders`. SigV4A requires the region set to be signed —
-/// otherwise an attacker could re-target an inbound request at a
-/// different region without breaking the signature.
+/// Confirm `x-amz-region-set` is present (with a non-empty ASCII
+/// value) in the request and listed in `SignedHeaders`. SigV4A
+/// requires the region set to be signed — otherwise an attacker could
+/// re-target an inbound request at a different region without breaking
+/// the signature.
+///
+/// Value-level checks reject:
+/// - absent header
+/// - non-ASCII / `to_str()` failure (the canonicalizer requires ASCII)
+/// - empty value after `trim()` (covers both `""` and whitespace-only)
+///
+/// All failures surface as `AuthorizationHeaderMalformed` so the
+/// client can correct the shape. Without the trim-and-reject, a
+/// request that signs an empty `x-amz-region-set` would canonicalize
+/// to `x-amz-region-set:\n` and the signed canonical request would
+/// match against an empty region intent — exactly what SigV4A's
+/// signed region set exists to prevent.
 pub(crate) fn ensure_sigv4a_region_set_signed(
     headers: &http::HeaderMap,
     signed_headers: &[HeaderName],
     request_id: &str,
 ) -> Result<(), S3Error> {
-    if !headers.contains_key("x-amz-region-set") {
-        return Err(S3Error::authorization_header_malformed(
+    let value = headers.get("x-amz-region-set").ok_or_else(|| {
+        S3Error::authorization_header_malformed(
             "SigV4A requests must include the x-amz-region-set header",
+            request_id,
+        )
+    })?;
+    let raw = value.to_str().map_err(|_| {
+        S3Error::authorization_header_malformed(
+            "SigV4A x-amz-region-set header is not valid ASCII",
+            request_id,
+        )
+    })?;
+    if raw.trim().is_empty() {
+        return Err(S3Error::authorization_header_malformed(
+            "SigV4A x-amz-region-set header is empty",
             request_id,
         ));
     }
@@ -452,6 +477,75 @@ mod tests {
         let signed = vec![HeaderName::from_static("host")];
         let err = ensure_sigv4a_region_set_signed(&headers, &signed, rid())
             .expect_err("unsigned region set");
+        assert_eq!(err.code, "AuthorizationHeaderMalformed");
+    }
+
+    /// SigV4A requires a non-empty signed region set. An empty header
+    /// value (`""`) would canonicalize to `x-amz-region-set:\n` and the
+    /// request would carry an "intentionally empty" region intent —
+    /// defeating the point of signing the region set. The helper now
+    /// rejects this at the parse boundary so the verifier doesn't
+    /// canonicalize against an empty signed field.
+    ///
+    /// Bug-revert reasoning: dropping the `raw.trim().is_empty()`
+    /// check in `ensure_sigv4a_region_set_signed` flips this assertion
+    /// from `AuthorizationHeaderMalformed` to `Ok(())`.
+    #[test]
+    fn test_sigv4a_region_set_empty_value_rejected() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-amz-region-set", "".parse().unwrap());
+        let signed = vec![
+            HeaderName::from_static("host"),
+            HeaderName::from_static("x-amz-region-set"),
+        ];
+        let err = ensure_sigv4a_region_set_signed(&headers, &signed, rid())
+            .expect_err("empty region set");
+        assert_eq!(err.code, "AuthorizationHeaderMalformed");
+        assert!(
+            err.message.contains("empty"),
+            "error should mention emptiness, got: {}",
+            err.message,
+        );
+    }
+
+    /// Whitespace-only region-set value normalizes to empty after
+    /// `trim()` and is rejected on the same path as the literal
+    /// `""` case. Pinned separately so a future refactor that
+    /// switches to `is_empty()` (no trim) regresses with a clear
+    /// failure rather than silently accepting `"   "`.
+    #[test]
+    fn test_sigv4a_region_set_whitespace_only_rejected() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-amz-region-set", "   ".parse().unwrap());
+        let signed = vec![
+            HeaderName::from_static("host"),
+            HeaderName::from_static("x-amz-region-set"),
+        ];
+        let err = ensure_sigv4a_region_set_signed(&headers, &signed, rid())
+            .expect_err("whitespace region set");
+        assert_eq!(err.code, "AuthorizationHeaderMalformed");
+    }
+
+    /// Non-ASCII bytes in the region-set value can't survive
+    /// `to_str()` and the canonicalizer requires ASCII anyway. Reject
+    /// up front rather than letting an invalid byte sequence flow
+    /// into the canonical request builder.
+    #[test]
+    fn test_sigv4a_region_set_invalid_utf8_rejected() {
+        let mut headers = http::HeaderMap::new();
+        // `0xC3 0x28` is an invalid UTF-8 sequence (continuation byte
+        // missing the high bit). `HeaderValue::from_bytes` accepts any
+        // visible bytes; `HeaderValue::to_str` then refuses it.
+        headers.insert(
+            "x-amz-region-set",
+            http::HeaderValue::from_bytes(&[0xc3, 0x28]).unwrap(),
+        );
+        let signed = vec![
+            HeaderName::from_static("host"),
+            HeaderName::from_static("x-amz-region-set"),
+        ];
+        let err = ensure_sigv4a_region_set_signed(&headers, &signed, rid())
+            .expect_err("non-ASCII region set");
         assert_eq!(err.code, "AuthorizationHeaderMalformed");
     }
 }
