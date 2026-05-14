@@ -134,9 +134,9 @@ pub(crate) fn verify_authorization_header_at(
     // SigV4A-specific: x-amz-region-set must be present and signed.
     ensure_sigv4a_region_set_signed(&parts.headers, &auth.signed_headers, request_id)?;
 
-    // Classify the payload header. Shape rules are identical to HMAC —
-    // SigV4A streaming sentinels are accepted here once commit 5 adds
-    // their variants; today they still surface as UnsupportedSignature.
+    // Classify the payload header. Shape rules are identical to HMAC,
+    // and SigV4A streaming sentinels are accepted alongside their HMAC
+    // counterparts (`auth::sigv4::payload`).
     let payload_header = parts
         .headers
         .get("x-amz-content-sha256")

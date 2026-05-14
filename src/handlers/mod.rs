@@ -1821,14 +1821,24 @@ mod tests {
     /// 400 dispatch-level reject and the assertions below fail.
     #[tokio::test]
     async fn test_aws_chunked_put_ecdsa_routes_to_decoder() {
+        use p256::ecdsa::{Signature, SigningKey, signature::Signer};
         use std::sync::atomic::Ordering;
 
-        // Well-formed aws-chunked frame for "hello". Shape-only
-        // (trust-mode) ECDSA signature validation accepts variable-
-        // width DER hex, so `deadbeef` (8 chars) passes the shape
-        // check.
-        let framed_body: &[u8] =
-            b"5;chunk-signature=deadbeef\r\nhello\r\n0;chunk-signature=cafef00d\r\n\r\n";
+        // The aws-chunked decoder now DER-validates the
+        // `chunk-signature=` hex even in trust mode (commit 10 of
+        // PR 5 of #63), so the test frame must carry real DER ECDSA
+        // signatures rather than literal `deadbeef`-style placeholders.
+        // We don't care WHICH key signs — trust mode is shape-only —
+        // so we just feed any DER bytes the signer happens to produce.
+        let scalar = aws_sigv4::sign::v4a::generate_signing_key("AKID", "SECRET");
+        let signing_key = SigningKey::from_bytes(scalar.as_ref()).unwrap();
+        let payload_sig: Signature = signing_key.sign(b"trust-mode-payload-chunk");
+        let zero_sig: Signature = signing_key.sign(b"trust-mode-zero-chunk");
+        let payload_sig_hex = hex::encode(payload_sig.to_der().as_ref());
+        let zero_sig_hex = hex::encode(zero_sig.to_der().as_ref());
+        let framed_body = format!(
+            "5;chunk-signature={payload_sig_hex}\r\nhello\r\n0;chunk-signature={zero_sig_hex}\r\n\r\n",
+        );
 
         let cache = MockCache::new();
         let mut config = test_config();
@@ -1868,7 +1878,7 @@ mod tests {
                 "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD",
             )
             .header("x-amz-decoded-content-length", "5")
-            .body(Body::from(framed_body.to_vec()))
+            .body(Body::from(framed_body.into_bytes()))
             .unwrap();
 
         let resp = handle_s3_request(State(state), req).await;

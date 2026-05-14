@@ -540,18 +540,6 @@ mod tests {
         );
     }
 
-    /// ECDSA-signed streaming uploads must be rejected up front with
-    /// `UnsupportedSignature` rather than routed to passthrough. The inbound
-    /// `chunk-signature` values are bound to the client's private key, so
-    /// passthrough would re-sign with the proxy backend credentials and the
-    /// signatures would never validate — failing fast avoids pointless
-    /// backend contact.
-    ///
-    /// Bug-revert reasoning: routing ECDSA back to `Passthrough` here flips
-    /// the assertion to a panic, and the matching integration test (which
-    /// pins HTTP 400 + `UnsupportedSignature` + zero backend hits) flips
-    /// alongside it.
-    #[test]
     /// PR 5 of #63 lifts ECDSA streaming from
     /// `RejectUnsupportedSignature` to `DecodeAwsChunked`: the
     /// aws-chunked decoder now verifies the per-chunk ECDSA signatures
@@ -561,6 +549,7 @@ mod tests {
     /// `WriteBodyRoute::RejectUnsupportedSignature` in
     /// `aws_chunked_route_for` flips both assertions back to
     /// `RejectUnsupportedSignature`.
+    #[test]
     fn test_ecdsa_non_trailer_routes_to_decode() {
         let mut headers = http::HeaderMap::new();
         headers.insert(

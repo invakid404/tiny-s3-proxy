@@ -29,7 +29,6 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::auth::sigv4::streaming::{StreamingSigV4Context, StreamingSigV4Error};
-use crate::auth::sigv4a::crypto::MAX_SIGV4A_DER_SIGNATURE_HEX_LEN;
 use crate::auth::sigv4a::streaming::{StreamingSigV4aContext, StreamingSigV4aError};
 use crate::s3::checksum::{ChecksumAlgorithm, ChecksumHeader};
 
@@ -1040,32 +1039,26 @@ pub(crate) fn validate_chunk_signature_shape(
         }
         SignedChunkAlgorithm::EcdsaP256 => {
             // AWS CRT right-pads SigV4A chunk signatures with `*` to
-            // `MAX_SIGV4A_DER_SIGNATURE_HEX_LEN`. Non-padded forms must
-            // still fit within that bound. The signature without
-            // padding is even-length lowercase hex.
-            if sig_hex.len() > MAX_SIGV4A_DER_SIGNATURE_HEX_LEN {
-                return Err(AwsChunkedError::MalformedFrame {
-                    message: format!(
-                        "SigV4A chunk-signature must be at most \
-                         {MAX_SIGV4A_DER_SIGNATURE_HEX_LEN} chars, got {}",
-                        sig_hex.len(),
-                    ),
-                });
-            }
-            let trimmed = sig_hex.trim_end_matches('*');
-            if trimmed.is_empty() || !trimmed.len().is_multiple_of(2) {
-                return Err(AwsChunkedError::MalformedFrame {
-                    message:
-                        "SigV4A chunk-signature must be even-length lowercase hex after `*` padding"
-                            .to_string(),
-                });
-            }
-            if !trimmed.bytes().all(is_lower_hex_byte) {
-                return Err(AwsChunkedError::MalformedFrame {
-                    message: "SigV4A chunk-signature must be lowercase hex".to_string(),
-                });
-            }
-            Ok(())
+            // `MAX_SIGV4A_DER_SIGNATURE_HEX_LEN`. After trimming the
+            // padding the bytes MUST be a valid DER ECDSA P-256
+            // signature — not just lowercase hex of the right shape.
+            // `parse_streaming_der_signature_hex_padded` strips the
+            // padding, checks hex shape, and calls `Signature::from_der`
+            // inline; failure surfaces as `MalformedFrame` so the
+            // handler maps it to `IncompleteBody` (a framing error),
+            // NOT `ChunkSignatureMismatch`. The latter is reserved for
+            // valid DER that doesn't match the chained ECDSA
+            // verification.
+            //
+            // Trust mode (shape-only) and strict mode both go through
+            // here, so non-DER ECDSA wire shapes are rejected up front
+            // regardless of whether per-chunk crypto verification is
+            // configured.
+            crate::auth::sigv4a::crypto::parse_streaming_der_signature_hex_padded(sig_hex)
+                .map(|_| ())
+                .map_err(|e| AwsChunkedError::MalformedFrame {
+                    message: format!("SigV4A chunk-signature failed shape validation: {e}"),
+                })
         }
     }
 }
@@ -2502,6 +2495,156 @@ mod tests {
             }
             other => panic!("expected ChunkSignatureMismatch or MalformedFrame, got {other:?}"),
         }
+    }
+
+    /// Non-DER ECDSA chunk signature hex (here: 8-char `deadbeef`,
+    /// well-formed lowercase hex but not a valid DER signature) must
+    /// surface `MalformedFrame` at the decoder's shape-validation step,
+    /// NOT `ChunkSignatureMismatch`. The wire-format error code is the
+    /// load-bearing thing: malformed framing maps to `IncompleteBody`
+    /// (a 400) at the handler layer; `ChunkSignatureMismatch` maps to
+    /// `SignatureDoesNotMatch` (a 403). Routing a shape problem
+    /// through the crypto-mismatch path tells the client the wrong
+    /// remediation.
+    ///
+    /// Trust mode (shape-only) still rejects non-DER bytes — shape
+    /// validation is independent of crypto.
+    ///
+    /// Bug-revert reasoning: dropping the
+    /// `parse_streaming_der_signature_hex_padded` call inside
+    /// `validate_chunk_signature_shape`'s `EcdsaP256` arm flips this
+    /// from `MalformedFrame` (trust mode) / `MalformedFrame` (strict
+    /// mode through the same gate) back to `Ok(_)` in trust mode and
+    /// `ChunkSignatureMismatch` in strict mode.
+    #[tokio::test]
+    async fn test_decoder_rejects_non_der_ecdsa_chunk_signature_shape_only() {
+        // 8-char lowercase hex — well-formed hex, valid `*`-padded
+        // streaming shape, but NOT a DER ECDSA signature.
+        let frame: Vec<u8> =
+            b"5;chunk-signature=deadbeef\r\nhello\r\n0;chunk-signature=cafef00d\r\n\r\n".to_vec();
+        let mode = DecoderMode::NonTrailer {
+            signature_algorithm: SignedChunkAlgorithm::EcdsaP256,
+        };
+        // Trust mode (shape-only) MUST still reject non-DER bytes.
+        let err = decode_with_policy(&frame, 5, mode, ChunkSignaturePolicy::ShapeOnly)
+            .await
+            .expect_err("non-DER chunk signature must reject even in trust mode");
+        assert!(
+            matches!(err, AwsChunkedError::MalformedFrame { .. }),
+            "expected MalformedFrame, got {err:?}",
+        );
+    }
+
+    /// Same input as above but with the strict-mode ECDSA verify
+    /// policy. The shape check fires before any crypto, so the wire
+    /// error is still `MalformedFrame` — NOT
+    /// `ChunkSignatureMismatch`.
+    ///
+    /// Bug-revert reasoning: moving the DER validation from
+    /// `validate_chunk_signature_shape` to inside the verifier flips
+    /// this from `MalformedFrame` to `ChunkSignatureMismatch`, and
+    /// the wire response code changes from `IncompleteBody`/400 to
+    /// `SignatureDoesNotMatch`/403.
+    #[tokio::test]
+    async fn test_decoder_rejects_non_der_ecdsa_chunk_signature_strict_mode() {
+        let frame: Vec<u8> =
+            b"5;chunk-signature=deadbeef\r\nhello\r\n0;chunk-signature=cafef00d\r\n\r\n".to_vec();
+        let mode = DecoderMode::NonTrailer {
+            signature_algorithm: SignedChunkAlgorithm::EcdsaP256,
+        };
+        let err = decode_with_policy(&frame, 5, mode, ecdsa_verify_ctx())
+            .await
+            .expect_err("non-DER chunk signature must reject in strict mode too");
+        assert!(
+            matches!(err, AwsChunkedError::MalformedFrame { .. }),
+            "expected MalformedFrame (NOT ChunkSignatureMismatch), got {err:?}",
+        );
+    }
+
+    /// Companion to the negative cases above: a valid-DER chunk
+    /// signature that doesn't crypto-match (the chain says the
+    /// previous-signature is different) MUST surface
+    /// `ChunkSignatureMismatch`, not `MalformedFrame`. Proves the
+    /// layering: shape errors → framing path, crypto errors → mismatch
+    /// path.
+    #[tokio::test]
+    async fn test_decoder_valid_der_with_crypto_mismatch_is_chunk_signature_mismatch() {
+        let key = ecdsa_signing_key();
+        let payload = b"valid-der-wrong-content";
+
+        // Sign chunk 1 against a DIFFERENT previous-signature than the
+        // verifier's seed. The DER is well-formed; the math is wrong.
+        let wrong_prev = "1".repeat(64);
+        let chunk_sig = compute_ecdsa_chunk_sig(&key, &wrong_prev, payload);
+        let zero_sig = compute_ecdsa_chunk_sig(&key, &chunk_sig, b"");
+        let mut frame = Vec::new();
+        frame.extend_from_slice(
+            format!("{:x};chunk-signature={chunk_sig}\r\n", payload.len()).as_bytes(),
+        );
+        frame.extend_from_slice(payload);
+        frame.extend_from_slice(b"\r\n");
+        frame.extend_from_slice(format!("0;chunk-signature={zero_sig}\r\n\r\n").as_bytes());
+
+        let mode = DecoderMode::NonTrailer {
+            signature_algorithm: SignedChunkAlgorithm::EcdsaP256,
+        };
+        let err = decode_with_policy(&frame, payload.len() as u64, mode, ecdsa_verify_ctx())
+            .await
+            .expect_err("valid DER + crypto-mismatch must error");
+        match err {
+            AwsChunkedError::ChunkSignatureMismatch { chunk_index: 0 } => {}
+            other => panic!("expected ChunkSignatureMismatch on chunk 0, got {other:?}"),
+        }
+    }
+
+    /// Non-DER ECDSA trailer signature must surface
+    /// `InvalidTrailerSignature` (mapped to `InvalidRequest` at the
+    /// handler) regardless of policy. This is the trailer-side
+    /// analogue of `test_decoder_rejects_non_der_ecdsa_chunk_signature_*`.
+    ///
+    /// Bug-revert reasoning: the trailer-signature read path
+    /// (`read_and_validate_trailer_signature`) calls
+    /// `validate_chunk_signature_shape` and re-maps its
+    /// `MalformedFrame` to `InvalidTrailerSignature`. Either dropping
+    /// the DER validation OR dropping the remap flips this assertion.
+    #[tokio::test]
+    async fn test_decoder_rejects_non_der_ecdsa_trailer_signature() {
+        let key = ecdsa_signing_key();
+        let payload = b"trailer-shape-test";
+        let algo = ChecksumAlgorithm::Crc32;
+        let trailer_value = compute_trailer_value(algo, payload);
+
+        // Build a signed-trailer frame whose trailer-signature line is
+        // syntactically lowercase hex but not DER. We reuse the
+        // ECDSA-stream builder helper to get the chunk + zero-chunk
+        // signatures right, then substitute the trailer signature.
+        let mut frame = Vec::new();
+        let mut prev = ECDSA_SEED_SIG.to_string();
+        let payload_sig = compute_ecdsa_chunk_sig(&key, &prev, payload);
+        frame.extend_from_slice(
+            format!("{:x};chunk-signature={payload_sig}\r\n", payload.len()).as_bytes(),
+        );
+        frame.extend_from_slice(payload);
+        frame.extend_from_slice(b"\r\n");
+        prev = payload_sig;
+        let zero_sig = compute_ecdsa_chunk_sig(&key, &prev, b"");
+        frame.extend_from_slice(format!("0;chunk-signature={zero_sig}\r\n").as_bytes());
+        frame.extend_from_slice(format!("{}:{trailer_value}\r\n", algo.header_name()).as_bytes());
+        // Non-DER trailer signature.
+        frame.extend_from_slice(b"x-amz-trailer-signature:deadbeefdeadbeef\r\n\r\n");
+
+        let mode = DecoderMode::SignedTrailer {
+            expected_trailer_name: algo.header_name().to_string(),
+            algorithm: algo,
+            signature_algorithm: SignedChunkAlgorithm::EcdsaP256,
+        };
+        let err = decode_with_policy(&frame, payload.len() as u64, mode, ecdsa_verify_ctx())
+            .await
+            .expect_err("non-DER trailer signature must error");
+        assert!(
+            matches!(err, AwsChunkedError::InvalidTrailerSignature { .. }),
+            "expected InvalidTrailerSignature, got {err:?}",
+        );
     }
 
     /// Unsigned-trailer mode has no chunk signatures to verify. Even
