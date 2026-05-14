@@ -934,15 +934,25 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_signed_headers_security_token_rejected() {
-        // STS via SignedHeaders should be rejected the same way the
-        // header-path parser does it; routed through `parse_signed_headers`.
+    fn test_parse_signed_headers_security_token_now_accepted_at_parser_level() {
+        // The shared `parse_signed_headers` used to reject
+        // `x-amz-security-token` outright (PR 1 behavior). PR 4 lifts that
+        // because the canonical request includes the token header (and the
+        // canonical query includes the `X-Amz-Security-Token` parameter)
+        // when the client presents STS credentials. Re-adding the
+        // parser-level reject in `parse_signed_headers` flips this back
+        // to an `InvalidToken` error.
         let q = aws_doc_presigned_query().replace(
             "&X-Amz-SignedHeaders=host",
             "&X-Amz-SignedHeaders=host%3Bx-amz-security-token",
         );
-        let err = parse_presigned_authorization(&q, rid()).expect_err("STS in signed headers");
-        assert_eq!(err.code, "InvalidToken");
+        let pres =
+            parse_presigned_authorization(&q, rid()).expect("STS in signed headers now parses");
+        assert!(
+            pres.signed_headers
+                .iter()
+                .any(|n| n.as_str() == "x-amz-security-token")
+        );
     }
 
     #[test]

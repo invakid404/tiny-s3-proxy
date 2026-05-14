@@ -337,14 +337,31 @@ impl S3Error {
         }
     }
 
-    /// Create an InvalidToken error (HTTP 400). Used by the strict SigV4
-    /// verifier when a request carries `x-amz-security-token` — STS-issued
-    /// temporary credentials are fail-closed in this PR and tracked in a
-    /// follow-up PR of #63.
+    /// Create an InvalidToken error (HTTP 400). AWS uses this code for
+    /// session tokens that are themselves malformed or otherwise invalid;
+    /// the strict SigV4 verifier surfaces it only when a resolver
+    /// explicitly classifies a supplied token as malformed. Expired
+    /// credentials use `expired_token` instead, and tuple misses use
+    /// `invalid_access_key_id`.
     pub fn invalid_token(message: &str, request_id: &str) -> Self {
         S3Error {
             http_status: StatusCode::BAD_REQUEST,
             code: "InvalidToken".to_string(),
+            message: message.to_string(),
+            resource: None,
+            request_id: request_id.to_string(),
+        }
+    }
+
+    /// Create an ExpiredToken error (HTTP 400). Mirrors AWS S3's standard
+    /// error for an STS session token whose `expires_at` has passed.
+    /// Distinct from `InvalidToken` so the client can tell "your
+    /// credentials expired, refresh them" from "the token is structurally
+    /// broken".
+    pub fn expired_token(message: &str, request_id: &str) -> Self {
+        S3Error {
+            http_status: StatusCode::BAD_REQUEST,
+            code: "ExpiredToken".to_string(),
             message: message.to_string(),
             resource: None,
             request_id: request_id.to_string(),
@@ -553,6 +570,16 @@ mod tests {
         assert_eq!(err.http_status, StatusCode::BAD_REQUEST);
         assert_eq!(err.code, "InvalidToken");
         assert!(err.to_xml().contains("<Code>InvalidToken</Code>"));
+    }
+
+    #[test]
+    fn test_expired_token_status_and_code() {
+        let err = S3Error::expired_token("The provided token has expired.", "req-7");
+        assert_eq!(err.http_status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.code, "ExpiredToken");
+        let xml = err.to_xml();
+        assert!(xml.contains("<Code>ExpiredToken</Code>"));
+        assert!(xml.contains("The provided token has expired."));
     }
 
     #[test]
