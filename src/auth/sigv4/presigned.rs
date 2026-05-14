@@ -495,43 +495,65 @@ fn enforce_presigned_validity(
     Ok(())
 }
 
-/// Verify the request's `x-amz-content-sha256` marker (header or query) is
-/// either absent or set to `UNSIGNED-PAYLOAD`. Signed-payload-hash and
-/// streaming presigned URLs are deferred — the standard S3 presigned canonical
-/// request uses `UNSIGNED-PAYLOAD`.
+/// Verify the request's `x-amz-content-sha256` marker (header *and* query)
+/// is either absent or set to `UNSIGNED-PAYLOAD`. Both sources are scanned
+/// because a concrete signed-payload hash in the signed query string would
+/// otherwise be hidden by an `UNSIGNED-PAYLOAD` header (the query form is
+/// part of the canonical request the client signed). Signed-payload-hash
+/// and streaming presigned URLs are deferred to follow-up PRs of issue #63
+/// — the standard S3 presigned canonical request uses `UNSIGNED-PAYLOAD`.
 fn check_presigned_payload_marker(
     parts: &http::request::Parts,
     request_id: &str,
 ) -> Result<(), S3Error> {
-    // Header form takes precedence — if both are present and signed, the
-    // header is the one that goes into `canonical_headers`. The query form
-    // is still scanned so a header-absent / query-present URL is validated.
-    let mut marker_bytes: Option<Vec<u8>> = None;
+    let header_marker = parts
+        .headers
+        .get("x-amz-content-sha256")
+        .map(|v| v.as_bytes().to_vec());
 
-    if let Some(v) = parts.headers.get("x-amz-content-sha256") {
-        marker_bytes = Some(v.as_bytes().to_vec());
-    } else {
-        let raw_query = parts.uri.query().unwrap_or("");
-        for chunk in raw_query.split('&') {
-            if chunk.is_empty() {
-                continue;
-            }
-            let (raw_k, raw_v) = match chunk.split_once('=') {
-                Some((k, v)) => (k, v),
-                None => (chunk, ""),
-            };
-            let decoded_k = percent_decode_for_query(raw_k);
-            if decoded_k.as_slice() == b"X-Amz-Content-Sha256" {
-                marker_bytes = Some(percent_decode_for_query(raw_v));
-                break;
-            }
+    let mut query_marker: Option<Vec<u8>> = None;
+    let raw_query = parts.uri.query().unwrap_or("");
+    for chunk in raw_query.split('&') {
+        if chunk.is_empty() {
+            continue;
+        }
+        let (raw_k, raw_v) = match chunk.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (chunk, ""),
+        };
+        let decoded_k = percent_decode_for_query(raw_k);
+        if decoded_k.as_slice() == b"X-Amz-Content-Sha256" {
+            query_marker = Some(percent_decode_for_query(raw_v));
+            break;
         }
     }
 
-    let Some(bytes) = marker_bytes else {
+    // If both sources are present they must agree — otherwise an
+    // `UNSIGNED-PAYLOAD` header could mask a concrete signed-payload hash
+    // in the signed query string, or vice versa. The bytes are compared
+    // directly; classification (UNSIGNED-PAYLOAD / STREAMING / 64-hex /
+    // malformed) happens once on the unified value below.
+    if let (Some(h), Some(q)) = (&header_marker, &query_marker)
+        && h != q
+    {
+        return Err(S3Error::invalid_request(
+            "presigned URL x-amz-content-sha256 header and X-Amz-Content-Sha256 query \
+             parameter disagree",
+            request_id,
+        ));
+    }
+
+    let Some(bytes) = header_marker.or(query_marker) else {
         return Ok(());
     };
-    let s = std::str::from_utf8(&bytes).map_err(|_| {
+    classify_presigned_payload_marker(&bytes, request_id)
+}
+
+/// Classify a unified `x-amz-content-sha256` marker value (from header or
+/// query). Pulled out so the disagreement check above can call it on the
+/// single agreed-on byte sequence without duplicating the rules.
+fn classify_presigned_payload_marker(bytes: &[u8], request_id: &str) -> Result<(), S3Error> {
+    let s = std::str::from_utf8(bytes).map_err(|_| {
         S3Error::authorization_header_malformed(
             "x-amz-content-sha256 is not valid UTF-8",
             request_id,
@@ -547,14 +569,13 @@ fn check_presigned_payload_marker(
             request_id,
         ));
     }
-    // 64 lowercase hex characters → a concrete signed-payload digest. AWS's
-    // documented presigned canonical request is `UNSIGNED-PAYLOAD`; supporting
-    // signed-payload presigned URLs would require buffering bodies on a path
-    // that currently avoids it. Deferred.
-    if s.len() == 64
-        && s.bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
+    // 64 hex characters (case-insensitive) → a concrete signed-payload
+    // digest. AWS's documented presigned canonical request is
+    // `UNSIGNED-PAYLOAD`; supporting signed-payload presigned URLs would
+    // require buffering bodies on a path that currently avoids it.
+    // Deferred. Accept both lowercase and uppercase / mixed-case hex so
+    // the error code stays `InvalidRequest` regardless of casing.
+    if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(S3Error::invalid_request(
             "presigned URLs with signed payload hashes are not supported",
             request_id,
@@ -1153,6 +1174,68 @@ mod verify_tests {
         );
         let err = verify_presigned_request(&parts, &aws_doc_resolver(), rid(), aws_doc_now())
             .expect_err("signed-payload hash");
+        assert_eq!(err.code, "InvalidRequest");
+    }
+
+    #[test]
+    fn test_uppercase_signed_payload_hash_header_rejected_as_invalid_request() {
+        // Same 64-hex digest but in uppercase. Before the case-insensitive
+        // hex check this would fall through to `AuthorizationHeaderMalformed`
+        // instead of `InvalidRequest`; replacing `is_ascii_hexdigit` with
+        // the prior lowercase-only check flips this assertion.
+        let parts = parts_with_extra_header(
+            "x-amz-content-sha256",
+            "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855",
+        );
+        let err = verify_presigned_request(&parts, &aws_doc_resolver(), rid(), aws_doc_now())
+            .expect_err("uppercase signed-payload hash");
+        assert_eq!(err.code, "InvalidRequest");
+    }
+
+    #[test]
+    fn test_signed_payload_hash_query_marker_rejected_even_when_header_unsigned() {
+        // Header carries the well-behaved `UNSIGNED-PAYLOAD` value, but
+        // the signed query string smuggles in a concrete 64-hex digest.
+        // The prior "header takes precedence" logic let this slip past;
+        // scanning *both* sources catches it as `InvalidRequest`.
+        let q = format!(
+            "{}&X-Amz-Content-Sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            aws_doc_query()
+        );
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/test.txt?{q}"))
+            .header("host", AWS_DOC_HOST)
+            .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+            .body(())
+            .unwrap();
+        let (parts, _) = req.into_parts();
+        let err = verify_presigned_request(&parts, &aws_doc_resolver(), rid(), aws_doc_now())
+            .expect_err("query-side signed-payload hash");
+        assert_eq!(err.code, "InvalidRequest");
+    }
+
+    #[test]
+    fn test_signed_payload_hash_header_and_query_must_agree() {
+        // Header says `UNSIGNED-PAYLOAD`, query says something else
+        // entirely (deliberately non-`STREAMING-*` and non-64-hex so the
+        // disagreement check — not the aws-chunked gate or the hex
+        // check — is the rule under test). Without the agreement check,
+        // the header would "win" silently and the request would proceed.
+        let q = format!(
+            "{}&X-Amz-Content-Sha256=UNSIGNED-DIFFERENT",
+            aws_doc_query()
+        );
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/test.txt?{q}"))
+            .header("host", AWS_DOC_HOST)
+            .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+            .body(())
+            .unwrap();
+        let (parts, _) = req.into_parts();
+        let err = verify_presigned_request(&parts, &aws_doc_resolver(), rid(), aws_doc_now())
+            .expect_err("header/query disagreement");
         assert_eq!(err.code, "InvalidRequest");
     }
 

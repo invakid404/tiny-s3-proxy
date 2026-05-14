@@ -3339,15 +3339,11 @@ async fn test_strict_sigv4_rejects_tampered_signed_header() {
     let (strict_client, _wrong, proxy_endpoint, _cache, _creds) =
         build_strict_proxy_stack(&backend_endpoint).await;
 
-    // Use a presign so we get to inspect the full signed request shape.
-    // Actually, presigned URLs are fail-closed in strict mode, so instead
-    // we drive a real PUT via the SDK and rely on the SDK adding x-amz-meta
-    // headers. To produce a tamper, we make a raw request whose
-    // Authorization header was signed for a different value of host.
-    //
-    // The simplest tamper that's robust to SDK choices: drive an unsigned
-    // raw HTTP request that carries an Authorization header copied from a
-    // legitimate signed request, then mutate `host`.
+    // Simplest tamper that's robust to SDK choices: drive an unsigned
+    // raw HTTP request that carries an Authorization header copied from
+    // a legitimate signed request, then mutate `host` so the proxy
+    // canonicalizes against a different value than the one the signature
+    // was computed over.
     let _ = strict_client; // Keep the SDK live until the proxy is fully torn down.
 
     let http_client = reqwest::Client::new();
