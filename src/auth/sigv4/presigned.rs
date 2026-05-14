@@ -513,12 +513,26 @@ pub(crate) fn reject_presigned_aws_chunked(
     {
         return Err(mismatch());
     }
-    if let Some(v) = parts.headers.get("content-encoding")
-        && let Ok(s) = v.to_str()
-        && s.split(',')
+    // Walk every `Content-Encoding` header value, not just `.get()`.
+    // A client can send `Content-Encoding: identity` followed by a
+    // second `Content-Encoding: aws-chunked` line; `.get()` returns
+    // only the first and would silently miss the second. Splitting
+    // each value on `,` separately also handles the comma-list form
+    // (`Content-Encoding: identity, aws-chunked`) — both layers fail
+    // closed.
+    //
+    // CodeRabbit round-2 Finding E. Same gate is reused by the SigV4A
+    // presigned verifier (`auth::sigv4a::presigned`), so the fix
+    // benefits both algorithms.
+    for v in parts.headers.get_all("content-encoding").iter() {
+        let Ok(s) = v.to_str() else {
+            continue;
+        };
+        if s.split(',')
             .any(|t| t.trim().eq_ignore_ascii_case("aws-chunked"))
-    {
-        return Err(mismatch());
+        {
+            return Err(mismatch());
+        }
     }
     if let Some(v) = parts.headers.get("x-amz-content-sha256")
         && let Ok(s) = v.to_str()
@@ -1594,6 +1608,55 @@ mod verify_tests {
         let parts = parts_with_extra_header("content-encoding", "aws-chunked");
         let err = verify_presigned_request(&parts, &aws_doc_resolver(), rid(), aws_doc_now())
             .expect_err("aws-chunked CE");
+        assert_eq!(err.code, "UnsupportedSignature");
+    }
+
+    /// `Content-Encoding: identity` followed by a SECOND
+    /// `Content-Encoding: aws-chunked` header line. The first
+    /// `.get()` returns "identity"; only the multi-value scan from
+    /// CodeRabbit Finding E catches the second `aws-chunked`. Without
+    /// the `get_all()` walk, a client could hide the
+    /// presigned-aws-chunked combination behind a no-op first value.
+    ///
+    /// Bug-revert reasoning: replacing the
+    /// `parts.headers.get_all("content-encoding")` walk with a single
+    /// `parts.headers.get("content-encoding")` flips this assertion
+    /// from `UnsupportedSignature` to `Ok(_)` (the first header's
+    /// "identity" value matches nothing, the second is never read).
+    #[test]
+    fn test_presigned_aws_chunked_via_repeated_content_encoding_header_rejected() {
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/test.txt?{}", aws_doc_query()))
+            .header("host", AWS_DOC_HOST)
+            .header("content-encoding", "identity")
+            .header("content-encoding", "aws-chunked")
+            .body(())
+            .unwrap();
+        let parts = req.into_parts().0;
+        let err = verify_presigned_request(&parts, &aws_doc_resolver(), rid(), aws_doc_now())
+            .expect_err("repeated content-encoding lines");
+        assert_eq!(err.code, "UnsupportedSignature");
+    }
+
+    /// Reverse order: `aws-chunked` on the first header line, then
+    /// `identity` on a second. The `get()`-only form would catch the
+    /// first one too, but we want the contract pinned in both
+    /// directions so a refactor that re-orders the walk doesn't
+    /// silently regress the load-bearing case.
+    #[test]
+    fn test_presigned_aws_chunked_via_repeated_content_encoding_header_reversed() {
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/test.txt?{}", aws_doc_query()))
+            .header("host", AWS_DOC_HOST)
+            .header("content-encoding", "aws-chunked")
+            .header("content-encoding", "identity")
+            .body(())
+            .unwrap();
+        let parts = req.into_parts().0;
+        let err = verify_presigned_request(&parts, &aws_doc_resolver(), rid(), aws_doc_now())
+            .expect_err("repeated content-encoding lines (reverse order)");
         assert_eq!(err.code, "UnsupportedSignature");
     }
 

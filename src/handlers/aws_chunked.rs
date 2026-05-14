@@ -1845,8 +1845,7 @@ mod tests {
             region: "us-east-1".to_string(),
             service: "s3".to_string(),
         };
-        let signing_key =
-            derive_signing_key("test-secret", "20260101", "us-east-1", "s3");
+        let signing_key = derive_signing_key("test-secret", "20260101", "us-east-1", "s3");
         VerifiedRequest {
             access_key_id: std::sync::Arc::from("AKID"),
             credential_scope: VerifiedCredentialScope::SigV4(scope),
