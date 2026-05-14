@@ -4897,3 +4897,312 @@ async fn test_strict_sigv4_rejects_bad_signature_on_non_first_chunk() {
         "object must not exist on the backend after a tampered-chunk-1 PUT was rejected"
     );
 }
+
+// ============================================================================
+// SigV4A (AWS4-ECDSA-P256-SHA256) inbound verification (PR 5 of #63)
+// ============================================================================
+
+/// Manually sign a SigV4A request and return the `Authorization` header
+/// alongside the original header map (so the caller can replay the
+/// exact byte sequence the signer canonicalized over).
+///
+/// Uses the same `aws_sigv4::sign::v4a::generate_signing_key` + `p256`
+/// pipeline AWS SDKs use; the only thing custom here is the SigV4A
+/// canonical-request layout, which we duplicate inline rather than
+/// re-export from the crate's `(crate)` builder.
+fn sign_sigv4a_get_request(
+    proxy_host: &str,
+    path_and_query: &str,
+    amz_date: &str,
+    region_set: &str,
+    akid: &str,
+    secret: &str,
+) -> String {
+    use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+    use sha2::{Digest, Sha256};
+
+    let body_hash = "UNSIGNED-PAYLOAD";
+    let signed_headers = "host;x-amz-content-sha256;x-amz-date;x-amz-region-set";
+    let canonical = format!(
+        "GET\n{path_and_query}\n\nhost:{proxy_host}\nx-amz-content-sha256:{body_hash}\nx-amz-date:{amz_date}\nx-amz-region-set:{region_set}\n\n{signed_headers}\n{body_hash}",
+    );
+    let creq_hex = {
+        let mut h = Sha256::new();
+        h.update(canonical.as_bytes());
+        hex::encode(h.finalize())
+    };
+    let date_yyyymmdd = &amz_date[..8];
+    let scope = format!("{date_yyyymmdd}/s3/aws4_request");
+    let sts = format!("AWS4-ECDSA-P256-SHA256\n{amz_date}\n{scope}\n{creq_hex}");
+    let scalar = aws_sigv4::sign::v4a::generate_signing_key(akid, secret);
+    let signing_key = SigningKey::from_bytes(scalar.as_ref()).expect("signing key");
+    let sig: Signature = signing_key.sign(sts.as_bytes());
+    let der_hex = hex::encode(sig.to_der().as_ref());
+    format!(
+        "AWS4-ECDSA-P256-SHA256 Credential={akid}/{date_yyyymmdd}/s3/aws4_request, SignedHeaders={signed_headers}, Signature={der_hex}"
+    )
+}
+
+fn proxy_host_only(proxy_endpoint: &str) -> String {
+    proxy_endpoint
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// SigV4A header-auth happy path: a manually-signed GET (the same KDF +
+/// p256 pipeline AWS SDKs use) round-trips through the proxy. Pre-seeds
+/// the backend so the GET has something to return.
+///
+/// Bug-revert reasoning: dropping the `verify_sigv4a_der_signature`
+/// call in `auth::sigv4a::verify_authorization_header_at` lets a
+/// tampered request slip through, but it would also let this happy
+/// path keep passing — what guards against that is the tamper test
+/// below. This test pins the routing + parser + KDF + verify chain
+/// end-to-end: if any step misclassifies the algorithm or builds the
+/// wrong scope, the proxy returns SignatureDoesNotMatch instead of
+/// the body.
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4a_accepts_valid_manual_get() {
+    let (_container, backend_endpoint) = start_versitygw().await;
+    ensure_test_bucket(&backend_endpoint).await;
+    let backend_client =
+        build_raw_s3_client(&backend_endpoint, TEST_ACCESS_KEY, TEST_SECRET_KEY).await;
+    backend_client
+        .put_object()
+        .bucket(TEST_BUCKET)
+        .key("sigv4a-get.txt")
+        .body(b"sigv4a-payload".to_vec().into())
+        .send()
+        .await
+        .expect("seed object");
+
+    let (_strict_sdk, _wrong, proxy_endpoint, _cache, _creds) =
+        build_strict_proxy_stack(&backend_endpoint).await;
+    let host = proxy_host_only(&proxy_endpoint);
+    let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let path = format!("/{TEST_BUCKET}/sigv4a-get.txt");
+    let auth = sign_sigv4a_get_request(
+        &host,
+        &path,
+        &amz_date,
+        "us-east-1",
+        STRICT_INBOUND_KEY,
+        STRICT_INBOUND_SECRET,
+    );
+
+    let http_client = reqwest::Client::new();
+    let resp = http_client
+        .get(format!("{proxy_endpoint}{path}"))
+        .header("host", &host)
+        .header("x-amz-date", &amz_date)
+        .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+        .header("x-amz-region-set", "us-east-1")
+        .header("authorization", &auth)
+        .send()
+        .await
+        .expect("send manual SigV4A GET");
+    let status = resp.status().as_u16();
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(
+        status,
+        200,
+        "SigV4A GET should succeed; body: {}",
+        String::from_utf8_lossy(&body),
+    );
+    assert_eq!(body.as_ref(), b"sigv4a-payload");
+}
+
+/// Tamper the `host` header AFTER signing — the canonical request the
+/// proxy builds will differ from the one the signer used, and the
+/// ECDSA verify fails with `SignatureDoesNotMatch` (HTTP 403).
+///
+/// Bug-revert reasoning: removing the explicit ECDSA verify call in
+/// the SigV4A header-auth verifier (just trusting the parser) flips
+/// this from 403 to 200.
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4a_rejects_tampered_host() {
+    let (_container, backend_endpoint) = start_versitygw().await;
+    ensure_test_bucket(&backend_endpoint).await;
+    let (_strict_sdk, _wrong, proxy_endpoint, _cache, _creds) =
+        build_strict_proxy_stack(&backend_endpoint).await;
+    let host = proxy_host_only(&proxy_endpoint);
+    let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let path = format!("/{TEST_BUCKET}/sigv4a-tamper.txt");
+    let auth = sign_sigv4a_get_request(
+        &host,
+        &path,
+        &amz_date,
+        "us-east-1",
+        STRICT_INBOUND_KEY,
+        STRICT_INBOUND_SECRET,
+    );
+
+    let http_client = reqwest::Client::new();
+    let resp = http_client
+        .get(format!("{proxy_endpoint}{path}"))
+        // Wrong host: signer used `proxy_host_only(...)`.
+        .header("host", "evil.example")
+        .header("x-amz-date", &amz_date)
+        .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+        .header("x-amz-region-set", "us-east-1")
+        .header("authorization", &auth)
+        .send()
+        .await
+        .expect("send tampered request");
+    assert_eq!(resp.status().as_u16(), 403);
+    let body = resp.bytes().await.unwrap();
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(
+        body_str.contains("SignatureDoesNotMatch"),
+        "expected SignatureDoesNotMatch, got: {body_str}",
+    );
+}
+
+/// SigV4A requires `x-amz-region-set` to be present AND signed.
+/// Stripping the header after signing surfaces
+/// `AuthorizationHeaderMalformed` (HTTP 400) up front, before any
+/// crypto runs.
+///
+/// Bug-revert reasoning: dropping `ensure_sigv4a_region_set_signed`
+/// from the verifier flips this to either 200 (the canonical builder
+/// just omits the missing header) or 403 (signature mismatch), but
+/// the wire response code changes either way.
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4a_rejects_missing_region_set() {
+    let (_container, backend_endpoint) = start_versitygw().await;
+    ensure_test_bucket(&backend_endpoint).await;
+    let (_strict_sdk, _wrong, proxy_endpoint, _cache, _creds) =
+        build_strict_proxy_stack(&backend_endpoint).await;
+    let host = proxy_host_only(&proxy_endpoint);
+    let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let path = format!("/{TEST_BUCKET}/sigv4a-noregion.txt");
+    let auth = sign_sigv4a_get_request(
+        &host,
+        &path,
+        &amz_date,
+        "us-east-1",
+        STRICT_INBOUND_KEY,
+        STRICT_INBOUND_SECRET,
+    );
+
+    let http_client = reqwest::Client::new();
+    let resp = http_client
+        .get(format!("{proxy_endpoint}{path}"))
+        .header("host", &host)
+        .header("x-amz-date", &amz_date)
+        .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+        // Intentionally omit x-amz-region-set.
+        .header("authorization", &auth)
+        .send()
+        .await
+        .expect("send no-region request");
+    assert_eq!(resp.status().as_u16(), 400);
+    let body = resp.bytes().await.unwrap();
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(
+        body_str.contains("AuthorizationHeaderMalformed"),
+        "expected AuthorizationHeaderMalformed, got: {body_str}",
+    );
+}
+
+/// SigV4A presigned URL round-trip: build a presigned GET with
+/// `X-Amz-Algorithm=AWS4-ECDSA-P256-SHA256` + `X-Amz-Region-Set`,
+/// sign the canonical query, and confirm the proxy decodes / verifies
+/// it. Pre-seeds the backend.
+///
+/// Bug-revert reasoning: dropping the presigned ECDSA dispatch in
+/// `SigV4Verifier::verify_at` (the `classify_presigned_algorithm`
+/// branch) routes this through the HMAC presigned verifier instead,
+/// which rejects the `AWS4-ECDSA-P256-SHA256` algorithm as
+/// `AuthorizationHeaderMalformed`; this test catches that regression.
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4a_presigned_get_round_trip() {
+    use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+    use sha2::{Digest, Sha256};
+
+    let (_container, backend_endpoint) = start_versitygw().await;
+    ensure_test_bucket(&backend_endpoint).await;
+    let backend_client =
+        build_raw_s3_client(&backend_endpoint, TEST_ACCESS_KEY, TEST_SECRET_KEY).await;
+    backend_client
+        .put_object()
+        .bucket(TEST_BUCKET)
+        .key("sigv4a-presigned.txt")
+        .body(b"sigv4a-presigned-body".to_vec().into())
+        .send()
+        .await
+        .expect("seed object");
+
+    let (_strict_sdk, _wrong, proxy_endpoint, _cache, _creds) =
+        build_strict_proxy_stack(&backend_endpoint).await;
+    let host = proxy_host_only(&proxy_endpoint);
+    let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let date_yyyymmdd = &amz_date[..8];
+
+    fn enc(s: &str) -> String {
+        const HEX: &[u8] = b"0123456789ABCDEF";
+        let mut out = String::with_capacity(s.len());
+        for &b in s.as_bytes() {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+                out.push(b as char);
+            } else {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0f) as usize] as char);
+            }
+        }
+        out
+    }
+
+    let credential_enc = enc(&format!(
+        "{STRICT_INBOUND_KEY}/{date_yyyymmdd}/s3/aws4_request"
+    ));
+    let region_set_enc = enc("us-east-1");
+    let signed_headers_enc = enc("host");
+    let query_no_sig = format!(
+        "X-Amz-Algorithm=AWS4-ECDSA-P256-SHA256\
+         &X-Amz-Credential={credential_enc}\
+         &X-Amz-Date={amz_date}\
+         &X-Amz-Expires=3600\
+         &X-Amz-Region-Set={region_set_enc}\
+         &X-Amz-SignedHeaders={signed_headers_enc}",
+    );
+    let path = format!("/{TEST_BUCKET}/sigv4a-presigned.txt");
+    let canonical = format!("GET\n{path}\n{query_no_sig}\nhost:{host}\n\nhost\nUNSIGNED-PAYLOAD",);
+    let creq_hex = {
+        let mut h = Sha256::new();
+        h.update(canonical.as_bytes());
+        hex::encode(h.finalize())
+    };
+    let scope = format!("{date_yyyymmdd}/s3/aws4_request");
+    let sts = format!("AWS4-ECDSA-P256-SHA256\n{amz_date}\n{scope}\n{creq_hex}");
+    let scalar =
+        aws_sigv4::sign::v4a::generate_signing_key(STRICT_INBOUND_KEY, STRICT_INBOUND_SECRET);
+    let signing_key = SigningKey::from_bytes(scalar.as_ref()).expect("signing key");
+    let sig: Signature = signing_key.sign(sts.as_bytes());
+    let signature_hex = hex::encode(sig.to_der().as_ref());
+    let presigned_url =
+        format!("{proxy_endpoint}{path}?{query_no_sig}&X-Amz-Signature={signature_hex}",);
+
+    let http_client = reqwest::Client::new();
+    let resp = http_client
+        .get(&presigned_url)
+        .header("host", &host)
+        .send()
+        .await
+        .expect("send SigV4A presigned GET");
+    let status = resp.status().as_u16();
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(
+        status,
+        200,
+        "SigV4A presigned GET should succeed; body: {}",
+        String::from_utf8_lossy(&body),
+    );
+    assert_eq!(body.as_ref(), b"sigv4a-presigned-body");
+}
