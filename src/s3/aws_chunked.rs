@@ -5,8 +5,16 @@
 //! - `STREAMING-UNSIGNED-PAYLOAD-TRAILER`: bare-size chunk headers (no
 //!   signature), followed by a single `x-amz-checksum-*` trailer line.
 //! - `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`: signed chunks PLUS a
-//!   trailer line PLUS an `x-amz-trailer-signature` line. Trailer-signature
-//!   is shape-validated only (64 hex chars); the crypto check is #63.
+//!   trailer line PLUS an `x-amz-trailer-signature` line. The
+//!   trailer-signature is shape-validated (64 lowercase hex chars) AND,
+//!   under [`ChunkSignaturePolicy::Verify`], cryptographically verified
+//!   against the trailer's canonical bytes.
+//!
+//! For HMAC-signed chunk modes the decoder additionally verifies each
+//! chunk's `chunk-signature=` against the chained HMAC when
+//! [`ChunkSignaturePolicy::Verify`] is supplied; trust-mode callers stay
+//! on [`ChunkSignaturePolicy::ShapeOnly`] and only shape-check the
+//! signature value. See `crate::auth::sigv4::streaming` for the math.
 //!
 //! For trailer modes the decoder ALSO validates that the declared checksum
 //! matches the computed checksum over the decoded body. A mismatch fails the
@@ -357,14 +365,16 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
             }
 
             let chunk_sha = self.copy_chunk_payload(writer, chunk_size).await?;
-            self.expect_crlf().await?;
 
             // Strict-mode verification: each chunk's signature must match
-            // the chained HMAC. Verification happens AFTER the payload +
-            // CRLF have been consumed off the wire, so a mismatch can't
-            // be confused with a framing error. Gated on `expects_signature`
-            // so unsigned-trailer mode never tries to verify a signature
-            // that the wire format doesn't carry.
+            // the chained HMAC. Run BEFORE consuming the post-payload CRLF
+            // so a tampered signature surfaces as `ChunkSignatureMismatch`
+            // even when the post-payload framing is also malformed —
+            // otherwise a request with both faults would surface as the
+            // framing error and mask the signature failure, and the read
+            // cursor would advance past bytes the verifier didn't need.
+            // Gated on `expects_signature` so unsigned-trailer mode never
+            // tries to verify a signature the wire format doesn't carry.
             if expects_signature
                 && let ChunkSignaturePolicy::Verify(ctx) = &mut self.signature_policy
             {
@@ -398,6 +408,8 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
                     }
                 }
             }
+
+            self.expect_crlf().await?;
 
             self.decoded_len += chunk_size;
             self.previous_data_chunk_size = Some(chunk_size);
@@ -1644,8 +1656,9 @@ mod tests {
         );
     }
 
-    /// Signed-trailer with a non-hex `x-amz-trailer-signature` value. Catches
-    /// regressions in the shape-check (which is the only check we do until #63).
+    /// Signed-trailer with a non-hex `x-amz-trailer-signature` value.
+    /// Caught at the shape-check stage before the cryptographic compare
+    /// runs (`Verify` runs `verify_trailer` only on a hex-valid value).
     #[tokio::test]
     async fn test_signed_trailer_non_hex_signature_rejected() {
         let payload = b"abcdefgh";
@@ -1963,6 +1976,54 @@ mod tests {
             }
             other => panic!("expected ChunkSignatureMismatch, got {other:?}"),
         }
+    }
+
+    /// A request with BOTH a bad chunk signature AND a malformed
+    /// post-payload CRLF must surface `ChunkSignatureMismatch`, not the
+    /// framing error. The signature check has to run before the CRLF
+    /// terminator is consumed — otherwise a tampered chunk paired with
+    /// any post-payload framing fault would mask the signature failure
+    /// and advance the read cursor past bytes the verifier didn't need
+    /// to look at.
+    ///
+    /// Bug-revert reasoning: swapping `expect_crlf()` to run BEFORE the
+    /// `Verify` branch (the pre-fix shape) flips this assertion to
+    /// `AwsChunkedError::MalformedFrame` — the CRLF check fires first
+    /// and never gets to the signature comparison.
+    #[tokio::test]
+    async fn test_decoder_rejects_bad_signature_before_post_payload_crlf() {
+        let key = test_signing_key();
+        let payload: &[u8] = b"hello-streaming";
+        // Hand-build the frame so the post-payload terminator is `XX`
+        // (not `\r\n`) AND the chunk-signature is one of pure zeros
+        // (which can't match the chained HMAC for any non-empty payload).
+        const BAD_SIG: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+        let mut frame = Vec::new();
+        frame.extend_from_slice(
+            format!("{:x};chunk-signature={BAD_SIG}\r\n", payload.len()).as_bytes(),
+        );
+        frame.extend_from_slice(payload);
+        // Malformed post-payload terminator.
+        frame.extend_from_slice(b"XX");
+        // Append a valid-shape zero chunk so the loop has somewhere to
+        // continue if the framing check were to fire first.
+        frame.extend_from_slice(format!("0;chunk-signature={BAD_SIG}\r\n\r\n").as_bytes());
+
+        let err = decode_with_policy(
+            &frame,
+            payload.len() as u64,
+            DecoderMode::NonTrailer,
+            verify_ctx(),
+        )
+        .await
+        .expect_err("must error");
+        assert!(
+            matches!(
+                err,
+                AwsChunkedError::ChunkSignatureMismatch { chunk_index: 0 }
+            ),
+            "signature check must fire before the CRLF check; got {err:?}",
+        );
     }
 
     /// Valid data chunks but corrupted zero-chunk signature must surface
