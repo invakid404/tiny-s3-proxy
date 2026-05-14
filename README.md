@@ -206,7 +206,9 @@ Strict-mode behavior:
 | `STREAMING-AWS4-HMAC-SHA256-PAYLOAD*` (signed aws-chunked) | Verified chunk-by-chunk (PR 2 of #63) |
 | Presigned URLs (`X-Amz-Signature` query parameter) | Verified including validity window and canonical query (PR 3 of #63) |
 | STS / temporary credentials (`x-amz-security-token`, `X-Amz-Security-Token`) | Verified against v2 token-bearing entries (PR 4 of #63) |
-| `AWS4-ECDSA-P256-SHA256` (SigV4A) | `UnsupportedSignature` 400 (lands in PR 5 of #63) |
+| `AWS4-ECDSA-P256-SHA256` (SigV4A) header auth | Verified — P-256 verifying key derived from `(access_key_id, secret_access_key)` via the AWS SP 800-108 KDF; signature is DER-hex (≤144 chars); `x-amz-region-set` must be present and signed (PR 5 of #63) |
+| SigV4A presigned URLs (`X-Amz-Algorithm=AWS4-ECDSA-P256-SHA256`) | Verified — same KDF + ECDSA verify; `X-Amz-Region-Set` required as a canonical query parameter (PR 5 of #63) |
+| `STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD*` (ECDSA-signed aws-chunked) | Verified chunk-by-chunk; AWS CRT's `*`-to-144 padding on `chunk-signature=` is stripped before hex decode and chain advancement (PR 5 of #63) |
 
 STS-specific error mapping (PR 4 of #63):
 
@@ -218,10 +220,17 @@ STS-specific error mapping (PR 4 of #63):
 | Duplicate `x-amz-security-token` header or duplicate `X-Amz-Security-Token` query parameter | `AuthorizationHeaderMalformed` 400 |
 | Empty token value (header or query) | `AuthorizationHeaderMalformed` 400 |
 
+SigV4A-specific notes (PR 5 of #63):
+
+- The credential scope is regionless: `<akid>/<yyyymmdd>/s3/aws4_request`. Five-component HMAC-shaped credentials are rejected as `AuthorizationHeaderMalformed`.
+- `x-amz-region-set` (header auth) / `X-Amz-Region-Set` (presigned) is required and is part of the signed canonical request. The proxy forwards this value without filtering — multi-region region sets (e.g. `us-west-*`) are accepted because the proxy re-signs outbound backend requests with the configured `BACKEND_REGION` regardless.
+- Chunk and trailer signatures on `STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD*` uploads are lowercase hex of DER ECDSA signatures (variable length, max 144 chars), optionally right-padded with `*` to that width per AWS CRT's wire format. Padding is stripped before hex decode and before chain advancement.
+- The derived P-256 verifying key is the only key material kept on the per-request `VerifiedRequest`; the private scalar is built, used to derive the public key, and dropped. HMAC `kSigning` likewise stays in `Zeroizing`.
+
 Other strict-mode behavior worth noting:
-- Signature comparison uses a constant-time compare (`subtle::ConstantTimeEq`) to avoid timing side-channels on byte mismatches.
+- Signature comparison uses a constant-time compare (`subtle::ConstantTimeEq`) for HMAC and ECDSA's own constant-time verification for SigV4A, to avoid timing side-channels on byte mismatches.
 - The verifier reuses S3's standard error codes (`SignatureDoesNotMatch`, `RequestTimeTooSkewed`, `InvalidAccessKeyId`, `AuthorizationHeaderMalformed`, `ExpiredToken`) so existing AWS SDK clients surface clear errors.
-- The proxy still re-signs outbound backend requests with `BACKEND_ACCESS_KEY_ID` / `BACKEND_SECRET_ACCESS_KEY`; client-side auth headers (including `x-amz-security-token`) are stripped before forwarding.
+- The proxy still re-signs outbound backend requests with `BACKEND_ACCESS_KEY_ID` / `BACKEND_SECRET_ACCESS_KEY`; client-side auth headers (including `x-amz-security-token` and `x-amz-region-set`) are stripped before forwarding.
 
 ### Cache invalidation
 
