@@ -3951,9 +3951,25 @@ async fn test_strict_sigv4_signed_non_trailer_full_https_backend_round_trip() {
     let proxy_host = proxy_endpoint.strip_prefix("http://").unwrap();
 
     let key = "strict/signed-non-trailer.bin";
-    let payload: &[u8] = b"strict-mode signed aws-chunked round trip payload";
-    let request =
-        build_signed_aws_chunked_put_non_trailer(proxy_host, TEST_BUCKET, key, &[payload], None);
+    // Multi-chunk: the first (non-final) chunk must be ≥ 8 KiB to clear
+    // the `MIN_NON_FINAL_CHUNK_BYTES` floor, and we use a distinct second
+    // chunk so the strict-mode chain-advance behavior is exercised at
+    // the integration tier — not just the unit tests. With a single-chunk
+    // success case, a regression that broke chain advancement (e.g.
+    // failing to update `previous_signature_hex` on a verified chunk)
+    // would still pass this test because there's no chunk-2 STS to
+    // validate against the chained signature.
+    let chunk1: Vec<u8> = vec![b'A'; 8192];
+    let chunk2: Vec<u8> = b"strict-mode multi-chunk tail payload".to_vec();
+    let mut full_payload = chunk1.clone();
+    full_payload.extend_from_slice(&chunk2);
+    let request = build_signed_aws_chunked_put_non_trailer(
+        proxy_host,
+        TEST_BUCKET,
+        key,
+        &[&chunk1, &chunk2],
+        None,
+    );
 
     let (status, raw_response) = raw_tcp_request(proxy_host, &request.request_bytes).await;
     let resp_text = String::from_utf8_lossy(&raw_response);
@@ -3976,8 +3992,8 @@ async fn test_strict_sigv4_signed_non_trailer_full_https_backend_round_trip() {
         .await
         .expect("read body")
         .into_bytes();
-    assert_eq!(body.as_ref(), payload);
-    assert_eq!(payload.len(), request.payload_len);
+    assert_eq!(body.as_ref(), full_payload.as_slice());
+    assert_eq!(full_payload.len(), request.payload_len);
 }
 
 /// Same as the round-trip test but the first chunk's `chunk-signature=`
@@ -4273,5 +4289,81 @@ async fn test_strict_sigv4_rejects_signed_streaming_with_unsupported_trailer_alg
     assert!(
         resp_text.contains("<Code>UnsupportedSignature</Code>"),
         "expected UnsupportedSignature, got: {resp_text}",
+    );
+}
+
+/// Strict mode + multi-chunk signed aws-chunked PUT where chunk index 1
+/// (the second data chunk, not the first) has its signature tampered.
+/// The decoder must reject with `SignatureDoesNotMatch`, and the
+/// upstream must not see the body. Chunk 0's signature is correct so
+/// the chain advances normally; the mismatch surfaces at chunk 1.
+///
+/// Bug-revert reasoning: failing to advance `previous_signature_hex`
+/// after a successful chunk-0 verify leaves chunk 1's STS computed
+/// against the seed signature. Chunk 1's wire-level signature in this
+/// test is computed against chunk 0's signature (with one byte
+/// flipped); against the seed it doesn't match either, so a buggy
+/// chain-advance would still surface as `SignatureDoesNotMatch` — but
+/// at chunk index 0 of the second STS, not chunk index 1. A second
+/// regression — skipping the `Verify` branch entirely for chunks
+/// after the first — would flip this test to 200 OK with the tampered
+/// body landing on the upstream. The 403 + zero-object assertions
+/// catch both classes.
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4_rejects_bad_signature_on_non_first_chunk() {
+    let tls = generate_test_tls();
+    let (_container, backend_endpoint) = start_versitygw_https(&tls).await;
+
+    let direct_http_client = aws_http_client_trusting(&tls.ca_pem);
+    let direct_client = build_raw_s3_client_with_http_client(
+        &backend_endpoint,
+        TEST_ACCESS_KEY,
+        TEST_SECRET_KEY,
+        direct_http_client,
+    )
+    .await;
+    direct_client
+        .create_bucket()
+        .bucket(TEST_BUCKET)
+        .send()
+        .await
+        .expect("create_bucket on HTTPS VersityGW");
+
+    let (proxy_endpoint, _cache_dir, _creds_file) =
+        build_strict_proxy_stack_with_https_backend(&backend_endpoint, &tls.ca_pem).await;
+    let proxy_host = proxy_endpoint.strip_prefix("http://").unwrap();
+
+    let key = "strict/bad-non-first-chunk-signature.bin";
+    let chunk1: Vec<u8> = vec![b'A'; 8192];
+    let chunk2: Vec<u8> = b"tail chunk to be reached after a clean chunk-0 verify".to_vec();
+    let request = build_signed_aws_chunked_put_non_trailer(
+        proxy_host,
+        TEST_BUCKET,
+        key,
+        &[&chunk1, &chunk2],
+        Some(1),
+    );
+
+    let (status, raw_response) = raw_tcp_request(proxy_host, &request.request_bytes).await;
+    let resp_text = String::from_utf8_lossy(&raw_response);
+    assert_eq!(
+        status, 403,
+        "tampered chunk-1 signature must produce HTTP 403; got {status} with body: {resp_text}",
+    );
+    assert!(
+        resp_text.contains("SignatureDoesNotMatch"),
+        "expected SignatureDoesNotMatch in response body; got: {resp_text}",
+    );
+
+    let head = direct_client
+        .head_object()
+        .bucket(TEST_BUCKET)
+        .key(key)
+        .send()
+        .await;
+    assert!(
+        head.is_err(),
+        "object must not exist on the backend after a tampered-chunk-1 PUT was rejected"
     );
 }
