@@ -696,6 +696,13 @@ pub mod test_utils {
         pub head_read_calls: Mutex<Vec<ReadOptions>>,
         pub put_calls: Mutex<Vec<PutObjectInput>>,
         pub put_spool_calls: Mutex<Vec<PutObjectSpoolInput>>,
+        /// Captured bytes of every spool file `put_object_from_path`
+        /// saw, slurped inside the mock BEFORE
+        /// `handle_put_decode_aws_chunked`'s `guard.cleanup().await`
+        /// runs and unlinks the file. Lets tests prove the decoder
+        /// wrote the decoded payload (e.g. `b"hello"`) instead of
+        /// the raw aws-chunked framing.
+        pub put_spool_bodies: Mutex<Vec<Vec<u8>>>,
         pub upload_part_spool_calls: Mutex<Vec<UploadPartSpoolInput>>,
         pub delete_calls: Mutex<Vec<(String, String)>>,
         /// Total number of Backend trait method invocations.
@@ -719,6 +726,7 @@ pub mod test_utils {
                 head_read_calls: Mutex::new(Vec::new()),
                 put_calls: Mutex::new(Vec::new()),
                 put_spool_calls: Mutex::new(Vec::new()),
+                put_spool_bodies: Mutex::new(Vec::new()),
                 upload_part_spool_calls: Mutex::new(Vec::new()),
                 delete_calls: Mutex::new(Vec::new()),
                 total_calls: std::sync::atomic::AtomicU32::new(0),
@@ -854,6 +862,20 @@ pub mod test_utils {
         ) -> Result<PutObjectOutput, ProxyError> {
             self.total_calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Slurp the spool bytes BEFORE recording the call /
+            // returning. `handle_put_decode_aws_chunked` calls
+            // `guard.cleanup().await` as soon as this method returns
+            // and unlinks the file, so any test that wants to assert
+            // on the decoded payload has to capture it here. We use
+            // `tokio::fs::read` because the trait method is async; a
+            // blocking `std::fs::read` would also work since the
+            // file is small, but staying async-native keeps the mock
+            // self-consistent. The body is captured even on the
+            // unhappy path (the `put_response` may be configured to
+            // return an error) so tests can pin "decoder wrote X
+            // before the backend rejected" if needed.
+            let body_bytes = tokio::fs::read(&req.path).await.unwrap_or_default();
+            self.put_spool_bodies.lock().unwrap().push(body_bytes);
             self.put_spool_calls
                 .lock()
                 .unwrap()
@@ -1918,6 +1940,36 @@ mod tests {
         assert_eq!(spool_calls[0].key, "key");
         assert_eq!(spool_calls[0].len, 5);
         drop(spool_calls);
+
+        // Filesystem-level proof: the bytes on disk at the spool path
+        // were the DECODED payload (`b"hello"`), not the raw
+        // aws-chunked frame. `put_spool_calls[0].len == 5` only
+        // checks `DecodedSummary::decoded_len` (which the decoder
+        // computes), so a regression that wrote the wrong bytes to
+        // the spool — for example, writing the raw aws-chunked frame
+        // (`5;chunk-signature=...\r\nhello\r\n0;...\r\n\r\n`) verbatim
+        // and incorrectly setting `decoded_len = 5` — would slip past
+        // a len-only check. `MockBackend::put_object_from_path` reads
+        // the file BEFORE returning, so the slurp happens before
+        // `handle_put_decode_aws_chunked`'s `guard.cleanup().await`
+        // unlinks it.
+        //
+        // Bug-revert reasoning: piping the raw inbound stream (or
+        // any non-decoded byte sequence) to the spool while keeping
+        // `decoded_len = 5` flips this from `b"hello"` to whatever
+        // wrong bytes were written and the test fails.
+        let spool_bodies = backend.put_spool_bodies.lock().unwrap();
+        assert_eq!(
+            spool_bodies.len(),
+            1,
+            "expected exactly one captured spool body",
+        );
+        assert_eq!(
+            spool_bodies[0].as_slice(),
+            b"hello",
+            "spooled bytes must be the decoded payload, not the raw aws-chunked frame",
+        );
+        drop(spool_bodies);
 
         assert!(
             backend.put_calls.lock().unwrap().is_empty(),
