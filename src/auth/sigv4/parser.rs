@@ -175,7 +175,10 @@ pub fn parse_authorization(
     })
 }
 
-fn parse_credential(value: &str, request_id: &str) -> Result<(String, CredentialScope), S3Error> {
+pub(crate) fn parse_credential(
+    value: &str,
+    request_id: &str,
+) -> Result<(String, CredentialScope), S3Error> {
     let mut parts = value.split('/');
     let akid = parts.next().ok_or_else(|| {
         S3Error::authorization_header_malformed(
@@ -248,7 +251,10 @@ fn parse_credential(value: &str, request_id: &str) -> Result<(String, Credential
     ))
 }
 
-fn parse_signed_headers(value: &str, request_id: &str) -> Result<Vec<HeaderName>, S3Error> {
+pub(crate) fn parse_signed_headers(
+    value: &str,
+    request_id: &str,
+) -> Result<Vec<HeaderName>, S3Error> {
     if value.is_empty() {
         return Err(S3Error::authorization_header_malformed(
             "SignedHeaders is empty",
@@ -324,7 +330,10 @@ fn parse_signed_headers(value: &str, request_id: &str) -> Result<Vec<HeaderName>
     Ok(names)
 }
 
-fn parse_signature_hex(value: &str, request_id: &str) -> Result<([u8; 32], String), S3Error> {
+pub(crate) fn parse_signature_hex(
+    value: &str,
+    request_id: &str,
+) -> Result<([u8; 32], String), S3Error> {
     if value.len() != 64 {
         return Err(S3Error::authorization_header_malformed(
             "Signature must be 64 hex characters",

@@ -18,7 +18,18 @@
 use crate::auth::sigv4::parser::SigV4Authorization;
 use crate::auth::sigv4::payload::PayloadHashForSigning;
 use crate::s3::errors::S3Error;
+use http::HeaderName;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_encode};
+
+/// Which query-string keys the canonical query string should keep. The
+/// header-auth path includes every query param; the presigned path leaves
+/// out `X-Amz-Signature` (the signature itself is verified against the
+/// signed-over canonical query, which by AWS spec excludes it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CanonicalQueryMode {
+    IncludeAll,
+    ExcludePresignedSignature,
+}
 
 /// AWS canonical query encoding: encode every byte that isn't an "unreserved"
 /// character per RFC 3986. Unreserved = `A-Z / a-z / 0-9 / - / . / _ / ~`.
@@ -48,11 +59,34 @@ pub fn build_canonical_request(
     payload: &PayloadHashForSigning,
     request_id: &str,
 ) -> Result<CanonicalRequest, S3Error> {
+    build_canonical_request_from_signed_headers(
+        parts,
+        &auth.signed_headers,
+        payload,
+        CanonicalQueryMode::IncludeAll,
+        request_id,
+    )
+}
+
+/// Shared canonical-request builder. Header auth supplies signed headers from
+/// the `Authorization` header; presigned auth supplies them from
+/// `X-Amz-SignedHeaders`. Both paths feed the same canonicalization here so
+/// header-value normalization, byte-level query encoding, and the final
+/// canonical-request layout stay in one place.
+pub(crate) fn build_canonical_request_from_signed_headers(
+    parts: &http::request::Parts,
+    signed_headers: &[HeaderName],
+    payload: &PayloadHashForSigning,
+    query_mode: CanonicalQueryMode,
+    request_id: &str,
+) -> Result<CanonicalRequest, S3Error> {
     let method = parts.method.as_str(); // already uppercase
     let path = parts.uri.path();
 
-    let canonical_query = canonicalize_query(parts.uri.query().unwrap_or(""), request_id)?;
-    let (canonical_headers, signed_headers) = canonicalize_headers(parts, auth, request_id)?;
+    let canonical_query =
+        canonicalize_query(parts.uri.query().unwrap_or(""), query_mode, request_id)?;
+    let (canonical_headers, signed_headers_str) =
+        canonicalize_headers(parts, signed_headers, request_id)?;
 
     let hashed_payload = payload.canonical_string().to_owned();
 
@@ -61,7 +95,7 @@ pub fn build_canonical_request(
             + path.len()
             + canonical_query.len()
             + canonical_headers.len()
-            + signed_headers.len()
+            + signed_headers_str.len()
             + hashed_payload.len()
             + 16,
     );
@@ -73,14 +107,14 @@ pub fn build_canonical_request(
     creq.push('\n');
     creq.push_str(&canonical_headers);
     creq.push('\n');
-    creq.push_str(&signed_headers);
+    creq.push_str(&signed_headers_str);
     creq.push('\n');
     creq.push_str(&hashed_payload);
 
     Ok(CanonicalRequest {
         canonical_request: creq,
         canonical_headers,
-        signed_headers,
+        signed_headers: signed_headers_str,
         hashed_payload,
     })
 }
@@ -92,7 +126,7 @@ pub fn build_canonical_request(
 /// round trip in `canonicalize_query` operates on raw bytes: a
 /// percent-encoded query may carry arbitrary non-UTF-8 sequences and we
 /// must preserve them byte-for-byte across the canonical round trip.
-fn aws_uri_encode_bytes(bytes: &[u8]) -> String {
+pub(crate) fn aws_uri_encode_bytes(bytes: &[u8]) -> String {
     percent_encode(bytes, AWS_CANONICAL_ENCODE).to_string()
 }
 
@@ -114,7 +148,7 @@ fn aws_uri_encode_bytes(bytes: &[u8]) -> String {
 /// values may contain arbitrary bytes (e.g., a binary value carried via
 /// `%FF`). Converting through `String::from_utf8_lossy` would replace those
 /// bytes with U+FFFD and corrupt the canonical request.
-fn percent_decode_for_query(s: &str) -> Vec<u8> {
+pub(crate) fn percent_decode_for_query(s: &str) -> Vec<u8> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -135,16 +169,6 @@ fn percent_decode_for_query(s: &str) -> Vec<u8> {
     out
 }
 
-/// ASCII-case-insensitive byte-slice comparison. Used for the
-/// presigned-URL key detection so a percent-encoded `X-Amz-Signature` is
-/// recognised regardless of casing or encoding form.
-fn eq_ignore_ascii_case_bytes(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len()
-        && a.iter()
-            .zip(b.iter())
-            .all(|(x, y)| x.eq_ignore_ascii_case(y))
-}
-
 fn hex_nibble(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
@@ -154,7 +178,11 @@ fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
-fn canonicalize_query(raw_query: &str, request_id: &str) -> Result<String, S3Error> {
+fn canonicalize_query(
+    raw_query: &str,
+    mode: CanonicalQueryMode,
+    _request_id: &str,
+) -> Result<String, S3Error> {
     if raw_query.is_empty() {
         return Ok(String::new());
     }
@@ -171,27 +199,18 @@ fn canonicalize_query(raw_query: &str, request_id: &str) -> Result<String, S3Err
             None => (chunk, ""),
         };
 
-        // Reject presigned-URL query keys up front. Strict mode does not yet
-        // verify presigned URLs (PR 3 of issue #63); silently accepting them
-        // would either bypass verification or produce confusing
-        // SignatureDoesNotMatch errors. Surfacing
-        // MissingAuthenticationToken at this stage mirrors what S3 returns
-        // for an unsigned request and points the client at the real cause.
-        //
-        // We compare decoded BYTES (not lossy strings) so a percent-encoded
-        // key such as `X%2DAmz%2DSignature` is still recognised; the byte
-        // form means non-UTF-8 oddities can't sneak past the check via the
-        // lossy-decode replacement character.
         let decoded_k = percent_decode_for_query(raw_k);
         let decoded_v = percent_decode_for_query(raw_v);
-        if eq_ignore_ascii_case_bytes(raw_k.as_bytes(), b"X-Amz-Signature")
-            || eq_ignore_ascii_case_bytes(&decoded_k, b"X-Amz-Signature")
+
+        // In presigned-URL mode AWS computes the canonical query string
+        // over every query param *except* `X-Amz-Signature`. Case-sensitive
+        // exact match on decoded bytes mirrors the AWS spec (other casings
+        // of `X-Amz-Signature` will have been rejected by the presigned
+        // parser before we reach this point).
+        if mode == CanonicalQueryMode::ExcludePresignedSignature
+            && decoded_k.as_slice() == b"X-Amz-Signature"
         {
-            return Err(S3Error::missing_authentication_token(
-                "presigned URLs (X-Amz-Signature) are not supported in strict mode; \
-                 tracked in PR 3 of issue #63",
-                request_id,
-            ));
+            continue;
         }
 
         pairs.push((
@@ -216,13 +235,13 @@ fn canonicalize_query(raw_query: &str, request_id: &str) -> Result<String, S3Err
 
 fn canonicalize_headers(
     parts: &http::request::Parts,
-    auth: &SigV4Authorization,
+    signed_headers: &[HeaderName],
     request_id: &str,
 ) -> Result<(String, String), S3Error> {
     let mut canonical = String::new();
     let mut signed_list = String::new();
 
-    for (i, name) in auth.signed_headers.iter().enumerate() {
+    for (i, name) in signed_headers.iter().enumerate() {
         // If the request declares x-amz-date in signed headers, it MUST be
         // present in the request. Same for any signed header — a missing one
         // means the canonical request can't be reconstructed and silently
@@ -446,13 +465,44 @@ mod tests {
     }
 
     #[test]
-    fn test_presigned_query_rejected() {
+    fn test_include_all_canonicalizes_x_amz_signature_query() {
+        // PR 3 removed the blanket strict-mode rejection of `X-Amz-Signature`
+        // in the header-auth canonical builder — dual auth (header +
+        // presigned) is now caught by `SigV4Verifier::verify_at`. Deleting
+        // the `IncludeAll` arm here would flip the canonical query back to
+        // dropping the param, which would silently change every header-auth
+        // request that happens to carry a stray `X-Amz-Signature=…`.
         let parts = parts_with("/b?X-Amz-Signature=abc&foo=1", "GET", &[("host", "h")]);
         let auth = auth_with_signed_headers(&["host"]);
         let payload = PayloadHashForSigning::UnsignedPayload;
-        let err = build_canonical_request(&parts, &auth, &payload, "rid")
-            .expect_err("presigned must reject");
-        assert_eq!(err.code, "MissingAuthenticationToken");
+        let cr = build_canonical_request(&parts, &auth, &payload, "rid").unwrap();
+        let lines: Vec<&str> = cr.canonical_request.split('\n').collect();
+        assert_eq!(lines[2], "X-Amz-Signature=abc&foo=1");
+    }
+
+    #[test]
+    fn test_exclude_presigned_signature_drops_only_the_signature_key() {
+        // Deleting the `ExcludePresignedSignature` branch would flip the
+        // presigned canonical query from "sorted everything-except-signature"
+        // back to the header-auth shape — a presigned-GET verification round
+        // trip would then go from 200 OK to 403 SignatureDoesNotMatch.
+        let parts = parts_with(
+            "/b?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=abc&foo=1",
+            "GET",
+            &[("host", "h")],
+        );
+        let signed = vec![HeaderName::from_static("host")];
+        let payload = PayloadHashForSigning::UnsignedPayload;
+        let cr = build_canonical_request_from_signed_headers(
+            &parts,
+            &signed,
+            &payload,
+            CanonicalQueryMode::ExcludePresignedSignature,
+            "rid",
+        )
+        .unwrap();
+        let lines: Vec<&str> = cr.canonical_request.split('\n').collect();
+        assert_eq!(lines[2], "X-Amz-Algorithm=AWS4-HMAC-SHA256&foo=1");
     }
 
     #[test]
@@ -500,27 +550,26 @@ mod tests {
     }
 
     #[test]
-    fn test_percent_encoded_x_amz_signature_key_still_rejected() {
-        // `X%2DAmz%2DSignature` decodes (byte-level) to `X-Amz-Signature`.
-        // Our presigned-URL detection compares decoded bytes
-        // case-insensitively, so the encoded form must still trigger
-        // MissingAuthenticationToken.
+    fn test_exclude_presigned_signature_decoded_byte_match() {
+        // `X%2DAmz%2DSignature` decodes byte-level to `X-Amz-Signature`, so
+        // `ExcludePresignedSignature` must drop it from the canonical query.
         let parts = parts_with(
             "/b?X%2DAmz%2DSignature=deadbeef&foo=1",
             "GET",
             &[("host", "h")],
         );
-        let auth = auth_with_signed_headers(&["host"]);
+        let signed = vec![HeaderName::from_static("host")];
         let payload = PayloadHashForSigning::UnsignedPayload;
-        let err = build_canonical_request(&parts, &auth, &payload, "rid")
-            .expect_err("encoded presigned key must reject");
-        assert_eq!(err.code, "MissingAuthenticationToken");
-
-        // Case variation too: lower-case raw key.
-        let parts = parts_with("/b?x-amz-signature=abc", "GET", &[("host", "h")]);
-        let err = build_canonical_request(&parts, &auth, &payload, "rid")
-            .expect_err("lowercase presigned key must reject");
-        assert_eq!(err.code, "MissingAuthenticationToken");
+        let cr = build_canonical_request_from_signed_headers(
+            &parts,
+            &signed,
+            &payload,
+            CanonicalQueryMode::ExcludePresignedSignature,
+            "rid",
+        )
+        .unwrap();
+        let lines: Vec<&str> = cr.canonical_request.split('\n').collect();
+        assert_eq!(lines[2], "foo=1");
     }
 
     #[test]

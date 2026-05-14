@@ -296,9 +296,9 @@ impl S3Error {
         }
     }
 
-    /// Create a MissingAuthenticationToken error (HTTP 403). Returned when an
-    /// `Authorization` header is absent, or when a presigned URL is detected
-    /// in strict mode (presigned URLs are scoped to a later PR of #63).
+    /// Create a MissingAuthenticationToken error (HTTP 403). Returned by the
+    /// strict inbound SigV4 verifier when neither an `Authorization` header
+    /// nor an `X-Amz-Signature` presigned-URL query parameter is present.
     pub fn missing_authentication_token(message: &str, request_id: &str) -> Self {
         S3Error {
             http_status: StatusCode::FORBIDDEN,

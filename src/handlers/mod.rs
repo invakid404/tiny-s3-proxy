@@ -122,7 +122,7 @@ pub struct AppState<B: Backend, C: CacheStore> {
     pub singleflight: Arc<SingleFlight>,
     pub auth: Arc<dyn RequestGate>,
     /// Optional strict-mode SigV4 verifier. When `Some`, replaces the
-    /// `auth` gate for normal (non-streaming, non-presigned) requests —
+    /// `auth` gate for `Authorization`-header and presigned-URL requests —
     /// see `handle_s3_request`.
     pub inbound_sigv4: Option<Arc<SigV4Verifier>>,
     pub policy: CachePolicy,
