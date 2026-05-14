@@ -495,23 +495,33 @@ fn enforce_presigned_validity(
     Ok(())
 }
 
-/// Verify the request's `x-amz-content-sha256` marker (header *and* query)
-/// is either absent or set to `UNSIGNED-PAYLOAD`. Both sources are scanned
-/// because a concrete signed-payload hash in the signed query string would
-/// otherwise be hidden by an `UNSIGNED-PAYLOAD` header (the query form is
-/// part of the canonical request the client signed). Signed-payload-hash
-/// and streaming presigned URLs are deferred to follow-up PRs of issue #63
-/// — the standard S3 presigned canonical request uses `UNSIGNED-PAYLOAD`.
+/// Verify the request's `x-amz-content-sha256` markers (header *and*
+/// query — every occurrence on both sides) are either absent or all
+/// `UNSIGNED-PAYLOAD`. A presigned URL can legally sign more than one
+/// `X-Amz-Content-Sha256` query parameter, so the canonical query — and
+/// therefore the HMAC — stays valid even when those occurrences disagree;
+/// classifying only the first occurrence let a trailing concrete 64-hex
+/// digest slip past the unsigned marker that came before it. Signed-
+/// payload-hash and streaming presigned URLs are deferred to follow-up
+/// PRs of issue #63 — the standard S3 presigned canonical request uses
+/// `UNSIGNED-PAYLOAD`.
 fn check_presigned_payload_marker(
     parts: &http::request::Parts,
     request_id: &str,
 ) -> Result<(), S3Error> {
-    let header_marker = parts
-        .headers
-        .get("x-amz-content-sha256")
-        .map(|v| v.as_bytes().to_vec());
+    let mut markers: Vec<Vec<u8>> = Vec::new();
 
-    let mut query_marker: Option<Vec<u8>> = None;
+    // Every `x-amz-content-sha256` header value (`get_all` so the rare
+    // multiple-header-line case fails closed instead of being silently
+    // truncated to the first value).
+    for v in parts.headers.get_all("x-amz-content-sha256").iter() {
+        markers.push(v.as_bytes().to_vec());
+    }
+
+    // Every exact-case `X-Amz-Content-Sha256` query occurrence (mis-cased
+    // forms are already rejected by the auth-key parser before we get
+    // here). All occurrences feed into the same dangerous-pattern /
+    // disagreement scan below.
     let raw_query = parts.uri.query().unwrap_or("");
     for chunk in raw_query.split('&') {
         if chunk.is_empty() {
@@ -523,30 +533,53 @@ fn check_presigned_payload_marker(
         };
         let decoded_k = percent_decode_for_query(raw_k);
         if decoded_k.as_slice() == b"X-Amz-Content-Sha256" {
-            query_marker = Some(percent_decode_for_query(raw_v));
-            break;
+            markers.push(percent_decode_for_query(raw_v));
         }
     }
 
-    // If both sources are present they must agree — otherwise an
-    // `UNSIGNED-PAYLOAD` header could mask a concrete signed-payload hash
-    // in the signed query string, or vice versa. The bytes are compared
-    // directly; classification (UNSIGNED-PAYLOAD / STREAMING / 64-hex /
-    // malformed) happens once on the unified value below.
-    if let (Some(h), Some(q)) = (&header_marker, &query_marker)
-        && h != q
-    {
+    if markers.is_empty() {
+        return Ok(());
+    }
+
+    // Per-marker scan for the dangerous patterns first, so a single
+    // 64-hex / STREAMING marker among a list of `UNSIGNED-PAYLOAD`s
+    // surfaces the specific spec-mandated error code instead of the
+    // generic disagreement one. STREAMING-* normally never reaches us
+    // because `reject_presigned_aws_chunked` runs earlier and iterates
+    // every header / query occurrence; this branch is kept for
+    // defence-in-depth so a future refactor that drops that gate can't
+    // silently downgrade STREAMING to `AuthorizationHeaderMalformed`.
+    for bytes in &markers {
+        if let Ok(s) = std::str::from_utf8(bytes) {
+            if s.starts_with("STREAMING-") {
+                return Err(S3Error::unsupported_signature(
+                    "presigned aws-chunked streaming uploads are not supported in strict mode; \
+                     tracked in PR 5 of issue #63",
+                    request_id,
+                ));
+            }
+            if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(S3Error::invalid_request(
+                    "presigned URLs with signed payload hashes are not supported",
+                    request_id,
+                ));
+            }
+        }
+    }
+
+    // Disagreement among the (already-collected-from-everywhere) markers.
+    // Even if every individual occurrence is itself "safe-looking", a
+    // mismatch between them means the client signed two conflicting
+    // payload-hash intents; fail closed before classifying.
+    if markers.iter().any(|m| m != &markers[0]) {
         return Err(S3Error::invalid_request(
-            "presigned URL x-amz-content-sha256 header and X-Amz-Content-Sha256 query \
-             parameter disagree",
+            "presigned URL x-amz-content-sha256 header / query markers disagree",
             request_id,
         ));
     }
 
-    let Some(bytes) = header_marker.or(query_marker) else {
-        return Ok(());
-    };
-    classify_presigned_payload_marker(&bytes, request_id)
+    // All markers identical at this point; classify the unified value.
+    classify_presigned_payload_marker(&markers[0], request_id)
 }
 
 /// Classify a unified `x-amz-content-sha256` marker value (from header or
@@ -1213,6 +1246,66 @@ mod verify_tests {
         let err = verify_presigned_request(&parts, &aws_doc_resolver(), rid(), aws_doc_now())
             .expect_err("query-side signed-payload hash");
         assert_eq!(err.code, "InvalidRequest");
+    }
+
+    #[test]
+    fn test_multiple_signed_payload_hash_query_markers_with_concrete_hex_rejected() {
+        // Two `X-Amz-Content-Sha256` query occurrences: an unsigned
+        // marker followed by a concrete 64-hex digest. Replacing the
+        // all-occurrences scan in `check_presigned_payload_marker` with
+        // a first-wins `break` flips this from `InvalidRequest` back to
+        // acceptance via the leading `UNSIGNED-PAYLOAD` marker. Both
+        // orderings are exercised so the rejection isn't accidentally
+        // position-dependent.
+        let hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+        for q in [
+            format!(
+                "{}&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Content-Sha256={hex}",
+                aws_doc_query()
+            ),
+            format!(
+                "{}&X-Amz-Content-Sha256={hex}&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD",
+                aws_doc_query()
+            ),
+        ] {
+            let parts = aws_doc_parts(&q);
+            let err = verify_presigned_request(&parts, &aws_doc_resolver(), rid(), aws_doc_now())
+                .expect_err("trailing concrete-hex marker must fail closed");
+            assert_eq!(err.code, "InvalidRequest");
+        }
+    }
+
+    #[test]
+    fn test_multiple_signed_payload_hash_query_markers_with_disagreement_rejected() {
+        // Two `X-Amz-Content-Sha256` query occurrences with distinct
+        // non-streaming, non-hex values. The dangerous-pattern scan
+        // passes; the disagreement check has to catch this.
+        let q = format!(
+            "{}&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Content-Sha256=UNSIGNED-OTHER",
+            aws_doc_query()
+        );
+        let parts = aws_doc_parts(&q);
+        let err = verify_presigned_request(&parts, &aws_doc_resolver(), rid(), aws_doc_now())
+            .expect_err("multi-marker disagreement");
+        assert_eq!(err.code, "InvalidRequest");
+    }
+
+    #[test]
+    fn test_identical_duplicate_unsigned_payload_query_markers_accepted() {
+        // Pin the accept case: two identical `UNSIGNED-PAYLOAD` query
+        // markers must not be widened into a rejection. The HMAC will
+        // not match (the canonical query now contains an unsigned extra
+        // param) but the payload-marker stage itself must pass — calling
+        // the classifier directly isolates the property we care about
+        // without coupling it to the signature compare.
+        let q = format!(
+            "{}&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD",
+            aws_doc_query()
+        );
+        let parts = aws_doc_parts(&q);
+        check_presigned_payload_marker(&parts, rid())
+            .expect("identical duplicate markers accepted at the payload-marker stage");
     }
 
     #[test]
