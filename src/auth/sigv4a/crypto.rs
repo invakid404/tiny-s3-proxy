@@ -179,9 +179,12 @@ pub fn derive_sigv4a_verifying_key(
 /// `MalformedFrame` at the parser layer), and `SignatureDoesNotMatch`
 /// is reserved for crypto-mismatch on valid DER.
 pub fn parse_der_signature_hex(signature_hex: &str) -> Result<Vec<u8>, SigV4aCryptoError> {
-    if signature_hex.is_empty()
-        || !signature_hex.len().is_multiple_of(2)
-        || signature_hex.len() > MAX_SIGV4A_DER_SIGNATURE_HEX_LEN
+    // `% 2 != 0` rather than `len().is_multiple_of(2)` so we don't
+    // require Rust 1.87+. The repo has no `rust-version` floor and
+    // `edition = "2024"` puts the language baseline at 1.85.
+    #[allow(clippy::manual_is_multiple_of)]
+    let odd_len = signature_hex.len() % 2 != 0;
+    if signature_hex.is_empty() || odd_len || signature_hex.len() > MAX_SIGV4A_DER_SIGNATURE_HEX_LEN
     {
         return Err(SigV4aCryptoError::InvalidSignatureHex);
     }
