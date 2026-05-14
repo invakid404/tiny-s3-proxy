@@ -559,6 +559,58 @@ mod tests {
         assert_eq!(err.code, "RequestTimeTooSkewed");
     }
 
+    /// Tampering `X-Amz-Region-Set` after signing must surface
+    /// `SignatureDoesNotMatch` — the region set is part of the
+    /// canonical query (it's a `pub(crate)` AWS-doc auth param the
+    /// canonicalizer signs alongside the others) and any change to it
+    /// invalidates the ECDSA verify. Without this test, a future
+    /// refactor that strips `X-Amz-Region-Set` from canonicalization
+    /// would let a tampered region-set value verify as 200 OK.
+    ///
+    /// Bug-revert reasoning: removing `X-Amz-Region-Set` from
+    /// `PRESIGNED_AUTH_NAMES` (so the canonicalizer treats it as an
+    /// ordinary query param it doesn't strip) would still keep this
+    /// test green; the load-bearing edit is the canonicalizer keeping
+    /// `X-Amz-Region-Set` in the canonical query the verifier
+    /// rebuilds. Dropping `X-Amz-Region-Set` from
+    /// `build_canonical_request_from_signed_headers`'s
+    /// `CanonicalQueryMode::ExcludePresignedSignature` semantics —
+    /// i.e. EXCLUDING region-set instead of just `X-Amz-Signature` —
+    /// flips this assertion from `SignatureDoesNotMatch` to `Ok(_)`.
+    #[test]
+    fn test_sigv4a_presigned_tampered_region_set_rejected() {
+        // Sign with `us-east-1`, then rewrite the query so the
+        // canonical-request region-set line changes to `us-west-2`.
+        // The signer committed to `us-east-1`; the verifier
+        // canonicalizes the request as-sent and the ECDSA verify
+        // fails.
+        let q_signed = sign_sigv4a_presigned_query(
+            "/bucket/key",
+            "example.com",
+            "20260101T120000Z",
+            3600,
+            "AKID",
+            "SECRET",
+            "us-east-1",
+            &[],
+        );
+        // Mutate ONLY the X-Amz-Region-Set value, leaving every other
+        // query param (including X-Amz-Signature) byte-identical.
+        let q_tampered = q_signed.replace(
+            &format!("X-Amz-Region-Set={}", enc("us-east-1")),
+            &format!("X-Amz-Region-Set={}", enc("us-west-2")),
+        );
+        assert_ne!(
+            q_signed, q_tampered,
+            "tamper substitution must change the query string",
+        );
+        let parts = parts_for("GET", "/bucket/key", &q_tampered, "example.com");
+        let resolver = build_resolver("AKID", "SECRET");
+        let err = verify_sigv4a_presigned_request(&parts, &resolver, rid(), now())
+            .expect_err("tampered region set");
+        assert_eq!(err.code, "SignatureDoesNotMatch");
+    }
+
     /// Tampering a signed query param (here, the path → forces a
     /// different canonical request) flips the signature.
     #[test]
