@@ -350,11 +350,18 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
     }
 
     /// Build a decoder for the specified wire-format mode AND chunk-
-    /// signature policy. Strict-mode callers pass
-    /// [`ChunkSignaturePolicy::Verify`] with a [`StreamingSigV4Context`]
-    /// seeded from the request's verified signature so each chunk (and,
-    /// for signed-trailer mode, the trailer signature) is verified
-    /// against the chained HMAC before the decoded bytes are released.
+    /// signature policy.
+    ///
+    /// Strict-mode callers pass [`ChunkSignaturePolicy::VerifyHmac`]
+    /// with a [`StreamingSigV4Context`] (for `STREAMING-AWS4-HMAC-SHA256-*`
+    /// streams) or [`ChunkSignaturePolicy::VerifyEcdsa`] with a
+    /// [`StreamingSigV4aContext`] (for
+    /// `STREAMING-AWS4-ECDSA-P256-SHA256-*` streams), seeded from the
+    /// matching variant on the request's `VerifiedRequest`
+    /// `signing_context`. Each chunk — and, for signed-trailer mode,
+    /// the trailer signature — is verified against the chained
+    /// per-algorithm context (HMAC compare or ECDSA-P256/SHA-256
+    /// verify) before any decoded bytes are released to `writer`.
     pub fn with_mode_and_signature_policy(
         inner: R,
         declared_decoded_len: u64,
