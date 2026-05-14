@@ -1827,6 +1827,148 @@ mod tests {
         }
     }
 
+    /// Minimal HMAC `VerifiedRequest` fixture for policy-selector
+    /// tests. Reuses the real `derive_signing_key` so the production
+    /// signing-key shape is exercised; the secret / region / date
+    /// don't matter because the policy selector only reads the
+    /// `signing_context` variant.
+    fn fake_hmac_verified_request() -> crate::auth::VerifiedRequest {
+        use crate::auth::sigv4::derive_signing_key;
+        use crate::auth::sigv4::parser::CredentialScope;
+        use crate::auth::sigv4::payload::PayloadHashForSigning;
+        use crate::auth::verified::{
+            VerifiedCredentialScope, VerifiedRequest, VerifiedSigningContext,
+        };
+        let scope = CredentialScope {
+            date: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            date_yyyymmdd: "20260101".to_string(),
+            region: "us-east-1".to_string(),
+            service: "s3".to_string(),
+        };
+        let signing_key =
+            derive_signing_key("test-secret", "20260101", "us-east-1", "s3");
+        VerifiedRequest {
+            access_key_id: std::sync::Arc::from("AKID"),
+            credential_scope: VerifiedCredentialScope::SigV4(scope),
+            signed_headers: vec![http::HeaderName::from_static("host")],
+            request_signature_hex: "0".repeat(64),
+            signing_context: VerifiedSigningContext::HmacSha256(signing_key),
+            amz_date: "20260101T120000Z".to_string(),
+            payload: PayloadHashForSigning::StreamingAws4HmacSha256Payload,
+        }
+    }
+
+    /// Minimal SigV4A `VerifiedRequest` fixture. The verifying key is
+    /// the real KDF output for `("AKID", "test-secret")` so production
+    /// shape is exercised; per-chunk verification isn't run by the
+    /// policy selector, only the `EcdsaP256` variant tag is read.
+    fn fake_sigv4a_verified_request() -> crate::auth::VerifiedRequest {
+        use crate::auth::sigv4::payload::PayloadHashForSigning;
+        use crate::auth::sigv4a::SigV4aCredentialScope;
+        use crate::auth::sigv4a::crypto::derive_sigv4a_verifying_key;
+        use crate::auth::verified::{
+            VerifiedCredentialScope, VerifiedRequest, VerifiedSigningContext,
+        };
+        let scope = SigV4aCredentialScope {
+            date: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            date_yyyymmdd: "20260101".to_string(),
+            service: "s3".to_string(),
+        };
+        let verifying_key = derive_sigv4a_verifying_key("AKID", "test-secret").unwrap();
+        VerifiedRequest {
+            access_key_id: std::sync::Arc::from("AKID"),
+            credential_scope: VerifiedCredentialScope::SigV4a(scope),
+            signed_headers: vec![http::HeaderName::from_static("host")],
+            request_signature_hex: "0".repeat(64),
+            signing_context: VerifiedSigningContext::EcdsaP256(verifying_key),
+            amz_date: "20260101T120000Z".to_string(),
+            payload: PayloadHashForSigning::StreamingAws4EcdsaP256Sha256Payload,
+        }
+    }
+
+    /// `DecoderMode::NonTrailer { EcdsaP256 }` + SigV4A
+    /// `VerifiedRequest` → `ChunkSignaturePolicy::VerifyEcdsa`. End-to-end
+    /// integration covers the full path; this unit pin guards the policy
+    /// selector itself against a future refactor that misroutes ECDSA
+    /// modes.
+    ///
+    /// Bug-revert reasoning: replacing the `EcdsaP256` arm in
+    /// `signature_policy_for_decode` with the HMAC `VerifyHmac` builder
+    /// flips this from `Ok(VerifyEcdsa)` to either
+    /// `Err(InternalError)` or `Ok(VerifyHmac)`.
+    #[test]
+    fn test_signature_policy_ecdsa_mode_with_sigv4a_request_yields_verify_ecdsa() {
+        let mode = DecoderMode::NonTrailer {
+            signature_algorithm: SignedChunkAlgorithm::EcdsaP256,
+        };
+        let verified = fake_sigv4a_verified_request();
+        match signature_policy_for_decode(&mode, Some(&verified), true, "r") {
+            Ok(ChunkSignaturePolicy::VerifyEcdsa(_)) => {}
+            Ok(other) => panic!(
+                "expected ChunkSignaturePolicy::VerifyEcdsa, got {}",
+                policy_kind(&other),
+            ),
+            Err(e) => panic!("expected VerifyEcdsa, got error: {e:?}"),
+        }
+    }
+
+    /// `DecoderMode::NonTrailer { EcdsaP256 }` + an HMAC-shaped
+    /// `VerifiedRequest` is an algorithm/context mismatch — the
+    /// request was verified under HMAC but the decoder mode says ECDSA.
+    /// Must fail closed with `InternalError`, not silently downgrade to
+    /// `ShapeOnly` or pick the wrong policy.
+    ///
+    /// Bug-revert reasoning: replacing the `None => Err(InternalError(...))`
+    /// arm with `None => Ok(ShapeOnly)` flips this assertion to a
+    /// `ChunkSignaturePolicy::ShapeOnly` and the request silently rides
+    /// an unverified streaming path.
+    #[test]
+    fn test_signature_policy_ecdsa_mode_with_hmac_request_yields_internal_error() {
+        let mode = DecoderMode::NonTrailer {
+            signature_algorithm: SignedChunkAlgorithm::EcdsaP256,
+        };
+        let verified = fake_hmac_verified_request();
+        // `ChunkSignaturePolicy` doesn't impl `Debug` (its streaming
+        // contexts deliberately omit it for key-material fields), so
+        // we can't use `expect_err`. Match the Result directly.
+        match signature_policy_for_decode(&mode, Some(&verified), true, "r") {
+            Ok(p) => panic!(
+                "ECDSA mode + HMAC context must reject; got policy {}",
+                policy_kind(&p),
+            ),
+            Err(err) => assert_eq!(err.code, "InternalError"),
+        }
+    }
+
+    /// Symmetric: `DecoderMode::NonTrailer { HmacSha256 }` + a SigV4A
+    /// `VerifiedRequest` must also fail closed with `InternalError`.
+    /// Catches the regression in the other direction.
+    #[test]
+    fn test_signature_policy_hmac_mode_with_sigv4a_request_yields_internal_error() {
+        let mode = DecoderMode::NonTrailer {
+            signature_algorithm: SignedChunkAlgorithm::HmacSha256,
+        };
+        let verified = fake_sigv4a_verified_request();
+        match signature_policy_for_decode(&mode, Some(&verified), true, "r") {
+            Ok(p) => panic!(
+                "HMAC mode + SigV4A context must reject; got policy {}",
+                policy_kind(&p),
+            ),
+            Err(err) => assert_eq!(err.code, "InternalError"),
+        }
+    }
+
+    /// Render `ChunkSignaturePolicy` variants by name without `Debug`
+    /// on the enum (the inner streaming contexts deliberately omit
+    /// `Debug` for fields that hold key material).
+    fn policy_kind(policy: &ChunkSignaturePolicy) -> &'static str {
+        match policy {
+            ChunkSignaturePolicy::ShapeOnly => "ShapeOnly",
+            ChunkSignaturePolicy::VerifyHmac(_) => "VerifyHmac",
+            ChunkSignaturePolicy::VerifyEcdsa(_) => "VerifyEcdsa",
+        }
+    }
+
     /// PR 5 of #63 lifts ECDSA streaming from `RejectUnsupportedSignature`
     /// to `DecodeAwsChunked` with chunk-by-chunk ECDSA verification. The
     /// decoder now BUILDS a `DecoderMode::SignedTrailer { signature_algorithm:
