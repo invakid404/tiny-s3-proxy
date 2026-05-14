@@ -215,11 +215,15 @@ pub fn parse_sigv4a_presigned_authorization(
 
     let (access_key_id, scope) = parse_sigv4a_credential(&credential_v, request_id)?;
     let signed_headers = parse_signed_headers(&signed_headers_v, request_id)?;
+    // `parse_der_signature_hex` does both hex-shape and DER-structure
+    // validation, so raw `r||s` and arbitrary non-DER hex are rejected
+    // here as `AuthorizationHeaderMalformed` rather than collapsing
+    // into `SignatureDoesNotMatch` at verify time.
     let signature_der = parse_der_signature_hex(&signature_v).map_err(|_| {
         S3Error::authorization_header_malformed(
             &format!(
-                "X-Amz-Signature must be lowercase hex of a DER ECDSA P-256/SHA-256 signature \
-                 (even length, <= {MAX_SIGV4A_DER_SIGNATURE_HEX_LEN} chars)"
+                "X-Amz-Signature must be lowercase hex of a DER-encoded ECDSA P-256/SHA-256 \
+                 signature (even length, <= {MAX_SIGV4A_DER_SIGNATURE_HEX_LEN} chars)"
             ),
             request_id,
         )
@@ -603,5 +607,51 @@ mod tests {
             "error should explain SigV4A is regionless, got: {}",
             err.message,
         );
+    }
+
+    /// Raw 64-byte `r||s` (128 hex chars) as `X-Amz-Signature` must
+    /// reject as `AuthorizationHeaderMalformed` at parse time, not
+    /// `SignatureDoesNotMatch` at verify time. Mirrors the header-auth
+    /// layering test in `auth::sigv4a::parser`.
+    ///
+    /// Bug-revert reasoning: dropping the `Signature::from_der` call
+    /// inside `parse_der_signature_hex` flips this from
+    /// `AuthorizationHeaderMalformed` to `SignatureDoesNotMatch`.
+    #[test]
+    fn test_sigv4a_presigned_raw_r_s_signature_rejected_at_parse_layer() {
+        let amz_date = "20260101T120000Z";
+        let credential_enc = enc("AKID/20260101/s3/aws4_request");
+        let raw_rs = "0".repeat(128);
+        let q = format!(
+            "X-Amz-Algorithm={SIGV4A_ALGORITHM}\
+             &X-Amz-Credential={credential_enc}\
+             &X-Amz-Date={amz_date}\
+             &X-Amz-Expires=3600\
+             &X-Amz-Region-Set=us-east-1\
+             &X-Amz-SignedHeaders=host\
+             &X-Amz-Signature={raw_rs}"
+        );
+        let err = parse_sigv4a_presigned_authorization(&q, rid()).expect_err("raw r||s");
+        assert_eq!(err.code, "AuthorizationHeaderMalformed");
+    }
+
+    /// Arbitrary non-DER lowercase hex — well-formed hex of an
+    /// acceptable length, but no DER structure — must also reject as
+    /// `AuthorizationHeaderMalformed`.
+    #[test]
+    fn test_sigv4a_presigned_arbitrary_non_der_hex_rejected_at_parse_layer() {
+        let amz_date = "20260101T120000Z";
+        let credential_enc = enc("AKID/20260101/s3/aws4_request");
+        let q = format!(
+            "X-Amz-Algorithm={SIGV4A_ALGORITHM}\
+             &X-Amz-Credential={credential_enc}\
+             &X-Amz-Date={amz_date}\
+             &X-Amz-Expires=3600\
+             &X-Amz-Region-Set=us-east-1\
+             &X-Amz-SignedHeaders=host\
+             &X-Amz-Signature=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+        );
+        let err = parse_sigv4a_presigned_authorization(&q, rid()).expect_err("non-DER hex");
+        assert_eq!(err.code, "AuthorizationHeaderMalformed");
     }
 }

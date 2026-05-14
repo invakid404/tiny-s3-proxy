@@ -166,6 +166,18 @@ pub fn derive_sigv4a_verifying_key(
 /// Strictness mirrors the HMAC SigV4 parser: lowercase only, even length,
 /// no whitespace, and bounded at `MAX_SIGV4A_DER_SIGNATURE_HEX_LEN`. Empty
 /// strings are rejected because AWS never emits an empty signature.
+///
+/// **DER-validates at parse time.** Returning successfully means the
+/// bytes are a structurally valid ECDSA P-256 DER signature; the caller
+/// gets `Vec<u8>` rather than the parsed `Signature` so other layers can
+/// log the raw bytes for diagnostics, but a subsequent
+/// [`verify_sigv4a_der_signature`] call can safely assume DER-validity
+/// (its `from_der` re-parse is now belt-and-suspenders, not the only
+/// gate). This is the layering the wire-format error codes depend on:
+/// malformed DER must surface as `InvalidSignatureHex` /
+/// `InvalidDerSignature` (mapped to `AuthorizationHeaderMalformed` /
+/// `MalformedFrame` at the parser layer), and `SignatureDoesNotMatch`
+/// is reserved for crypto-mismatch on valid DER.
 pub fn parse_der_signature_hex(signature_hex: &str) -> Result<Vec<u8>, SigV4aCryptoError> {
     if signature_hex.is_empty()
         || !signature_hex.len().is_multiple_of(2)
@@ -179,7 +191,15 @@ pub fn parse_der_signature_hex(signature_hex: &str) -> Result<Vec<u8>, SigV4aCry
     {
         return Err(SigV4aCryptoError::InvalidSignatureHex);
     }
-    hex::decode(signature_hex).map_err(|_| SigV4aCryptoError::InvalidSignatureHex)
+    let bytes = hex::decode(signature_hex).map_err(|_| SigV4aCryptoError::InvalidSignatureHex)?;
+    // DER-validate inline. Without this, raw `r||s` (128 hex chars) and
+    // arbitrary non-DER lowercase hex slip through parsing and collapse
+    // into `SignatureDoesNotMatch` at verify time — wrong wire-format
+    // error code. Validating here keeps `InvalidDerSignature` on the
+    // shape-malformed path so the parser layer can map it to
+    // `AuthorizationHeaderMalformed`.
+    Signature::from_der(&bytes).map_err(|_| SigV4aCryptoError::InvalidDerSignature)?;
+    Ok(bytes)
 }
 
 /// Parse a SigV4A streaming chunk / trailer signature.
@@ -187,8 +207,8 @@ pub fn parse_der_signature_hex(signature_hex: &str) -> Result<Vec<u8>, SigV4aCry
 /// AWS CRT right-pads chunk and trailer signatures with `*` to the full
 /// 144-hex width so chunk frames can be parsed with a fixed-width
 /// signature field. The padding is **outside** the signature and is
-/// stripped before hex decoding; the resulting bytes are still a valid
-/// DER ECDSA signature.
+/// stripped before hex decoding; the trimmed bytes must be a valid DER
+/// ECDSA signature (validation happens inside [`parse_der_signature_hex`]).
 pub fn parse_streaming_der_signature_hex_padded(
     signature_hex_with_optional_padding: &str,
 ) -> Result<Vec<u8>, SigV4aCryptoError> {
@@ -207,6 +227,12 @@ pub fn parse_streaming_der_signature_hex_padded(
 /// for header / presigned auth, or the streaming STS for chunk / trailer
 /// frames) — the verifier hashes it internally per RFC 6979 / ECDSA, so
 /// callers must NOT pre-hash.
+///
+/// Returns `InvalidDerSignature` for non-DER input and
+/// `VerificationFailed` for valid DER that doesn't match. Production
+/// callers should pre-validate with [`parse_der_signature_hex`] so the
+/// `InvalidDerSignature` path is unreachable here and any error is the
+/// real crypto-mismatch.
 pub fn verify_sigv4a_der_signature(
     verifying_key: &SigV4aVerifyingKey,
     string_to_sign: &[u8],
@@ -370,19 +396,35 @@ mod tests {
     }
 
     /// Raw 64-byte `r||s` (128 hex chars) is well-formed lowercase hex
-    /// but is NOT DER, so `from_der` will reject it. This guards against
-    /// accidentally accepting fixed-width ECDSA signatures, which would
-    /// be a different encoding from AWS's wire format.
+    /// but is NOT DER. The parser MUST reject it at parse time so the
+    /// wire-format error code stays on the malformed-auth path; if the
+    /// reject only fires inside `verify_sigv4a_der_signature`, the
+    /// client sees `SignatureDoesNotMatch` instead of
+    /// `AuthorizationHeaderMalformed` — wrong layering, no caller can
+    /// tell whether it was a shape bug or a crypto miss.
+    ///
+    /// Bug-revert reasoning: dropping the
+    /// `Signature::from_der(&bytes).map_err(...)?` call inside
+    /// `parse_der_signature_hex` flips this test from
+    /// `InvalidDerSignature` back to `Ok(_)`.
     #[test]
     fn parse_der_signature_hex_rejects_raw_r_s_encoding() {
         let raw_rs_hex = "00".repeat(64);
-        let bytes = parse_der_signature_hex(&raw_rs_hex).expect("hex shape ok");
-        // Hex shape is valid; DER decode must fail.
-        let err = Signature::from_der(&bytes).expect_err("not DER");
-        // The exact error type from ecdsa-core isn't important; matching
-        // the construction in `verify_sigv4a_der_signature` shows we map
-        // that to InvalidDerSignature.
-        drop(err);
+        let err = parse_der_signature_hex(&raw_rs_hex).expect_err("raw r||s must reject at parse");
+        assert!(matches!(err, SigV4aCryptoError::InvalidDerSignature));
+    }
+
+    /// Arbitrary non-DER lowercase hex (right length, valid hex shape,
+    /// but no DER ASN.1 structure) must also reject at parse time. Guards
+    /// the layering: malformed DER stays on the
+    /// `InvalidDerSignature` → `AuthorizationHeaderMalformed` path, not
+    /// the `SignatureDoesNotMatch` path.
+    #[test]
+    fn parse_der_signature_hex_rejects_arbitrary_non_der_hex() {
+        // 70 lowercase hex bytes — well-formed shape, but not DER.
+        let hex = "deadbeef".repeat(17) + "be";
+        let err = parse_der_signature_hex(&hex).expect_err("non-DER must reject at parse");
+        assert!(matches!(err, SigV4aCryptoError::InvalidDerSignature));
     }
 
     #[test]

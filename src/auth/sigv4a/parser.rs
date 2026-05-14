@@ -140,11 +140,16 @@ pub fn parse_sigv4a_authorization(
 
     let (access_key_id, scope) = parse_sigv4a_credential(credential, request_id)?;
     let signed_headers = parse_signed_headers(signed_headers_raw, request_id)?;
+    // `parse_der_signature_hex` does both hex-shape validation
+    // (lowercase, even length, <=144) AND DER-structure validation, so
+    // raw `r||s` and arbitrary non-DER hex are rejected here as
+    // `AuthorizationHeaderMalformed` rather than collapsing into
+    // `SignatureDoesNotMatch` at verify time.
     let signature_der = parse_der_signature_hex(signature_raw).map_err(|_| {
         S3Error::authorization_header_malformed(
             &format!(
-                "Signature must be lowercase hex of a DER ECDSA P-256/SHA-256 signature \
-                 (even length, <= {MAX_SIGV4A_DER_SIGNATURE_HEX_LEN} chars)"
+                "Signature must be lowercase hex of a DER-encoded ECDSA P-256/SHA-256 \
+                 signature (even length, <= {MAX_SIGV4A_DER_SIGNATURE_HEX_LEN} chars)"
             ),
             request_id,
         )
@@ -270,19 +275,38 @@ mod tests {
         "req-test"
     }
 
-    /// A baseline header that the parser must accept. The 4-byte DER
-    /// blob `3001020100` is the shortest valid ASN.1 signature shape;
-    /// parsing only checks structural validity, not curve membership.
-    fn valid_header() -> &'static str {
-        "AWS4-ECDSA-P256-SHA256 Credential=AKID/20260101/s3/aws4_request, \
-         SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-region-set, \
-         Signature=304402201111111111111111111111111111111111111111111111111111111111111111\
-         0220222222222222222222222222222222222222222222222222222222222222222222"
+    /// Lowercase hex of a real ECDSA P-256 DER signature produced via
+    /// the same `aws_sigv4` + `p256` primitives the production verifier
+    /// expects. We can't hard-code a placeholder anymore because PR 5
+    /// (commit 9) DER-validates at parse time; `from_der` rejects
+    /// bytes that decode as ASN.1 but aren't a valid ECDSA P-256
+    /// signature (out-of-range scalars, non-canonical integer
+    /// encodings, etc.). Curve membership / canonical-form rules are
+    /// enforced by `ecdsa-core` 0.14's `from_der`.
+    fn real_der_hex() -> String {
+        use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+        let scalar = aws_sigv4::sign::v4a::generate_signing_key("AKID", "SECRET");
+        let signing_key = SigningKey::from_bytes(scalar.as_ref()).unwrap();
+        let sig: Signature = signing_key.sign(b"parser-test-string-to-sign");
+        hex::encode(sig.to_der().as_ref())
+    }
+
+    /// A baseline header that the parser must accept. Uses a real DER
+    /// signature for the load-bearing happy-path test; tests that fail
+    /// before the DER check (credential parsing, lowercase check, etc.)
+    /// continue to use literal placeholder hex.
+    fn valid_header() -> String {
+        format!(
+            "AWS4-ECDSA-P256-SHA256 Credential=AKID/20260101/s3/aws4_request, \
+             SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-region-set, \
+             Signature={}",
+            real_der_hex(),
+        )
     }
 
     #[test]
     fn test_parse_valid_regionless_scope() {
-        let auth = parse_sigv4a_authorization(valid_header(), rid()).expect("parses");
+        let auth = parse_sigv4a_authorization(&valid_header(), rid()).expect("parses");
         assert_eq!(auth.access_key_id, "AKID");
         assert_eq!(auth.scope.service, "s3");
         assert_eq!(auth.scope.date_yyyymmdd, "20260101");
@@ -355,6 +379,46 @@ mod tests {
              SignedHeaders=host, Signature={sig}"
         );
         let err = parse_sigv4a_authorization(&h, rid()).expect_err("over-144");
+        assert_eq!(err.code, "AuthorizationHeaderMalformed");
+    }
+
+    /// Raw 64-byte `r||s` (128 hex chars) is well-formed lowercase hex
+    /// of the right length but is NOT DER. The parser must reject it
+    /// as `AuthorizationHeaderMalformed` at the DER-validation step
+    /// inside `parse_der_signature_hex`. Without this layering, raw
+    /// `r||s` slips through and only fails inside
+    /// `verify_sigv4a_der_signature`, surfacing as
+    /// `SignatureDoesNotMatch` — wrong wire-format error.
+    ///
+    /// Bug-revert reasoning: dropping the `Signature::from_der` call
+    /// inside `parse_der_signature_hex` flips this assertion from
+    /// `AuthorizationHeaderMalformed` to `SignatureDoesNotMatch`.
+    #[test]
+    fn test_rejects_raw_r_s_signature_at_parse_layer() {
+        let raw_rs = "0".repeat(128);
+        let h = format!(
+            "AWS4-ECDSA-P256-SHA256 \
+             Credential=AKID/20260101/s3/aws4_request, \
+             SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-region-set, \
+             Signature={raw_rs}"
+        );
+        let err = parse_sigv4a_authorization(&h, rid()).expect_err("raw r||s");
+        assert_eq!(err.code, "AuthorizationHeaderMalformed");
+    }
+
+    /// Arbitrary non-DER lowercase hex (right hex shape, wrong ASN.1
+    /// structure) must reject as `AuthorizationHeaderMalformed`, not
+    /// `SignatureDoesNotMatch`. Same layering check as
+    /// `test_rejects_raw_r_s_signature_at_parse_layer`, but with input
+    /// that doesn't even start with a valid `30 ..` DER sequence
+    /// header.
+    #[test]
+    fn test_rejects_arbitrary_non_der_hex_at_parse_layer() {
+        let h = "AWS4-ECDSA-P256-SHA256 \
+                 Credential=AKID/20260101/s3/aws4_request, \
+                 SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-region-set, \
+                 Signature=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        let err = parse_sigv4a_authorization(h, rid()).expect_err("non-DER hex");
         assert_eq!(err.code, "AuthorizationHeaderMalformed");
     }
 
