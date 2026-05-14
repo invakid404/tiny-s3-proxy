@@ -1,4 +1,5 @@
 pub mod allowlist;
+pub mod credentials;
 pub mod trusted_internal;
 
 use crate::config::{AuthMode, Config};
