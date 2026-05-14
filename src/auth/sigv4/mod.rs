@@ -1,8 +1,15 @@
 //! Strict-mode inbound SigV4 verification.
 //!
-//! Public entry point: [`SigV4Verifier::verify`] (header / scope / date /
-//! canonical request / signature) and [`SigV4Verifier::verify_payload_hash`]
-//! (body sha256 vs. signed `x-amz-content-sha256`).
+//! Public entry point: [`SigV4Verifier::verify`] dispatches between the
+//! `Authorization` header path and the presigned-URL `X-Amz-*` query path
+//! (or rejects requests that mix both / carry neither). The header path
+//! does scope / date / canonical-request / signature; the presigned path
+//! does query-param parse / validity-window / canonical-request /
+//! signature. Both return the same [`VerifiedRequest`] shape so downstream
+//! handler code stays agnostic of which mechanism the client used.
+//! [`SigV4Verifier::verify_payload_hash`] confirms the body SHA-256 matches
+//! a signed `x-amz-content-sha256` (header path only — presigned URLs use
+//! `UNSIGNED-PAYLOAD` and skip body buffering).
 //!
 //! The verifier deliberately does not pull bytes off the wire. The caller
 //! decides whether the operation has a body and whether to buffer it
@@ -98,22 +105,46 @@ impl SigV4Verifier {
     }
 
     /// Testing seam: same as `verify` but with a caller-supplied `now`.
+    /// Dispatches between the `Authorization` header path and the
+    /// `X-Amz-*` presigned-URL query path; rejects requests that mix both
+    /// or carry neither up front.
     pub fn verify_at(
         &self,
         parts: &http::request::Parts,
         request_id: &str,
         now: DateTime<Utc>,
     ) -> Result<VerifiedRequest, S3Error> {
-        // Reject any presigned-URL keys up front, even before parsing the
-        // Authorization header — they bypass strict mode by design.
-        if has_presigned_query(parts.uri.query().unwrap_or("")) {
-            return Err(S3Error::missing_authentication_token(
-                "presigned URLs (X-Amz-Signature) are not supported in strict mode; \
-                 tracked in PR 3 of issue #63",
-                request_id,
-            ));
-        }
+        let has_query_auth =
+            presigned::has_presigned_signature_query(parts.uri.query().unwrap_or(""));
+        let has_header_auth = parts.headers.contains_key(http::header::AUTHORIZATION);
 
+        match (has_header_auth, has_query_auth) {
+            (true, true) => Err(S3Error::invalid_request(
+                "Only one auth mechanism is allowed; use either the Authorization header \
+                 or X-Amz-* query authentication, not both",
+                request_id,
+            )),
+            (false, true) => {
+                presigned::verify_presigned_request(parts, self.resolver.as_ref(), request_id, now)
+            }
+            (true, false) => self.verify_authorization_header_at(parts, request_id, now),
+            (false, false) => Err(S3Error::missing_authentication_token(
+                "request is missing the Authorization header or X-Amz-Signature query parameter",
+                request_id,
+            )),
+        }
+    }
+
+    /// Header-auth path: parse the `Authorization` header, classify the
+    /// payload, build and verify the canonical request. Extracted from the
+    /// PR 1 `verify_at` body so the new dispatch can route header vs.
+    /// presigned-URL flows separately.
+    fn verify_authorization_header_at(
+        &self,
+        parts: &http::request::Parts,
+        request_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<VerifiedRequest, S3Error> {
         let auth_header = parts.headers.get("authorization").ok_or_else(|| {
             S3Error::missing_authentication_token(
                 "request is missing the Authorization header",
@@ -234,13 +265,6 @@ impl SigV4Verifier {
             | PayloadHashForSigning::StreamingAws4HmacSha256PayloadTrailer => Ok(()),
         }
     }
-}
-
-fn has_presigned_query(raw_query: &str) -> bool {
-    raw_query.split('&').any(|chunk| {
-        let key = chunk.split_once('=').map(|(k, _)| k).unwrap_or(chunk);
-        key.eq_ignore_ascii_case("X-Amz-Signature")
-    })
 }
 
 pub(crate) fn derive_signing_key(
@@ -588,10 +612,13 @@ mod tests {
     }
 
     #[test]
-    fn test_presigned_query_rejected_up_front() {
+    fn test_dispatch_rejects_no_auth_at_all() {
+        // Neither Authorization header nor X-Amz-Signature query →
+        // MissingAuthenticationToken (the catch-all "where's the auth"
+        // response for strict mode).
         let req = Request::builder()
             .method("GET")
-            .uri("/b/k?X-Amz-Signature=deadbeef")
+            .uri("/b/k")
             .header("host", "example.com")
             .header("x-amz-date", "20260101T120000Z")
             .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
@@ -599,8 +626,30 @@ mod tests {
             .unwrap();
         let (parts, _) = req.into_parts();
         let v = build_verifier("AKID", "SECRET");
-        let err = v.verify_at(&parts, "rid", now()).expect_err("presigned");
+        let err = v.verify_at(&parts, "rid", now()).expect_err("no auth");
         assert_eq!(err.code, "MissingAuthenticationToken");
+    }
+
+    #[test]
+    fn test_dispatch_rejects_dual_auth_as_invalid_request() {
+        // Authorization header AND X-Amz-Signature query both present →
+        // InvalidRequest. Deleting the (true, true) arm in `verify_at`
+        // would let one of the two paths win silently — both clients would
+        // then be relying on whichever path the proxy happens to choose.
+        let (auth, headers) = sign_request_for_test(
+            "GET",
+            "/b/k?X-Amz-Signature=deadbeef",
+            "example.com",
+            "20260101T120000Z",
+            "UNSIGNED-PAYLOAD",
+            "AKID",
+            "SECRET",
+            "us-east-1",
+        );
+        let parts = parts_for("GET", "/b/k?X-Amz-Signature=deadbeef", headers, &auth);
+        let v = build_verifier("AKID", "SECRET");
+        let err = v.verify_at(&parts, "rid", now()).expect_err("dual auth");
+        assert_eq!(err.code, "InvalidRequest");
     }
 
     #[test]
