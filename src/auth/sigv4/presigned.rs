@@ -49,7 +49,51 @@ use subtle::ConstantTimeEq;
 pub const MAX_PRESIGNED_EXPIRES_SECS: u64 = 604_800;
 
 const ALGORITHM: &str = "AWS4-HMAC-SHA256";
-const ECDSA_ALGORITHM_PREFIX: &str = "AWS4-ECDSA-";
+const SIGV4A_ALGORITHM: &str = "AWS4-ECDSA-P256-SHA256";
+
+/// Result of `classify_presigned_algorithm` — used by the top-level
+/// verifier to route a presigned URL request to either the HMAC parser
+/// or the SigV4A parser before either of them tries to enforce its own
+/// algorithm-specific rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresignedAlgorithm {
+    SigV4HmacSha256,
+    SigV4aEcdsaP256Sha256,
+    Other,
+}
+
+/// Peek at `X-Amz-Algorithm` in a presigned URL's raw query string and
+/// classify it. Case-insensitive on the key (matches
+/// [`has_presigned_signature_query`]'s detection strictness) but
+/// case-sensitive on the value (the HMAC / SigV4A parsers both require
+/// exact-case algorithm tokens). Returns `None` if no `X-Amz-Algorithm`
+/// is present at all.
+pub fn classify_presigned_algorithm(raw_query: &str) -> Option<PresignedAlgorithm> {
+    for chunk in raw_query.split('&') {
+        if chunk.is_empty() {
+            continue;
+        }
+        let (raw_k, raw_v) = match chunk.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (chunk, ""),
+        };
+        let key_matches = eq_ignore_ascii_case_bytes(raw_k.as_bytes(), b"X-Amz-Algorithm")
+            || eq_ignore_ascii_case_bytes(&percent_decode_for_query(raw_k), b"X-Amz-Algorithm");
+        if !key_matches {
+            continue;
+        }
+        let decoded_v = percent_decode_for_query(raw_v);
+        let Ok(value) = std::str::from_utf8(&decoded_v) else {
+            return Some(PresignedAlgorithm::Other);
+        };
+        return Some(match value {
+            ALGORITHM => PresignedAlgorithm::SigV4HmacSha256,
+            SIGV4A_ALGORITHM => PresignedAlgorithm::SigV4aEcdsaP256Sha256,
+            _ => PresignedAlgorithm::Other,
+        });
+    }
+    None
+}
 
 /// Canonical (AWS-documented) casing for every `X-Amz-*` query parameter
 /// the parser cares about. The parser does case-insensitive matching to
@@ -260,20 +304,11 @@ pub fn parse_presigned_authorization(
         *slot = Some(value_str.to_string());
     }
 
-    // SigV4A presigned URLs use `AWS4-ECDSA-*`. The signing keys are ECDSA,
-    // not HMAC, so neither the proxy nor the upstream re-signer can verify
-    // them — fail closed before structural required-field checks.
-    if let Some(algo) = algorithm.as_deref()
-        && (algo.starts_with(ECDSA_ALGORITHM_PREFIX)
-            || algo.eq_ignore_ascii_case("AWS4-ECDSA-P256-SHA256"))
-    {
-        return Err(S3Error::unsupported_signature(
-            "SigV4A (AWS4-ECDSA-P256-SHA256) presigned URLs are not supported in strict mode; \
-             tracked in PR 5 of issue #63",
-            request_id,
-        ));
-    }
-
+    // PR 5 commit 4 lifts the SigV4A `UnsupportedSignature` rejection
+    // out of this parser; SigV4A presigned URLs now route through
+    // `auth::sigv4a::presigned`. The HMAC parser still rejects any
+    // non-HMAC algorithm at the `algorithm != ALGORITHM` check below as
+    // `AuthorizationHeaderMalformed`.
     let algorithm = algorithm.ok_or_else(|| {
         S3Error::authorization_header_malformed(
             "presigned auth missing X-Amz-Algorithm",
@@ -459,7 +494,9 @@ pub fn verify_presigned_request(
 
 /// Reject the request before signature work if it looks like a presigned
 /// aws-chunked streaming upload — that shape is fail-closed in PR 3.
-fn reject_presigned_aws_chunked(
+/// Shared between the HMAC and SigV4A presigned verifiers so both paths
+/// route streaming sentinels to the same `UnsupportedSignature` error.
+pub(crate) fn reject_presigned_aws_chunked(
     parts: &http::request::Parts,
     request_id: &str,
 ) -> Result<(), S3Error> {
@@ -514,16 +551,27 @@ fn enforce_presigned_validity(
     now: DateTime<Utc>,
     request_id: &str,
 ) -> Result<(), S3Error> {
-    // `pres.expires` is bounded to `MAX_PRESIGNED_EXPIRES_SECS` by the parser,
-    // so the chrono conversion can never overflow in production.
-    let expires = chrono::Duration::from_std(pres.expires).map_err(|_| {
+    enforce_presigned_window(pres.request_time, pres.expires, now, request_id)
+}
+
+/// Validity-window check decoupled from `PresignedAuthorization` so the
+/// SigV4A presigned verifier can reuse it. AWS S3 caps `X-Amz-Expires`
+/// at `MAX_PRESIGNED_EXPIRES_SECS` and both parsers enforce that bound,
+/// so the chrono conversion below can't overflow in production.
+pub(crate) fn enforce_presigned_window(
+    request_time: DateTime<Utc>,
+    expires: Duration,
+    now: DateTime<Utc>,
+    request_id: &str,
+) -> Result<(), S3Error> {
+    let expires = chrono::Duration::from_std(expires).map_err(|_| {
         S3Error::authorization_header_malformed(
             "presigned auth X-Amz-Expires is out of range",
             request_id,
         )
     })?;
-    let expires_at = pres.request_time + expires;
-    if now < pres.request_time || now > expires_at {
+    let expires_at = request_time + expires;
+    if now < request_time || now > expires_at {
         return Err(S3Error::request_time_too_skewed(
             "presigned URL is outside its validity window",
             request_id,
@@ -542,7 +590,7 @@ fn enforce_presigned_validity(
 /// payload-hash and streaming presigned URLs are deferred to follow-up
 /// PRs of issue #63 — the standard S3 presigned canonical request uses
 /// `UNSIGNED-PAYLOAD`.
-fn check_presigned_payload_marker(
+pub(crate) fn check_presigned_payload_marker(
     parts: &http::request::Parts,
     request_id: &str,
 ) -> Result<(), S3Error> {
@@ -976,14 +1024,46 @@ mod tests {
         assert_eq!(err.code, "AuthorizationHeaderMalformed");
     }
 
+    /// PR 5 commit 4 lifts the SigV4A `UnsupportedSignature` rejection
+    /// out of the HMAC presigned parser; SigV4A presigned URLs now
+    /// dispatch to `auth::sigv4a::presigned`. The HMAC parser still
+    /// fails closed on the algorithm token at the `AWS4-HMAC-SHA256`
+    /// equality check, just as `AuthorizationHeaderMalformed` rather
+    /// than the previous `UnsupportedSignature`. Top-level dispatch
+    /// routing is covered by the `classify_presigned_algorithm` test
+    /// below.
+    ///
+    /// Bug-revert reasoning: re-adding the `algorithm.starts_with("AWS4-ECDSA-")`
+    /// arm with `S3Error::unsupported_signature(...)` flips this assertion
+    /// back to `"UnsupportedSignature"`.
     #[test]
-    fn test_parse_sigv4a_algorithm_rejected_as_unsupported() {
+    fn test_parse_sigv4a_algorithm_routed_via_dispatcher() {
         let q = aws_doc_presigned_query().replace(
             "X-Amz-Algorithm=AWS4-HMAC-SHA256",
             "X-Amz-Algorithm=AWS4-ECDSA-P256-SHA256",
         );
-        let err = parse_presigned_authorization(&q, rid()).expect_err("SigV4A");
-        assert_eq!(err.code, "UnsupportedSignature");
+        assert_eq!(
+            classify_presigned_algorithm(&q),
+            Some(PresignedAlgorithm::SigV4aEcdsaP256Sha256),
+        );
+        let err = parse_presigned_authorization(&q, rid()).expect_err("HMAC parser sees SigV4A");
+        assert_eq!(err.code, "AuthorizationHeaderMalformed");
+    }
+
+    #[test]
+    fn test_classify_presigned_algorithm_hmac() {
+        assert_eq!(
+            classify_presigned_algorithm(&aws_doc_presigned_query()),
+            Some(PresignedAlgorithm::SigV4HmacSha256),
+        );
+    }
+
+    #[test]
+    fn test_classify_presigned_algorithm_missing() {
+        assert_eq!(
+            classify_presigned_algorithm("X-Amz-Signature=deadbeef"),
+            None,
+        );
     }
 
     #[test]
@@ -1810,9 +1890,17 @@ mod verify_tests {
         assert_eq!(err.code, "UnsupportedSignature");
     }
 
+    /// SigV4A presigned URLs now route through `auth::sigv4a::presigned`
+    /// via the top-level dispatcher (`SigV4Verifier::verify_at`). The
+    /// HMAC verifier itself only sees them as a non-HMAC algorithm and
+    /// surfaces `AuthorizationHeaderMalformed`. The full SigV4A-with-STS
+    /// round trip is covered by tests in `auth::sigv4a::presigned`.
+    ///
+    /// Bug-revert reasoning: re-adding the dispatch-level
+    /// `unsupported_signature` reject inside `parse_presigned_authorization`
+    /// flips this assertion back to `"UnsupportedSignature"`.
     #[test]
-    fn test_presigned_sts_with_sigv4a_still_rejected() {
-        // SigV4A rejection happens before STS handling too.
+    fn test_presigned_sts_with_sigv4a_routed_to_malformed_in_hmac_verifier() {
         let amz_date = "20260101T120000Z";
         let date_yyyymmdd = &amz_date[..8];
         let q = format!(
@@ -1832,7 +1920,7 @@ mod verify_tests {
             Some(Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap()),
         );
         let err = verify_presigned_request(&parts, &resolver, rid(), sts_now())
-            .expect_err("SigV4A + STS");
-        assert_eq!(err.code, "UnsupportedSignature");
+            .expect_err("SigV4A reaching HMAC verifier directly");
+        assert_eq!(err.code, "AuthorizationHeaderMalformed");
     }
 }

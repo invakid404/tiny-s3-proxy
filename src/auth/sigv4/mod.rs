@@ -124,7 +124,27 @@ impl SigV4Verifier {
                 request_id,
             )),
             (false, true) => {
-                presigned::verify_presigned_request(parts, self.resolver.as_ref(), request_id, now)
+                // Cheap algorithm sniff so SigV4A presigned URLs route
+                // to their own verifier. Missing / unrecognised
+                // algorithms fall through to the HMAC parser, which
+                // surfaces `AuthorizationHeaderMalformed`.
+                let raw_query = parts.uri.query().unwrap_or("");
+                match presigned::classify_presigned_algorithm(raw_query) {
+                    Some(presigned::PresignedAlgorithm::SigV4aEcdsaP256Sha256) => {
+                        crate::auth::sigv4a::presigned::verify_sigv4a_presigned_request(
+                            parts,
+                            self.resolver.as_ref(),
+                            request_id,
+                            now,
+                        )
+                    }
+                    _ => presigned::verify_presigned_request(
+                        parts,
+                        self.resolver.as_ref(),
+                        request_id,
+                        now,
+                    ),
+                }
             }
             (true, false) => {
                 // Cheap algorithm sniff so SigV4A (`AWS4-ECDSA-P256-SHA256`)
