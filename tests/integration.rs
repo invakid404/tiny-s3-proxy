@@ -75,6 +75,169 @@ async fn build_raw_s3_client(
     aws_sdk_s3::Client::from_conf(config)
 }
 
+/// Variant of `build_raw_s3_client` that uses a caller-supplied
+/// `SharedHttpClient`. Used to talk DIRECTLY to the HTTPS VersityGW
+/// fixture with a TLS trust store that pins the test CA.
+async fn build_raw_s3_client_with_http_client(
+    endpoint: &str,
+    access_key: &str,
+    secret_key: &str,
+    http_client: aws_sdk_s3::config::SharedHttpClient,
+) -> aws_sdk_s3::Client {
+    let creds = aws_credential_types::Credentials::new(access_key, secret_key, None, None, "test");
+    let config = aws_sdk_s3::config::Builder::new()
+        .endpoint_url(endpoint)
+        .region(aws_sdk_s3::config::Region::new("us-east-1"))
+        .credentials_provider(creds)
+        .force_path_style(true)
+        .http_client(http_client)
+        .behavior_version_latest()
+        .build();
+    aws_sdk_s3::Client::from_conf(config)
+}
+
+/// Test TLS material: a self-signed CA and a leaf certificate signed by
+/// that CA with SANs for `127.0.0.1` and `localhost`. Generated fresh for
+/// each fixture invocation — short-lived, never persisted.
+struct TestTls {
+    /// CA certificate PEM. Loaded into the SDK trust store on both the
+    /// test-direct and proxy-outbound clients.
+    ca_pem: String,
+    /// Leaf cert followed by the CA cert (PEM concatenation), suitable for
+    /// VersityGW's `--cert` flag.
+    server_chain_pem: String,
+    /// Leaf key PEM for VersityGW's `--key` flag.
+    server_key_pem: String,
+}
+
+/// Generate a fresh self-signed CA + leaf cert for the HTTPS VersityGW
+/// fixture. Uses rcgen's default ECDSA-P256 + SHA256, which both rustls
+/// (test SDK) and Go's crypto/tls (VersityGW server) accept out of the
+/// box.
+fn generate_test_tls() -> TestTls {
+    use rcgen::{
+        BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
+        KeyPair, KeyUsagePurpose, SanType,
+    };
+    use std::net::IpAddr;
+
+    let mut ca_params =
+        CertificateParams::new(Vec::<String>::new()).expect("CA params: empty SAN cannot fail");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "tiny-s3-proxy test CA");
+    ca_params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+    ca_params.key_usages.push(KeyUsagePurpose::CrlSign);
+    let ca_key = KeyPair::generate().expect("generate CA key");
+    let ca_cert = ca_params.self_signed(&ca_key).expect("self-sign CA");
+    let issuer = Issuer::new(ca_params, ca_key);
+
+    let mut leaf_params =
+        CertificateParams::new(vec!["localhost".to_string()]).expect("leaf params: known-good SAN");
+    leaf_params
+        .distinguished_name
+        .push(DnType::CommonName, "127.0.0.1");
+    leaf_params.subject_alt_names = vec![
+        SanType::DnsName("localhost".try_into().expect("localhost is valid IA5")),
+        SanType::IpAddress("127.0.0.1".parse::<IpAddr>().expect("127.0.0.1 is valid")),
+    ];
+    leaf_params
+        .key_usages
+        .push(KeyUsagePurpose::DigitalSignature);
+    leaf_params
+        .extended_key_usages
+        .push(ExtendedKeyUsagePurpose::ServerAuth);
+    let leaf_key = KeyPair::generate().expect("generate leaf key");
+    let leaf_cert = leaf_params
+        .signed_by(&leaf_key, &issuer)
+        .expect("sign leaf cert");
+
+    let ca_pem = ca_cert.pem();
+    let server_chain_pem = format!("{}{}", leaf_cert.pem(), ca_pem);
+    let server_key_pem = leaf_key.serialize_pem();
+    TestTls {
+        ca_pem,
+        server_chain_pem,
+        server_key_pem,
+    }
+}
+
+/// Start a VersityGW container speaking native TLS via the `--cert`/`--key`
+/// flags. The supplied chain and key are copied into the container at
+/// `/tls/server.pem` and `/tls/server.key`, then VersityGW is launched
+/// listening on container port 10000. Returns the container handle (must
+/// be held to keep the container alive) and the `https://127.0.0.1:<port>`
+/// endpoint URL.
+async fn start_versitygw_https(
+    tls: &TestTls,
+) -> (testcontainers::ContainerAsync<GenericImage>, String) {
+    let container = GenericImage::new(
+        "versity/versitygw",
+        "latest@sha256:a86791b684a1dd3c5a255ca755bb51783a72696cf1b5a843f800b08bfd6f921c",
+    )
+    .with_entrypoint("sh")
+    .with_exposed_port(10000.into())
+    .with_wait_for(WaitFor::message_on_stdout("listening on"))
+    .with_env_var("ROOT_ACCESS_KEY", TEST_ACCESS_KEY)
+    .with_env_var("ROOT_SECRET_KEY", TEST_SECRET_KEY)
+    .with_copy_to("/tls/server.pem", tls.server_chain_pem.as_bytes().to_vec())
+    .with_copy_to("/tls/server.key", tls.server_key_pem.as_bytes().to_vec())
+    .with_cmd([
+        "-c",
+        "mkdir -p /tmp/data /tmp/iam && \
+         versitygw --port :10000 --cert /tls/server.pem --key /tls/server.key \
+         --iam-dir /tmp/iam posix /tmp/data",
+    ])
+    .start()
+    .await
+    .expect("Failed to start HTTPS VersityGW container");
+
+    let port = container.get_host_port_ipv4(10000).await.unwrap();
+    let endpoint = format!("https://127.0.0.1:{}", port);
+    (container, endpoint)
+}
+
+/// Build an AWS SDK `SharedHttpClient` whose rustls (aws-lc) backend
+/// trusts ONLY the supplied CA PEM. Native roots are disabled so a real
+/// CA can never silently substitute for the test trust anchor.
+fn aws_http_client_trusting(ca_pem: &str) -> aws_sdk_s3::config::SharedHttpClient {
+    use aws_smithy_http_client::Builder;
+    use aws_smithy_http_client::tls::{self, TlsContext, TrustStore, rustls_provider::CryptoMode};
+
+    let trust_store = TrustStore::empty()
+        .with_native_roots(false)
+        .with_pem_certificate(ca_pem.as_bytes().to_vec());
+    let tls_context = TlsContext::builder()
+        .with_trust_store(trust_store)
+        .build()
+        .expect("build TLS context");
+    Builder::new()
+        .tls_provider(tls::Provider::Rustls(CryptoMode::AwsLc))
+        .tls_context(tls_context)
+        .build_https()
+}
+
+/// Build a `reqwest::Client` whose trust store contains ONLY the supplied
+/// CA PEM — native / built-in roots are explicitly disabled by
+/// `tls_certs_only`, mirroring the AWS-SDK helper's
+/// `TrustStore::empty().with_native_roots(false)` behaviour so a real CA
+/// can never silently substitute for the test trust anchor. Used for the
+/// proxy's OUTBOUND passthrough client in the HTTPS fixture —
+/// `passthrough::handle_passthrough` issues requests via
+/// `state.http_client` (a `reqwest::Client`), so without this the
+/// passthrough route would fail TLS verification against the
+/// self-signed test leaf even though the typed/decode path's AWS-SDK
+/// client trusts it just fine.
+fn reqwest_client_trusting(ca_pem: &str) -> reqwest::Client {
+    let cert =
+        reqwest::Certificate::from_pem(ca_pem.as_bytes()).expect("parse test CA PEM for reqwest");
+    reqwest::Client::builder()
+        .tls_certs_only(std::iter::once(cert))
+        .build()
+        .expect("build reqwest client trusting test CA")
+}
+
 /// Build the default test `Config` aimed at `backend_endpoint`, using the
 /// given auth mode / allowed keys and rooting the cache at `cache_dir`. Pulled
 /// out so tests that need a non-default Config (e.g. a small
@@ -259,6 +422,90 @@ where
         mutate_config,
     )
     .await
+}
+
+/// Variant of `build_proxy_stack_with_opts` that points the proxy at an
+/// `https://` backend and supplies a trusting `SharedHttpClient` (CA-pinned
+/// rustls) so the SDK can validate the test fixture's self-signed leaf.
+/// Mirrors `build_proxy_stack_inner` line-for-line aside from the
+/// `from_config_with_http_client` swap.
+async fn build_proxy_stack_with_https_backend(
+    backend_endpoint: &str,
+    ca_pem: &str,
+) -> (
+    aws_sdk_s3::Client,
+    reqwest::Client,
+    String,
+    tempfile::TempDir,
+) {
+    let cache_dir = tempfile::TempDir::new().expect("create temp cache dir");
+    let config = default_proxy_test_config(
+        backend_endpoint,
+        AuthMode::TrustedInternal,
+        vec![],
+        cache_dir.path(),
+    );
+
+    let aws_http_client = aws_http_client_trusting(ca_pem);
+    let s3_backend =
+        backend::client::S3Backend::from_config_with_http_client(&config, aws_http_client)
+            .await
+            .expect("build S3 backend (HTTPS)");
+
+    let cache_policy = cache::policy::CachePolicy::new(
+        config.cacheable_prefixes.clone(),
+        config.cache_max_object_bytes,
+    );
+    let disk_cache = cache::DiskCache::new(
+        config.cache_dir.clone(),
+        config.cache_max_bytes,
+        cache_policy.clone(),
+    )
+    .await
+    .expect("build disk cache");
+
+    let singleflight = Arc::new(cache::SingleFlight::new());
+    let authenticator = Arc::from(auth::create_request_gate(&config));
+
+    // Passthrough handler issues outbound requests via `state.http_client`
+    // against the same HTTPS backend, so this reqwest client must also
+    // trust the self-signed test CA — a default `reqwest::Client::new()`
+    // would fail TLS verification on every passthrough request.
+    let passthrough_http_client = reqwest_client_trusting(ca_pem);
+
+    let state = Arc::new(handlers::AppState {
+        backend: Arc::new(s3_backend),
+        cache: Arc::new(disk_cache),
+        singleflight,
+        auth: authenticator,
+        policy: cache_policy,
+        config: Arc::new(config),
+        frontend_bucket: Arc::from(TEST_BUCKET),
+        backend_bucket: Arc::from(TEST_BUCKET),
+        http_client: passthrough_http_client,
+    });
+
+    let app = axum::Router::new()
+        .fallback(handlers::handle_s3_request)
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let proxy_endpoint = format!("http://127.0.0.1:{}", addr.port());
+    let proxy_client = build_raw_s3_client(&proxy_endpoint, TEST_ACCESS_KEY, TEST_SECRET_KEY).await;
+    // Test-facing client talks to the proxy over plain HTTP — it does NOT
+    // need to trust the test CA. Distinct from the `passthrough_http_client`
+    // stored inside `AppState`, which DOES need the CA pinned.
+    let test_http_client = reqwest::Client::new();
+
+    (proxy_client, test_http_client, proxy_endpoint, cache_dir)
 }
 
 /// Helper: PUT an object through the given S3 client.
@@ -2586,5 +2833,271 @@ async fn test_tmp_sweep_removes_abandoned_upload_spool_files() {
         !abandoned.exists(),
         "tmp sweep should have removed the abandoned upload-spool file at {}",
         abandoned.display(),
+    );
+}
+
+/// Build a non-trailer signed aws-chunked frame for a single payload chunk.
+/// Chunk signatures are dummy zero hex — the proxy does not cryptographically
+/// verify them (it decodes and forwards). Shape:
+///   `<hex-size>;chunk-signature=<64-hex>\r\n<payload>\r\n0;chunk-signature=<64-hex>\r\n\r\n`.
+fn build_signed_non_trailer_frame_bytes(payload: &[u8]) -> Vec<u8> {
+    const SIG: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+    let mut out = Vec::new();
+    out.extend_from_slice(format!("{:x};chunk-signature={SIG}\r\n", payload.len()).as_bytes());
+    out.extend_from_slice(payload);
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(format!("0;chunk-signature={SIG}\r\n").as_bytes());
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
+/// End-to-end aws-chunked round-trip against a REAL HTTPS-backed VersityGW.
+/// Sends an unsigned-trailer PUT with a CRC32 trailer through the proxy,
+/// then reads back via a direct (trust-pinned) SDK GET against the same
+/// VersityGW. Asserts the upstream sees the decoded payload bytes — proving
+/// that the aws-chunked decode path actually rewrites the wire body rather
+/// than just routing to it.
+///
+/// What this test does NOT cover: with aws-sdk-s3 1.132.0 +
+/// aws-smithy-checksums 0.64.7 and the per-algorithm checksum setters
+/// (`.checksum_crc32(...)` etc), the SDK does not re-frame outbound bodies
+/// as aws-chunked — the outbound wire is `Content-Length: N` + raw bytes +
+/// `x-amz-content-sha256: UNSIGNED-PAYLOAD` regardless of the
+/// `RequestChecksumCalculation::WhenRequired` + `disable_payload_signing()`
+/// overrides in `S3Backend::put_object_from_path`. Flipping those
+/// overrides does NOT cause this test to fail today. It stays as a
+/// forward regression guard against a future SDK / smithy revision that
+/// re-introduces outbound aws-chunked framing on the decode path.
+///
+/// Docker + the pinned `versity/versitygw` image required.
+#[tokio::test]
+#[ignore]
+async fn test_aws_chunked_unsigned_trailer_crc32_full_https_backend_round_trip() {
+    use tiny_s3_proxy::s3::checksum::ChecksumAlgorithm;
+
+    let tls = generate_test_tls();
+    let (_container, backend_endpoint) = start_versitygw_https(&tls).await;
+
+    // Direct SDK client over HTTPS for bucket setup + GET verification.
+    let direct_http_client = aws_http_client_trusting(&tls.ca_pem);
+    let direct_client = build_raw_s3_client_with_http_client(
+        &backend_endpoint,
+        TEST_ACCESS_KEY,
+        TEST_SECRET_KEY,
+        direct_http_client,
+    )
+    .await;
+    direct_client
+        .create_bucket()
+        .bucket(TEST_BUCKET)
+        .send()
+        .await
+        .expect("create_bucket on HTTPS VersityGW");
+
+    let (_proxy_client, _http_client, proxy_endpoint, _cache_dir) =
+        build_proxy_stack_with_https_backend(&backend_endpoint, &tls.ca_pem).await;
+    let proxy_host = proxy_endpoint.strip_prefix("http://").unwrap();
+
+    let key = "https-backend/unsigned-trailer-crc32.bin";
+    let payload: &[u8] = b"hello aws-chunked unsigned trailer over https";
+    let value = compute_smithy_checksum_b64(ChecksumAlgorithm::Crc32, payload);
+    let frame = build_unsigned_trailer_frame_bytes(payload, "x-amz-checksum-crc32", &value);
+    let headers = format!(
+        "PUT /{TEST_BUCKET}/{key} HTTP/1.1\r\n\
+         Host: {proxy_host}\r\n\
+         Content-Length: {body_len}\r\n\
+         Content-Encoding: aws-chunked\r\n\
+         x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER\r\n\
+         x-amz-decoded-content-length: {payload_len}\r\n\
+         x-amz-trailer: x-amz-checksum-crc32\r\n\
+         Connection: close\r\n\
+         \r\n",
+        body_len = frame.len(),
+        payload_len = payload.len(),
+    );
+    let mut request = headers.into_bytes();
+    request.extend_from_slice(&frame);
+
+    let (status, raw_response) = raw_tcp_request(proxy_host, &request).await;
+    let resp_text = String::from_utf8_lossy(&raw_response);
+    assert_eq!(
+        status, 200,
+        "PUT through proxy to HTTPS VersityGW must succeed; got status {status} with body: {resp_text}",
+    );
+
+    // Read back DIRECTLY from VersityGW (bypassing the proxy) and assert
+    // the upstream sees the decoded payload bytes. The proxy claims to
+    // decode aws-chunked into a plain body before forwarding — this is
+    // the load-bearing assertion.
+    let get_resp = direct_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key(key)
+        .send()
+        .await
+        .expect("get_object on HTTPS VersityGW");
+    let body = get_resp
+        .body
+        .collect()
+        .await
+        .expect("read body")
+        .into_bytes();
+    assert_eq!(
+        body.as_ref(),
+        payload,
+        "decoded body on HTTPS VersityGW must match the original payload — if this fails the aws-chunked framing leaked through the proxy to the upstream",
+    );
+}
+
+/// End-to-end aws-chunked round-trip for the SIGNED non-trailer mode
+/// (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`). Same shape as the unsigned-trailer
+/// test but exercises the other major decode branch — chunk-signature
+/// framing without a checksum trailer. Chunk signatures are dummy zeros:
+/// the proxy decodes and forwards without verifying chunk signatures
+/// cryptographically.
+///
+/// Docker + the pinned `versity/versitygw` image required.
+#[tokio::test]
+#[ignore]
+async fn test_aws_chunked_signed_non_trailer_full_https_backend_round_trip() {
+    let tls = generate_test_tls();
+    let (_container, backend_endpoint) = start_versitygw_https(&tls).await;
+
+    let direct_http_client = aws_http_client_trusting(&tls.ca_pem);
+    let direct_client = build_raw_s3_client_with_http_client(
+        &backend_endpoint,
+        TEST_ACCESS_KEY,
+        TEST_SECRET_KEY,
+        direct_http_client,
+    )
+    .await;
+    direct_client
+        .create_bucket()
+        .bucket(TEST_BUCKET)
+        .send()
+        .await
+        .expect("create_bucket on HTTPS VersityGW");
+
+    let (_proxy_client, _http_client, proxy_endpoint, _cache_dir) =
+        build_proxy_stack_with_https_backend(&backend_endpoint, &tls.ca_pem).await;
+    let proxy_host = proxy_endpoint.strip_prefix("http://").unwrap();
+
+    let key = "https-backend/signed-non-trailer.bin";
+    let payload: &[u8] = b"hello aws-chunked signed non-trailer over https";
+    let frame = build_signed_non_trailer_frame_bytes(payload);
+    let headers = format!(
+        "PUT /{TEST_BUCKET}/{key} HTTP/1.1\r\n\
+         Host: {proxy_host}\r\n\
+         Content-Length: {body_len}\r\n\
+         Content-Encoding: aws-chunked\r\n\
+         x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD\r\n\
+         x-amz-decoded-content-length: {payload_len}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        body_len = frame.len(),
+        payload_len = payload.len(),
+    );
+    let mut request = headers.into_bytes();
+    request.extend_from_slice(&frame);
+
+    let (status, raw_response) = raw_tcp_request(proxy_host, &request).await;
+    let resp_text = String::from_utf8_lossy(&raw_response);
+    assert_eq!(
+        status, 200,
+        "signed non-trailer PUT through proxy must succeed; got status {status} with body: {resp_text}",
+    );
+
+    let get_resp = direct_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key(key)
+        .send()
+        .await
+        .expect("get_object on HTTPS VersityGW");
+    let body = get_resp
+        .body
+        .collect()
+        .await
+        .expect("read body")
+        .into_bytes();
+    assert_eq!(
+        body.as_ref(),
+        payload,
+        "decoded body on HTTPS VersityGW must match the original payload",
+    );
+}
+
+/// Passthrough smoke test against a REAL HTTPS-backed VersityGW. A
+/// `Range:` header on a GET forces the request through
+/// `route_to_passthrough` (see `has_unsupported_get_modifiers`), which
+/// issues outbound requests via `state.http_client` — a `reqwest::Client`.
+/// That client must trust the test CA, otherwise every passthrough
+/// request to the HTTPS backend fails TLS verification.
+///
+/// Bug-revert signal: swap `AppState.http_client` back to
+/// `reqwest::Client::new()` and this test fails with a `Backend`-mapped
+/// error (TLS handshake failure surfaces as HTTP 5xx from the proxy with
+/// an `InternalError` / `connection/dispatch failure` body referencing
+/// certificate trust).
+///
+/// Docker + the pinned `versity/versitygw` image required.
+#[tokio::test]
+#[ignore]
+async fn test_passthrough_range_get_full_https_backend_round_trip() {
+    let tls = generate_test_tls();
+    let (_container, backend_endpoint) = start_versitygw_https(&tls).await;
+
+    // Direct (trust-pinned) SDK client for bucket setup + seeding.
+    let direct_client = build_raw_s3_client_with_http_client(
+        &backend_endpoint,
+        TEST_ACCESS_KEY,
+        TEST_SECRET_KEY,
+        aws_http_client_trusting(&tls.ca_pem),
+    )
+    .await;
+    direct_client
+        .create_bucket()
+        .bucket(TEST_BUCKET)
+        .send()
+        .await
+        .expect("create_bucket on HTTPS VersityGW");
+
+    let key = "passthrough/range-test.bin";
+    let payload: &[u8] = b"hello https passthrough world";
+    direct_client
+        .put_object()
+        .bucket(TEST_BUCKET)
+        .key(key)
+        .body(aws_sdk_s3::primitives::ByteStream::from(payload.to_vec()))
+        .send()
+        .await
+        .expect("seed object on HTTPS VersityGW");
+
+    let (_proxy_client, test_http_client, proxy_endpoint, _cache_dir) =
+        build_proxy_stack_with_https_backend(&backend_endpoint, &tls.ca_pem).await;
+
+    let url = format!("{proxy_endpoint}/{TEST_BUCKET}/{key}");
+    let resp = test_http_client
+        .get(&url)
+        .header("Range", "bytes=0-4")
+        .send()
+        .await
+        .expect("Range GET via proxy passthrough");
+    let status = resp.status().as_u16();
+    let body = resp
+        .bytes()
+        .await
+        .expect("read passthrough response body")
+        .to_vec();
+    assert_eq!(
+        status,
+        206,
+        "Range GET through proxy passthrough must return 206 Partial Content from HTTPS VersityGW; got status {status} with body: {}",
+        String::from_utf8_lossy(&body),
+    );
+    assert_eq!(
+        body.as_slice(),
+        &payload[0..5],
+        "passthrough response body must equal the first 5 bytes of the seeded payload",
     );
 }
