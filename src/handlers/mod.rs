@@ -302,10 +302,10 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
         }
         S3Operation::PutObject { key, .. } => {
             let route = classify_put_body_route(&parsed.extra_amz_headers, &parts.headers);
-            if let Err(resp) =
+            if let Err(s3err) =
                 enforce_signed_streaming_decode_route(verified.as_ref(), route, &parsed.request_id)
             {
-                resp
+                s3err.to_response()
             } else {
                 match route {
                     WriteBodyRoute::Typed => put::handle_put(&state, &parsed, key, body).await,
@@ -358,10 +358,10 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
             ..
         } => {
             let route = classify_upload_part_body_route(&parsed.extra_amz_headers, &parts.headers);
-            if let Err(resp) =
+            if let Err(s3err) =
                 enforce_signed_streaming_decode_route(verified.as_ref(), route, &parsed.request_id)
             {
-                resp
+                s3err.to_response()
             } else {
                 match route {
                     WriteBodyRoute::Typed => {
@@ -487,7 +487,7 @@ fn enforce_signed_streaming_decode_route(
     verified: Option<&VerifiedRequest>,
     route: WriteBodyRoute,
     request_id: &str,
-) -> Result<(), Response<Body>> {
+) -> Result<(), S3Error> {
     let Some(v) = verified else {
         return Ok(());
     };
@@ -506,8 +506,7 @@ fn enforce_signed_streaming_decode_route(
              decoder; the wire-format shape (e.g. unsupported x-amz-trailer algorithm, or a \
              sentinel/trailer combination this proxy does not model) is unsupported",
             request_id,
-        )
-        .to_response()),
+        )),
     }
 }
 

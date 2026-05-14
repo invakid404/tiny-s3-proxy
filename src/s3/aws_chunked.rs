@@ -1768,9 +1768,11 @@ mod tests {
     use crate::auth::sigv4::streaming::{EMPTY_SHA256_HEX, StreamingSigV4Context};
 
     /// Test signing key shared across the verification tests below. Same
-    /// derivation as `streaming.rs::tests::example_signing_key`, kept
-    /// inline so the verification tests don't depend on a `#[cfg(test)]`
-    /// import from another module.
+    /// derivation as `streaming.rs::tests::example_signing_key` — the AWS
+    /// S3 streaming docs secret with the SLASH before `bPx` (the plus
+    /// variant is the EC2 example secret and does NOT reproduce the
+    /// AWS-published streaming vectors). Kept inline so the verification
+    /// tests don't depend on a `#[cfg(test)]` import from another module.
     fn test_signing_key() -> [u8; 32] {
         use hmac::{Hmac, KeyInit, Mac};
         type HmacSha256 = Hmac<Sha256>;
@@ -1779,7 +1781,7 @@ mod tests {
             m.update(d);
             m.finalize().into_bytes().to_vec()
         }
-        let k_date = h(b"AWS4wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", b"20130524");
+        let k_date = h(b"AWS4wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", b"20130524");
         let k_region = h(&k_date, b"us-east-1");
         let k_service = h(&k_region, b"s3");
         let k_signing = h(&k_service, b"aws4_request");
@@ -1992,7 +1994,6 @@ mod tests {
     /// and never gets to the signature comparison.
     #[tokio::test]
     async fn test_decoder_rejects_bad_signature_before_post_payload_crlf() {
-        let key = test_signing_key();
         let payload: &[u8] = b"hello-streaming";
         // Hand-build the frame so the post-payload terminator is `XX`
         // (not `\r\n`) AND the chunk-signature is one of pure zeros
