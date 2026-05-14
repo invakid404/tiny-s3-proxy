@@ -3581,44 +3581,376 @@ async fn test_strict_sigv4_rejects_body_under_signed_payload() {
     );
 }
 
+/// SDK-presigned GET over an HTTPS-backed VersityGW: round trip from
+/// strict-mode proxy to backend and back. Bug-revert reasoning: deleting
+/// the `ExcludePresignedSignature` arm in `canonical::canonicalize_query`
+/// flips this test from `200 OK` to `403 SignatureDoesNotMatch` because
+/// the proxy's canonical query would then keep `X-Amz-Signature` in the
+/// hashed payload list, diverging from the SDK-signed canonical form.
 #[tokio::test]
 #[ignore]
-async fn test_strict_sigv4_rejects_presigned_url_as_missing_token() {
-    let (_container, backend_endpoint) = start_versitygw().await;
-    ensure_test_bucket(&backend_endpoint).await;
-    let (strict_client, _wrong, proxy_endpoint, _cache, _creds) =
-        build_strict_proxy_stack(&backend_endpoint).await;
+async fn test_strict_sigv4_accepts_presigned_get_https_round_trip() {
+    let tls = generate_test_tls();
+    let (_container, backend_endpoint) = start_versitygw_https(&tls).await;
 
-    // Use the SDK to presign a GET so we have a real X-Amz-Signature query
-    // parameter on the URL — our raw HTTP call below replays it.
+    let direct_http_client = aws_http_client_trusting(&tls.ca_pem);
+    let direct_client = build_raw_s3_client_with_http_client(
+        &backend_endpoint,
+        TEST_ACCESS_KEY,
+        TEST_SECRET_KEY,
+        direct_http_client,
+    )
+    .await;
+    direct_client
+        .create_bucket()
+        .bucket(TEST_BUCKET)
+        .send()
+        .await
+        .expect("create_bucket on HTTPS VersityGW");
+    direct_client
+        .put_object()
+        .bucket(TEST_BUCKET)
+        .key("presigned-get.txt")
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(
+            b"hello-from-presigned-get",
+        ))
+        .send()
+        .await
+        .expect("seed object via direct backend client");
+
+    let (proxy_endpoint, _cache_dir, _creds_file) =
+        build_strict_proxy_stack_with_https_backend(&backend_endpoint, &tls.ca_pem).await;
+    let strict_client =
+        build_raw_s3_client(&proxy_endpoint, STRICT_INBOUND_KEY, STRICT_INBOUND_SECRET).await;
+
     let presigning =
         aws_sdk_s3::presigning::PresigningConfig::expires_in(std::time::Duration::from_secs(60))
             .expect("presigning config");
     let presigned = strict_client
         .get_object()
         .bucket(TEST_BUCKET)
-        .key("presigned.txt")
+        .key("presigned-get.txt")
         .presigned(presigning)
         .await
         .expect("presign GET");
-    let uri = presigned.uri().to_string();
-    // The presigned URI may point at the SDK's hostname rather than our
-    // proxy; rewrite host:port portion so the request actually reaches the
-    // proxy. The query string carries the X-Amz-Signature.
-    let query = uri.split_once('?').map(|(_, q)| q).unwrap_or("");
-    let url = format!("{proxy_endpoint}/{TEST_BUCKET}/presigned.txt?{query}");
+    let url = presigned.uri().to_string();
 
     let http_client = reqwest::Client::new();
     let resp = http_client
         .get(&url)
         .send()
         .await
-        .expect("send presigned request");
+        .expect("send presigned GET");
+    let status = resp.status().as_u16();
+    let body = resp.bytes().await.unwrap().to_vec();
+    assert_eq!(
+        status,
+        200,
+        "strict-mode presigned GET must succeed; got {status} with body: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(body.as_slice(), b"hello-from-presigned-get");
+}
+
+/// SDK-presigned PUT over an HTTPS-backed VersityGW: strict-mode proxy
+/// accepts the upload, body lands on the backend. Bug-revert reasoning:
+/// removing the `UnsignedPayload` return from `verify_presigned_request`
+/// flips this — the dispatcher would then try to verify a body hash
+/// against `UNSIGNED-PAYLOAD` and refuse the PUT.
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4_accepts_presigned_put_https_round_trip() {
+    let tls = generate_test_tls();
+    let (_container, backend_endpoint) = start_versitygw_https(&tls).await;
+
+    let direct_http_client = aws_http_client_trusting(&tls.ca_pem);
+    let direct_client = build_raw_s3_client_with_http_client(
+        &backend_endpoint,
+        TEST_ACCESS_KEY,
+        TEST_SECRET_KEY,
+        direct_http_client,
+    )
+    .await;
+    direct_client
+        .create_bucket()
+        .bucket(TEST_BUCKET)
+        .send()
+        .await
+        .expect("create_bucket on HTTPS VersityGW");
+
+    let (proxy_endpoint, _cache_dir, _creds_file) =
+        build_strict_proxy_stack_with_https_backend(&backend_endpoint, &tls.ca_pem).await;
+    let strict_client =
+        build_raw_s3_client(&proxy_endpoint, STRICT_INBOUND_KEY, STRICT_INBOUND_SECRET).await;
+
+    let presigning =
+        aws_sdk_s3::presigning::PresigningConfig::expires_in(std::time::Duration::from_secs(60))
+            .expect("presigning config");
+    let presigned = strict_client
+        .put_object()
+        .bucket(TEST_BUCKET)
+        .key("presigned-put.txt")
+        .presigned(presigning)
+        .await
+        .expect("presign PUT");
+
+    let url = presigned.uri().to_string();
+    let payload: &[u8] = b"hello-from-presigned-put";
+    let http_client = reqwest::Client::new();
+    let resp = http_client
+        .put(&url)
+        .body(payload.to_vec())
+        .send()
+        .await
+        .expect("send presigned PUT");
+    let status = resp.status().as_u16();
+    let resp_body = resp.bytes().await.unwrap().to_vec();
+    assert_eq!(
+        status,
+        200,
+        "strict-mode presigned PUT must succeed; got {status} with body: {}",
+        String::from_utf8_lossy(&resp_body)
+    );
+
+    let get_resp = direct_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key("presigned-put.txt")
+        .send()
+        .await
+        .expect("get_object after presigned PUT");
+    let body = get_resp.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), payload);
+}
+
+/// Mutate a signed query value AFTER the SDK signs the URL. Strict-mode
+/// must refuse the request because our recomputed canonical query no
+/// longer hashes to the supplied signature.
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4_rejects_tampered_presigned_query_value() {
+    let (_container, backend_endpoint) = start_versitygw().await;
+    ensure_test_bucket(&backend_endpoint).await;
+    let (strict_client, _wrong, proxy_endpoint, _cache, _creds) =
+        build_strict_proxy_stack(&backend_endpoint).await;
+
+    let presigning =
+        aws_sdk_s3::presigning::PresigningConfig::expires_in(std::time::Duration::from_secs(60))
+            .expect("presigning config");
+    let presigned = strict_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key("tamper-q.txt")
+        .presigned(presigning)
+        .await
+        .expect("presign GET");
+    // Re-target the URL at the proxy in case the SDK formatted it for a
+    // different hostname, then mutate a *non-auth* signed query param: the
+    // bucket name in the path is part of the canonical request but the
+    // expiry value is signed too, so changing it is enough to invalidate
+    // the signature without falling out of the validity window.
+    let original_url = presigned.uri().to_string();
+    let original_query = original_url.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let tampered_query = original_query.replace("X-Amz-Expires=60", "X-Amz-Expires=90");
+    let url = format!("{proxy_endpoint}/{TEST_BUCKET}/tamper-q.txt?{tampered_query}");
+
+    let http_client = reqwest::Client::new();
+    let resp = http_client
+        .get(&url)
+        .send()
+        .await
+        .expect("send tampered presigned GET");
     assert_eq!(resp.status().as_u16(), 403);
     let body = String::from_utf8_lossy(&resp.bytes().await.unwrap()).to_string();
     assert!(
-        body.contains("MissingAuthenticationToken"),
-        "expected MissingAuthenticationToken, got: {body}"
+        body.contains("SignatureDoesNotMatch"),
+        "expected SignatureDoesNotMatch, got: {body}"
+    );
+}
+
+/// Replace the supplied `X-Amz-Signature` with zeros; the constant-time
+/// compare must fail.
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4_rejects_tampered_presigned_signature() {
+    let (_container, backend_endpoint) = start_versitygw().await;
+    ensure_test_bucket(&backend_endpoint).await;
+    let (strict_client, _wrong, proxy_endpoint, _cache, _creds) =
+        build_strict_proxy_stack(&backend_endpoint).await;
+
+    let presigning =
+        aws_sdk_s3::presigning::PresigningConfig::expires_in(std::time::Duration::from_secs(60))
+            .expect("presigning config");
+    let presigned = strict_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key("tamper-sig.txt")
+        .presigned(presigning)
+        .await
+        .expect("presign GET");
+    let original_url = presigned.uri().to_string();
+    let original_query = original_url.split_once('?').map(|(_, q)| q).unwrap_or("");
+    // Replace the signature hex with all-zeros. The query rebuild keeps
+    // every other signed param intact.
+    let mut parts: Vec<String> = Vec::new();
+    for chunk in original_query.split('&') {
+        if let Some((k, _)) = chunk.split_once('=')
+            && k == "X-Amz-Signature"
+        {
+            parts.push(format!("X-Amz-Signature={}", "0".repeat(64)));
+        } else {
+            parts.push(chunk.to_string());
+        }
+    }
+    let tampered_query = parts.join("&");
+    let url = format!("{proxy_endpoint}/{TEST_BUCKET}/tamper-sig.txt?{tampered_query}");
+
+    let http_client = reqwest::Client::new();
+    let resp = http_client
+        .get(&url)
+        .send()
+        .await
+        .expect("send tampered signature request");
+    assert_eq!(resp.status().as_u16(), 403);
+    let body = String::from_utf8_lossy(&resp.bytes().await.unwrap()).to_string();
+    assert!(
+        body.contains("SignatureDoesNotMatch"),
+        "expected SignatureDoesNotMatch, got: {body}"
+    );
+}
+
+/// SDK presign with a fixed start time in 2020 + 60s expiry — the
+/// resulting URL is well past its validity window by the time the test
+/// fires it. The proxy must respond with `RequestTimeTooSkewed`.
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4_rejects_expired_presigned_url() {
+    let (_container, backend_endpoint) = start_versitygw().await;
+    ensure_test_bucket(&backend_endpoint).await;
+    let (strict_client, _wrong, proxy_endpoint, _cache, _creds) =
+        build_strict_proxy_stack(&backend_endpoint).await;
+
+    // 2020-01-01T00:00:00Z + 60s = expired by ~6 years at test time.
+    let start = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+    let presigning = aws_sdk_s3::presigning::PresigningConfig::builder()
+        .expires_in(std::time::Duration::from_secs(60))
+        .start_time(start)
+        .build()
+        .expect("presigning config");
+    let presigned = strict_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key("expired.txt")
+        .presigned(presigning)
+        .await
+        .expect("presign GET (expired)");
+    let original_url = presigned.uri().to_string();
+    let query = original_url.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let url = format!("{proxy_endpoint}/{TEST_BUCKET}/expired.txt?{query}");
+
+    let http_client = reqwest::Client::new();
+    let resp = http_client
+        .get(&url)
+        .send()
+        .await
+        .expect("send expired presigned GET");
+    assert_eq!(resp.status().as_u16(), 403);
+    let body = String::from_utf8_lossy(&resp.bytes().await.unwrap()).to_string();
+    assert!(
+        body.contains("RequestTimeTooSkewed"),
+        "expected RequestTimeTooSkewed, got: {body}"
+    );
+}
+
+/// Both an `Authorization` header and an `X-Amz-Signature` query
+/// parameter on the same request must be fail-closed with
+/// `InvalidRequest`. Bug-revert reasoning: deleting the `(true, true)`
+/// arm in `SigV4Verifier::verify_at` lets whichever code path the
+/// dispatcher picks "win" — that's an undefined-behavior contract for
+/// strict mode.
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4_rejects_dual_auth_header_and_presigned_query() {
+    let (_container, backend_endpoint) = start_versitygw().await;
+    ensure_test_bucket(&backend_endpoint).await;
+    let (strict_client, _wrong, proxy_endpoint, _cache, _creds) =
+        build_strict_proxy_stack(&backend_endpoint).await;
+
+    let presigning =
+        aws_sdk_s3::presigning::PresigningConfig::expires_in(std::time::Duration::from_secs(60))
+            .expect("presigning config");
+    let presigned = strict_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key("dual-auth.txt")
+        .presigned(presigning)
+        .await
+        .expect("presign GET");
+    let original_url = presigned.uri().to_string();
+    let query = original_url.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let url = format!("{proxy_endpoint}/{TEST_BUCKET}/dual-auth.txt?{query}");
+
+    let http_client = reqwest::Client::new();
+    let resp = http_client
+        .get(&url)
+        // Attach a syntactically valid SigV4 Authorization header on top
+        // of the X-Amz-Signature query — its actual content doesn't matter
+        // because the verifier fails closed before parsing.
+        .header(
+            "authorization",
+            "AWS4-HMAC-SHA256 Credential=A/20260101/us-east-1/s3/aws4_request, \
+             SignedHeaders=host, \
+             Signature=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .send()
+        .await
+        .expect("send dual-auth request");
+    assert_eq!(resp.status().as_u16(), 400);
+    let body = String::from_utf8_lossy(&resp.bytes().await.unwrap()).to_string();
+    assert!(
+        body.contains("InvalidRequest"),
+        "expected InvalidRequest, got: {body}"
+    );
+}
+
+/// A presigned URL that carries an `X-Amz-Security-Token` query param
+/// must fail closed with `InvalidToken` — STS support is scoped to PR 4.
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4_rejects_presigned_security_token_query() {
+    let (_container, backend_endpoint) = start_versitygw().await;
+    ensure_test_bucket(&backend_endpoint).await;
+    let (strict_client, _wrong, proxy_endpoint, _cache, _creds) =
+        build_strict_proxy_stack(&backend_endpoint).await;
+
+    let presigning =
+        aws_sdk_s3::presigning::PresigningConfig::expires_in(std::time::Duration::from_secs(60))
+            .expect("presigning config");
+    let presigned = strict_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key("sts-token.txt")
+        .presigned(presigning)
+        .await
+        .expect("presign GET");
+    let original_url = presigned.uri().to_string();
+    let query = original_url.split_once('?').map(|(_, q)| q).unwrap_or("");
+    // Tack on an unsigned STS token query param. The proxy must reject
+    // before reaching the canonical-request HMAC.
+    let url =
+        format!("{proxy_endpoint}/{TEST_BUCKET}/sts-token.txt?{query}&X-Amz-Security-Token=FQoG");
+
+    let http_client = reqwest::Client::new();
+    let resp = http_client
+        .get(&url)
+        .send()
+        .await
+        .expect("send STS-token presigned request");
+    assert_eq!(resp.status().as_u16(), 400);
+    let body = String::from_utf8_lossy(&resp.bytes().await.unwrap()).to_string();
+    assert!(
+        body.contains("InvalidToken"),
+        "expected InvalidToken, got: {body}"
     );
 }
 
