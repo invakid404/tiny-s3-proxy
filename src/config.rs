@@ -62,6 +62,16 @@ pub struct Config {
     pub upstream_request_timeout_ms: u64,
     pub max_request_body_bytes: u64,
     pub passthrough_unsigned_payload: bool,
+
+    // Inbound SigV4 verification (strict mode). When `inbound_auth_verify_signatures`
+    // is true, normal (non-streaming, non-presigned) requests are required to
+    // carry a valid SigV4 `Authorization` header signed with one of the
+    // credentials in `inbound_credentials_path`. Streaming, presigned-URL, STS,
+    // and SigV4A flows are fail-closed in this mode (rejected up front;
+    // tracked in follow-up PRs of issue #63).
+    pub inbound_auth_verify_signatures: bool,
+    pub inbound_credentials_path: Option<PathBuf>,
+    pub inbound_auth_max_skew_secs: u64,
 }
 
 impl Config {
@@ -110,13 +120,54 @@ impl Config {
             upstream_request_timeout_ms: parse_u64_env("UPSTREAM_REQUEST_TIMEOUT_MS", 30000)?,
             max_request_body_bytes: parse_u64_env("MAX_REQUEST_BODY_BYTES", 268_435_456)?, // 256 MiB default
             passthrough_unsigned_payload: parse_bool_env("PASSTHROUGH_UNSIGNED_PAYLOAD", false)?,
+
+            inbound_auth_verify_signatures: parse_bool_env(
+                "INBOUND_AUTH_VERIFY_SIGNATURES",
+                false,
+            )?,
+            inbound_credentials_path: env::var("INBOUND_CREDENTIALS_PATH")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
+            inbound_auth_max_skew_secs: parse_u64_env("INBOUND_AUTH_MAX_SKEW_SECS", 900)?,
         };
 
+        // The AccessKeyAllowlist mode requires a non-empty key list — without
+        // one every request would be rejected. Strict SigV4 verification
+        // replaces that gate entirely (the resolver IS the allowlist), so the
+        // empty-keys check is skipped when strict mode is on.
         if config.auth_mode == AuthMode::AccessKeyAllowlist
             && config.allowed_frontend_keys.is_empty()
+            && !config.inbound_auth_verify_signatures
         {
             return Err(ConfigError::ValidationError {
                 reason: "AUTH_MODE is access_key_allowlist but ALLOWED_FRONTEND_KEYS is empty or not set; all requests would be rejected".to_string(),
+            });
+        }
+
+        // Strict mode REQUIRES a credentials file; without it the resolver has
+        // no keys to validate against, so every request would be rejected.
+        if config.inbound_auth_verify_signatures && config.inbound_credentials_path.is_none() {
+            return Err(ConfigError::ValidationError {
+                reason: "INBOUND_AUTH_VERIFY_SIGNATURES=true requires INBOUND_CREDENTIALS_PATH \
+                         to point at a credentials JSON file"
+                    .to_string(),
+            });
+        }
+
+        // If strict mode is on and a credentials path is set, the file must
+        // exist at startup. We deliberately catch this here rather than at
+        // first request: a missing file would otherwise fail every request
+        // long after deployment instead of failing the rollout.
+        if let Some(ref path) = config.inbound_credentials_path
+            && config.inbound_auth_verify_signatures
+            && !path.exists()
+        {
+            return Err(ConfigError::ValidationError {
+                reason: format!(
+                    "INBOUND_CREDENTIALS_PATH does not exist: {}",
+                    path.display()
+                ),
             });
         }
 
@@ -317,6 +368,9 @@ mod tests {
         "UPSTREAM_REQUEST_TIMEOUT_MS",
         "MAX_REQUEST_BODY_BYTES",
         "PASSTHROUGH_UNSIGNED_PAYLOAD",
+        "INBOUND_AUTH_VERIFY_SIGNATURES",
+        "INBOUND_CREDENTIALS_PATH",
+        "INBOUND_AUTH_MAX_SKEW_SECS",
     ];
 
     fn with_env_vars<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
@@ -637,6 +691,97 @@ mod tests {
             redact_url_userinfo("https://a@b:c@example.com/root"),
             "https://example.com/root"
         );
+    }
+
+    #[test]
+    fn test_strict_inbound_defaults_off() {
+        with_env_vars(&required_env_vars(), || {
+            let config = Config::from_env().expect("should parse");
+            assert!(!config.inbound_auth_verify_signatures);
+            assert!(config.inbound_credentials_path.is_none());
+            assert_eq!(config.inbound_auth_max_skew_secs, 900);
+        });
+    }
+
+    #[test]
+    fn test_strict_inbound_requires_credentials_path() {
+        let mut vars = required_env_vars();
+        vars.push(("INBOUND_AUTH_VERIFY_SIGNATURES", "true"));
+        with_env_vars(&vars, || {
+            let err = Config::from_env()
+                .expect_err("strict mode without credentials path must fail validation");
+            match err {
+                ConfigError::ValidationError { reason } => {
+                    assert!(reason.contains("INBOUND_AUTH_VERIFY_SIGNATURES"));
+                    assert!(reason.contains("INBOUND_CREDENTIALS_PATH"));
+                }
+                other => panic!("expected ValidationError, got: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn test_strict_inbound_requires_existing_credentials_file() {
+        let mut vars = required_env_vars();
+        vars.push(("INBOUND_AUTH_VERIFY_SIGNATURES", "true"));
+        vars.push(("INBOUND_CREDENTIALS_PATH", "/nonexistent/path/to/creds.json"));
+        with_env_vars(&vars, || {
+            let err = Config::from_env()
+                .expect_err("strict mode with missing creds file must fail validation");
+            match err {
+                ConfigError::ValidationError { reason } => {
+                    assert!(reason.contains("INBOUND_CREDENTIALS_PATH"));
+                    assert!(reason.contains("does not exist"));
+                }
+                other => panic!("expected ValidationError, got: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn test_strict_inbound_relaxes_allowlist_empty_check() {
+        // Without strict mode, AccessKeyAllowlist + empty keys is fatal.
+        // With strict mode, the resolver replaces the allowlist, so the
+        // empty-keys validation is intentionally skipped.
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        std::io::Write::write_all(
+            &mut tmp,
+            br#"{"version":1,"credentials":[{"access_key_id":"AKID","secret_access_key":"s"}]}"#,
+        )
+        .unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+
+        let mut vars = required_env_vars();
+        vars.push(("AUTH_MODE", "access_key_allowlist"));
+        vars.push(("INBOUND_AUTH_VERIFY_SIGNATURES", "true"));
+        vars.push(("INBOUND_CREDENTIALS_PATH", &path));
+        with_env_vars(&vars, || {
+            let config =
+                Config::from_env().expect("strict mode should bypass empty-allowlist check");
+            assert!(config.inbound_auth_verify_signatures);
+            assert_eq!(config.auth_mode, AuthMode::AccessKeyAllowlist);
+            assert!(config.allowed_frontend_keys.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_strict_inbound_custom_skew() {
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        std::io::Write::write_all(
+            &mut tmp,
+            br#"{"version":1,"credentials":[{"access_key_id":"AKID","secret_access_key":"s"}]}"#,
+        )
+        .unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+
+        let mut vars = required_env_vars();
+        vars.push(("INBOUND_AUTH_VERIFY_SIGNATURES", "true"));
+        vars.push(("INBOUND_CREDENTIALS_PATH", &path));
+        vars.push(("INBOUND_AUTH_MAX_SKEW_SECS", "60"));
+        with_env_vars(&vars, || {
+            let config = Config::from_env().expect("should parse");
+            assert_eq!(config.inbound_auth_max_skew_secs, 60);
+        });
     }
 
     #[test]

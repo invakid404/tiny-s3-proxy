@@ -267,6 +267,90 @@ impl S3Error {
         }
     }
 
+    /// Create a SignatureDoesNotMatch error (HTTP 403). Returned by the
+    /// strict inbound SigV4 verifier when the computed signature differs from
+    /// the one supplied by the client, including the x-amz-content-sha256
+    /// mismatch with the actual body.
+    pub fn signature_does_not_match(message: &str, request_id: &str) -> Self {
+        S3Error {
+            http_status: StatusCode::FORBIDDEN,
+            code: "SignatureDoesNotMatch".to_string(),
+            message: message.to_string(),
+            resource: None,
+            request_id: request_id.to_string(),
+        }
+    }
+
+    /// Create a RequestTimeTooSkewed error (HTTP 403). Returned by the strict
+    /// inbound SigV4 verifier when the request `x-amz-date` (or `Date`) falls
+    /// outside the configured skew window. Mirrors S3's own response when a
+    /// client's clock is far enough off that signatures could no longer be
+    /// trusted as fresh.
+    pub fn request_time_too_skewed(message: &str, request_id: &str) -> Self {
+        S3Error {
+            http_status: StatusCode::FORBIDDEN,
+            code: "RequestTimeTooSkewed".to_string(),
+            message: message.to_string(),
+            resource: None,
+            request_id: request_id.to_string(),
+        }
+    }
+
+    /// Create a MissingAuthenticationToken error (HTTP 403). Returned when an
+    /// `Authorization` header is absent, or when a presigned URL is detected
+    /// in strict mode (presigned URLs are scoped to a later PR of #63).
+    pub fn missing_authentication_token(message: &str, request_id: &str) -> Self {
+        S3Error {
+            http_status: StatusCode::FORBIDDEN,
+            code: "MissingAuthenticationToken".to_string(),
+            message: message.to_string(),
+            resource: None,
+            request_id: request_id.to_string(),
+        }
+    }
+
+    /// Create an InvalidAccessKeyId error (HTTP 403). Returned by the strict
+    /// inbound SigV4 verifier when the supplied access-key id does not
+    /// resolve to any configured credential.
+    pub fn invalid_access_key_id(message: &str, request_id: &str) -> Self {
+        S3Error {
+            http_status: StatusCode::FORBIDDEN,
+            code: "InvalidAccessKeyId".to_string(),
+            message: message.to_string(),
+            resource: None,
+            request_id: request_id.to_string(),
+        }
+    }
+
+    /// Create an AuthorizationHeaderMalformed error (HTTP 400). Returned by
+    /// the strict inbound SigV4 verifier when the `Authorization` header
+    /// itself is structurally invalid: missing fields, duplicate fields,
+    /// wrong algorithm, non-lowercase signature hex, unsorted signed
+    /// headers, etc.
+    pub fn authorization_header_malformed(message: &str, request_id: &str) -> Self {
+        S3Error {
+            http_status: StatusCode::BAD_REQUEST,
+            code: "AuthorizationHeaderMalformed".to_string(),
+            message: message.to_string(),
+            resource: None,
+            request_id: request_id.to_string(),
+        }
+    }
+
+    /// Create an InvalidToken error (HTTP 400). Used by the strict SigV4
+    /// verifier when a request carries `x-amz-security-token` — STS-issued
+    /// temporary credentials are fail-closed in this PR and tracked in a
+    /// follow-up PR of #63.
+    pub fn invalid_token(message: &str, request_id: &str) -> Self {
+        S3Error {
+            http_status: StatusCode::BAD_REQUEST,
+            code: "InvalidToken".to_string(),
+            message: message.to_string(),
+            resource: None,
+            request_id: request_id.to_string(),
+        }
+    }
+
     /// Create a NotImplemented error.
     pub fn not_implemented(operation: &str, request_id: &str) -> Self {
         S3Error {
@@ -413,6 +497,62 @@ mod tests {
         let xml = err.to_xml();
         assert!(xml.contains("<Code>UnsupportedSignature</Code>"));
         assert!(xml.contains("ECDSA streaming not supported"));
+    }
+
+    #[test]
+    fn test_signature_does_not_match_status_and_code() {
+        let err = S3Error::signature_does_not_match("computed != supplied", "req-1");
+        assert_eq!(err.http_status, StatusCode::FORBIDDEN);
+        assert_eq!(err.code, "SignatureDoesNotMatch");
+        let xml = err.to_xml();
+        assert!(xml.contains("<Code>SignatureDoesNotMatch</Code>"));
+        assert!(xml.contains("computed != supplied"));
+    }
+
+    #[test]
+    fn test_request_time_too_skewed_status_and_code() {
+        let err = S3Error::request_time_too_skewed("clock skew exceeds 900s", "req-2");
+        assert_eq!(err.http_status, StatusCode::FORBIDDEN);
+        assert_eq!(err.code, "RequestTimeTooSkewed");
+        assert!(err.to_xml().contains("<Code>RequestTimeTooSkewed</Code>"));
+    }
+
+    #[test]
+    fn test_missing_authentication_token_status_and_code() {
+        let err = S3Error::missing_authentication_token("presigned URLs not supported", "req-3");
+        assert_eq!(err.http_status, StatusCode::FORBIDDEN);
+        assert_eq!(err.code, "MissingAuthenticationToken");
+        assert!(
+            err.to_xml()
+                .contains("<Code>MissingAuthenticationToken</Code>")
+        );
+    }
+
+    #[test]
+    fn test_invalid_access_key_id_status_and_code() {
+        let err = S3Error::invalid_access_key_id("unknown access key", "req-4");
+        assert_eq!(err.http_status, StatusCode::FORBIDDEN);
+        assert_eq!(err.code, "InvalidAccessKeyId");
+        assert!(err.to_xml().contains("<Code>InvalidAccessKeyId</Code>"));
+    }
+
+    #[test]
+    fn test_authorization_header_malformed_status_and_code() {
+        let err = S3Error::authorization_header_malformed("missing Signature field", "req-5");
+        assert_eq!(err.http_status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.code, "AuthorizationHeaderMalformed");
+        assert!(
+            err.to_xml()
+                .contains("<Code>AuthorizationHeaderMalformed</Code>")
+        );
+    }
+
+    #[test]
+    fn test_invalid_token_status_and_code() {
+        let err = S3Error::invalid_token("session tokens not supported", "req-6");
+        assert_eq!(err.http_status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.code, "InvalidToken");
+        assert!(err.to_xml().contains("<Code>InvalidToken</Code>"));
     }
 
     #[test]
