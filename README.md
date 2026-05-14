@@ -94,6 +94,9 @@ All configuration is via environment variables.
 | `FRONTEND_BUCKET` | *required* | Bucket name clients use |
 | `AUTH_MODE` | `trusted_internal` | Access control mode: `trusted_internal` (allow all) or `access_key_allowlist` (check access-key ID against allowlist — does NOT verify SigV4 signatures) |
 | `ALLOWED_FRONTEND_KEYS` | | Comma-separated access key IDs for allowlist mode. NOTE: only the key ID is checked, not the signature — see security section below |
+| `INBOUND_AUTH_VERIFY_SIGNATURES` | `false` | Opt-in strict SigV4 verification for inbound requests. Replaces the `AUTH_MODE` gate. See "Strict inbound SigV4 verification" below |
+| `INBOUND_CREDENTIALS_PATH` | | Path to a JSON file with the inbound access-key id / secret pairs. Required when `INBOUND_AUTH_VERIFY_SIGNATURES=true`; the file is loaded once at startup and a missing or malformed file fails the rollout |
+| `INBOUND_AUTH_MAX_SKEW_SECS` | `900` | Maximum permitted clock skew (seconds) between the request `x-amz-date` and the proxy's wall clock in strict mode. Requests outside the window return `RequestTimeTooSkewed` |
 
 ### Backend
 
@@ -149,7 +152,44 @@ All configuration is via environment variables.
 
 In both modes, the proxy re-signs all backend requests with its own `BACKEND_ACCESS_KEY_ID` / `BACKEND_SECRET_ACCESS_KEY`. Inbound signatures are never validated against client secrets. Client-side auth/signing headers (`x-amz-security-token`, `x-amz-credential`, `x-amz-signature`, etc.) are stripped before forwarding to the backend.
 
-If you need actual signature verification with per-client secrets, implement a full SigV4 validator or place the proxy behind an authenticating reverse proxy.
+If you need actual signature verification with per-client secrets, set `INBOUND_AUTH_VERIFY_SIGNATURES=true` (see below) or place the proxy behind an authenticating reverse proxy.
+
+### Strict inbound SigV4 verification
+
+`INBOUND_AUTH_VERIFY_SIGNATURES=true` enables cryptographic SigV4 verification of inbound requests. When this flag is set, the legacy `AUTH_MODE` gate is bypassed entirely — every normal (non-streaming, non-presigned) request must carry a valid `AWS4-HMAC-SHA256` `Authorization` header signed with a credential listed in `INBOUND_CREDENTIALS_PATH`, and signed payloads must match the actual body bytes.
+
+The credentials file is a versioned JSON document:
+
+```json
+{
+  "version": 1,
+  "credentials": [
+    { "access_key_id": "AKID-FRONTEND-1", "secret_access_key": "..." },
+    { "access_key_id": "AKID-FRONTEND-2", "secret_access_key": "..." }
+  ]
+}
+```
+
+- `version` must be `1`. Unknown fields and unknown top-level keys are rejected at load time (typos fail the rollout).
+- Both `access_key_id` and `secret_access_key` must be non-empty and free of leading/trailing whitespace.
+- Duplicate access-key ids are rejected.
+- Secrets are zeroized in memory on the final drop (`Zeroizing<String>` behind an `Arc`); the raw file contents are wiped immediately after parsing.
+
+Scope and fail-closed behavior (issue #63 PR 1 of 5):
+
+| Inbound flow | Strict-mode behavior |
+|---|---|
+| Normal signed requests (`UNSIGNED-PAYLOAD`, signed SHA-256) | Verified end-to-end (header, scope, date, canonical request, body hash if signed) |
+| `STREAMING-UNSIGNED-PAYLOAD-TRAILER` | Verified for the request header; chunk framing handled by the existing decoder |
+| `STREAMING-AWS4-HMAC-SHA256-PAYLOAD*` (signed aws-chunked) | `UnsupportedSignature` 400 (lands in PR 2 of #63) |
+| Presigned URLs (`X-Amz-Signature` query parameter) | `MissingAuthenticationToken` 403 (lands in PR 3 of #63) |
+| STS / temporary credentials (`x-amz-security-token`) | `InvalidToken` 400 (lands in PR 4 of #63) |
+| `AWS4-ECDSA-P256-SHA256` (SigV4A) | `UnsupportedSignature` 400 (lands in PR 5 of #63) |
+
+Other strict-mode behavior worth noting:
+- Signature comparison uses a constant-time compare (`subtle::ConstantTimeEq`) to avoid timing side-channels on byte mismatches.
+- The verifier reuses S3's standard error codes (`SignatureDoesNotMatch`, `RequestTimeTooSkewed`, `InvalidAccessKeyId`, `AuthorizationHeaderMalformed`) so existing AWS SDK clients surface clear errors.
+- The proxy still re-signs outbound backend requests with `BACKEND_ACCESS_KEY_ID` / `BACKEND_SECRET_ACCESS_KEY`; client-side auth headers are stripped before forwarding.
 
 ### Cache invalidation
 

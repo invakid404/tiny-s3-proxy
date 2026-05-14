@@ -26,12 +26,10 @@ use zeroize::Zeroizing;
 
 use self::canonical::build_canonical_request;
 use self::parser::{
-    CredentialScope, ensure_scope_date_matches, enforce_skew, parse_authorization,
+    CredentialScope, enforce_skew, ensure_scope_date_matches, parse_authorization,
     resolve_request_time,
 };
-use self::payload::{
-    PayloadHashForSigning, classify_payload_header, verify_payload_matches_hash,
-};
+use self::payload::{PayloadHashForSigning, classify_payload_header, verify_payload_matches_hash};
 
 /// SigV4 signing key (HMAC-SHA256 output, 32 bytes), zeroized on drop.
 ///
@@ -170,10 +168,7 @@ impl SigV4Verifier {
                 S3Error::internal_error("credential resolver failed", request_id)
             })?
             .ok_or_else(|| {
-                S3Error::invalid_access_key_id(
-                    "access-key id is not configured",
-                    request_id,
-                )
+                S3Error::invalid_access_key_id("access-key id is not configured", request_id)
             })?;
 
         // Build canonical request, hash it, derive signing key, calculate
@@ -186,16 +181,14 @@ impl SigV4Verifier {
             &auth.scope.service,
         );
 
-        let string_to_sign = build_string_to_sign(&auth.scope, &amz_date, &canonical.canonical_request);
+        let string_to_sign =
+            build_string_to_sign(&auth.scope, &amz_date, &canonical.canonical_request);
         let expected_hex = aws_sigv4::sign::v4::calculate_signature(
             signing_key.as_bytes(),
             string_to_sign.as_bytes(),
         );
         let expected_bytes = parse_hex32(&expected_hex).ok_or_else(|| {
-            S3Error::internal_error(
-                "internal error computing expected signature",
-                request_id,
-            )
+            S3Error::internal_error("internal error computing expected signature", request_id)
         })?;
 
         if expected_bytes.ct_eq(&auth.signature).unwrap_u8() != 1 {
@@ -244,7 +237,12 @@ fn has_presigned_query(raw_query: &str) -> bool {
     })
 }
 
-fn derive_signing_key(secret: &str, date_yyyymmdd: &str, region: &str, service: &str) -> SigningKey {
+fn derive_signing_key(
+    secret: &str,
+    date_yyyymmdd: &str,
+    region: &str,
+    service: &str,
+) -> SigningKey {
     // We could use aws_sigv4::sign::v4::generate_signing_key, but its
     // return type is `impl AsRef<[u8]>` (and it owns a different internal
     // buffer type), which is awkward to keep in our zeroized container.
@@ -272,7 +270,11 @@ fn derive_signing_key(secret: &str, date_yyyymmdd: &str, region: &str, service: 
     SigningKey(Zeroizing::new(k_signing))
 }
 
-fn build_string_to_sign(scope: &CredentialScope, amz_date: &str, canonical_request: &str) -> String {
+fn build_string_to_sign(
+    scope: &CredentialScope,
+    amz_date: &str,
+    canonical_request: &str,
+) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(canonical_request.as_bytes());
@@ -288,10 +290,7 @@ fn build_string_to_sign(scope: &CredentialScope, amz_date: &str, canonical_reque
         "{}/{}/{}/aws4_request",
         scope.date_yyyymmdd, scope.region, scope.service
     );
-    format!(
-        "AWS4-HMAC-SHA256\n{}\n{}\n{}",
-        amz_date, scope_str, hex
-    )
+    format!("AWS4-HMAC-SHA256\n{}\n{}\n{}", amz_date, scope_str, hex)
 }
 
 fn parse_hex32(s: &str) -> Option<[u8; 32]> {
@@ -457,7 +456,12 @@ mod tests {
         SigV4Verifier::new(resolver, Duration::from_secs(900))
     }
 
-    fn parts_for(method: &str, uri: &str, headers: http::HeaderMap, auth: &str) -> http::request::Parts {
+    fn parts_for(
+        method: &str,
+        uri: &str,
+        headers: http::HeaderMap,
+        auth: &str,
+    ) -> http::request::Parts {
         let mut req = Request::builder().method(method).uri(uri);
         for (k, v) in headers.iter() {
             req = req.header(k.clone(), v.clone());

@@ -724,7 +724,10 @@ mod tests {
     fn test_strict_inbound_requires_existing_credentials_file() {
         let mut vars = required_env_vars();
         vars.push(("INBOUND_AUTH_VERIFY_SIGNATURES", "true"));
-        vars.push(("INBOUND_CREDENTIALS_PATH", "/nonexistent/path/to/creds.json"));
+        vars.push((
+            "INBOUND_CREDENTIALS_PATH",
+            "/nonexistent/path/to/creds.json",
+        ));
         with_env_vars(&vars, || {
             let err = Config::from_env()
                 .expect_err("strict mode with missing creds file must fail validation");

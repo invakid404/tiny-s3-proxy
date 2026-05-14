@@ -52,8 +52,7 @@ pub fn build_canonical_request(
     let path = parts.uri.path();
 
     let canonical_query = canonicalize_query(parts.uri.query().unwrap_or(""), request_id)?;
-    let (canonical_headers, signed_headers) =
-        canonicalize_headers(parts, auth, request_id)?;
+    let (canonical_headers, signed_headers) = canonicalize_headers(parts, auth, request_id)?;
 
     let hashed_payload = payload.canonical_string().to_owned();
 
@@ -107,9 +106,7 @@ fn percent_decode_for_query(s: &str) -> String {
             out.push(b' ');
             i += 1;
         } else if b == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) =
-                (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2]))
-            {
+            if let (Some(h), Some(l)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
                 out.push((h << 4) | l);
                 i += 3;
             } else {
@@ -319,11 +316,7 @@ mod tests {
     #[test]
     fn test_query_encoding_uppercase_hex() {
         // `=` in the value must be encoded as %3D (uppercase).
-        let parts = parts_with(
-            "/b/k?a=value%3Dwith%3Dequals",
-            "GET",
-            &[("host", "h")],
-        );
+        let parts = parts_with("/b/k?a=value%3Dwith%3Dequals", "GET", &[("host", "h")]);
         let auth = auth_with_signed_headers(&["host"]);
         let payload = PayloadHashForSigning::UnsignedPayload;
         let cr = build_canonical_request(&parts, &auth, &payload, "rid").unwrap();
@@ -333,11 +326,7 @@ mod tests {
 
     #[test]
     fn test_query_sorted_by_encoded_key() {
-        let parts = parts_with(
-            "/b?b=2&a=1&c=3",
-            "GET",
-            &[("host", "h")],
-        );
+        let parts = parts_with("/b?b=2&a=1&c=3", "GET", &[("host", "h")]);
         let auth = auth_with_signed_headers(&["host"]);
         let payload = PayloadHashForSigning::UnsignedPayload;
         let cr = build_canonical_request(&parts, &auth, &payload, "rid").unwrap();
@@ -347,11 +336,7 @@ mod tests {
 
     #[test]
     fn test_bare_query_key_encoded_with_empty_value() {
-        let parts = parts_with(
-            "/b?delete",
-            "DELETE",
-            &[("host", "h")],
-        );
+        let parts = parts_with("/b?delete", "DELETE", &[("host", "h")]);
         let auth = auth_with_signed_headers(&["host"]);
         let payload = PayloadHashForSigning::UnsignedPayload;
         let cr = build_canonical_request(&parts, &auth, &payload, "rid").unwrap();
@@ -361,11 +346,7 @@ mod tests {
 
     #[test]
     fn test_duplicate_query_keys_sorted_by_value() {
-        let parts = parts_with(
-            "/b?x=2&x=1",
-            "GET",
-            &[("host", "h")],
-        );
+        let parts = parts_with("/b?x=2&x=1", "GET", &[("host", "h")]);
         let auth = auth_with_signed_headers(&["host"]);
         let payload = PayloadHashForSigning::UnsignedPayload;
         let cr = build_canonical_request(&parts, &auth, &payload, "rid").unwrap();

@@ -102,6 +102,7 @@ use http::{Request, Response};
 use metrics::{counter, gauge, histogram};
 
 use crate::auth::RequestGate;
+use crate::auth::sigv4::SigV4Verifier;
 use crate::backend::Backend;
 use crate::cache::policy::CachePolicy;
 use crate::cache::{CacheStore, SingleFlight};
@@ -118,6 +119,10 @@ pub struct AppState<B: Backend, C: CacheStore> {
     pub cache: Arc<C>,
     pub singleflight: Arc<SingleFlight>,
     pub auth: Arc<dyn RequestGate>,
+    /// Optional strict-mode SigV4 verifier. When `Some`, replaces the
+    /// `auth` gate for normal (non-streaming, non-presigned) requests —
+    /// see `handle_s3_request`.
+    pub inbound_sigv4: Option<Arc<SigV4Verifier>>,
     pub policy: CachePolicy,
     pub config: Arc<Config>,
     pub frontend_bucket: Arc<str>,
@@ -139,6 +144,9 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
     let parse_req = Request::from_parts(parts, ());
     let parsed = parse_request(&parse_req);
     let (parts, _) = parse_req.into_parts();
+    // `body` may need to be replaced after we buffer it for strict
+    // payload-hash verification; rebind as mut for that branch.
+    let mut body = body;
 
     let op_name = parsed.operation.name();
 
@@ -181,13 +189,31 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
         histogram!("s3proxy_request_size_bytes", "operation" => op_name).record(n as f64);
     }
 
-    // Auth check (applies to ALL operations including passthrough)
-    if let Err(e) = state.auth.check_access(&parsed) {
-        let s3err = S3Error::from_proxy_error(&e, &parsed.request_id, None);
-        let response = s3err.to_response();
-        record_metrics(op_name, &response, start);
-        return response;
-    }
+    // Auth check (applies to ALL operations including passthrough).
+    //
+    // When strict-mode SigV4 verification is configured, it REPLACES the
+    // legacy `RequestGate`. The verifier authenticates the request via
+    // signature comparison rather than gating on access-key allowlist /
+    // trust-the-network. We hold onto the VerifiedRequest so we can drive
+    // the (optional) body-hash check after bucket validation.
+    let verified = if let Some(verifier) = &state.inbound_sigv4 {
+        match verifier.verify(&parts, &parsed.request_id) {
+            Ok(v) => Some(v),
+            Err(s3err) => {
+                let response = s3err.to_response();
+                record_metrics(op_name, &response, start);
+                return response;
+            }
+        }
+    } else {
+        if let Err(e) = state.auth.check_access(&parsed) {
+            let s3err = S3Error::from_proxy_error(&e, &parsed.request_id, None);
+            let response = s3err.to_response();
+            record_metrics(op_name, &response, start);
+            return response;
+        }
+        None
+    };
 
     // Check bucket is allowed (must match frontend_bucket).
     // For Unsupported operations, extract the bucket from the raw path.
@@ -207,6 +233,34 @@ pub async fn handle_s3_request<B: Backend + 'static, C: CacheStore + 'static>(
         let response = s3err.to_response();
         record_metrics(op_name, &response, start);
         return response;
+    }
+
+    // Strict mode body-hash verification. When the client signed a concrete
+    // payload digest (x-amz-content-sha256 is hex, not UNSIGNED-PAYLOAD or a
+    // streaming sentinel), buffer the body up to max_request_body_bytes,
+    // confirm SHA-256 matches the signed value, then put the bytes back so
+    // the downstream handler can read them. We deliberately do this AFTER
+    // bucket validation so an unrelated bucket gets the cheaper NoSuchBucket
+    // response rather than burning a body read first.
+    if let (Some(v), Some(verifier)) = (verified.as_ref(), state.inbound_sigv4.as_ref())
+        && v.payload.requires_body_bytes()
+    {
+        match axum::body::to_bytes(body, state.config.max_request_body_bytes as usize).await {
+            Ok(bytes) => {
+                if let Err(s3err) = verifier.verify_payload_hash(v, &bytes, &parsed.request_id) {
+                    let response = s3err.to_response();
+                    record_metrics(op_name, &response, start);
+                    return response;
+                }
+                body = Body::from(bytes);
+            }
+            Err(e) => {
+                let s3err = S3Error::from_body_error(&e, &parsed.request_id);
+                let response = s3err.to_response();
+                record_metrics(op_name, &response, start);
+                return response;
+            }
+        }
     }
 
     // Handle unsupported S3 operations by proxying to the backend.
@@ -1483,6 +1537,7 @@ pub mod test_utils {
             cache: Arc::new(cache),
             singleflight: Arc::new(SingleFlight::new()),
             auth: Arc::new(auth),
+            inbound_sigv4: None,
             policy: CachePolicy::new(
                 config.cacheable_prefixes.clone(),
                 config.cache_max_object_bytes,
@@ -1728,6 +1783,7 @@ mod tests {
             cache: std::sync::Arc::new(cache),
             singleflight: std::sync::Arc::new(crate::cache::SingleFlight::new()),
             auth: std::sync::Arc::new(MockAuth::allow_all()),
+            inbound_sigv4: None,
             policy: crate::cache::policy::CachePolicy::new(
                 config.cacheable_prefixes.clone(),
                 config.cache_max_object_bytes,

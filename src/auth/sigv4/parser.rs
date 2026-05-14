@@ -24,8 +24,8 @@
 
 use crate::s3::errors::S3Error;
 use chrono::{DateTime, Duration, NaiveDate, Utc};
-use http::HeaderName;
 use http::HeaderMap;
+use http::HeaderName;
 use std::str::FromStr;
 use std::time::SystemTime;
 
@@ -51,7 +51,10 @@ pub struct SigV4Authorization {
 const ALGORITHM: &str = "AWS4-HMAC-SHA256";
 const ECDSA_ALGORITHM: &str = "AWS4-ECDSA-P256-SHA256";
 
-pub fn parse_authorization(header_value: &str, request_id: &str) -> Result<SigV4Authorization, S3Error> {
+pub fn parse_authorization(
+    header_value: &str,
+    request_id: &str,
+) -> Result<SigV4Authorization, S3Error> {
     // Split on the first whitespace to separate algorithm from params.
     let (algorithm, params) = header_value
         .split_once(char::is_whitespace)
@@ -430,7 +433,11 @@ pub fn enforce_skew(
     request_id: &str,
 ) -> Result<(), S3Error> {
     let delta = now.signed_duration_since(request_time);
-    let abs = if delta < Duration::zero() { -delta } else { delta };
+    let abs = if delta < Duration::zero() {
+        -delta
+    } else {
+        delta
+    };
     if abs > max_skew {
         return Err(S3Error::request_time_too_skewed(
             "request date is outside the configured clock-skew window",
@@ -607,7 +614,10 @@ mod tests {
     #[test]
     fn test_amz_date_basic_iso8601() {
         let parsed = dt("20260114T123000Z");
-        assert_eq!(parsed.format("%Y%m%dT%H%M%SZ").to_string(), "20260114T123000Z");
+        assert_eq!(
+            parsed.format("%Y%m%dT%H%M%SZ").to_string(),
+            "20260114T123000Z"
+        );
     }
 
     #[test]
@@ -654,8 +664,8 @@ mod tests {
     fn test_enforce_skew_too_old_rejected() {
         let now = dt("20260101T120000Z");
         let req = dt("20260101T100000Z"); // 2 hours ago
-        let err = enforce_skew(req, now, Duration::seconds(900), rid())
-            .expect_err("stale should reject");
+        let err =
+            enforce_skew(req, now, Duration::seconds(900), rid()).expect_err("stale should reject");
         assert_eq!(err.code, "RequestTimeTooSkewed");
     }
 

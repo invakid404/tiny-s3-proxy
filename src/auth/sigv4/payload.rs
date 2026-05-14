@@ -42,7 +42,10 @@ impl PayloadHashForSigning {
     }
 }
 
-pub fn classify_payload_header(value: &str, request_id: &str) -> Result<PayloadHashForSigning, S3Error> {
+pub fn classify_payload_header(
+    value: &str,
+    request_id: &str,
+) -> Result<PayloadHashForSigning, S3Error> {
     if value == "UNSIGNED-PAYLOAD" {
         return Ok(PayloadHashForSigning::UnsignedPayload);
     }
@@ -63,7 +66,11 @@ pub fn classify_payload_header(value: &str, request_id: &str) -> Result<PayloadH
     }
 
     // Otherwise we expect a 64-char lowercase hex digest.
-    if value.len() == 64 && value.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    {
         let mut bytes = [0u8; 32];
         for (i, byte) in bytes.iter_mut().enumerate() {
             let hi = hex_nibble(value.as_bytes()[2 * i]).ok_or_else(|| {
@@ -179,17 +186,15 @@ mod tests {
 
     #[test]
     fn test_streaming_hmac_trailer_sentinel_unsupported() {
-        let err =
-            classify_payload_header("STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER", rid())
-                .expect_err("hmac streaming trailer fail-closed");
+        let err = classify_payload_header("STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER", rid())
+            .expect_err("hmac streaming trailer fail-closed");
         assert_eq!(err.code, "UnsupportedSignature");
     }
 
     #[test]
     fn test_streaming_ecdsa_sentinel_unsupported() {
-        let err =
-            classify_payload_header("STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD", rid())
-                .expect_err("ecdsa streaming fail-closed");
+        let err = classify_payload_header("STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD", rid())
+            .expect_err("ecdsa streaming fail-closed");
         assert_eq!(err.code, "UnsupportedSignature");
         let err =
             classify_payload_header("STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER", rid())
@@ -219,8 +224,7 @@ mod tests {
         let expected = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
         verify_payload_matches_hash(b"", expected, rid()).expect("empty body matches");
 
-        let err = verify_payload_matches_hash(b"data", expected, rid())
-            .expect_err("body mismatch");
+        let err = verify_payload_matches_hash(b"data", expected, rid()).expect_err("body mismatch");
         assert_eq!(err.code, "SignatureDoesNotMatch");
         assert!(err.message.contains("mismatch"));
     }

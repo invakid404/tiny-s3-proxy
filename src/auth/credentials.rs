@@ -159,12 +159,11 @@ impl StaticInboundCredentials {
         // bytes are wiped when we drop the buffer at the end of this fn.
         let raw = Zeroizing::new(raw);
 
-        let parsed: CredentialsFile = serde_json::from_str(raw.as_str()).map_err(|e| {
-            StaticCredentialsLoadError::Parse {
+        let parsed: CredentialsFile =
+            serde_json::from_str(raw.as_str()).map_err(|e| StaticCredentialsLoadError::Parse {
                 path: path.to_path_buf(),
                 reason: e.to_string(),
-            }
-        })?;
+            })?;
 
         if parsed.version != 1 {
             return Err(StaticCredentialsLoadError::Validation {
@@ -328,8 +327,8 @@ mod tests {
         let f = write_file(
             r#"{ "version": 2, "credentials": [{ "access_key_id": "a", "secret_access_key": "b" }] }"#,
         );
-        let err = StaticInboundCredentials::load_from_file(f.path())
-            .expect_err("version!=1 must error");
+        let err =
+            StaticInboundCredentials::load_from_file(f.path()).expect_err("version!=1 must error");
         match err {
             StaticCredentialsLoadError::Validation { reason, .. } => {
                 assert!(reason.contains("version"), "got: {reason}");
@@ -341,8 +340,8 @@ mod tests {
     #[test]
     fn test_rejects_empty_credentials_array() {
         let f = write_file(r#"{ "version": 1, "credentials": [] }"#);
-        let err = StaticInboundCredentials::load_from_file(f.path())
-            .expect_err("empty array must error");
+        let err =
+            StaticInboundCredentials::load_from_file(f.path()).expect_err("empty array must error");
         match err {
             StaticCredentialsLoadError::Validation { reason, .. } => {
                 assert!(reason.contains("empty"), "got: {reason}");
@@ -358,10 +357,7 @@ mod tests {
         );
         let err = StaticInboundCredentials::load_from_file(f.path())
             .expect_err("empty access_key_id must error");
-        assert!(matches!(
-            err,
-            StaticCredentialsLoadError::Validation { .. }
-        ));
+        assert!(matches!(err, StaticCredentialsLoadError::Validation { .. }));
     }
 
     #[test]
@@ -371,10 +367,7 @@ mod tests {
         );
         let err = StaticInboundCredentials::load_from_file(f.path())
             .expect_err("empty secret must error");
-        assert!(matches!(
-            err,
-            StaticCredentialsLoadError::Validation { .. }
-        ));
+        assert!(matches!(err, StaticCredentialsLoadError::Validation { .. }));
     }
 
     #[test]
@@ -384,20 +377,14 @@ mod tests {
         );
         let err = StaticInboundCredentials::load_from_file(f.path())
             .expect_err("padded access_key_id must error");
-        assert!(matches!(
-            err,
-            StaticCredentialsLoadError::Validation { .. }
-        ));
+        assert!(matches!(err, StaticCredentialsLoadError::Validation { .. }));
 
         let f = write_file(
             r#"{ "version": 1, "credentials": [{ "access_key_id": "a", "secret_access_key": " s" }] }"#,
         );
         let err = StaticInboundCredentials::load_from_file(f.path())
             .expect_err("padded secret must error");
-        assert!(matches!(
-            err,
-            StaticCredentialsLoadError::Validation { .. }
-        ));
+        assert!(matches!(err, StaticCredentialsLoadError::Validation { .. }));
     }
 
     #[test]
