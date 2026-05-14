@@ -243,7 +243,7 @@ fn has_presigned_query(raw_query: &str) -> bool {
     })
 }
 
-fn derive_signing_key(
+pub(crate) fn derive_signing_key(
     secret: &str,
     date_yyyymmdd: &str,
     region: &str,
@@ -285,7 +285,7 @@ fn derive_signing_key(
     SigningKey(k_signing)
 }
 
-fn build_string_to_sign(
+pub(crate) fn build_string_to_sign(
     scope: &CredentialScope,
     amz_date: &str,
     canonical_request: &str,
@@ -308,7 +308,7 @@ fn build_string_to_sign(
     format!("AWS4-HMAC-SHA256\n{}\n{}\n{}", amz_date, scope_str, hex)
 }
 
-fn parse_hex32(s: &str) -> Option<[u8; 32]> {
+pub(crate) fn parse_hex32(s: &str) -> Option<[u8; 32]> {
     if s.len() != 64 {
         return None;
     }

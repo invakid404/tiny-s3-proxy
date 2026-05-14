@@ -1,6 +1,11 @@
-//! Strict-mode parser for SigV4 presigned URL query auth (`X-Amz-*` query
-//! parameters). The canonical-request rebuild and signature comparison live in
-//! a follow-up step; this module only parses the auth fields the URL carries.
+//! Strict-mode SigV4 presigned URL query-auth parser and verifier.
+//!
+//! Public entry points: [`has_presigned_signature_query`] (cheap precheck),
+//! [`parse_presigned_authorization`] (field parser), and
+//! [`verify_presigned_request`] (canonical-request rebuild and HMAC-SHA256
+//! comparison against the supplied `X-Amz-Signature`). The verifier returns
+//! the same [`VerifiedRequest`] shape the header-auth path produces, so
+//! downstream handler code consumes it identically.
 //!
 //! Detection vs. parsing have intentionally different strictness:
 //!
@@ -14,14 +19,20 @@
 //!   `AuthorizationHeaderMalformed`, rather than silently ignoring the
 //!   request's signing intent.
 
-use crate::auth::sigv4::canonical::percent_decode_for_query;
+use crate::auth::credentials::InboundCredentialResolver;
+use crate::auth::sigv4::canonical::{
+    CanonicalQueryMode, build_canonical_request_from_signed_headers, percent_decode_for_query,
+};
 use crate::auth::sigv4::parser::{
     CredentialScope, parse_amz_date, parse_credential, parse_signature_hex, parse_signed_headers,
 };
+use crate::auth::sigv4::payload::PayloadHashForSigning;
+use crate::auth::sigv4::{VerifiedRequest, build_string_to_sign, derive_signing_key, parse_hex32};
 use crate::s3::errors::S3Error;
 use chrono::{DateTime, Utc};
 use http::HeaderName;
 use std::time::Duration;
+use subtle::ConstantTimeEq;
 
 /// AWS S3 caps presigned URL validity at 7 days (604 800 seconds).
 pub const MAX_PRESIGNED_EXPIRES_SECS: u64 = 604_800;
@@ -246,6 +257,240 @@ fn eq_ignore_ascii_case_bytes(a: &[u8], b: &[u8]) -> bool {
         && a.iter()
             .zip(b.iter())
             .all(|(x, y)| x.eq_ignore_ascii_case(y))
+}
+
+/// End-to-end strict verification of a presigned URL request.
+///
+/// Performs (in order): aws-chunked compatibility rejection, query-auth
+/// parse, validity-window check against `now`, payload-marker sanity check
+/// (`UNSIGNED-PAYLOAD` only — STREAMING-* and signed-payload-hash presigned
+/// URLs are deferred), credential resolution, canonical-request rebuild
+/// with `X-Amz-Signature` excluded from the query, HMAC-SHA256 over the
+/// string-to-sign, and constant-time comparison against the supplied
+/// signature.
+///
+/// Returns the same [`VerifiedRequest`] shape the header-auth path produces
+/// so the handler's request-scoped logic stays unaware of which auth
+/// mechanism the client used. `payload` is always
+/// `PayloadHashForSigning::UnsignedPayload`, which means downstream body
+/// buffering for hash verification is skipped.
+pub fn verify_presigned_request(
+    parts: &http::request::Parts,
+    resolver: &dyn InboundCredentialResolver,
+    request_id: &str,
+    now: DateTime<Utc>,
+) -> Result<VerifiedRequest, S3Error> {
+    // Reject the presigned/aws-chunked intersection before anything else.
+    // PR 2's chunk verifier can't be seeded from a query signature without
+    // a deliberate seeding step we haven't designed, and "presigned + signed
+    // streaming" is not part of the documented S3 presigned auth flow.
+    reject_presigned_aws_chunked(parts, request_id)?;
+
+    let raw_query = parts.uri.query().unwrap_or("");
+    let pres = parse_presigned_authorization(raw_query, request_id)?;
+
+    enforce_presigned_validity(&pres, now, request_id)?;
+    check_presigned_payload_marker(parts, request_id)?;
+
+    // Resolve the access key. A miss → InvalidAccessKeyId; a store error →
+    // InternalError. PR 3 always passes `None` for the session token —
+    // STS-issued temporary credentials are rejected earlier by the parser.
+    let credential = resolver
+        .resolve(&pres.access_key_id, None)
+        .map_err(|e| {
+            tracing::error!(error = %e, "credential resolver failed");
+            S3Error::internal_error("credential resolver failed", request_id)
+        })?
+        .ok_or_else(|| {
+            S3Error::invalid_access_key_id("access-key id is not configured", request_id)
+        })?;
+
+    let payload = PayloadHashForSigning::UnsignedPayload;
+    let canonical = build_canonical_request_from_signed_headers(
+        parts,
+        &pres.signed_headers,
+        &payload,
+        CanonicalQueryMode::ExcludePresignedSignature,
+        request_id,
+    )?;
+
+    let signing_key = derive_signing_key(
+        credential.secret_access_key.expose(),
+        &pres.scope.date_yyyymmdd,
+        &pres.scope.region,
+        &pres.scope.service,
+    );
+
+    let string_to_sign =
+        build_string_to_sign(&pres.scope, &pres.amz_date, &canonical.canonical_request);
+    let expected_hex =
+        aws_sigv4::sign::v4::calculate_signature(signing_key.as_bytes(), string_to_sign.as_bytes());
+    let expected_bytes = parse_hex32(&expected_hex).ok_or_else(|| {
+        S3Error::internal_error("internal error computing expected signature", request_id)
+    })?;
+
+    if expected_bytes.ct_eq(&pres.signature).unwrap_u8() != 1 {
+        return Err(S3Error::signature_does_not_match(
+            "computed request signature does not match the supplied X-Amz-Signature",
+            request_id,
+        ));
+    }
+
+    Ok(VerifiedRequest {
+        access_key_id: credential.access_key_id.clone(),
+        scope: pres.scope,
+        signed_headers: pres.signed_headers,
+        request_signature_hex: pres.signature_hex,
+        signing_key,
+        amz_date: pres.amz_date,
+        payload,
+    })
+}
+
+/// Reject the request before signature work if it looks like a presigned
+/// aws-chunked streaming upload — that shape is fail-closed in PR 3.
+fn reject_presigned_aws_chunked(
+    parts: &http::request::Parts,
+    request_id: &str,
+) -> Result<(), S3Error> {
+    let mismatch = || {
+        S3Error::unsupported_signature(
+            "presigned aws-chunked streaming uploads are not supported in strict mode; \
+             tracked in PR 5 of issue #63",
+            request_id,
+        )
+    };
+
+    if parts.headers.contains_key("x-amz-decoded-content-length")
+        || parts.headers.contains_key("x-amz-trailer")
+    {
+        return Err(mismatch());
+    }
+    if let Some(v) = parts.headers.get("content-encoding")
+        && let Ok(s) = v.to_str()
+        && s.split(',')
+            .any(|t| t.trim().eq_ignore_ascii_case("aws-chunked"))
+    {
+        return Err(mismatch());
+    }
+    if let Some(v) = parts.headers.get("x-amz-content-sha256")
+        && let Ok(s) = v.to_str()
+        && s.starts_with("STREAMING-")
+    {
+        return Err(mismatch());
+    }
+    let raw_query = parts.uri.query().unwrap_or("");
+    for chunk in raw_query.split('&') {
+        if chunk.is_empty() {
+            continue;
+        }
+        let (raw_k, raw_v) = match chunk.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (chunk, ""),
+        };
+        let decoded_k = percent_decode_for_query(raw_k);
+        if decoded_k.as_slice() == b"X-Amz-Content-Sha256" {
+            let decoded_v = percent_decode_for_query(raw_v);
+            if decoded_v.starts_with(b"STREAMING-") {
+                return Err(mismatch());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn enforce_presigned_validity(
+    pres: &PresignedAuthorization,
+    now: DateTime<Utc>,
+    request_id: &str,
+) -> Result<(), S3Error> {
+    // `pres.expires` is bounded to `MAX_PRESIGNED_EXPIRES_SECS` by the parser,
+    // so the chrono conversion can never overflow in production.
+    let expires = chrono::Duration::from_std(pres.expires).map_err(|_| {
+        S3Error::authorization_header_malformed(
+            "presigned auth X-Amz-Expires is out of range",
+            request_id,
+        )
+    })?;
+    let expires_at = pres.request_time + expires;
+    if now < pres.request_time || now > expires_at {
+        return Err(S3Error::request_time_too_skewed(
+            "presigned URL is outside its validity window",
+            request_id,
+        ));
+    }
+    Ok(())
+}
+
+/// Verify the request's `x-amz-content-sha256` marker (header or query) is
+/// either absent or set to `UNSIGNED-PAYLOAD`. Signed-payload-hash and
+/// streaming presigned URLs are deferred — the standard S3 presigned canonical
+/// request uses `UNSIGNED-PAYLOAD`.
+fn check_presigned_payload_marker(
+    parts: &http::request::Parts,
+    request_id: &str,
+) -> Result<(), S3Error> {
+    // Header form takes precedence — if both are present and signed, the
+    // header is the one that goes into `canonical_headers`. The query form
+    // is still scanned so a header-absent / query-present URL is validated.
+    let mut marker_bytes: Option<Vec<u8>> = None;
+
+    if let Some(v) = parts.headers.get("x-amz-content-sha256") {
+        marker_bytes = Some(v.as_bytes().to_vec());
+    } else {
+        let raw_query = parts.uri.query().unwrap_or("");
+        for chunk in raw_query.split('&') {
+            if chunk.is_empty() {
+                continue;
+            }
+            let (raw_k, raw_v) = match chunk.split_once('=') {
+                Some((k, v)) => (k, v),
+                None => (chunk, ""),
+            };
+            let decoded_k = percent_decode_for_query(raw_k);
+            if decoded_k.as_slice() == b"X-Amz-Content-Sha256" {
+                marker_bytes = Some(percent_decode_for_query(raw_v));
+                break;
+            }
+        }
+    }
+
+    let Some(bytes) = marker_bytes else {
+        return Ok(());
+    };
+    let s = std::str::from_utf8(&bytes).map_err(|_| {
+        S3Error::authorization_header_malformed(
+            "x-amz-content-sha256 is not valid UTF-8",
+            request_id,
+        )
+    })?;
+    if s == "UNSIGNED-PAYLOAD" {
+        return Ok(());
+    }
+    if s.starts_with("STREAMING-") {
+        return Err(S3Error::unsupported_signature(
+            "presigned aws-chunked streaming uploads are not supported in strict mode; \
+             tracked in PR 5 of issue #63",
+            request_id,
+        ));
+    }
+    // 64 lowercase hex characters → a concrete signed-payload digest. AWS's
+    // documented presigned canonical request is `UNSIGNED-PAYLOAD`; supporting
+    // signed-payload presigned URLs would require buffering bodies on a path
+    // that currently avoids it. Deferred.
+    if s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(S3Error::invalid_request(
+            "presigned URLs with signed payload hashes are not supported",
+            request_id,
+        ));
+    }
+    Err(S3Error::authorization_header_malformed(
+        "presigned URL x-amz-content-sha256 must be UNSIGNED-PAYLOAD",
+        request_id,
+    ))
 }
 
 #[cfg(test)]
@@ -558,5 +803,284 @@ mod tests {
         let q = aws_doc_presigned_query().replace("%2Fs3%2Faws4_request", "%2Fec2%2Faws4_request");
         let err = parse_presigned_authorization(&q, rid()).expect_err("non-s3 service");
         assert_eq!(err.code, "AuthorizationHeaderMalformed");
+    }
+}
+
+#[cfg(test)]
+mod verify_tests {
+    use super::*;
+    use crate::auth::credentials::{
+        CredentialResolveError, InboundCredential, InboundCredentialResolver, InboundSecret,
+    };
+    use chrono::{TimeZone, Utc};
+    use http::Request;
+    use std::sync::Arc;
+
+    fn rid() -> &'static str {
+        "rid"
+    }
+
+    struct FixedResolver {
+        akid: Arc<str>,
+        secret: InboundSecret,
+    }
+
+    impl FixedResolver {
+        fn new(akid: &str, secret: &str) -> Self {
+            Self {
+                akid: Arc::from(akid),
+                secret: InboundSecret::new(secret.to_string()),
+            }
+        }
+    }
+
+    impl InboundCredentialResolver for FixedResolver {
+        fn resolve(
+            &self,
+            access_key_id: &str,
+            _session_token: Option<&str>,
+        ) -> Result<Option<Arc<InboundCredential>>, CredentialResolveError> {
+            if access_key_id == self.akid.as_ref() {
+                Ok(Some(Arc::new(InboundCredential {
+                    access_key_id: self.akid.clone(),
+                    secret_access_key: self.secret.clone(),
+                    session_token: None,
+                    expires_at: None,
+                })))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    // ── AWS-published reference vector ──────────────────────────────────
+    //
+    // The presigned GET URL example from AWS S3 docs (the one that lists
+    // `aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404` as
+    // the signature). Pinning this round trip means our canonical query
+    // construction, header normalization, signing-key derivation, and
+    // string-to-sign all match the documented AWS output bit-for-bit.
+
+    const AWS_DOC_AKID: &str = "AKIAIOSFODNN7EXAMPLE";
+    const AWS_DOC_SECRET: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+    const AWS_DOC_HOST: &str = "examplebucket.s3.amazonaws.com";
+    const AWS_DOC_SIGNATURE: &str =
+        "aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404";
+
+    fn aws_doc_query() -> String {
+        format!(
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256\
+             &X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request\
+             &X-Amz-Date=20130524T000000Z\
+             &X-Amz-Expires=86400\
+             &X-Amz-SignedHeaders=host\
+             &X-Amz-Signature={AWS_DOC_SIGNATURE}",
+        )
+    }
+
+    fn aws_doc_parts(query: &str) -> http::request::Parts {
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/test.txt?{query}"))
+            .header("host", AWS_DOC_HOST)
+            .body(())
+            .unwrap();
+        req.into_parts().0
+    }
+
+    fn aws_doc_now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2013, 5, 24, 1, 0, 0).unwrap()
+    }
+
+    fn aws_doc_resolver() -> FixedResolver {
+        FixedResolver::new(AWS_DOC_AKID, AWS_DOC_SECRET)
+    }
+
+    #[test]
+    fn test_aws_published_presigned_get_vector_round_trip() {
+        // The whole `aeeed9bb…` signature is documented by AWS — if any
+        // step in the verifier diverges (query sort, header trim, key
+        // derivation, string-to-sign layout) we get SignatureDoesNotMatch
+        // instead of a 200. Replacing `ExcludePresignedSignature` with
+        // `IncludeAll` flips this from Ok to SignatureDoesNotMatch.
+        let parts = aws_doc_parts(&aws_doc_query());
+        let resolver = aws_doc_resolver();
+        let verified =
+            verify_presigned_request(&parts, &resolver, rid(), aws_doc_now()).expect("verifies");
+        assert_eq!(&*verified.access_key_id, AWS_DOC_AKID);
+        assert_eq!(verified.request_signature_hex, AWS_DOC_SIGNATURE);
+        assert_eq!(verified.payload, PayloadHashForSigning::UnsignedPayload);
+    }
+
+    #[test]
+    fn test_aws_published_vector_tampered_query_value_fails() {
+        // Bump `X-Amz-Expires` from 86400 to 86500 — still keeps `aws_doc_now`
+        // inside the validity window, but flips one byte of the canonical
+        // query so our recomputed signature diverges from the AWS-published
+        // `aeeed9bb…` value.
+        let q = aws_doc_query().replace("&X-Amz-Expires=86400", "&X-Amz-Expires=86500");
+        let parts = aws_doc_parts(&q);
+        let err = verify_presigned_request(&parts, &aws_doc_resolver(), rid(), aws_doc_now())
+            .expect_err("tampered expires");
+        assert_eq!(err.code, "SignatureDoesNotMatch");
+    }
+
+    #[test]
+    fn test_aws_published_vector_tampered_host_fails() {
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/test.txt?{}", aws_doc_query()))
+            .header("host", "evil.example.com")
+            .body(())
+            .unwrap();
+        let (parts, _) = req.into_parts();
+        let err = verify_presigned_request(&parts, &aws_doc_resolver(), rid(), aws_doc_now())
+            .expect_err("tampered host");
+        assert_eq!(err.code, "SignatureDoesNotMatch");
+    }
+
+    #[test]
+    fn test_aws_published_vector_tampered_signature_fails() {
+        let q = aws_doc_query().replace(AWS_DOC_SIGNATURE, &"0".repeat(64));
+        let parts = aws_doc_parts(&q);
+        let err = verify_presigned_request(&parts, &aws_doc_resolver(), rid(), aws_doc_now())
+            .expect_err("tampered signature");
+        assert_eq!(err.code, "SignatureDoesNotMatch");
+    }
+
+    #[test]
+    fn test_unknown_access_key_rejected() {
+        let parts = aws_doc_parts(&aws_doc_query());
+        let other = FixedResolver::new("OTHER", AWS_DOC_SECRET);
+        let err = verify_presigned_request(&parts, &other, rid(), aws_doc_now())
+            .expect_err("unknown akid");
+        assert_eq!(err.code, "InvalidAccessKeyId");
+    }
+
+    // ── Validity-window edges ───────────────────────────────────────────
+    //
+    // X-Amz-Date is the inclusive lower bound; `X-Amz-Date + X-Amz-Expires`
+    // is the inclusive upper bound.
+
+    #[test]
+    fn test_validity_window_at_start_accepted() {
+        let parts = aws_doc_parts(&aws_doc_query());
+        let now = Utc.with_ymd_and_hms(2013, 5, 24, 0, 0, 0).unwrap();
+        verify_presigned_request(&parts, &aws_doc_resolver(), rid(), now)
+            .expect("exact start accepted");
+    }
+
+    #[test]
+    fn test_validity_window_at_expiry_accepted() {
+        let parts = aws_doc_parts(&aws_doc_query());
+        // 20130524T000000Z + 86400 seconds = 20130525T000000Z.
+        let now = Utc.with_ymd_and_hms(2013, 5, 25, 0, 0, 0).unwrap();
+        verify_presigned_request(&parts, &aws_doc_resolver(), rid(), now)
+            .expect("exact expiry accepted");
+    }
+
+    #[test]
+    fn test_validity_window_after_expiry_rejected() {
+        let parts = aws_doc_parts(&aws_doc_query());
+        let now = Utc.with_ymd_and_hms(2013, 5, 25, 0, 0, 1).unwrap();
+        let err =
+            verify_presigned_request(&parts, &aws_doc_resolver(), rid(), now).expect_err("expired");
+        assert_eq!(err.code, "RequestTimeTooSkewed");
+    }
+
+    #[test]
+    fn test_validity_window_before_start_rejected() {
+        let parts = aws_doc_parts(&aws_doc_query());
+        let now = Utc.with_ymd_and_hms(2013, 5, 23, 23, 59, 59).unwrap();
+        let err = verify_presigned_request(&parts, &aws_doc_resolver(), rid(), now)
+            .expect_err("not yet valid");
+        assert_eq!(err.code, "RequestTimeTooSkewed");
+    }
+
+    // ── Payload-marker rules ────────────────────────────────────────────
+
+    fn parts_with_extra_header(name: &str, value: &str) -> http::request::Parts {
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/test.txt?{}", aws_doc_query()))
+            .header("host", AWS_DOC_HOST)
+            .header(name, value)
+            .body(())
+            .unwrap();
+        req.into_parts().0
+    }
+
+    #[test]
+    fn test_unsigned_payload_header_accepted() {
+        // Setting `x-amz-content-sha256: UNSIGNED-PAYLOAD` doesn't enter the
+        // canonical request (the URL didn't sign that header), so the
+        // signature still matches the AWS-published vector.
+        let parts = parts_with_extra_header("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        verify_presigned_request(&parts, &aws_doc_resolver(), rid(), aws_doc_now())
+            .expect("unsigned-payload header accepted");
+    }
+
+    #[test]
+    fn test_signed_payload_hash_header_rejected() {
+        // 64 lowercase hex chars — looks like a signed body digest. PR 3
+        // doesn't support presigned URLs that sign over a concrete body
+        // hash, so this is InvalidRequest before signature work.
+        let parts = parts_with_extra_header(
+            "x-amz-content-sha256",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        );
+        let err = verify_presigned_request(&parts, &aws_doc_resolver(), rid(), aws_doc_now())
+            .expect_err("signed-payload hash");
+        assert_eq!(err.code, "InvalidRequest");
+    }
+
+    #[test]
+    fn test_streaming_payload_marker_header_rejected() {
+        let parts =
+            parts_with_extra_header("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD");
+        let err = verify_presigned_request(&parts, &aws_doc_resolver(), rid(), aws_doc_now())
+            .expect_err("streaming marker");
+        assert_eq!(err.code, "UnsupportedSignature");
+    }
+
+    // ── aws-chunked rejection (request-shape gate) ──────────────────────
+
+    #[test]
+    fn test_presigned_aws_chunked_content_encoding_rejected() {
+        let parts = parts_with_extra_header("content-encoding", "aws-chunked");
+        let err = verify_presigned_request(&parts, &aws_doc_resolver(), rid(), aws_doc_now())
+            .expect_err("aws-chunked CE");
+        assert_eq!(err.code, "UnsupportedSignature");
+    }
+
+    #[test]
+    fn test_presigned_x_amz_decoded_content_length_rejected() {
+        let parts = parts_with_extra_header("x-amz-decoded-content-length", "100");
+        let err = verify_presigned_request(&parts, &aws_doc_resolver(), rid(), aws_doc_now())
+            .expect_err("x-amz-decoded-content-length");
+        assert_eq!(err.code, "UnsupportedSignature");
+    }
+
+    #[test]
+    fn test_presigned_x_amz_trailer_rejected() {
+        let parts = parts_with_extra_header("x-amz-trailer", "x-amz-checksum-sha256");
+        let err = verify_presigned_request(&parts, &aws_doc_resolver(), rid(), aws_doc_now())
+            .expect_err("x-amz-trailer");
+        assert_eq!(err.code, "UnsupportedSignature");
+    }
+
+    #[test]
+    fn test_presigned_x_amz_content_sha256_streaming_query_rejected() {
+        // STREAMING-* via the X-Amz-Content-Sha256 query param. Some
+        // S3-compatible presigners put the marker on the URL instead of as
+        // a header; either form must fail closed.
+        let q = format!(
+            "{}&X-Amz-Content-Sha256=STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+            aws_doc_query()
+        );
+        let parts = aws_doc_parts(&q);
+        let err = verify_presigned_request(&parts, &aws_doc_resolver(), rid(), aws_doc_now())
+            .expect_err("streaming via query");
+        assert_eq!(err.code, "UnsupportedSignature");
     }
 }
