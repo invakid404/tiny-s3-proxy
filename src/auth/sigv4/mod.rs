@@ -247,27 +247,36 @@ fn derive_signing_key(
     // return type is `impl AsRef<[u8]>` (and it owns a different internal
     // buffer type), which is awkward to keep in our zeroized container.
     // Recomputing the four-step HMAC ourselves is trivial.
+    //
+    // Each intermediate HMAC output (kDate, kRegion, kService) is wrapped in
+    // `Zeroizing` so the stack-stored 32-byte buffer is wiped when the
+    // wrapper drops. Without this, the intermediates would linger in the
+    // stack frame after the function returns, defeating the point of
+    // zeroizing only the final kSigning.
     use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
 
-    fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
+    fn hmac(key: &[u8], data: &[u8]) -> Zeroizing<[u8; 32]> {
         let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key size");
         mac.update(data);
         let result = mac.finalize().into_bytes();
+
         let mut out = [0u8; 32];
         out.copy_from_slice(&result);
-        out
+        Zeroizing::new(out)
     }
 
     let mut prefix = Zeroizing::new(String::with_capacity(4 + secret.len()));
     prefix.push_str("AWS4");
     prefix.push_str(secret);
+
     let k_date = hmac(prefix.as_bytes(), date_yyyymmdd.as_bytes());
-    let k_region = hmac(&k_date, region.as_bytes());
-    let k_service = hmac(&k_region, service.as_bytes());
-    let k_signing = hmac(&k_service, b"aws4_request");
-    SigningKey(Zeroizing::new(k_signing))
+    let k_region = hmac(&k_date[..], region.as_bytes());
+    let k_service = hmac(&k_region[..], service.as_bytes());
+    let k_signing = hmac(&k_service[..], b"aws4_request");
+
+    SigningKey(k_signing)
 }
 
 fn build_string_to_sign(

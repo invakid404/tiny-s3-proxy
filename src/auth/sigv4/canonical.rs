@@ -18,7 +18,7 @@
 use crate::auth::sigv4::parser::SigV4Authorization;
 use crate::auth::sigv4::payload::PayloadHashForSigning;
 use crate::s3::errors::S3Error;
-use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_encode};
 
 /// AWS canonical query encoding: encode every byte that isn't an "unreserved"
 /// character per RFC 3986. Unreserved = `A-Z / a-z / 0-9 / - / . / _ / ~`.
@@ -85,40 +85,64 @@ pub fn build_canonical_request(
     })
 }
 
-/// Encode a string with AWS canonical encoding (RFC 3986 unreserved set,
+/// Encode raw bytes with AWS canonical encoding (RFC 3986 unreserved set,
 /// uppercase percent escapes).
-pub(crate) fn aws_uri_encode(s: &str) -> String {
-    utf8_percent_encode(s, AWS_CANONICAL_ENCODE).to_string()
+///
+/// Takes a byte slice rather than a `&str` because the decode-then-re-encode
+/// round trip in `canonicalize_query` operates on raw bytes: a
+/// percent-encoded query may carry arbitrary non-UTF-8 sequences and we
+/// must preserve them byte-for-byte across the canonical round trip.
+fn aws_uri_encode_bytes(bytes: &[u8]) -> String {
+    percent_encode(bytes, AWS_CANONICAL_ENCODE).to_string()
 }
 
-/// Decode a single percent-encoded query component. Tolerates `+` as a
-/// literal space (form-encoded behavior, which is how SDKs sign). Invalid
-/// percent escapes preserve the raw bytes so we can still produce *some*
-/// canonical string — a downstream signature mismatch will surface the
-/// problem clearly.
-fn percent_decode_for_query(s: &str) -> String {
+/// Decode a single percent-encoded query component to its raw bytes.
+///
+/// SigV4 (not form-encoding) semantics:
+/// - `%XX` decodes to the single byte with that hex value (both nibbles
+///   required; uppercase or lowercase).
+/// - `+` is a LITERAL plus sign — NOT a space. AWS S3 SigV4 specifies byte
+///   level URI encoding where space is `%20`. Treating `+` as space here
+///   would cause `prefix=a+b` to canonicalize to `a%20b` and the client's
+///   signature would never match.
+/// - Any other byte (including a `%` that isn't followed by two hex digits)
+///   is passed through verbatim, so the canonical request stays defined
+///   even for slightly malformed inputs; a real signature mismatch will
+///   surface the actual problem.
+///
+/// Returns `Vec<u8>` rather than `String` because percent-decoded query
+/// values may contain arbitrary bytes (e.g., a binary value carried via
+/// `%FF`). Converting through `String::from_utf8_lossy` would replace those
+/// bytes with U+FFFD and corrupt the canonical request.
+fn percent_decode_for_query(s: &str) -> Vec<u8> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
+
     while i < bytes.len() {
-        let b = bytes[i];
-        if b == b'+' {
-            out.push(b' ');
-            i += 1;
-        } else if b == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
-                out.push((h << 4) | l);
-                i += 3;
-            } else {
-                out.push(b);
-                i += 1;
-            }
-        } else {
-            out.push(b);
-            i += 1;
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(h), Some(l)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2]))
+        {
+            out.push((h << 4) | l);
+            i += 3;
+            continue;
         }
+        out.push(bytes[i]);
+        i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+
+    out
+}
+
+/// ASCII-case-insensitive byte-slice comparison. Used for the
+/// presigned-URL key detection so a percent-encoded `X-Amz-Signature` is
+/// recognised regardless of casing or encoding form.
+fn eq_ignore_ascii_case_bytes(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
 fn hex_nibble(b: u8) -> Option<u8> {
@@ -153,8 +177,15 @@ fn canonicalize_query(raw_query: &str, request_id: &str) -> Result<String, S3Err
         // SignatureDoesNotMatch errors. Surfacing
         // MissingAuthenticationToken at this stage mirrors what S3 returns
         // for an unsigned request and points the client at the real cause.
-        if raw_k.eq_ignore_ascii_case("X-Amz-Signature")
-            || percent_decode_for_query(raw_k).eq_ignore_ascii_case("X-Amz-Signature")
+        //
+        // We compare decoded BYTES (not lossy strings) so a percent-encoded
+        // key such as `X%2DAmz%2DSignature` is still recognised; the byte
+        // form means non-UTF-8 oddities can't sneak past the check via the
+        // lossy-decode replacement character.
+        let decoded_k = percent_decode_for_query(raw_k);
+        let decoded_v = percent_decode_for_query(raw_v);
+        if eq_ignore_ascii_case_bytes(raw_k.as_bytes(), b"X-Amz-Signature")
+            || eq_ignore_ascii_case_bytes(&decoded_k, b"X-Amz-Signature")
         {
             return Err(S3Error::missing_authentication_token(
                 "presigned URLs (X-Amz-Signature) are not supported in strict mode; \
@@ -163,9 +194,10 @@ fn canonicalize_query(raw_query: &str, request_id: &str) -> Result<String, S3Err
             ));
         }
 
-        let decoded_k = percent_decode_for_query(raw_k);
-        let decoded_v = percent_decode_for_query(raw_v);
-        pairs.push((aws_uri_encode(&decoded_k), aws_uri_encode(&decoded_v)));
+        pairs.push((
+            aws_uri_encode_bytes(&decoded_k),
+            aws_uri_encode_bytes(&decoded_v),
+        ));
     }
 
     pairs.sort();
@@ -433,5 +465,105 @@ mod tests {
         };
         let cr = build_canonical_request(&parts, &auth, &payload, "rid").unwrap();
         assert!(cr.canonical_request.ends_with("\nabc"));
+    }
+
+    // ── Byte-level query decoding round-trip ─────────────────────────────
+    //
+    // SigV4 (not form-encoding) semantics: `+` is a literal `+`, space is
+    // `%20`, and arbitrary non-UTF-8 byte values round-trip cleanly.
+
+    #[test]
+    fn test_literal_plus_in_query_value_not_form_decoded() {
+        // `a+b` on the wire is the literal three-character string `a+b`.
+        // AWS encoding emits `+` as `%2B`. Form-encoding semantics would
+        // (incorrectly) decode `+` to a space and re-encode it as `%20`,
+        // which would never match an AWS SDK signer's canonical form.
+        let parts = parts_with("/b?prefix=a+b", "GET", &[("host", "h")]);
+        let auth = auth_with_signed_headers(&["host"]);
+        let payload = PayloadHashForSigning::UnsignedPayload;
+        let cr = build_canonical_request(&parts, &auth, &payload, "rid").unwrap();
+        let lines: Vec<&str> = cr.canonical_request.split('\n').collect();
+        assert_eq!(lines[2], "prefix=a%2Bb");
+    }
+
+    #[test]
+    fn test_non_utf8_byte_value_round_trips() {
+        // A percent-encoded value `%FF%2B` is the two bytes [0xFF, 0x2B].
+        // A lossy UTF-8 decode would turn 0xFF into U+FFFD and corrupt the
+        // canonical request; the byte-level decoder must preserve 0xFF.
+        let parts = parts_with("/b?x=%FF%2B", "GET", &[("host", "h")]);
+        let auth = auth_with_signed_headers(&["host"]);
+        let payload = PayloadHashForSigning::UnsignedPayload;
+        let cr = build_canonical_request(&parts, &auth, &payload, "rid").unwrap();
+        let lines: Vec<&str> = cr.canonical_request.split('\n').collect();
+        assert_eq!(lines[2], "x=%FF%2B");
+    }
+
+    #[test]
+    fn test_percent_encoded_x_amz_signature_key_still_rejected() {
+        // `X%2DAmz%2DSignature` decodes (byte-level) to `X-Amz-Signature`.
+        // Our presigned-URL detection compares decoded bytes
+        // case-insensitively, so the encoded form must still trigger
+        // MissingAuthenticationToken.
+        let parts = parts_with(
+            "/b?X%2DAmz%2DSignature=deadbeef&foo=1",
+            "GET",
+            &[("host", "h")],
+        );
+        let auth = auth_with_signed_headers(&["host"]);
+        let payload = PayloadHashForSigning::UnsignedPayload;
+        let err = build_canonical_request(&parts, &auth, &payload, "rid")
+            .expect_err("encoded presigned key must reject");
+        assert_eq!(err.code, "MissingAuthenticationToken");
+
+        // Case variation too: lower-case raw key.
+        let parts = parts_with("/b?x-amz-signature=abc", "GET", &[("host", "h")]);
+        let err = build_canonical_request(&parts, &auth, &payload, "rid")
+            .expect_err("lowercase presigned key must reject");
+        assert_eq!(err.code, "MissingAuthenticationToken");
+    }
+
+    #[test]
+    fn test_trailing_bare_percent_passes_through() {
+        // A bare `%` at end-of-string is malformed; we pass it through
+        // verbatim rather than erroring (signature mismatch will surface
+        // the real issue if it matters).
+        let parts = parts_with("/b?x=foo%", "GET", &[("host", "h")]);
+        let auth = auth_with_signed_headers(&["host"]);
+        let payload = PayloadHashForSigning::UnsignedPayload;
+        let cr = build_canonical_request(&parts, &auth, &payload, "rid").unwrap();
+        let lines: Vec<&str> = cr.canonical_request.split('\n').collect();
+        // `%` is encoded as `%25` on re-encode.
+        assert_eq!(lines[2], "x=foo%25");
+    }
+
+    #[test]
+    fn test_malformed_single_hex_digit_passes_through() {
+        // `%X` (one hex digit) is malformed; verbatim pass-through means
+        // the `%` and `X` both survive into the decoded bytes and then get
+        // re-encoded as `%25X`.
+        let parts = parts_with("/b?x=%X", "GET", &[("host", "h")]);
+        let auth = auth_with_signed_headers(&["host"]);
+        let payload = PayloadHashForSigning::UnsignedPayload;
+        let cr = build_canonical_request(&parts, &auth, &payload, "rid").unwrap();
+        let lines: Vec<&str> = cr.canonical_request.split('\n').collect();
+        assert_eq!(lines[2], "x=%25X");
+    }
+
+    #[test]
+    fn test_aws_get_vanilla_query_unreserved_vector() {
+        // AWS reference vector "get-vanilla-query-unreserved" exercises a
+        // query string of all RFC 3986 unreserved characters — none of
+        // them should be percent-encoded by the canonicalizer. Confirms
+        // the byte-level decoder doesn't accidentally rewrite unreserved
+        // characters.
+        let unreserved = "-._~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+        let raw_query = format!("{unreserved}={unreserved}");
+        let parts = parts_with(&format!("/?{raw_query}"), "GET", &[("host", "h")]);
+        let auth = auth_with_signed_headers(&["host"]);
+        let payload = PayloadHashForSigning::UnsignedPayload;
+        let cr = build_canonical_request(&parts, &auth, &payload, "rid").unwrap();
+        let lines: Vec<&str> = cr.canonical_request.split('\n').collect();
+        assert_eq!(lines[2], raw_query);
     }
 }
