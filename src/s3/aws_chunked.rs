@@ -1,38 +1,35 @@
-//! Decoder for the AWS aws-chunked wire format. Handles three modes:
+//! Decoder for the AWS aws-chunked wire format. Handles five modes:
 //!
-//! - `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` (non-trailer): signed chunks, no
-//!   HTTP trailers after the final zero chunk.
+//! - `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` (non-trailer, HMAC): signed
+//!   chunks, no HTTP trailers after the final zero chunk.
+//! - `STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD` (non-trailer, ECDSA): same
+//!   shape with DER-hex chunk signatures (variable length, max 144 chars,
+//!   AWS CRT right-pads with `*` to that width).
 //! - `STREAMING-UNSIGNED-PAYLOAD-TRAILER`: bare-size chunk headers (no
 //!   signature), followed by a single `x-amz-checksum-*` trailer line.
-//! - `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`: signed chunks PLUS a
-//!   trailer line PLUS an `x-amz-trailer-signature` line. The
-//!   trailer-signature is shape-validated (64 lowercase hex chars) AND,
-//!   under [`ChunkSignaturePolicy::Verify`], cryptographically verified
-//!   against the trailer's canonical bytes.
+//! - `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`: HMAC-signed chunks PLUS
+//!   a trailer line PLUS an `x-amz-trailer-signature` line.
+//! - `STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER`: ECDSA-signed
+//!   variant of the signed-trailer mode.
 //!
-//! For HMAC-signed chunk modes the decoder additionally verifies each
-//! chunk's `chunk-signature=` against the chained HMAC when
-//! [`ChunkSignaturePolicy::Verify`] is supplied; trust-mode callers stay
-//! on [`ChunkSignaturePolicy::ShapeOnly`] and only shape-check the
-//! signature value. See `crate::auth::sigv4::streaming` for the math.
+//! For signed modes the decoder verifies each chunk's `chunk-signature=`
+//! against the chained per-request context — HMAC via
+//! `auth::sigv4::streaming::StreamingSigV4Context`, ECDSA via
+//! `auth::sigv4a::streaming::StreamingSigV4aContext` — when
+//! [`ChunkSignaturePolicy::VerifyHmac`] / [`ChunkSignaturePolicy::VerifyEcdsa`]
+//! is supplied; trust-mode callers stay on
+//! [`ChunkSignaturePolicy::ShapeOnly`] and only shape-check the
+//! signature value.
 //!
 //! For trailer modes the decoder ALSO validates that the declared checksum
 //! matches the computed checksum over the decoded body. A mismatch fails the
 //! decode before any backend contact happens.
-//!
-//! ECDSA streaming variants (`STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD*`)
-//! are out of scope: the inbound `chunk-signature` values are bound to the
-//! client's private key, so the proxy can neither validate them nor have
-//! the upstream re-validate them after re-signing. The dispatch layer
-//! rejects these requests outright with `UnsupportedSignature` (HTTP 400)
-//! — they never reach this decoder. See
-//! `handlers::modifiers::WriteBodyRoute::RejectUnsupportedSignature` and
-//! issue #63.
 
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::auth::sigv4::streaming::{StreamingSigV4Context, StreamingSigV4Error};
+use crate::auth::sigv4a::streaming::{StreamingSigV4aContext, StreamingSigV4aError};
 use crate::s3::checksum::{ChecksumAlgorithm, ChecksumHeader};
 
 /// The non-trailer SigV4 streaming sentinel.
@@ -47,6 +44,14 @@ pub const STREAMING_UNSIGNED_PAYLOAD_TRAILER: &str = "STREAMING-UNSIGNED-PAYLOAD
 pub const STREAMING_AWS4_HMAC_SHA256_PAYLOAD_TRAILER: &str =
     "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER";
 
+/// SigV4A non-trailer streaming sentinel.
+pub const STREAMING_AWS4_ECDSA_P256_SHA256_PAYLOAD: &str =
+    "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD";
+
+/// SigV4A signed-trailer streaming sentinel.
+pub const STREAMING_AWS4_ECDSA_P256_SHA256_PAYLOAD_TRAILER: &str =
+    "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER";
+
 /// Maximum bytes for a single trailer header line. Trailers are short
 /// (`x-amz-checksum-<algo>:<base64>`) so the cap is intentionally generous,
 /// matching the chunk-header cap rather than introducing a separate constant
@@ -58,8 +63,27 @@ pub const MAX_TRAILER_LINE_BYTES: usize = MAX_CHUNK_HEADER_LINE_BYTES;
 /// a malformed/never-terminating header line is sent.
 pub const MAX_CHUNK_HEADER_LINE_BYTES: usize = 4096;
 
-/// Required length of the hex-encoded chunk signature.
+/// Required length of the hex-encoded HMAC-SHA256 chunk signature.
+/// SigV4A signatures use a variable-length DER ECDSA encoding instead;
+/// see [`MAX_SIGV4A_DER_SIGNATURE_HEX_LEN`].
 pub const CHUNK_SIGNATURE_HEX_LEN: usize = 64;
+
+/// Signed-streaming chunk-signature algorithm. Carried on
+/// [`DecoderMode`] so the chunk-header parser can dispatch the
+/// HMAC-vs-ECDSA signature width / shape rules and so the decoder
+/// knows which streaming context type the policy is expected to
+/// supply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignedChunkAlgorithm {
+    /// HMAC-SHA256 chunk signatures (`STREAMING-AWS4-HMAC-SHA256-*`).
+    /// Wire format is exactly 64 lowercase hex chars.
+    HmacSha256,
+    /// ECDSA P-256 / SHA-256 chunk signatures
+    /// (`STREAMING-AWS4-ECDSA-P256-SHA256-*`). Wire format is
+    /// lowercase hex of a DER signature, variable length, right-padded
+    /// with `*` to `MAX_SIGV4A_DER_SIGNATURE_HEX_LEN` per AWS CRT.
+    EcdsaP256,
+}
 
 /// AWS-documented minimum size of any non-final signed chunk (8 KiB). Smaller
 /// non-final chunks fragment the signature stream and are rejected.
@@ -70,9 +94,14 @@ pub const MIN_NON_FINAL_CHUNK_BYTES: u64 = 8192;
 /// header — see `handlers::aws_chunked::decoder_mode_from_headers`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecoderMode {
-    /// Non-trailer SigV4 streaming. Chunk headers carry `;chunk-signature=...`,
-    /// no trailers follow the final zero chunk.
-    NonTrailer,
+    /// Signed-streaming non-trailer mode. Chunk headers carry
+    /// `;chunk-signature=...`; no trailers follow the final zero chunk.
+    /// `signature_algorithm` distinguishes HMAC-SHA256 (64 hex chars)
+    /// from ECDSA-P256 (DER hex, variable length up to 144, `*`-padded
+    /// on the wire).
+    NonTrailer {
+        signature_algorithm: SignedChunkAlgorithm,
+    },
     /// `STREAMING-UNSIGNED-PAYLOAD-TRAILER`. Chunk headers are bare
     /// `<hex-size>\r\n` (signature MUST be absent), and the stream ends with
     /// a single `x-amz-checksum-<algo>:<base64>` trailer line.
@@ -80,12 +109,15 @@ pub enum DecoderMode {
         expected_trailer_name: String,
         algorithm: ChecksumAlgorithm,
     },
-    /// `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`. Chunk headers carry
-    /// `;chunk-signature=...`, the stream ends with a trailer line followed
-    /// by `x-amz-trailer-signature:<64 hex>`.
+    /// Signed-trailer streaming mode. Chunk headers carry
+    /// `;chunk-signature=...`; the stream ends with a trailer line
+    /// followed by `x-amz-trailer-signature:<hex>`.
+    /// `signature_algorithm` distinguishes HMAC-SHA256 from
+    /// ECDSA-P256 (same width / padding rules as `NonTrailer`).
     SignedTrailer {
         expected_trailer_name: String,
         algorithm: ChecksumAlgorithm,
+        signature_algorithm: SignedChunkAlgorithm,
     },
 }
 
@@ -94,9 +126,24 @@ impl DecoderMode {
         !matches!(self, DecoderMode::UnsignedTrailer { .. })
     }
 
+    /// Chunk-signature algorithm for the signed variants; `None` for
+    /// unsigned trailer mode.
+    pub fn signed_chunk_algorithm(&self) -> Option<SignedChunkAlgorithm> {
+        match self {
+            DecoderMode::NonTrailer {
+                signature_algorithm,
+            }
+            | DecoderMode::SignedTrailer {
+                signature_algorithm,
+                ..
+            } => Some(*signature_algorithm),
+            DecoderMode::UnsignedTrailer { .. } => None,
+        }
+    }
+
     fn trailer_info(&self) -> Option<(&str, ChecksumAlgorithm, bool)> {
         match self {
-            DecoderMode::NonTrailer => None,
+            DecoderMode::NonTrailer { .. } => None,
             DecoderMode::UnsignedTrailer {
                 expected_trailer_name,
                 algorithm,
@@ -104,6 +151,7 @@ impl DecoderMode {
             DecoderMode::SignedTrailer {
                 expected_trailer_name,
                 algorithm,
+                ..
             } => Some((expected_trailer_name.as_str(), *algorithm, true)),
         }
     }
@@ -220,15 +268,20 @@ pub enum AwsChunkedError {
 /// signature when shape-parsing has succeeded.
 ///
 /// - [`ChunkSignaturePolicy::ShapeOnly`] preserves the trust-mode shape
-///   check: the signature has to be 64 lowercase hex chars, but its
+///   check: the signature has to be syntactically well-formed (the
+///   algorithm-specific shape from [`SignedChunkAlgorithm`]), but its
 ///   value isn't compared against anything. Used when strict-mode SigV4
 ///   isn't configured.
-/// - [`ChunkSignaturePolicy::Verify`] additionally verifies each chunk
+/// - [`ChunkSignaturePolicy::VerifyHmac`] additionally verifies each chunk
 ///   signature (and the trailer signature on signed-trailer mode) against
 ///   the chained HMAC seeded from the request's verified signature.
+/// - [`ChunkSignaturePolicy::VerifyEcdsa`] does the same for SigV4A
+///   streams: each chunk signature is verified against the ECDSA P-256
+///   key derived from the inbound credential.
 pub enum ChunkSignaturePolicy {
     ShapeOnly,
-    Verify(StreamingSigV4Context),
+    VerifyHmac(StreamingSigV4Context),
+    VerifyEcdsa(StreamingSigV4aContext),
 }
 
 /// Streaming aws-chunked decoder. Reads frames from `inner`, validates them,
@@ -268,10 +321,18 @@ pub struct AwsChunkedDecoder<R> {
 }
 
 impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
-    /// Build a non-trailer decoder. Equivalent to
-    /// `with_mode(inner, declared_decoded_len, DecoderMode::NonTrailer)`.
+    /// Build a non-trailer HMAC-SHA256 decoder. Equivalent to
+    /// `with_mode(inner, declared_decoded_len,
+    ///  DecoderMode::NonTrailer { signature_algorithm:
+    ///  SignedChunkAlgorithm::HmacSha256 })`.
     pub fn new(inner: R, declared_decoded_len: u64) -> Self {
-        Self::with_mode(inner, declared_decoded_len, DecoderMode::NonTrailer)
+        Self::with_mode(
+            inner,
+            declared_decoded_len,
+            DecoderMode::NonTrailer {
+                signature_algorithm: SignedChunkAlgorithm::HmacSha256,
+            },
+        )
     }
 
     /// Build a decoder for the specified wire-format mode in trust mode
@@ -289,11 +350,18 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
     }
 
     /// Build a decoder for the specified wire-format mode AND chunk-
-    /// signature policy. Strict-mode callers pass
-    /// [`ChunkSignaturePolicy::Verify`] with a [`StreamingSigV4Context`]
-    /// seeded from the request's verified signature so each chunk (and,
-    /// for signed-trailer mode, the trailer signature) is verified
-    /// against the chained HMAC before the decoded bytes are released.
+    /// signature policy.
+    ///
+    /// Strict-mode callers pass [`ChunkSignaturePolicy::VerifyHmac`]
+    /// with a [`StreamingSigV4Context`] (for `STREAMING-AWS4-HMAC-SHA256-*`
+    /// streams) or [`ChunkSignaturePolicy::VerifyEcdsa`] with a
+    /// [`StreamingSigV4aContext`] (for
+    /// `STREAMING-AWS4-ECDSA-P256-SHA256-*` streams), seeded from the
+    /// matching variant on the request's `VerifiedRequest`
+    /// `signing_context`. Each chunk — and, for signed-trailer mode,
+    /// the trailer signature — is verified against the chained
+    /// per-algorithm context (HMAC compare or ECDSA-P256/SHA-256
+    /// verify) before any decoded bytes are released to `writer`.
     pub fn with_mode_and_signature_policy(
         inner: R,
         declared_decoded_len: u64,
@@ -328,11 +396,12 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
     where
         W: AsyncWrite + Unpin,
     {
-        let expects_signature = self.mode.expects_chunk_signature();
+        let signed_algorithm = self.mode.signed_chunk_algorithm();
+        let expects_signature = signed_algorithm.is_some();
 
         loop {
             let header = self.read_chunk_header_line().await?;
-            let parsed = parse_chunk_header(&header, expects_signature)?;
+            let parsed = parse_chunk_header(&header, signed_algorithm)?;
             let chunk_size = parsed.size;
 
             if chunk_size == 0 {
@@ -367,44 +436,28 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
             let chunk_sha = self.copy_chunk_payload(writer, chunk_size).await?;
 
             // Strict-mode verification: each chunk's signature must match
-            // the chained HMAC. Run BEFORE consuming the post-payload CRLF
-            // so a tampered signature surfaces as `ChunkSignatureMismatch`
-            // even when the post-payload framing is also malformed —
-            // otherwise a request with both faults would surface as the
-            // framing error and mask the signature failure, and the read
-            // cursor would advance past bytes the verifier didn't need.
-            // Gated on `expects_signature` so unsigned-trailer mode never
-            // tries to verify a signature the wire format doesn't carry.
-            if expects_signature
-                && let ChunkSignaturePolicy::Verify(ctx) = &mut self.signature_policy
-            {
+            // the chained per-algorithm context. Run BEFORE consuming the
+            // post-payload CRLF so a tampered signature surfaces as
+            // `ChunkSignatureMismatch` even when the post-payload framing
+            // is also malformed — otherwise a request with both faults
+            // would surface as the framing error and mask the signature
+            // failure, and the read cursor would advance past bytes the
+            // verifier didn't need. Gated on `expects_signature` so
+            // unsigned-trailer mode never tries to verify a signature the
+            // wire format doesn't carry.
+            if expects_signature {
                 let supplied = parsed.signature_hex.expect(
                     "signed mode guarantees chunk-signature is present (parse_chunk_header would \
                      have errored otherwise)",
                 );
                 let chunk_sha_hex = hex_encode_lower(&chunk_sha);
-                match ctx.verify_payload_chunk(&chunk_sha_hex, supplied) {
-                    Ok(()) => {}
-                    Err(StreamingSigV4Error::ChunkSignatureMismatch) => {
-                        return Err(AwsChunkedError::ChunkSignatureMismatch {
-                            chunk_index: self.chunk_index,
-                        });
+                match &mut self.signature_policy {
+                    ChunkSignaturePolicy::ShapeOnly => {}
+                    ChunkSignaturePolicy::VerifyHmac(ctx) => {
+                        verify_hmac_chunk(ctx, &chunk_sha_hex, supplied, self.chunk_index)?;
                     }
-                    Err(StreamingSigV4Error::InvalidSignatureHex(_)) => {
-                        // `parse_chunk_header` already validated lowercase + 64-char.
-                        // Reaching this arm would indicate a shape regression there.
-                        return Err(AwsChunkedError::MalformedFrame {
-                            message: format!(
-                                "chunk-signature failed hex validation at chunk {}",
-                                self.chunk_index,
-                            ),
-                        });
-                    }
-                    Err(StreamingSigV4Error::TrailerSignatureMismatch) => {
-                        // verify_payload_chunk never produces this variant.
-                        unreachable!(
-                            "verify_payload_chunk does not produce TrailerSignatureMismatch"
-                        );
+                    ChunkSignaturePolicy::VerifyEcdsa(ctx) => {
+                        verify_ecdsa_chunk(ctx, &chunk_sha_hex, supplied, self.chunk_index)?;
                     }
                 }
             }
@@ -441,26 +494,27 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
         // returns `signature_hex: None` there, and there's nothing for the
         // streaming context to verify against.
         let expects_signature = self.mode.expects_chunk_signature();
-        if expects_signature && let ChunkSignaturePolicy::Verify(ctx) = &mut self.signature_policy {
+        if expects_signature {
             let supplied = zero_chunk_signature_hex
                 .as_deref()
                 .expect("signed mode guarantees final chunk-signature is present");
-            match ctx
-                .verify_payload_chunk(crate::auth::sigv4::streaming::EMPTY_SHA256_HEX, supplied)
-            {
-                Ok(()) => {}
-                Err(StreamingSigV4Error::ChunkSignatureMismatch) => {
-                    return Err(AwsChunkedError::ChunkSignatureMismatch {
-                        chunk_index: self.chunk_index,
-                    });
+            match &mut self.signature_policy {
+                ChunkSignaturePolicy::ShapeOnly => {}
+                ChunkSignaturePolicy::VerifyHmac(ctx) => {
+                    verify_hmac_chunk(
+                        ctx,
+                        crate::auth::sigv4::streaming::EMPTY_SHA256_HEX,
+                        supplied,
+                        self.chunk_index,
+                    )?;
                 }
-                Err(StreamingSigV4Error::InvalidSignatureHex(_)) => {
-                    return Err(AwsChunkedError::MalformedFrame {
-                        message: "final chunk-signature failed hex validation".to_string(),
-                    });
-                }
-                Err(StreamingSigV4Error::TrailerSignatureMismatch) => {
-                    unreachable!("verify_payload_chunk does not produce TrailerSignatureMismatch");
+                ChunkSignaturePolicy::VerifyEcdsa(ctx) => {
+                    verify_ecdsa_chunk(
+                        ctx,
+                        crate::auth::sigv4a::streaming::EMPTY_SHA256_HEX,
+                        supplied,
+                        self.chunk_index,
+                    )?;
                 }
             }
         }
@@ -483,32 +537,60 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
             Some((expected_name, algo, signed)) => {
                 let parsed = self.read_and_validate_trailer(&expected_name, algo).await?;
                 if signed {
-                    let trailer_sig = self.read_and_validate_trailer_signature().await?;
+                    let trailer_algorithm = self
+                        .mode
+                        .signed_chunk_algorithm()
+                        .expect("signed-trailer mode must carry a chunk-signature algorithm");
+                    let trailer_sig = self
+                        .read_and_validate_trailer_signature(trailer_algorithm)
+                        .await?;
                     // Strict-mode trailer signature verification. The canonical
                     // trailer bytes are `<lowercase-name>:<value>\n` — the
                     // `x-amz-trailer-signature` line itself is NOT included.
-                    if let ChunkSignaturePolicy::Verify(ctx) = &self.signature_policy {
-                        let mut canonical =
-                            Vec::with_capacity(parsed.name.len() + parsed.value.len() + 2);
-                        canonical.extend_from_slice(parsed.name.to_ascii_lowercase().as_bytes());
-                        canonical.push(b':');
-                        canonical.extend_from_slice(parsed.value.as_bytes());
-                        canonical.push(b'\n');
-                        match ctx.verify_trailer(&canonical, &trailer_sig) {
-                            Ok(()) => {}
-                            Err(StreamingSigV4Error::TrailerSignatureMismatch) => {
-                                return Err(AwsChunkedError::TrailerSignatureMismatch);
+                    let mut canonical =
+                        Vec::with_capacity(parsed.name.len() + parsed.value.len() + 2);
+                    canonical.extend_from_slice(parsed.name.to_ascii_lowercase().as_bytes());
+                    canonical.push(b':');
+                    canonical.extend_from_slice(parsed.value.as_bytes());
+                    canonical.push(b'\n');
+                    match &self.signature_policy {
+                        ChunkSignaturePolicy::ShapeOnly => {}
+                        ChunkSignaturePolicy::VerifyHmac(ctx) => {
+                            match ctx.verify_trailer(&canonical, &trailer_sig) {
+                                Ok(()) => {}
+                                Err(StreamingSigV4Error::TrailerSignatureMismatch) => {
+                                    return Err(AwsChunkedError::TrailerSignatureMismatch);
+                                }
+                                Err(StreamingSigV4Error::InvalidSignatureHex(_)) => {
+                                    return Err(AwsChunkedError::InvalidTrailerSignature {
+                                        message: "x-amz-trailer-signature failed hex validation"
+                                            .to_string(),
+                                    });
+                                }
+                                Err(StreamingSigV4Error::ChunkSignatureMismatch) => {
+                                    unreachable!(
+                                        "verify_trailer does not produce ChunkSignatureMismatch"
+                                    );
+                                }
                             }
-                            Err(StreamingSigV4Error::InvalidSignatureHex(_)) => {
-                                return Err(AwsChunkedError::InvalidTrailerSignature {
-                                    message: "x-amz-trailer-signature failed hex validation"
-                                        .to_string(),
-                                });
-                            }
-                            Err(StreamingSigV4Error::ChunkSignatureMismatch) => {
-                                unreachable!(
-                                    "verify_trailer does not produce ChunkSignatureMismatch"
-                                );
+                        }
+                        ChunkSignaturePolicy::VerifyEcdsa(ctx) => {
+                            match ctx.verify_trailer(&canonical, &trailer_sig) {
+                                Ok(()) => {}
+                                Err(StreamingSigV4aError::TrailerSignatureMismatch) => {
+                                    return Err(AwsChunkedError::TrailerSignatureMismatch);
+                                }
+                                Err(StreamingSigV4aError::InvalidSignatureHex(_)) => {
+                                    return Err(AwsChunkedError::InvalidTrailerSignature {
+                                        message: "x-amz-trailer-signature failed hex validation"
+                                            .to_string(),
+                                    });
+                                }
+                                Err(StreamingSigV4aError::ChunkSignatureMismatch) => {
+                                    unreachable!(
+                                        "verify_trailer does not produce ChunkSignatureMismatch"
+                                    );
+                                }
                             }
                         }
                     }
@@ -725,12 +807,17 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
         })
     }
 
-    /// Read the `x-amz-trailer-signature:<64 hex>` line that follows the
+    /// Read the `x-amz-trailer-signature:<hex>` line that follows the
     /// declared trailer on signed-trailer uploads. Shape-validates the
-    /// 64-lowercase-hex form and returns the value so a strict-mode
-    /// caller can drive [`StreamingSigV4Context::verify_trailer`] over it.
-    /// The trailing line terminator (CRLF or bare LF) is consumed.
-    async fn read_and_validate_trailer_signature(&mut self) -> Result<String, AwsChunkedError> {
+    /// hex form for `algorithm` (HMAC: exactly 64 lowercase hex chars;
+    /// ECDSA: lowercase DER hex up to 144 chars, optional `*` padding)
+    /// and returns the value so a strict-mode caller can drive the
+    /// matching streaming-context's `verify_trailer` over it. The
+    /// trailing line terminator (CRLF or bare LF) is consumed.
+    async fn read_and_validate_trailer_signature(
+        &mut self,
+        algorithm: SignedChunkAlgorithm,
+    ) -> Result<String, AwsChunkedError> {
         let line = self
             .read_trailer_line("x-amz-trailer-signature")
             .await
@@ -754,19 +841,16 @@ impl<R: AsyncRead + Unpin> AwsChunkedDecoder<R> {
             });
         }
         let sig = value.trim();
-        if sig.len() != CHUNK_SIGNATURE_HEX_LEN {
-            return Err(AwsChunkedError::InvalidTrailerSignature {
-                message: format!(
-                    "x-amz-trailer-signature must be {CHUNK_SIGNATURE_HEX_LEN} hex chars, got {}",
-                    sig.len(),
-                ),
-            });
-        }
-        if !sig.bytes().all(is_lower_hex_byte) {
-            return Err(AwsChunkedError::InvalidTrailerSignature {
-                message: "x-amz-trailer-signature must be lowercase hex".to_string(),
-            });
-        }
+        validate_chunk_signature_shape(sig, algorithm).map_err(|e| match e {
+            // Re-map the chunk-signature error to a trailer-specific one
+            // so the wire response says "InvalidRequest:
+            // invalid trailer signature" rather than the generic frame
+            // malformedness it would for a chunk header.
+            AwsChunkedError::MalformedFrame { message } => {
+                AwsChunkedError::InvalidTrailerSignature { message }
+            }
+            other => other,
+        })?;
         Ok(sig.to_string())
     }
 
@@ -881,58 +965,27 @@ struct ParsedChunkHeader<'a> {
 
 /// Parse a chunk header line.
 ///
-/// When `expects_signature` is true (non-trailer and signed-trailer modes),
-/// the form is `<hex-size>;chunk-signature=<64 hex>`. When false (unsigned
-/// trailer mode), the form is the bare `<hex-size>` with no extensions; any
-/// `;`-extension is rejected.
+/// When `signed_algorithm` is `Some(_)` the form is
+/// `<hex-size>;chunk-signature=<hex>`; signature shape is enforced per
+/// algorithm (HMAC: exactly 64 lowercase hex chars; ECDSA P-256:
+/// lowercase hex of a DER signature, up to 144 chars, optional trailing
+/// `*` padding to that width per AWS CRT).
+///
+/// When `signed_algorithm` is `None` (unsigned trailer mode) the form
+/// is the bare `<hex-size>` with no extensions; any `;`-extension is
+/// rejected so a spurious signature on an unsigned-trailer chunk
+/// (an SDK-side mistake) can't smuggle past the gate.
 fn parse_chunk_header(
     line: &str,
-    expects_signature: bool,
+    signed_algorithm: Option<SignedChunkAlgorithm>,
 ) -> Result<ParsedChunkHeader<'_>, AwsChunkedError> {
-    if expects_signature {
-        // Split on the first `;`. Anything before is the hex size; the
-        // remainder must be exactly `chunk-signature=<64 hex>`.
-        let (size_part, sig_part) =
-            line.split_once(';')
-                .ok_or_else(|| AwsChunkedError::MalformedFrame {
-                    message: format!(
-                        "chunk header missing `;chunk-signature=` extension: `{line}`",
-                    ),
-                })?;
-
-        let size = parse_chunk_size(size_part)?;
-
-        let sig_hex = sig_part.strip_prefix("chunk-signature=").ok_or_else(|| {
-            AwsChunkedError::MalformedFrame {
-                message: format!(
-                    "chunk header extension is not `chunk-signature=...`: `{sig_part}`",
-                ),
-            }
-        })?;
-        if sig_hex.len() != CHUNK_SIGNATURE_HEX_LEN {
-            return Err(AwsChunkedError::MalformedFrame {
-                message: format!(
-                    "chunk-signature must be {CHUNK_SIGNATURE_HEX_LEN} hex chars, got {}",
-                    sig_hex.len(),
-                ),
-            });
-        }
-        if !sig_hex.bytes().all(is_lower_hex_byte) {
-            return Err(AwsChunkedError::MalformedFrame {
-                message: "chunk-signature must be lowercase hex".to_string(),
-            });
-        }
-        Ok(ParsedChunkHeader {
-            size,
-            signature_hex: Some(sig_hex),
-        })
-    } else {
-        // Unsigned trailer mode: bare `<hex-size>`. Any extension — including
-        // a spurious `chunk-signature` — is a framing violation. Rejecting
-        // here is the load-bearing classifier: a signature appearing on an
-        // unsigned-trailer chunk is the kind of thing a client SDK might do
-        // by mistake, and forwarding it would mean we accepted a stream we
-        // didn't actually validate.
+    let Some(algorithm) = signed_algorithm else {
+        // Unsigned trailer mode: bare `<hex-size>`. Any extension —
+        // including a spurious `chunk-signature` — is a framing
+        // violation. Rejecting here is the load-bearing classifier: a
+        // signature appearing on an unsigned-trailer chunk is the kind
+        // of thing a client SDK might do by mistake, and forwarding it
+        // would mean we accepted a stream we didn't actually validate.
         if line.contains(';') {
             return Err(AwsChunkedError::MalformedFrame {
                 message: format!(
@@ -940,10 +993,130 @@ fn parse_chunk_header(
                 ),
             });
         }
-        Ok(ParsedChunkHeader {
+        return Ok(ParsedChunkHeader {
             size: parse_chunk_size(line)?,
             signature_hex: None,
-        })
+        });
+    };
+
+    // Signed modes: split on the first `;`. Anything before is the
+    // hex size; the remainder must be `chunk-signature=<hex>`.
+    let (size_part, sig_part) =
+        line.split_once(';')
+            .ok_or_else(|| AwsChunkedError::MalformedFrame {
+                message: format!("chunk header missing `;chunk-signature=` extension: `{line}`",),
+            })?;
+    let size = parse_chunk_size(size_part)?;
+    let sig_hex = sig_part.strip_prefix("chunk-signature=").ok_or_else(|| {
+        AwsChunkedError::MalformedFrame {
+            message: format!("chunk header extension is not `chunk-signature=...`: `{sig_part}`",),
+        }
+    })?;
+    validate_chunk_signature_shape(sig_hex, algorithm)?;
+    Ok(ParsedChunkHeader {
+        size,
+        signature_hex: Some(sig_hex),
+    })
+}
+
+/// Shape-validate a chunk-signature hex string per `algorithm`. Returns
+/// `Ok(())` for syntactically valid signatures (including the `*`-padded
+/// ECDSA form). Cryptographic verification happens later via the
+/// chunk-signature policy.
+pub(crate) fn validate_chunk_signature_shape(
+    sig_hex: &str,
+    algorithm: SignedChunkAlgorithm,
+) -> Result<(), AwsChunkedError> {
+    match algorithm {
+        SignedChunkAlgorithm::HmacSha256 => {
+            if sig_hex.len() != CHUNK_SIGNATURE_HEX_LEN {
+                return Err(AwsChunkedError::MalformedFrame {
+                    message: format!(
+                        "chunk-signature must be {CHUNK_SIGNATURE_HEX_LEN} hex chars, got {}",
+                        sig_hex.len(),
+                    ),
+                });
+            }
+            if !sig_hex.bytes().all(is_lower_hex_byte) {
+                return Err(AwsChunkedError::MalformedFrame {
+                    message: "chunk-signature must be lowercase hex".to_string(),
+                });
+            }
+            Ok(())
+        }
+        SignedChunkAlgorithm::EcdsaP256 => {
+            // AWS CRT right-pads SigV4A chunk signatures with `*` to
+            // `MAX_SIGV4A_DER_SIGNATURE_HEX_LEN`. After trimming the
+            // padding the bytes MUST be a valid DER ECDSA P-256
+            // signature — not just lowercase hex of the right shape.
+            // `parse_streaming_der_signature_hex_padded` strips the
+            // padding, checks hex shape, and calls `Signature::from_der`
+            // inline; failure surfaces as `MalformedFrame` so the
+            // handler maps it to `IncompleteBody` (a framing error),
+            // NOT `ChunkSignatureMismatch`. The latter is reserved for
+            // valid DER that doesn't match the chained ECDSA
+            // verification.
+            //
+            // Trust mode (shape-only) and strict mode both go through
+            // here, so non-DER ECDSA wire shapes are rejected up front
+            // regardless of whether per-chunk crypto verification is
+            // configured.
+            crate::auth::sigv4a::crypto::parse_streaming_der_signature_hex_padded(sig_hex)
+                .map(|_| ())
+                .map_err(|e| AwsChunkedError::MalformedFrame {
+                    message: format!("SigV4A chunk-signature failed shape validation: {e}"),
+                })
+        }
+    }
+}
+
+/// HMAC chunk-signature verify. Maps streaming-context errors onto the
+/// decoder's `AwsChunkedError` variants. Shared between the in-loop and
+/// final-chunk verification sites so both paths produce identical wire
+/// errors for identical failures.
+fn verify_hmac_chunk(
+    ctx: &mut StreamingSigV4Context,
+    chunk_sha_hex: &str,
+    supplied: &str,
+    chunk_index: u64,
+) -> Result<(), AwsChunkedError> {
+    match ctx.verify_payload_chunk(chunk_sha_hex, supplied) {
+        Ok(()) => Ok(()),
+        Err(StreamingSigV4Error::ChunkSignatureMismatch) => {
+            Err(AwsChunkedError::ChunkSignatureMismatch { chunk_index })
+        }
+        Err(StreamingSigV4Error::InvalidSignatureHex(_)) => {
+            // `parse_chunk_header` already validated shape; reaching
+            // this arm would indicate a regression there.
+            Err(AwsChunkedError::MalformedFrame {
+                message: format!("chunk-signature failed hex validation at chunk {chunk_index}",),
+            })
+        }
+        Err(StreamingSigV4Error::TrailerSignatureMismatch) => {
+            unreachable!("verify_payload_chunk does not produce TrailerSignatureMismatch")
+        }
+    }
+}
+
+/// ECDSA chunk-signature verify. Same shape as `verify_hmac_chunk` but
+/// over the SigV4A streaming context.
+fn verify_ecdsa_chunk(
+    ctx: &mut StreamingSigV4aContext,
+    chunk_sha_hex: &str,
+    supplied: &str,
+    chunk_index: u64,
+) -> Result<(), AwsChunkedError> {
+    match ctx.verify_payload_chunk(chunk_sha_hex, supplied) {
+        Ok(()) => Ok(()),
+        Err(StreamingSigV4aError::ChunkSignatureMismatch) => {
+            Err(AwsChunkedError::ChunkSignatureMismatch { chunk_index })
+        }
+        Err(StreamingSigV4aError::InvalidSignatureHex(_)) => Err(AwsChunkedError::MalformedFrame {
+            message: format!("SigV4A chunk-signature failed hex validation at chunk {chunk_index}",),
+        }),
+        Err(StreamingSigV4aError::TrailerSignatureMismatch) => {
+            unreachable!("verify_payload_chunk does not produce TrailerSignatureMismatch")
+        }
     }
 }
 
@@ -1380,6 +1553,7 @@ mod tests {
         DecoderMode::SignedTrailer {
             expected_trailer_name: algo.header_name().to_string(),
             algorithm: algo,
+            signature_algorithm: SignedChunkAlgorithm::HmacSha256,
         }
     }
 
@@ -1731,7 +1905,7 @@ mod tests {
         // 64 uppercase hex characters — protocol mandates lowercase.
         let upper = "0".repeat(63) + "A";
         let line = format!("8;chunk-signature={upper}");
-        let err = parse_chunk_header(&line, true).unwrap_err();
+        let err = parse_chunk_header(&line, Some(SignedChunkAlgorithm::HmacSha256)).unwrap_err();
         assert!(
             matches!(err, AwsChunkedError::MalformedFrame { .. }),
             "got {err:?}"
@@ -1741,7 +1915,7 @@ mod tests {
     #[test]
     fn test_parse_header_empty_size_rejected() {
         let line = format!(";chunk-signature={SIG}");
-        let err = parse_chunk_header(&line, true).unwrap_err();
+        let err = parse_chunk_header(&line, Some(SignedChunkAlgorithm::HmacSha256)).unwrap_err();
         assert!(
             matches!(err, AwsChunkedError::MalformedFrame { .. }),
             "got {err:?}"
@@ -1751,14 +1925,15 @@ mod tests {
     #[test]
     fn test_parse_header_returns_signature_hex() {
         let line = format!("8;chunk-signature={SIG}");
-        let parsed = parse_chunk_header(&line, true).expect("valid signed header");
+        let parsed = parse_chunk_header(&line, Some(SignedChunkAlgorithm::HmacSha256))
+            .expect("valid signed header");
         assert_eq!(parsed.size, 8);
         assert_eq!(parsed.signature_hex, Some(SIG));
     }
 
     #[test]
     fn test_parse_header_unsigned_has_no_signature() {
-        let parsed = parse_chunk_header("8", false).expect("valid unsigned header");
+        let parsed = parse_chunk_header("8", None).expect("valid unsigned header");
         assert_eq!(parsed.size, 8);
         assert_eq!(parsed.signature_hex, None);
     }
@@ -1881,7 +2056,7 @@ mod tests {
     }
 
     fn verify_ctx() -> ChunkSignaturePolicy {
-        ChunkSignaturePolicy::Verify(StreamingSigV4Context::from_parts(
+        ChunkSignaturePolicy::VerifyHmac(StreamingSigV4Context::from_parts(
             test_signing_key(),
             TEST_AMZ_DATE,
             TEST_SCOPE,
@@ -1915,7 +2090,9 @@ mod tests {
         let (decoded, summary) = decode_with_policy(
             &frame,
             payload.len() as u64,
-            DecoderMode::NonTrailer,
+            DecoderMode::NonTrailer {
+                signature_algorithm: SignedChunkAlgorithm::HmacSha256,
+            },
             verify_ctx(),
         )
         .await
@@ -1967,7 +2144,9 @@ mod tests {
         let err = decode_with_policy(
             &frame,
             payload.len() as u64,
-            DecoderMode::NonTrailer,
+            DecoderMode::NonTrailer {
+                signature_algorithm: SignedChunkAlgorithm::HmacSha256,
+            },
             verify_ctx(),
         )
         .await
@@ -2013,7 +2192,9 @@ mod tests {
         let err = decode_with_policy(
             &frame,
             payload.len() as u64,
-            DecoderMode::NonTrailer,
+            DecoderMode::NonTrailer {
+                signature_algorithm: SignedChunkAlgorithm::HmacSha256,
+            },
             verify_ctx(),
         )
         .await
@@ -2050,7 +2231,9 @@ mod tests {
         let err = decode_with_policy(
             &frame,
             payload.len() as u64,
-            DecoderMode::NonTrailer,
+            DecoderMode::NonTrailer {
+                signature_algorithm: SignedChunkAlgorithm::HmacSha256,
+            },
             verify_ctx(),
         )
         .await
@@ -2123,9 +2306,16 @@ mod tests {
         frame[target..target + 64].copy_from_slice(wrong_c2_sig.as_bytes());
 
         let total = (c1.len() + c2.len()) as u64;
-        let err = decode_with_policy(&frame, total, DecoderMode::NonTrailer, verify_ctx())
-            .await
-            .expect_err("broken chain must fail");
+        let err = decode_with_policy(
+            &frame,
+            total,
+            DecoderMode::NonTrailer {
+                signature_algorithm: SignedChunkAlgorithm::HmacSha256,
+            },
+            verify_ctx(),
+        )
+        .await
+        .expect_err("broken chain must fail");
         match err {
             AwsChunkedError::ChunkSignatureMismatch { chunk_index } => {
                 assert_eq!(chunk_index, 1);
@@ -2145,12 +2335,323 @@ mod tests {
         let (decoded, _) = decode_with_policy(
             &frame,
             payload.len() as u64,
-            DecoderMode::NonTrailer,
+            DecoderMode::NonTrailer {
+                signature_algorithm: SignedChunkAlgorithm::HmacSha256,
+            },
             ChunkSignaturePolicy::ShapeOnly,
         )
         .await
         .expect("shape-only mode must accept dummy signatures");
         assert_eq!(decoded, payload);
+    }
+
+    // ---- SigV4A (ECDSA-P256) streaming end-to-end coverage ----
+
+    use crate::auth::sigv4a::crypto::{
+        MAX_SIGV4A_DER_SIGNATURE_HEX_LEN, derive_sigv4a_verifying_key,
+    };
+    use crate::auth::sigv4a::streaming::StreamingSigV4aContext;
+    use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+
+    const ECDSA_AMZ_DATE: &str = "20260101T120000Z";
+    const ECDSA_SCOPE: &str = "20260101/s3/aws4_request";
+    const ECDSA_AKID: &str = "AKIDEXAMPLE";
+    const ECDSA_SECRET: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+    const ECDSA_SEED_SIG: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    fn ecdsa_signing_key() -> SigningKey {
+        let scalar = aws_sigv4::sign::v4a::generate_signing_key(ECDSA_AKID, ECDSA_SECRET);
+        SigningKey::from_bytes(scalar.as_ref()).unwrap()
+    }
+
+    fn ecdsa_verify_ctx() -> ChunkSignaturePolicy {
+        let vk = derive_sigv4a_verifying_key(ECDSA_AKID, ECDSA_SECRET).unwrap();
+        ChunkSignaturePolicy::VerifyEcdsa(StreamingSigV4aContext::from_parts(
+            vk,
+            ECDSA_AMZ_DATE,
+            ECDSA_SCOPE,
+            ECDSA_SEED_SIG,
+        ))
+    }
+
+    fn compute_ecdsa_chunk_sig(
+        signing_key: &SigningKey,
+        prev_sig: &str,
+        chunk_data: &[u8],
+    ) -> String {
+        let chunk_sha_hex = {
+            let mut h = Sha256::new();
+            h.update(chunk_data);
+            hex_encode_lower(&h.finalize())
+        };
+        let sts = format!(
+            "AWS4-ECDSA-P256-SHA256-PAYLOAD\n{ECDSA_AMZ_DATE}\n{ECDSA_SCOPE}\n{prev_sig}\n\
+             e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n{chunk_sha_hex}",
+        );
+        let sig: Signature = signing_key.sign(sts.as_bytes());
+        hex::encode(sig.to_der().as_ref())
+    }
+
+    fn build_ecdsa_non_trailer_stream(signing_key: &SigningKey, chunks: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut prev = ECDSA_SEED_SIG.to_string();
+        for c in chunks {
+            let sig = compute_ecdsa_chunk_sig(signing_key, &prev, c);
+            out.extend_from_slice(format!("{:x};chunk-signature={sig}\r\n", c.len()).as_bytes());
+            out.extend_from_slice(c);
+            out.extend_from_slice(b"\r\n");
+            prev = sig;
+        }
+        let zero_sig = compute_ecdsa_chunk_sig(signing_key, &prev, b"");
+        out.extend_from_slice(format!("0;chunk-signature={zero_sig}\r\n\r\n").as_bytes());
+        out
+    }
+
+    /// PR 5 of #63: an ECDSA-signed aws-chunked stream end-to-end —
+    /// chunk signatures verify against the chained `StreamingSigV4aContext`,
+    /// decode succeeds. Mirrors `test_decoder_verifies_signed_non_trailer_chunks`
+    /// for the HMAC path.
+    ///
+    /// Bug-revert reasoning: dropping the `ChunkSignaturePolicy::VerifyEcdsa`
+    /// arm from `decode_to_writer` (or its companion in `finalize`) lets a
+    /// tampered ECDSA chunk slip past — assertions below would no longer
+    /// hold once such a tamper is introduced.
+    #[tokio::test]
+    async fn test_decoder_verifies_signed_non_trailer_chunks_ecdsa() {
+        let key = ecdsa_signing_key();
+        let payload = b"hello-ecdsa-streaming";
+        let frame = build_ecdsa_non_trailer_stream(&key, &[payload]);
+        let mode = DecoderMode::NonTrailer {
+            signature_algorithm: SignedChunkAlgorithm::EcdsaP256,
+        };
+        let (decoded, summary) =
+            decode_with_policy(&frame, payload.len() as u64, mode, ecdsa_verify_ctx())
+                .await
+                .expect("valid ECDSA chunks must verify");
+        assert_eq!(decoded, payload);
+        assert_eq!(summary.decoded_len, payload.len() as u64);
+    }
+
+    /// Padded chunk signatures (`*`-padded to 144 hex chars per AWS CRT)
+    /// must verify and the chain must advance against the trimmed value.
+    /// Without `*`-stripping in the parser / chain advancement, the next
+    /// chunk's signature would diverge.
+    #[tokio::test]
+    async fn test_decoder_accepts_padded_ecdsa_chunk_signatures() {
+        let key = ecdsa_signing_key();
+        let payload = b"padded-ecdsa-chunk-test";
+        let chunk_sig = compute_ecdsa_chunk_sig(&key, ECDSA_SEED_SIG, payload);
+        let pad_len = MAX_SIGV4A_DER_SIGNATURE_HEX_LEN - chunk_sig.len();
+        let padded_chunk_sig = format!("{chunk_sig}{}", "*".repeat(pad_len));
+
+        let zero_sig = compute_ecdsa_chunk_sig(&key, &chunk_sig, b"");
+        let pad_len_zero = MAX_SIGV4A_DER_SIGNATURE_HEX_LEN - zero_sig.len();
+        let padded_zero_sig = format!("{zero_sig}{}", "*".repeat(pad_len_zero));
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(
+            format!("{:x};chunk-signature={padded_chunk_sig}\r\n", payload.len()).as_bytes(),
+        );
+        frame.extend_from_slice(payload);
+        frame.extend_from_slice(b"\r\n");
+        frame.extend_from_slice(format!("0;chunk-signature={padded_zero_sig}\r\n\r\n").as_bytes());
+
+        let mode = DecoderMode::NonTrailer {
+            signature_algorithm: SignedChunkAlgorithm::EcdsaP256,
+        };
+        decode_with_policy(&frame, payload.len() as u64, mode, ecdsa_verify_ctx())
+            .await
+            .expect("padded ECDSA chunks must verify");
+    }
+
+    /// Tampered ECDSA chunk signature → `ChunkSignatureMismatch`. The
+    /// signature decodes as DER (shape-valid) but the ECDSA verify
+    /// fails because we flipped a hex digit.
+    #[tokio::test]
+    async fn test_decoder_rejects_tampered_ecdsa_chunk_signature() {
+        let key = ecdsa_signing_key();
+        let payload = b"tampered-ecdsa-chunk";
+        let mut frame = build_ecdsa_non_trailer_stream(&key, &[payload]);
+
+        // Find first `chunk-signature=` and flip a hex digit AFTER the prefix.
+        let needle = b"chunk-signature=";
+        let idx = frame
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("chunk-signature present")
+            + needle.len();
+        // Bump a hex digit a few characters in (avoid the very first
+        // byte which is often a DER length byte and might be 0x30 ='3').
+        frame[idx + 10] = if frame[idx + 10] == b'a' { b'b' } else { b'a' };
+
+        let mode = DecoderMode::NonTrailer {
+            signature_algorithm: SignedChunkAlgorithm::EcdsaP256,
+        };
+        let err = decode_with_policy(&frame, payload.len() as u64, mode, ecdsa_verify_ctx())
+            .await
+            .expect_err("tampered ECDSA chunk must error");
+        match err {
+            AwsChunkedError::ChunkSignatureMismatch { chunk_index } => {
+                assert_eq!(chunk_index, 0, "first chunk was tampered");
+            }
+            AwsChunkedError::MalformedFrame { .. } => {
+                // Some byte-flips land on a position that breaks DER
+                // structure rather than the signature math itself; that
+                // also surfaces as a shape malformedness. Either outcome
+                // is the "reject, don't accept" we're pinning.
+            }
+            other => panic!("expected ChunkSignatureMismatch or MalformedFrame, got {other:?}"),
+        }
+    }
+
+    /// Non-DER ECDSA chunk signature hex (here: 8-char `deadbeef`,
+    /// well-formed lowercase hex but not a valid DER signature) must
+    /// surface `MalformedFrame` at the decoder's shape-validation step,
+    /// NOT `ChunkSignatureMismatch`. The wire-format error code is the
+    /// load-bearing thing: malformed framing maps to `IncompleteBody`
+    /// (a 400) at the handler layer; `ChunkSignatureMismatch` maps to
+    /// `SignatureDoesNotMatch` (a 403). Routing a shape problem
+    /// through the crypto-mismatch path tells the client the wrong
+    /// remediation.
+    ///
+    /// Trust mode (shape-only) still rejects non-DER bytes — shape
+    /// validation is independent of crypto.
+    ///
+    /// Bug-revert reasoning: dropping the
+    /// `parse_streaming_der_signature_hex_padded` call inside
+    /// `validate_chunk_signature_shape`'s `EcdsaP256` arm flips this
+    /// from `MalformedFrame` (trust mode) / `MalformedFrame` (strict
+    /// mode through the same gate) back to `Ok(_)` in trust mode and
+    /// `ChunkSignatureMismatch` in strict mode.
+    #[tokio::test]
+    async fn test_decoder_rejects_non_der_ecdsa_chunk_signature_shape_only() {
+        // 8-char lowercase hex — well-formed hex, valid `*`-padded
+        // streaming shape, but NOT a DER ECDSA signature.
+        let frame: Vec<u8> =
+            b"5;chunk-signature=deadbeef\r\nhello\r\n0;chunk-signature=cafef00d\r\n\r\n".to_vec();
+        let mode = DecoderMode::NonTrailer {
+            signature_algorithm: SignedChunkAlgorithm::EcdsaP256,
+        };
+        // Trust mode (shape-only) MUST still reject non-DER bytes.
+        let err = decode_with_policy(&frame, 5, mode, ChunkSignaturePolicy::ShapeOnly)
+            .await
+            .expect_err("non-DER chunk signature must reject even in trust mode");
+        assert!(
+            matches!(err, AwsChunkedError::MalformedFrame { .. }),
+            "expected MalformedFrame, got {err:?}",
+        );
+    }
+
+    /// Same input as above but with the strict-mode ECDSA verify
+    /// policy. The shape check fires before any crypto, so the wire
+    /// error is still `MalformedFrame` — NOT
+    /// `ChunkSignatureMismatch`.
+    ///
+    /// Bug-revert reasoning: moving the DER validation from
+    /// `validate_chunk_signature_shape` to inside the verifier flips
+    /// this from `MalformedFrame` to `ChunkSignatureMismatch`, and
+    /// the wire response code changes from `IncompleteBody`/400 to
+    /// `SignatureDoesNotMatch`/403.
+    #[tokio::test]
+    async fn test_decoder_rejects_non_der_ecdsa_chunk_signature_strict_mode() {
+        let frame: Vec<u8> =
+            b"5;chunk-signature=deadbeef\r\nhello\r\n0;chunk-signature=cafef00d\r\n\r\n".to_vec();
+        let mode = DecoderMode::NonTrailer {
+            signature_algorithm: SignedChunkAlgorithm::EcdsaP256,
+        };
+        let err = decode_with_policy(&frame, 5, mode, ecdsa_verify_ctx())
+            .await
+            .expect_err("non-DER chunk signature must reject in strict mode too");
+        assert!(
+            matches!(err, AwsChunkedError::MalformedFrame { .. }),
+            "expected MalformedFrame (NOT ChunkSignatureMismatch), got {err:?}",
+        );
+    }
+
+    /// Companion to the negative cases above: a valid-DER chunk
+    /// signature that doesn't crypto-match (the chain says the
+    /// previous-signature is different) MUST surface
+    /// `ChunkSignatureMismatch`, not `MalformedFrame`. Proves the
+    /// layering: shape errors → framing path, crypto errors → mismatch
+    /// path.
+    #[tokio::test]
+    async fn test_decoder_valid_der_with_crypto_mismatch_is_chunk_signature_mismatch() {
+        let key = ecdsa_signing_key();
+        let payload = b"valid-der-wrong-content";
+
+        // Sign chunk 1 against a DIFFERENT previous-signature than the
+        // verifier's seed. The DER is well-formed; the math is wrong.
+        let wrong_prev = "1".repeat(64);
+        let chunk_sig = compute_ecdsa_chunk_sig(&key, &wrong_prev, payload);
+        let zero_sig = compute_ecdsa_chunk_sig(&key, &chunk_sig, b"");
+        let mut frame = Vec::new();
+        frame.extend_from_slice(
+            format!("{:x};chunk-signature={chunk_sig}\r\n", payload.len()).as_bytes(),
+        );
+        frame.extend_from_slice(payload);
+        frame.extend_from_slice(b"\r\n");
+        frame.extend_from_slice(format!("0;chunk-signature={zero_sig}\r\n\r\n").as_bytes());
+
+        let mode = DecoderMode::NonTrailer {
+            signature_algorithm: SignedChunkAlgorithm::EcdsaP256,
+        };
+        let err = decode_with_policy(&frame, payload.len() as u64, mode, ecdsa_verify_ctx())
+            .await
+            .expect_err("valid DER + crypto-mismatch must error");
+        match err {
+            AwsChunkedError::ChunkSignatureMismatch { chunk_index: 0 } => {}
+            other => panic!("expected ChunkSignatureMismatch on chunk 0, got {other:?}"),
+        }
+    }
+
+    /// Non-DER ECDSA trailer signature must surface
+    /// `InvalidTrailerSignature` (mapped to `InvalidRequest` at the
+    /// handler) regardless of policy. This is the trailer-side
+    /// analogue of `test_decoder_rejects_non_der_ecdsa_chunk_signature_*`.
+    ///
+    /// Bug-revert reasoning: the trailer-signature read path
+    /// (`read_and_validate_trailer_signature`) calls
+    /// `validate_chunk_signature_shape` and re-maps its
+    /// `MalformedFrame` to `InvalidTrailerSignature`. Either dropping
+    /// the DER validation OR dropping the remap flips this assertion.
+    #[tokio::test]
+    async fn test_decoder_rejects_non_der_ecdsa_trailer_signature() {
+        let key = ecdsa_signing_key();
+        let payload = b"trailer-shape-test";
+        let algo = ChecksumAlgorithm::Crc32;
+        let trailer_value = compute_trailer_value(algo, payload);
+
+        // Build a signed-trailer frame whose trailer-signature line is
+        // syntactically lowercase hex but not DER. We reuse the
+        // ECDSA-stream builder helper to get the chunk + zero-chunk
+        // signatures right, then substitute the trailer signature.
+        let mut frame = Vec::new();
+        let mut prev = ECDSA_SEED_SIG.to_string();
+        let payload_sig = compute_ecdsa_chunk_sig(&key, &prev, payload);
+        frame.extend_from_slice(
+            format!("{:x};chunk-signature={payload_sig}\r\n", payload.len()).as_bytes(),
+        );
+        frame.extend_from_slice(payload);
+        frame.extend_from_slice(b"\r\n");
+        prev = payload_sig;
+        let zero_sig = compute_ecdsa_chunk_sig(&key, &prev, b"");
+        frame.extend_from_slice(format!("0;chunk-signature={zero_sig}\r\n").as_bytes());
+        frame.extend_from_slice(format!("{}:{trailer_value}\r\n", algo.header_name()).as_bytes());
+        // Non-DER trailer signature.
+        frame.extend_from_slice(b"x-amz-trailer-signature:deadbeefdeadbeef\r\n\r\n");
+
+        let mode = DecoderMode::SignedTrailer {
+            expected_trailer_name: algo.header_name().to_string(),
+            algorithm: algo,
+            signature_algorithm: SignedChunkAlgorithm::EcdsaP256,
+        };
+        let err = decode_with_policy(&frame, payload.len() as u64, mode, ecdsa_verify_ctx())
+            .await
+            .expect_err("non-DER trailer signature must error");
+        assert!(
+            matches!(err, AwsChunkedError::InvalidTrailerSignature { .. }),
+            "expected InvalidTrailerSignature, got {err:?}",
+        );
     }
 
     /// Unsigned-trailer mode has no chunk signatures to verify. Even

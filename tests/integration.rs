@@ -2347,67 +2347,6 @@ async fn test_aws_chunked_unsigned_trailer_upload_part_routes_to_decoder() {
     );
 }
 
-/// ECDSA-signed streaming uploads (`STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD`)
-/// must be rejected up front with `UnsupportedSignature` (HTTP 400) rather
-/// than silently routed through passthrough. The inbound `chunk-signature`
-/// values are bound to the client's private key, so passthrough would
-/// re-sign with the proxy backend credentials and the chunk signatures
-/// would never validate on the upstream — failing fast avoids pointless
-/// backend traffic.
-///
-/// Pins HTTP 400 + `<Code>UnsupportedSignature</Code>` + zero upstream
-/// contact, so a regression that routes ECDSA back to passthrough flips
-/// all three assertions.
-#[tokio::test]
-#[ignore]
-async fn test_aws_chunked_ecdsa_streaming_rejected_as_unsupported_signature() {
-    let mock = CountingMockUpstream::new();
-    let mock_endpoint = start_counting_mock_upstream(mock.clone()).await;
-    let cache_dir = tempfile::TempDir::new().expect("cache dir");
-    let (_proxy_client, _http_client, proxy_endpoint, _cache_dir) =
-        build_proxy_stack_with_opts(&mock_endpoint, cache_dir, |_cfg| {}).await;
-    let proxy_host = proxy_endpoint.strip_prefix("http://").unwrap();
-
-    // Single-chunk framed body, same shape as the trailer-mode test.
-    let body: Vec<u8> =
-        b"8;chunk-signature=0000000000000000000000000000000000000000000000000000000000000000\r\n\
-        abcdefgh\r\n\
-        0;chunk-signature=0000000000000000000000000000000000000000000000000000000000000000\r\n\
-        \r\n"
-            .to_vec();
-    let headers = format!(
-        "PUT /{TEST_BUCKET}/cold-review/aws-chunked-ecdsa-routing HTTP/1.1\r\n\
-         Host: {proxy_host}\r\n\
-         Content-Length: {body_len}\r\n\
-         Content-Encoding: aws-chunked\r\n\
-         x-amz-content-sha256: STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD\r\n\
-         x-amz-decoded-content-length: 8\r\n\
-         Connection: close\r\n\
-         \r\n",
-        body_len = body.len(),
-    );
-    let mut request_bytes = headers.into_bytes();
-    request_bytes.extend_from_slice(&body);
-    let (status, raw_response) = raw_tcp_request(proxy_host, &request_bytes).await;
-    assert_eq!(
-        status, 400,
-        "ECDSA streaming must be rejected with HTTP 400",
-    );
-    let resp_text = String::from_utf8_lossy(&raw_response);
-    assert!(
-        resp_text.contains("<Code>UnsupportedSignature</Code>"),
-        "expected UnsupportedSignature S3 error code, got: {resp_text}",
-    );
-    // Upstream must not have been contacted: this is the load-bearing
-    // "rejected before backend contact" assertion.
-    assert_eq!(
-        mock.received_count
-            .load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "upstream must not be contacted when ECDSA is rejected up front",
-    );
-}
-
 /// A non-trailer aws-chunked PUT whose `x-amz-decoded-content-length` exceeds
 /// the configured `max_request_body_bytes` must be rejected with
 /// `EntityTooLarge` (HTTP 400) **before** the proxy contacts the backend —
@@ -4891,5 +4830,656 @@ async fn test_strict_sigv4_rejects_bad_signature_on_non_first_chunk() {
     assert!(
         head.is_err(),
         "object must not exist on the backend after a tampered-chunk-1 PUT was rejected"
+    );
+}
+
+// ============================================================================
+// SigV4A (AWS4-ECDSA-P256-SHA256) inbound verification (PR 5 of #63)
+// ============================================================================
+
+/// Manually sign a SigV4A request and return the `Authorization` header
+/// alongside the original header map (so the caller can replay the
+/// exact byte sequence the signer canonicalized over).
+///
+/// Uses the same `aws_sigv4::sign::v4a::generate_signing_key` + `p256`
+/// pipeline AWS SDKs use; the only thing custom here is the SigV4A
+/// canonical-request layout, which we duplicate inline rather than
+/// re-export from the crate's `(crate)` builder.
+fn sign_sigv4a_get_request(
+    proxy_host: &str,
+    path_and_query: &str,
+    amz_date: &str,
+    region_set: &str,
+    akid: &str,
+    secret: &str,
+) -> String {
+    use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+    use sha2::{Digest, Sha256};
+
+    let body_hash = "UNSIGNED-PAYLOAD";
+    let signed_headers = "host;x-amz-content-sha256;x-amz-date;x-amz-region-set";
+    let canonical = format!(
+        "GET\n{path_and_query}\n\nhost:{proxy_host}\nx-amz-content-sha256:{body_hash}\nx-amz-date:{amz_date}\nx-amz-region-set:{region_set}\n\n{signed_headers}\n{body_hash}",
+    );
+    let creq_hex = {
+        let mut h = Sha256::new();
+        h.update(canonical.as_bytes());
+        hex::encode(h.finalize())
+    };
+    let date_yyyymmdd = &amz_date[..8];
+    let scope = format!("{date_yyyymmdd}/s3/aws4_request");
+    let sts = format!("AWS4-ECDSA-P256-SHA256\n{amz_date}\n{scope}\n{creq_hex}");
+    let scalar = aws_sigv4::sign::v4a::generate_signing_key(akid, secret);
+    let signing_key = SigningKey::from_bytes(scalar.as_ref()).expect("signing key");
+    let sig: Signature = signing_key.sign(sts.as_bytes());
+    let der_hex = hex::encode(sig.to_der().as_ref());
+    format!(
+        "AWS4-ECDSA-P256-SHA256 Credential={akid}/{date_yyyymmdd}/s3/aws4_request, SignedHeaders={signed_headers}, Signature={der_hex}"
+    )
+}
+
+fn proxy_host_only(proxy_endpoint: &str) -> String {
+    proxy_endpoint
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// SigV4A header-auth happy path: a manually-signed GET (the same KDF +
+/// p256 pipeline AWS SDKs use) round-trips through the proxy. Pre-seeds
+/// the backend so the GET has something to return.
+///
+/// Bug-revert reasoning: dropping the `verify_sigv4a_der_signature`
+/// call in `auth::sigv4a::verify_authorization_header_at` lets a
+/// tampered request slip through, but it would also let this happy
+/// path keep passing — what guards against that is the tamper test
+/// below. This test pins the routing + parser + KDF + verify chain
+/// end-to-end: if any step misclassifies the algorithm or builds the
+/// wrong scope, the proxy returns SignatureDoesNotMatch instead of
+/// the body.
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4a_accepts_valid_manual_get() {
+    let (_container, backend_endpoint) = start_versitygw().await;
+    ensure_test_bucket(&backend_endpoint).await;
+    let backend_client =
+        build_raw_s3_client(&backend_endpoint, TEST_ACCESS_KEY, TEST_SECRET_KEY).await;
+    backend_client
+        .put_object()
+        .bucket(TEST_BUCKET)
+        .key("sigv4a-get.txt")
+        .body(b"sigv4a-payload".to_vec().into())
+        .send()
+        .await
+        .expect("seed object");
+
+    let (_strict_sdk, _wrong, proxy_endpoint, _cache, _creds) =
+        build_strict_proxy_stack(&backend_endpoint).await;
+    let host = proxy_host_only(&proxy_endpoint);
+    let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let path = format!("/{TEST_BUCKET}/sigv4a-get.txt");
+    let auth = sign_sigv4a_get_request(
+        &host,
+        &path,
+        &amz_date,
+        "us-east-1",
+        STRICT_INBOUND_KEY,
+        STRICT_INBOUND_SECRET,
+    );
+
+    let http_client = reqwest::Client::new();
+    let resp = http_client
+        .get(format!("{proxy_endpoint}{path}"))
+        .header("host", &host)
+        .header("x-amz-date", &amz_date)
+        .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+        .header("x-amz-region-set", "us-east-1")
+        .header("authorization", &auth)
+        .send()
+        .await
+        .expect("send manual SigV4A GET");
+    let status = resp.status().as_u16();
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(
+        status,
+        200,
+        "SigV4A GET should succeed; body: {}",
+        String::from_utf8_lossy(&body),
+    );
+    assert_eq!(body.as_ref(), b"sigv4a-payload");
+}
+
+/// Tamper the `host` header AFTER signing — the canonical request the
+/// proxy builds will differ from the one the signer used, and the
+/// ECDSA verify fails with `SignatureDoesNotMatch` (HTTP 403).
+///
+/// Bug-revert reasoning: removing the explicit ECDSA verify call in
+/// the SigV4A header-auth verifier (just trusting the parser) flips
+/// this from 403 to 200.
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4a_rejects_tampered_host() {
+    let (_container, backend_endpoint) = start_versitygw().await;
+    ensure_test_bucket(&backend_endpoint).await;
+    let (_strict_sdk, _wrong, proxy_endpoint, _cache, _creds) =
+        build_strict_proxy_stack(&backend_endpoint).await;
+    let host = proxy_host_only(&proxy_endpoint);
+    let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let path = format!("/{TEST_BUCKET}/sigv4a-tamper.txt");
+    let auth = sign_sigv4a_get_request(
+        &host,
+        &path,
+        &amz_date,
+        "us-east-1",
+        STRICT_INBOUND_KEY,
+        STRICT_INBOUND_SECRET,
+    );
+
+    let http_client = reqwest::Client::new();
+    let resp = http_client
+        .get(format!("{proxy_endpoint}{path}"))
+        // Wrong host: signer used `proxy_host_only(...)`.
+        .header("host", "evil.example")
+        .header("x-amz-date", &amz_date)
+        .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+        .header("x-amz-region-set", "us-east-1")
+        .header("authorization", &auth)
+        .send()
+        .await
+        .expect("send tampered request");
+    assert_eq!(resp.status().as_u16(), 403);
+    let body = resp.bytes().await.unwrap();
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(
+        body_str.contains("SignatureDoesNotMatch"),
+        "expected SignatureDoesNotMatch, got: {body_str}",
+    );
+}
+
+/// SigV4A requires `x-amz-region-set` to be present AND signed.
+/// Stripping the header after signing surfaces
+/// `AuthorizationHeaderMalformed` (HTTP 400) up front, before any
+/// crypto runs.
+///
+/// Bug-revert reasoning: dropping `ensure_sigv4a_region_set_signed`
+/// from the verifier flips this to either 200 (the canonical builder
+/// just omits the missing header) or 403 (signature mismatch), but
+/// the wire response code changes either way.
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4a_rejects_missing_region_set() {
+    let (_container, backend_endpoint) = start_versitygw().await;
+    ensure_test_bucket(&backend_endpoint).await;
+    let (_strict_sdk, _wrong, proxy_endpoint, _cache, _creds) =
+        build_strict_proxy_stack(&backend_endpoint).await;
+    let host = proxy_host_only(&proxy_endpoint);
+    let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let path = format!("/{TEST_BUCKET}/sigv4a-noregion.txt");
+    let auth = sign_sigv4a_get_request(
+        &host,
+        &path,
+        &amz_date,
+        "us-east-1",
+        STRICT_INBOUND_KEY,
+        STRICT_INBOUND_SECRET,
+    );
+
+    let http_client = reqwest::Client::new();
+    let resp = http_client
+        .get(format!("{proxy_endpoint}{path}"))
+        .header("host", &host)
+        .header("x-amz-date", &amz_date)
+        .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+        // Intentionally omit x-amz-region-set.
+        .header("authorization", &auth)
+        .send()
+        .await
+        .expect("send no-region request");
+    assert_eq!(resp.status().as_u16(), 400);
+    let body = resp.bytes().await.unwrap();
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(
+        body_str.contains("AuthorizationHeaderMalformed"),
+        "expected AuthorizationHeaderMalformed, got: {body_str}",
+    );
+}
+
+/// SigV4A presigned URL round-trip: build a presigned GET with
+/// `X-Amz-Algorithm=AWS4-ECDSA-P256-SHA256` + `X-Amz-Region-Set`,
+/// sign the canonical query, and confirm the proxy decodes / verifies
+/// it. Pre-seeds the backend.
+///
+/// Bug-revert reasoning: dropping the presigned ECDSA dispatch in
+/// `SigV4Verifier::verify_at` (the `classify_presigned_algorithm`
+/// branch) routes this through the HMAC presigned verifier instead,
+/// which rejects the `AWS4-ECDSA-P256-SHA256` algorithm as
+/// `AuthorizationHeaderMalformed`; this test catches that regression.
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4a_presigned_get_round_trip() {
+    use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+    use sha2::{Digest, Sha256};
+
+    let (_container, backend_endpoint) = start_versitygw().await;
+    ensure_test_bucket(&backend_endpoint).await;
+    let backend_client =
+        build_raw_s3_client(&backend_endpoint, TEST_ACCESS_KEY, TEST_SECRET_KEY).await;
+    backend_client
+        .put_object()
+        .bucket(TEST_BUCKET)
+        .key("sigv4a-presigned.txt")
+        .body(b"sigv4a-presigned-body".to_vec().into())
+        .send()
+        .await
+        .expect("seed object");
+
+    let (_strict_sdk, _wrong, proxy_endpoint, _cache, _creds) =
+        build_strict_proxy_stack(&backend_endpoint).await;
+    let host = proxy_host_only(&proxy_endpoint);
+    let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let date_yyyymmdd = &amz_date[..8];
+
+    fn enc(s: &str) -> String {
+        const HEX: &[u8] = b"0123456789ABCDEF";
+        let mut out = String::with_capacity(s.len());
+        for &b in s.as_bytes() {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+                out.push(b as char);
+            } else {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0f) as usize] as char);
+            }
+        }
+        out
+    }
+
+    let credential_enc = enc(&format!(
+        "{STRICT_INBOUND_KEY}/{date_yyyymmdd}/s3/aws4_request"
+    ));
+    let region_set_enc = enc("us-east-1");
+    let signed_headers_enc = enc("host");
+    let query_no_sig = format!(
+        "X-Amz-Algorithm=AWS4-ECDSA-P256-SHA256\
+         &X-Amz-Credential={credential_enc}\
+         &X-Amz-Date={amz_date}\
+         &X-Amz-Expires=3600\
+         &X-Amz-Region-Set={region_set_enc}\
+         &X-Amz-SignedHeaders={signed_headers_enc}",
+    );
+    let path = format!("/{TEST_BUCKET}/sigv4a-presigned.txt");
+    let canonical = format!("GET\n{path}\n{query_no_sig}\nhost:{host}\n\nhost\nUNSIGNED-PAYLOAD",);
+    let creq_hex = {
+        let mut h = Sha256::new();
+        h.update(canonical.as_bytes());
+        hex::encode(h.finalize())
+    };
+    let scope = format!("{date_yyyymmdd}/s3/aws4_request");
+    let sts = format!("AWS4-ECDSA-P256-SHA256\n{amz_date}\n{scope}\n{creq_hex}");
+    let scalar =
+        aws_sigv4::sign::v4a::generate_signing_key(STRICT_INBOUND_KEY, STRICT_INBOUND_SECRET);
+    let signing_key = SigningKey::from_bytes(scalar.as_ref()).expect("signing key");
+    let sig: Signature = signing_key.sign(sts.as_bytes());
+    let signature_hex = hex::encode(sig.to_der().as_ref());
+    let presigned_url =
+        format!("{proxy_endpoint}{path}?{query_no_sig}&X-Amz-Signature={signature_hex}",);
+
+    let http_client = reqwest::Client::new();
+    let resp = http_client
+        .get(&presigned_url)
+        .header("host", &host)
+        .send()
+        .await
+        .expect("send SigV4A presigned GET");
+    let status = resp.status().as_u16();
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(
+        status,
+        200,
+        "SigV4A presigned GET should succeed; body: {}",
+        String::from_utf8_lossy(&body),
+    );
+    assert_eq!(body.as_ref(), b"sigv4a-presigned-body");
+}
+
+/// Strict-mode SigV4A streaming PUT: the full chain from
+/// request-level SigV4A envelope verification → `VerifiedRequest` with
+/// `EcdsaP256` signing context → `ChunkSignaturePolicy::VerifyEcdsa` →
+/// per-chunk ECDSA verify against the chained `(akid, secret)`-derived
+/// verifying key → typed backend upload.
+///
+/// Drives two ≥ 8 KiB payload chunks plus the zero chunk so the chain
+/// advancement and the `MIN_NON_FINAL_CHUNK_BYTES` floor are both
+/// exercised. Verifies the decoded object exists on the backend with
+/// the expected bytes.
+///
+/// Bug-revert reasoning: dropping the `EcdsaP256` arm from
+/// `signature_policy_for_decode` (or its `VerifyEcdsa` branch in the
+/// decoder's chunk loop) flips this from a successful round trip to
+/// either `SignatureDoesNotMatch` (chain mismatch) or
+/// `MalformedFrame`, depending on which arm is removed. The backend
+/// presence check then fails because the object was never uploaded.
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4a_streaming_put_round_trip() {
+    use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+    use sha2::{Digest, Sha256};
+
+    // aws-chunked decode requires an HTTPS backend (the proxy refuses
+    // to forward an `UNSIGNED-PAYLOAD` body over plaintext HTTP after
+    // decoding). Same harness the HMAC streaming round-trip test uses.
+    let tls = generate_test_tls();
+    let (_container, backend_endpoint) = start_versitygw_https(&tls).await;
+
+    let direct_http_client = aws_http_client_trusting(&tls.ca_pem);
+    let direct_client = build_raw_s3_client_with_http_client(
+        &backend_endpoint,
+        TEST_ACCESS_KEY,
+        TEST_SECRET_KEY,
+        direct_http_client,
+    )
+    .await;
+    direct_client
+        .create_bucket()
+        .bucket(TEST_BUCKET)
+        .send()
+        .await
+        .expect("create_bucket on HTTPS VersityGW");
+
+    let (proxy_endpoint, _cache_dir, _creds_file) =
+        build_strict_proxy_stack_with_https_backend(&backend_endpoint, &tls.ca_pem).await;
+    let proxy_host = proxy_host_only(&proxy_endpoint);
+    let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let date_yyyymmdd = &amz_date[..8];
+    let scope = format!("{date_yyyymmdd}/s3/aws4_request");
+
+    // Two payload chunks ≥ MIN_NON_FINAL_CHUNK_BYTES (8 KiB each).
+    let chunk1: Vec<u8> = vec![b'A'; 10_000];
+    let chunk2: Vec<u8> = vec![b'B'; 10_000];
+    let decoded_len = chunk1.len() + chunk2.len();
+    let decoded_body: Vec<u8> = chunk1.iter().chain(chunk2.iter()).copied().collect();
+
+    let path = format!("/{TEST_BUCKET}/sigv4a-streaming.txt");
+    let region_set = "us-east-1";
+    let payload_sentinel = "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD";
+    let signed_headers_str =
+        "host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length;x-amz-region-set";
+
+    // Request-level canonical request + SigV4A header signature.
+    let canonical = format!(
+        "PUT\n{path}\n\nhost:{proxy_host}\nx-amz-content-sha256:{payload_sentinel}\n\
+         x-amz-date:{amz_date}\nx-amz-decoded-content-length:{decoded_len}\n\
+         x-amz-region-set:{region_set}\n\n{signed_headers_str}\n{payload_sentinel}",
+    );
+    let creq_hex = {
+        let mut h = Sha256::new();
+        h.update(canonical.as_bytes());
+        hex::encode(h.finalize())
+    };
+    let sts = format!("AWS4-ECDSA-P256-SHA256\n{amz_date}\n{scope}\n{creq_hex}");
+    let scalar =
+        aws_sigv4::sign::v4a::generate_signing_key(STRICT_INBOUND_KEY, STRICT_INBOUND_SECRET);
+    let signing_key = SigningKey::from_bytes(scalar.as_ref()).expect("signing key");
+    let seed_sig: Signature = signing_key.sign(sts.as_bytes());
+    let seed_sig_hex = hex::encode(seed_sig.to_der().as_ref());
+    let auth_header = format!(
+        "AWS4-ECDSA-P256-SHA256 \
+         Credential={STRICT_INBOUND_KEY}/{date_yyyymmdd}/s3/aws4_request, \
+         SignedHeaders={signed_headers_str}, Signature={seed_sig_hex}",
+    );
+
+    // Per-chunk SigV4A signatures chained from the seed.
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let mut h = Sha256::new();
+        h.update(bytes);
+        hex::encode(h.finalize())
+    }
+    let empty_sha256_hex = sha256_hex(b"");
+    fn sign_chunk(
+        signing_key: &SigningKey,
+        amz_date: &str,
+        scope: &str,
+        prev_sig: &str,
+        empty_sha: &str,
+        chunk_sha: &str,
+    ) -> String {
+        let sts = format!(
+            "AWS4-ECDSA-P256-SHA256-PAYLOAD\n{amz_date}\n{scope}\n{prev_sig}\n{empty_sha}\n{chunk_sha}",
+        );
+        let sig: Signature = signing_key.sign(sts.as_bytes());
+        hex::encode(sig.to_der().as_ref())
+    }
+    let chunk1_sha = sha256_hex(&chunk1);
+    let chunk1_sig = sign_chunk(
+        &signing_key,
+        &amz_date,
+        &scope,
+        &seed_sig_hex,
+        &empty_sha256_hex,
+        &chunk1_sha,
+    );
+    let chunk2_sha = sha256_hex(&chunk2);
+    let chunk2_sig = sign_chunk(
+        &signing_key,
+        &amz_date,
+        &scope,
+        &chunk1_sig,
+        &empty_sha256_hex,
+        &chunk2_sha,
+    );
+    let zero_sig = sign_chunk(
+        &signing_key,
+        &amz_date,
+        &scope,
+        &chunk2_sig,
+        &empty_sha256_hex,
+        &empty_sha256_hex,
+    );
+
+    // Build the aws-chunked frame.
+    let mut framed_body: Vec<u8> = Vec::new();
+    framed_body.extend_from_slice(
+        format!("{:x};chunk-signature={chunk1_sig}\r\n", chunk1.len()).as_bytes(),
+    );
+    framed_body.extend_from_slice(&chunk1);
+    framed_body.extend_from_slice(b"\r\n");
+    framed_body.extend_from_slice(
+        format!("{:x};chunk-signature={chunk2_sig}\r\n", chunk2.len()).as_bytes(),
+    );
+    framed_body.extend_from_slice(&chunk2);
+    framed_body.extend_from_slice(b"\r\n");
+    framed_body.extend_from_slice(format!("0;chunk-signature={zero_sig}\r\n\r\n").as_bytes());
+
+    let http_client = reqwest::Client::new();
+    let resp = http_client
+        .put(format!("{proxy_endpoint}{path}"))
+        .header("host", &proxy_host)
+        .header("content-encoding", "aws-chunked")
+        .header("x-amz-date", &amz_date)
+        .header("x-amz-content-sha256", payload_sentinel)
+        .header("x-amz-decoded-content-length", decoded_len.to_string())
+        .header("x-amz-region-set", region_set)
+        .header("authorization", &auth_header)
+        .body(framed_body)
+        .send()
+        .await
+        .expect("send SigV4A streaming PUT");
+    let status = resp.status().as_u16();
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(
+        status,
+        200,
+        "SigV4A streaming PUT should succeed; body: {}",
+        String::from_utf8_lossy(&body),
+    );
+
+    // Read the object back through the backend and confirm bytes.
+    let got = direct_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key("sigv4a-streaming.txt")
+        .send()
+        .await
+        .expect("backend get_object after SigV4A streaming PUT");
+    let got_body = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(got_body.as_ref(), &decoded_body[..]);
+}
+
+/// Strict-mode SigV4A streaming PUT with a tampered chunk-1
+/// signature → `SignatureDoesNotMatch` 403 and no backend object.
+/// Mirrors the HMAC analogue
+/// (`test_strict_sigv4_rejects_bad_signature_on_non_first_chunk`) for
+/// the ECDSA chain; without this, a regression that lets ECDSA chain
+/// mismatches through would only be caught by the happy-path test
+/// failing (which is a much weaker signal).
+///
+/// Bug-revert reasoning: dropping the
+/// `verify_sigv4a_der_signature` call inside
+/// `StreamingSigV4aContext::verify_payload_chunk` (or its chained
+/// `previous_signature_hex` advance) flips this from
+/// `SignatureDoesNotMatch` to a successful upload.
+#[tokio::test]
+#[ignore]
+async fn test_strict_sigv4a_streaming_put_tampered_chunk_rejected() {
+    use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+    use sha2::{Digest, Sha256};
+
+    let tls = generate_test_tls();
+    let (_container, backend_endpoint) = start_versitygw_https(&tls).await;
+
+    let direct_http_client = aws_http_client_trusting(&tls.ca_pem);
+    let direct_client = build_raw_s3_client_with_http_client(
+        &backend_endpoint,
+        TEST_ACCESS_KEY,
+        TEST_SECRET_KEY,
+        direct_http_client,
+    )
+    .await;
+    direct_client
+        .create_bucket()
+        .bucket(TEST_BUCKET)
+        .send()
+        .await
+        .expect("create_bucket on HTTPS VersityGW");
+
+    let (proxy_endpoint, _cache_dir, _creds_file) =
+        build_strict_proxy_stack_with_https_backend(&backend_endpoint, &tls.ca_pem).await;
+    let proxy_host = proxy_host_only(&proxy_endpoint);
+    let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let date_yyyymmdd = &amz_date[..8];
+    let scope = format!("{date_yyyymmdd}/s3/aws4_request");
+
+    let chunk1: Vec<u8> = vec![b'A'; 10_000];
+    let chunk2: Vec<u8> = vec![b'B'; 10_000];
+    let decoded_len = chunk1.len() + chunk2.len();
+
+    let path = format!("/{TEST_BUCKET}/sigv4a-streaming-tamper.txt");
+    let region_set = "us-east-1";
+    let payload_sentinel = "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD";
+    let signed_headers_str =
+        "host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length;x-amz-region-set";
+
+    let canonical = format!(
+        "PUT\n{path}\n\nhost:{proxy_host}\nx-amz-content-sha256:{payload_sentinel}\n\
+         x-amz-date:{amz_date}\nx-amz-decoded-content-length:{decoded_len}\n\
+         x-amz-region-set:{region_set}\n\n{signed_headers_str}\n{payload_sentinel}",
+    );
+    let creq_hex = {
+        let mut h = Sha256::new();
+        h.update(canonical.as_bytes());
+        hex::encode(h.finalize())
+    };
+    let sts = format!("AWS4-ECDSA-P256-SHA256\n{amz_date}\n{scope}\n{creq_hex}");
+    let scalar =
+        aws_sigv4::sign::v4a::generate_signing_key(STRICT_INBOUND_KEY, STRICT_INBOUND_SECRET);
+    let signing_key = SigningKey::from_bytes(scalar.as_ref()).expect("signing key");
+    let seed_sig: Signature = signing_key.sign(sts.as_bytes());
+    let seed_sig_hex = hex::encode(seed_sig.to_der().as_ref());
+    let auth_header = format!(
+        "AWS4-ECDSA-P256-SHA256 \
+         Credential={STRICT_INBOUND_KEY}/{date_yyyymmdd}/s3/aws4_request, \
+         SignedHeaders={signed_headers_str}, Signature={seed_sig_hex}",
+    );
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let mut h = Sha256::new();
+        h.update(bytes);
+        hex::encode(h.finalize())
+    }
+    let empty_sha256_hex = sha256_hex(b"");
+
+    // Sign chunk 1 against the WRONG previous-signature (an all-zeros
+    // hex instead of the seed). DER is well-formed; the chain math
+    // breaks at the verifier.
+    let wrong_prev = "0".repeat(64);
+    let chunk1_sha = sha256_hex(&chunk1);
+    let sts1 = format!(
+        "AWS4-ECDSA-P256-SHA256-PAYLOAD\n{amz_date}\n{scope}\n{wrong_prev}\n{empty_sha256_hex}\n{chunk1_sha}",
+    );
+    let chunk1_sig: Signature = signing_key.sign(sts1.as_bytes());
+    let chunk1_sig_hex = hex::encode(chunk1_sig.to_der().as_ref());
+
+    // chunks 2/zero signed off the (bogus) chunk1_sig so the wire
+    // signatures themselves are valid DER — the verifier still rejects
+    // because chunk 1's chain link is wrong from the seed's
+    // perspective.
+    let chunk2_sha = sha256_hex(&chunk2);
+    let sts2 = format!(
+        "AWS4-ECDSA-P256-SHA256-PAYLOAD\n{amz_date}\n{scope}\n{chunk1_sig_hex}\n{empty_sha256_hex}\n{chunk2_sha}",
+    );
+    let chunk2_sig: Signature = signing_key.sign(sts2.as_bytes());
+    let chunk2_sig_hex = hex::encode(chunk2_sig.to_der().as_ref());
+
+    let sts_zero = format!(
+        "AWS4-ECDSA-P256-SHA256-PAYLOAD\n{amz_date}\n{scope}\n{chunk2_sig_hex}\n{empty_sha256_hex}\n{empty_sha256_hex}",
+    );
+    let zero_sig: Signature = signing_key.sign(sts_zero.as_bytes());
+    let zero_sig_hex = hex::encode(zero_sig.to_der().as_ref());
+
+    let mut framed_body: Vec<u8> = Vec::new();
+    framed_body.extend_from_slice(
+        format!("{:x};chunk-signature={chunk1_sig_hex}\r\n", chunk1.len()).as_bytes(),
+    );
+    framed_body.extend_from_slice(&chunk1);
+    framed_body.extend_from_slice(b"\r\n");
+    framed_body.extend_from_slice(
+        format!("{:x};chunk-signature={chunk2_sig_hex}\r\n", chunk2.len()).as_bytes(),
+    );
+    framed_body.extend_from_slice(&chunk2);
+    framed_body.extend_from_slice(b"\r\n");
+    framed_body.extend_from_slice(format!("0;chunk-signature={zero_sig_hex}\r\n\r\n").as_bytes());
+
+    let http_client = reqwest::Client::new();
+    let resp = http_client
+        .put(format!("{proxy_endpoint}{path}"))
+        .header("host", &proxy_host)
+        .header("content-encoding", "aws-chunked")
+        .header("x-amz-date", &amz_date)
+        .header("x-amz-content-sha256", payload_sentinel)
+        .header("x-amz-decoded-content-length", decoded_len.to_string())
+        .header("x-amz-region-set", region_set)
+        .header("authorization", &auth_header)
+        .body(framed_body)
+        .send()
+        .await
+        .expect("send tampered SigV4A streaming PUT");
+    assert_eq!(resp.status().as_u16(), 403);
+    let body = resp.bytes().await.unwrap();
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(
+        body_str.contains("SignatureDoesNotMatch"),
+        "expected SignatureDoesNotMatch, got: {body_str}",
+    );
+
+    // Backend object must NOT exist — fail-closed before backend write.
+    let head = direct_client
+        .head_object()
+        .bucket(TEST_BUCKET)
+        .key("sigv4a-streaming-tamper.txt")
+        .send()
+        .await;
+    assert!(
+        head.is_err(),
+        "object must not exist on the backend after a tampered SigV4A chunk was rejected",
     );
 }

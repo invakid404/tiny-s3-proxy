@@ -1,7 +1,11 @@
 pub mod allowlist;
 pub mod credentials;
 pub mod sigv4;
+pub mod sigv4a;
 pub mod trusted_internal;
+pub mod verified;
+
+pub use verified::{VerifiedCredentialScope, VerifiedRequest, VerifiedSigningContext};
 
 use crate::config::{AuthMode, Config};
 use crate::error::ProxyError;

@@ -2,8 +2,7 @@
 //! and request date. Pure functions; no I/O.
 //!
 //! Every malformed input here maps to `S3Error::authorization_header_malformed`
-//! (HTTP 400, AWS code `AuthorizationHeaderMalformed`) unless explicitly noted
-//! otherwise: ECDSA → `UnsupportedSignature`. STS-issued temporary
+//! (HTTP 400, AWS code `AuthorizationHeaderMalformed`). STS-issued temporary
 //! credentials (`x-amz-security-token` in `SignedHeaders`) are now accepted
 //! and verified by the resolver — see the header-auth path in
 //! [`super::SigV4Verifier`].
@@ -16,8 +15,11 @@
 //!     Signature=<64 lowercase hex chars>
 //! ```
 //!
-//! - The algorithm token MUST be exactly `AWS4-HMAC-SHA256` (we reject the
-//!   ECDSA variant `AWS4-ECDSA-P256-SHA256` with `UnsupportedSignature`).
+//! - The algorithm token MUST be exactly `AWS4-HMAC-SHA256`. SigV4A
+//!   (`AWS4-ECDSA-P256-SHA256`) is handled by
+//!   [`crate::auth::sigv4a::parser`]; this parser is now strictly HMAC.
+//!   The top-level verifier uses [`classify_authorization_algorithm`] to
+//!   dispatch.
 //! - Service MUST be `s3` in this PR.
 //! - Signed headers must be lowercase, sorted, deduplicated, and include
 //!   `host`. They must include `x-amz-date` when the request carries one.
@@ -53,6 +55,37 @@ pub struct SigV4Authorization {
 const ALGORITHM: &str = "AWS4-HMAC-SHA256";
 const ECDSA_ALGORITHM: &str = "AWS4-ECDSA-P256-SHA256";
 
+/// Cheap algorithm classification for the top-level dispatcher. Returns
+/// the parsed algorithm shape without doing any of the structural
+/// validation that [`parse_authorization`] (HMAC) or
+/// [`crate::auth::sigv4a::parser::parse_sigv4a_authorization`] do.
+///
+/// Used by the verifier to route an inbound `Authorization` header to
+/// the right parser; once routed, the per-algorithm parser enforces its
+/// own strictness rules (so e.g. mis-cased `aws4-hmac-sha256` is
+/// classified as `Other` here AND rejected by the HMAC parser if it
+/// somehow reached it directly).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthorizationAlgorithm {
+    SigV4HmacSha256,
+    SigV4aEcdsaP256Sha256,
+    Other,
+}
+
+pub fn classify_authorization_algorithm(header_value: &str) -> AuthorizationAlgorithm {
+    let Some((algorithm, _)) = header_value.split_once(char::is_whitespace) else {
+        return AuthorizationAlgorithm::Other;
+    };
+    let algorithm = algorithm.trim();
+    if algorithm == ALGORITHM {
+        AuthorizationAlgorithm::SigV4HmacSha256
+    } else if algorithm == ECDSA_ALGORITHM {
+        AuthorizationAlgorithm::SigV4aEcdsaP256Sha256
+    } else {
+        AuthorizationAlgorithm::Other
+    }
+}
+
 pub fn parse_authorization(
     header_value: &str,
     request_id: &str,
@@ -69,16 +102,6 @@ pub fn parse_authorization(
     let algorithm = algorithm.trim();
     let params = params.trim();
 
-    if algorithm == ECDSA_ALGORITHM
-        || algorithm.eq_ignore_ascii_case(ECDSA_ALGORITHM)
-        || algorithm.starts_with("AWS4-ECDSA-")
-    {
-        return Err(S3Error::unsupported_signature(
-            "SigV4A (AWS4-ECDSA-P256-SHA256) is not supported in strict mode; \
-             tracked in PR 5 of issue #63",
-            request_id,
-        ));
-    }
     if algorithm != ALGORITHM {
         return Err(S3Error::authorization_header_malformed(
             "unsupported signing algorithm; expected AWS4-HMAC-SHA256",
@@ -543,11 +566,50 @@ mod tests {
         assert_eq!(err.code, "AuthorizationHeaderMalformed");
     }
 
+    /// PR 5 commit 3 lifts the SigV4A rejection from the HMAC parser
+    /// into the top-level dispatcher (`classify_authorization_algorithm`).
+    /// The HMAC parser itself still rejects ECDSA if it's called directly
+    /// — just as `AuthorizationHeaderMalformed`, not `UnsupportedSignature`
+    /// (the algorithm string isn't HMAC, so the structural check fails
+    /// the same way any other non-HMAC algorithm would).
+    ///
+    /// Bug-revert reasoning: re-adding the `algorithm.starts_with("AWS4-ECDSA-")`
+    /// arm with `S3Error::unsupported_signature(...)` flips the assertion
+    /// below back to `"UnsupportedSignature"`.
     #[test]
-    fn test_ecdsa_rejected_as_unsupported_signature() {
+    fn test_ecdsa_routed_via_dispatcher_not_unsupported_signature() {
         let h = "AWS4-ECDSA-P256-SHA256 Credential=AKID/20260101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let err = parse_authorization(h, rid()).expect_err("ECDSA");
-        assert_eq!(err.code, "UnsupportedSignature");
+        assert_eq!(
+            classify_authorization_algorithm(h),
+            AuthorizationAlgorithm::SigV4aEcdsaP256Sha256,
+        );
+        // Calling the HMAC parser directly with an ECDSA algorithm is now
+        // a structural malformedness, not the dispatch-level
+        // UnsupportedSignature it used to be.
+        let err = parse_authorization(h, rid()).expect_err("HMAC parser sees ECDSA");
+        assert_eq!(err.code, "AuthorizationHeaderMalformed");
+    }
+
+    #[test]
+    fn test_classify_authorization_algorithm_hmac() {
+        let h = "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/s3/aws4_request, \
+                 SignedHeaders=host, Signature=00";
+        assert_eq!(
+            classify_authorization_algorithm(h),
+            AuthorizationAlgorithm::SigV4HmacSha256,
+        );
+    }
+
+    #[test]
+    fn test_classify_authorization_algorithm_other() {
+        assert_eq!(
+            classify_authorization_algorithm("Basic dXNlcjpwYXNz"),
+            AuthorizationAlgorithm::Other,
+        );
+        assert_eq!(
+            classify_authorization_algorithm("AWS4-HMAC-SHA1 ..."),
+            AuthorizationAlgorithm::Other,
+        );
     }
 
     #[test]

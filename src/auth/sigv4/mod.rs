@@ -27,6 +27,7 @@ pub mod streaming;
 use crate::auth::credentials::{
     CredentialResolveError, InboundCredential, InboundCredentialResolver,
 };
+use crate::auth::verified::{VerifiedCredentialScope, VerifiedSigningContext};
 use crate::s3::errors::S3Error;
 use chrono::{DateTime, Utc};
 use http::HeaderName;
@@ -35,23 +36,34 @@ use std::time::Duration;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
+pub use crate::auth::verified::VerifiedRequest;
+
 use self::canonical::build_canonical_request;
 use self::parser::{
-    CredentialScope, enforce_skew, ensure_scope_date_matches, parse_authorization,
-    resolve_request_time,
+    AuthorizationAlgorithm, CredentialScope, classify_authorization_algorithm, enforce_skew,
+    ensure_scope_date_matches, parse_authorization, resolve_request_time,
 };
 use self::payload::{PayloadHashForSigning, classify_payload_header, verify_payload_matches_hash};
 
 /// SigV4 signing key (HMAC-SHA256 output, 32 bytes), zeroized on drop.
 ///
-/// PR 2 will reuse this for chunk-by-chunk verification of aws-chunked
-/// uploads; keeping it in `Zeroizing` from the start avoids leaving HMAC
-/// keys lingering in memory after a request finishes.
+/// Reused for chunk-by-chunk verification of aws-chunked uploads (see
+/// [`streaming::StreamingSigV4Context`]); keeping it in `Zeroizing` from
+/// the start avoids leaving HMAC keys lingering in memory after a request
+/// finishes.
 pub struct SigningKey(Zeroizing<[u8; 32]>);
 
 impl SigningKey {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0[..]
+    }
+
+    /// Clone the underlying 32-byte HMAC key into a fresh `Zeroizing`
+    /// buffer. Used by the streaming verifier to carry a private copy of
+    /// the signing key across chunk boundaries without exposing it
+    /// through the public API.
+    pub(crate) fn clone_bytes(&self) -> Zeroizing<[u8; 32]> {
+        self.0.clone()
     }
 }
 
@@ -59,21 +71,6 @@ impl std::fmt::Debug for SigningKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("SigningKey(<32 bytes>)")
     }
-}
-
-/// Output of a successful header/canonical-request verification. The
-/// signature itself has matched; the payload-hash check is separate (see
-/// `verify_payload_hash`) so callers can avoid buffering bodies for requests
-/// that don't sign them.
-#[derive(Debug)]
-pub struct VerifiedRequest {
-    pub access_key_id: Arc<str>,
-    pub scope: CredentialScope,
-    pub signed_headers: Vec<HeaderName>,
-    pub request_signature_hex: String,
-    pub signing_key: SigningKey,
-    pub amz_date: String,
-    pub payload: PayloadHashForSigning,
 }
 
 /// Top-level verifier. One instance is shared via `Arc` across all requests.
@@ -127,9 +124,54 @@ impl SigV4Verifier {
                 request_id,
             )),
             (false, true) => {
-                presigned::verify_presigned_request(parts, self.resolver.as_ref(), request_id, now)
+                // Cheap algorithm sniff so SigV4A presigned URLs route
+                // to their own verifier. Missing / unrecognised
+                // algorithms fall through to the HMAC parser, which
+                // surfaces `AuthorizationHeaderMalformed`.
+                let raw_query = parts.uri.query().unwrap_or("");
+                match presigned::classify_presigned_algorithm(raw_query) {
+                    Some(presigned::PresignedAlgorithm::SigV4aEcdsaP256Sha256) => {
+                        crate::auth::sigv4a::presigned::verify_sigv4a_presigned_request(
+                            parts,
+                            self.resolver.as_ref(),
+                            request_id,
+                            now,
+                        )
+                    }
+                    _ => presigned::verify_presigned_request(
+                        parts,
+                        self.resolver.as_ref(),
+                        request_id,
+                        now,
+                    ),
+                }
             }
-            (true, false) => self.verify_authorization_header_at(parts, request_id, now),
+            (true, false) => {
+                // Cheap algorithm sniff so SigV4A (`AWS4-ECDSA-P256-SHA256`)
+                // requests are routed to their own parser/verifier; HMAC
+                // requests stay on the existing path. Unknown algorithms
+                // fall through to the HMAC parser, which surfaces a
+                // structured `AuthorizationHeaderMalformed` for them.
+                let raw = parts
+                    .headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                match classify_authorization_algorithm(raw) {
+                    AuthorizationAlgorithm::SigV4aEcdsaP256Sha256 => {
+                        crate::auth::sigv4a::verify_authorization_header_at(
+                            parts,
+                            self.resolver.as_ref(),
+                            self.max_skew,
+                            request_id,
+                            now,
+                        )
+                    }
+                    AuthorizationAlgorithm::SigV4HmacSha256 | AuthorizationAlgorithm::Other => {
+                        self.verify_authorization_header_at(parts, request_id, now)
+                    }
+                }
+            }
             (false, false) => Err(S3Error::missing_authentication_token(
                 "request is missing the Authorization header or X-Amz-Signature query parameter",
                 request_id,
@@ -239,10 +281,10 @@ impl SigV4Verifier {
 
         Ok(VerifiedRequest {
             access_key_id: credential.access_key_id.clone(),
-            scope: auth.scope,
+            credential_scope: VerifiedCredentialScope::SigV4(auth.scope),
             signed_headers: auth.signed_headers,
             request_signature_hex: auth.signature_hex,
-            signing_key,
+            signing_context: VerifiedSigningContext::HmacSha256(signing_key),
             amz_date,
             payload,
         })
@@ -268,7 +310,9 @@ impl SigV4Verifier {
             PayloadHashForSigning::UnsignedPayload
             | PayloadHashForSigning::StreamingUnsignedPayloadTrailer
             | PayloadHashForSigning::StreamingAws4HmacSha256Payload
-            | PayloadHashForSigning::StreamingAws4HmacSha256PayloadTrailer => Ok(()),
+            | PayloadHashForSigning::StreamingAws4HmacSha256PayloadTrailer
+            | PayloadHashForSigning::StreamingAws4EcdsaP256Sha256Payload
+            | PayloadHashForSigning::StreamingAws4EcdsaP256Sha256PayloadTrailer => Ok(()),
         }
     }
 }

@@ -17,7 +17,6 @@ use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio_util::io::StreamReader;
 
 use crate::auth::sigv4::VerifiedRequest;
-use crate::auth::sigv4::streaming::StreamingSigV4Context;
 use crate::backend::Backend;
 use crate::backend::models::{PutObjectSpoolInput, UploadPartSpoolInput};
 use crate::cache::CacheStore;
@@ -26,8 +25,9 @@ use crate::cache::perms::{create_dir_secure, open_file_secure};
 use crate::handlers::AppState;
 use crate::s3::aws_chunked::{
     AwsChunkedDecoder, AwsChunkedError, ChunkSignaturePolicy, DecodedSummary, DecoderMode,
+    STREAMING_AWS4_ECDSA_P256_SHA256_PAYLOAD, STREAMING_AWS4_ECDSA_P256_SHA256_PAYLOAD_TRAILER,
     STREAMING_AWS4_HMAC_SHA256_PAYLOAD, STREAMING_AWS4_HMAC_SHA256_PAYLOAD_TRAILER,
-    STREAMING_UNSIGNED_PAYLOAD_TRAILER,
+    STREAMING_UNSIGNED_PAYLOAD_TRAILER, SignedChunkAlgorithm,
 };
 use crate::s3::checksum::{ChecksumAlgorithm, ChecksumHeader};
 use crate::s3::errors::S3Error;
@@ -387,7 +387,14 @@ pub(super) fn decoder_mode_from_headers(
     }
     let upper = sentinel.to_ascii_uppercase();
     if upper == STREAMING_AWS4_HMAC_SHA256_PAYLOAD {
-        return Ok(DecoderMode::NonTrailer);
+        return Ok(DecoderMode::NonTrailer {
+            signature_algorithm: SignedChunkAlgorithm::HmacSha256,
+        });
+    }
+    if upper == STREAMING_AWS4_ECDSA_P256_SHA256_PAYLOAD {
+        return Ok(DecoderMode::NonTrailer {
+            signature_algorithm: SignedChunkAlgorithm::EcdsaP256,
+        });
     }
 
     let header = read_declared_trailer(raw_headers, request_id)?;
@@ -400,6 +407,13 @@ pub(super) fn decoder_mode_from_headers(
         Ok(DecoderMode::SignedTrailer {
             expected_trailer_name: header.name,
             algorithm: header.algorithm,
+            signature_algorithm: SignedChunkAlgorithm::HmacSha256,
+        })
+    } else if upper == STREAMING_AWS4_ECDSA_P256_SHA256_PAYLOAD_TRAILER {
+        Ok(DecoderMode::SignedTrailer {
+            expected_trailer_name: header.name,
+            algorithm: header.algorithm,
+            signature_algorithm: SignedChunkAlgorithm::EcdsaP256,
         })
     } else {
         Err(S3Error::invalid_request(
@@ -530,17 +544,20 @@ fn reject_if_oversized<B: Backend, C: CacheStore>(
 /// request.
 ///
 /// - Strict mode (`state.inbound_sigv4.is_some()`) plus a signed mode
-///   yields [`ChunkSignaturePolicy::Verify`] seeded from the request's
-///   [`VerifiedRequest`].
+///   yields [`ChunkSignaturePolicy::VerifyHmac`] / `VerifyEcdsa` seeded
+///   from the request's [`VerifiedRequest`], dispatching on the
+///   [`SignedChunkAlgorithm`] the decoder mode carries.
 /// - Strict mode plus unsigned-trailer yields
 ///   [`ChunkSignaturePolicy::ShapeOnly`]: the wire format carries no
 ///   chunk signatures to verify (the trailer integrity check stays via
 ///   the existing CRC/sha2 trailer validation).
 /// - Trust mode always yields [`ChunkSignaturePolicy::ShapeOnly`].
 ///
-/// Strict mode without a `VerifiedRequest` is a dispatch invariant
-/// violation (the verifier runs before this code) and surfaces as
-/// `InternalError` rather than silently downgrading to ShapeOnly.
+/// Strict mode without a `VerifiedRequest` — or with a
+/// `VerifiedRequest` whose signing context doesn't match the decoder
+/// mode's algorithm — is a dispatch invariant violation (the verifier
+/// runs before this code) and surfaces as `InternalError` rather than
+/// silently downgrading.
 fn signature_policy_for_decode(
     mode: &DecoderMode,
     verified: Option<&VerifiedRequest>,
@@ -551,15 +568,42 @@ fn signature_policy_for_decode(
         return Ok(ChunkSignaturePolicy::ShapeOnly);
     }
     match mode {
-        DecoderMode::NonTrailer | DecoderMode::SignedTrailer { .. } => match verified {
-            Some(v) => Ok(ChunkSignaturePolicy::Verify(
-                StreamingSigV4Context::from_verified(v),
-            )),
-            None => Err(S3Error::internal_error(
-                "strict-mode aws-chunked decode reached without a VerifiedRequest",
-                request_id,
-            )),
-        },
+        DecoderMode::NonTrailer {
+            signature_algorithm,
+        }
+        | DecoderMode::SignedTrailer {
+            signature_algorithm,
+            ..
+        } => {
+            let v = verified.ok_or_else(|| {
+                S3Error::internal_error(
+                    "strict-mode aws-chunked decode reached without a VerifiedRequest",
+                    request_id,
+                )
+            })?;
+            match signature_algorithm {
+                SignedChunkAlgorithm::HmacSha256 => {
+                    match crate::auth::sigv4::streaming::StreamingSigV4Context::from_verified(v) {
+                        Some(ctx) => Ok(ChunkSignaturePolicy::VerifyHmac(ctx)),
+                        None => Err(S3Error::internal_error(
+                            "strict-mode HMAC aws-chunked decode reached with a non-HMAC \
+                             VerifiedRequest",
+                            request_id,
+                        )),
+                    }
+                }
+                SignedChunkAlgorithm::EcdsaP256 => {
+                    match crate::auth::sigv4a::streaming::StreamingSigV4aContext::from_verified(v) {
+                        Some(ctx) => Ok(ChunkSignaturePolicy::VerifyEcdsa(ctx)),
+                        None => Err(S3Error::internal_error(
+                            "strict-mode ECDSA aws-chunked decode reached with a non-SigV4A \
+                             VerifiedRequest",
+                            request_id,
+                        )),
+                    }
+                }
+            }
+        }
         DecoderMode::UnsignedTrailer { .. } => {
             // Unsigned trailer has no chunk HMAC, so the eventual policy
             // is `ShapeOnly`. But strict mode still requires that the
@@ -1521,8 +1565,58 @@ mod tests {
         let h = make_headers(&[("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")]);
         assert_eq!(
             decoder_mode_from_headers(&h, "r").unwrap(),
-            DecoderMode::NonTrailer,
+            DecoderMode::NonTrailer {
+                signature_algorithm: SignedChunkAlgorithm::HmacSha256,
+            },
         );
+    }
+
+    /// SigV4A non-trailer streaming sentinel now classifies as ECDSA
+    /// rather than reaching the "unsupported sentinel" fall-through.
+    /// PR 5 of #63 turned this from `RejectUnsupportedSignature` into a
+    /// regular `DecodeAwsChunked` route; this test pins the
+    /// `decoder_mode_from_headers` half of that change.
+    ///
+    /// Bug-revert reasoning: dropping the `STREAMING_AWS4_ECDSA_P256_SHA256_PAYLOAD`
+    /// arm from `decoder_mode_from_headers` flips this to the
+    /// `unsupported aws-chunked sentinel ... reached the decode path`
+    /// error.
+    #[test]
+    fn test_decoder_mode_from_headers_non_trailer_ecdsa() {
+        let h = make_headers(&[(
+            "x-amz-content-sha256",
+            "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD",
+        )]);
+        assert_eq!(
+            decoder_mode_from_headers(&h, "r").unwrap(),
+            DecoderMode::NonTrailer {
+                signature_algorithm: SignedChunkAlgorithm::EcdsaP256,
+            },
+        );
+    }
+
+    #[test]
+    fn test_decoder_mode_from_headers_signed_trailer_ecdsa() {
+        let h = make_headers(&[
+            (
+                "x-amz-content-sha256",
+                "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER",
+            ),
+            ("x-amz-trailer", "x-amz-checksum-sha256"),
+        ]);
+        let mode = decoder_mode_from_headers(&h, "r").unwrap();
+        match mode {
+            DecoderMode::SignedTrailer {
+                expected_trailer_name,
+                algorithm,
+                signature_algorithm,
+            } => {
+                assert_eq!(expected_trailer_name, "x-amz-checksum-sha256");
+                assert_eq!(algorithm, ChecksumAlgorithm::Sha256);
+                assert_eq!(signature_algorithm, SignedChunkAlgorithm::EcdsaP256);
+            }
+            other => panic!("expected SignedTrailer (ECDSA), got {other:?}"),
+        }
     }
 
     #[test]
@@ -1558,9 +1652,11 @@ mod tests {
             DecoderMode::SignedTrailer {
                 expected_trailer_name,
                 algorithm,
+                signature_algorithm,
             } => {
                 assert_eq!(expected_trailer_name, "x-amz-checksum-sha256");
                 assert_eq!(algorithm, ChecksumAlgorithm::Sha256);
+                assert_eq!(signature_algorithm, SignedChunkAlgorithm::HmacSha256);
             }
             other => panic!("expected SignedTrailer, got {other:?}"),
         }
@@ -1731,25 +1827,159 @@ mod tests {
         }
     }
 
-    /// Defense-in-depth: if an ECDSA streaming sentinel somehow reaches
-    /// `decoder_mode_from_headers` (i.e. the dispatch routing regresses and
-    /// no longer rejects ECDSA up front), the decoder must still refuse to
-    /// build a `DecoderMode` — silently treating it as something we can
-    /// decode would mean accepting a stream we can't validate. Production
-    /// dispatch routes ECDSA to `RejectUnsupportedSignature` before reaching
-    /// here; this test pins the decode-path backstop.
+    /// Minimal HMAC `VerifiedRequest` fixture for policy-selector
+    /// tests. Reuses the real `derive_signing_key` so the production
+    /// signing-key shape is exercised; the secret / region / date
+    /// don't matter because the policy selector only reads the
+    /// `signing_context` variant.
+    fn fake_hmac_verified_request() -> crate::auth::VerifiedRequest {
+        use crate::auth::sigv4::derive_signing_key;
+        use crate::auth::sigv4::parser::CredentialScope;
+        use crate::auth::sigv4::payload::PayloadHashForSigning;
+        use crate::auth::verified::{
+            VerifiedCredentialScope, VerifiedRequest, VerifiedSigningContext,
+        };
+        let scope = CredentialScope {
+            date: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            date_yyyymmdd: "20260101".to_string(),
+            region: "us-east-1".to_string(),
+            service: "s3".to_string(),
+        };
+        let signing_key = derive_signing_key("test-secret", "20260101", "us-east-1", "s3");
+        VerifiedRequest {
+            access_key_id: std::sync::Arc::from("AKID"),
+            credential_scope: VerifiedCredentialScope::SigV4(scope),
+            signed_headers: vec![http::HeaderName::from_static("host")],
+            request_signature_hex: "0".repeat(64),
+            signing_context: VerifiedSigningContext::HmacSha256(signing_key),
+            amz_date: "20260101T120000Z".to_string(),
+            payload: PayloadHashForSigning::StreamingAws4HmacSha256Payload,
+        }
+    }
+
+    /// Minimal SigV4A `VerifiedRequest` fixture. The verifying key is
+    /// the real KDF output for `("AKID", "test-secret")` so production
+    /// shape is exercised; per-chunk verification isn't run by the
+    /// policy selector, only the `EcdsaP256` variant tag is read.
+    fn fake_sigv4a_verified_request() -> crate::auth::VerifiedRequest {
+        use crate::auth::sigv4::payload::PayloadHashForSigning;
+        use crate::auth::sigv4a::SigV4aCredentialScope;
+        use crate::auth::sigv4a::crypto::derive_sigv4a_verifying_key;
+        use crate::auth::verified::{
+            VerifiedCredentialScope, VerifiedRequest, VerifiedSigningContext,
+        };
+        let scope = SigV4aCredentialScope {
+            date: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            date_yyyymmdd: "20260101".to_string(),
+            service: "s3".to_string(),
+        };
+        let verifying_key = derive_sigv4a_verifying_key("AKID", "test-secret").unwrap();
+        VerifiedRequest {
+            access_key_id: std::sync::Arc::from("AKID"),
+            credential_scope: VerifiedCredentialScope::SigV4a(scope),
+            signed_headers: vec![http::HeaderName::from_static("host")],
+            request_signature_hex: "0".repeat(64),
+            signing_context: VerifiedSigningContext::EcdsaP256(verifying_key),
+            amz_date: "20260101T120000Z".to_string(),
+            payload: PayloadHashForSigning::StreamingAws4EcdsaP256Sha256Payload,
+        }
+    }
+
+    /// `DecoderMode::NonTrailer { EcdsaP256 }` + SigV4A
+    /// `VerifiedRequest` → `ChunkSignaturePolicy::VerifyEcdsa`. End-to-end
+    /// integration covers the full path; this unit pin guards the policy
+    /// selector itself against a future refactor that misroutes ECDSA
+    /// modes.
     ///
-    /// Even with a usable `x-amz-trailer` present (which would otherwise
-    /// short-circuit the missing-trailer guard for trailer-mode sentinels),
-    /// the ECDSA sentinel must still surface as `InvalidRequest` via the
-    /// `unsupported aws-chunked sentinel reached the decode path` branch.
-    ///
-    /// Bug-revert reasoning: replacing the fall-through `Err` branch with a
-    /// permissive ECDSA mapping (e.g. routing it through `DecoderMode::
-    /// SignedTrailer` because the suffix looks similar) flips this assertion
-    /// to a panic on `.unwrap_err()`.
+    /// Bug-revert reasoning: replacing the `EcdsaP256` arm in
+    /// `signature_policy_for_decode` with the HMAC `VerifyHmac` builder
+    /// flips this from `Ok(VerifyEcdsa)` to either
+    /// `Err(InternalError)` or `Ok(VerifyHmac)`.
     #[test]
-    fn test_decoder_mode_from_headers_rejects_ecdsa_sentinel() {
+    fn test_signature_policy_ecdsa_mode_with_sigv4a_request_yields_verify_ecdsa() {
+        let mode = DecoderMode::NonTrailer {
+            signature_algorithm: SignedChunkAlgorithm::EcdsaP256,
+        };
+        let verified = fake_sigv4a_verified_request();
+        match signature_policy_for_decode(&mode, Some(&verified), true, "r") {
+            Ok(ChunkSignaturePolicy::VerifyEcdsa(_)) => {}
+            Ok(other) => panic!(
+                "expected ChunkSignaturePolicy::VerifyEcdsa, got {}",
+                policy_kind(&other),
+            ),
+            Err(e) => panic!("expected VerifyEcdsa, got error: {e:?}"),
+        }
+    }
+
+    /// `DecoderMode::NonTrailer { EcdsaP256 }` + an HMAC-shaped
+    /// `VerifiedRequest` is an algorithm/context mismatch — the
+    /// request was verified under HMAC but the decoder mode says ECDSA.
+    /// Must fail closed with `InternalError`, not silently downgrade to
+    /// `ShapeOnly` or pick the wrong policy.
+    ///
+    /// Bug-revert reasoning: replacing the `None => Err(InternalError(...))`
+    /// arm with `None => Ok(ShapeOnly)` flips this assertion to a
+    /// `ChunkSignaturePolicy::ShapeOnly` and the request silently rides
+    /// an unverified streaming path.
+    #[test]
+    fn test_signature_policy_ecdsa_mode_with_hmac_request_yields_internal_error() {
+        let mode = DecoderMode::NonTrailer {
+            signature_algorithm: SignedChunkAlgorithm::EcdsaP256,
+        };
+        let verified = fake_hmac_verified_request();
+        // `ChunkSignaturePolicy` doesn't impl `Debug` (its streaming
+        // contexts deliberately omit it for key-material fields), so
+        // we can't use `expect_err`. Match the Result directly.
+        match signature_policy_for_decode(&mode, Some(&verified), true, "r") {
+            Ok(p) => panic!(
+                "ECDSA mode + HMAC context must reject; got policy {}",
+                policy_kind(&p),
+            ),
+            Err(err) => assert_eq!(err.code, "InternalError"),
+        }
+    }
+
+    /// Symmetric: `DecoderMode::NonTrailer { HmacSha256 }` + a SigV4A
+    /// `VerifiedRequest` must also fail closed with `InternalError`.
+    /// Catches the regression in the other direction.
+    #[test]
+    fn test_signature_policy_hmac_mode_with_sigv4a_request_yields_internal_error() {
+        let mode = DecoderMode::NonTrailer {
+            signature_algorithm: SignedChunkAlgorithm::HmacSha256,
+        };
+        let verified = fake_sigv4a_verified_request();
+        match signature_policy_for_decode(&mode, Some(&verified), true, "r") {
+            Ok(p) => panic!(
+                "HMAC mode + SigV4A context must reject; got policy {}",
+                policy_kind(&p),
+            ),
+            Err(err) => assert_eq!(err.code, "InternalError"),
+        }
+    }
+
+    /// Render `ChunkSignaturePolicy` variants by name without `Debug`
+    /// on the enum (the inner streaming contexts deliberately omit
+    /// `Debug` for fields that hold key material).
+    fn policy_kind(policy: &ChunkSignaturePolicy) -> &'static str {
+        match policy {
+            ChunkSignaturePolicy::ShapeOnly => "ShapeOnly",
+            ChunkSignaturePolicy::VerifyHmac(_) => "VerifyHmac",
+            ChunkSignaturePolicy::VerifyEcdsa(_) => "VerifyEcdsa",
+        }
+    }
+
+    /// PR 5 of #63 lifts ECDSA streaming from `RejectUnsupportedSignature`
+    /// to `DecodeAwsChunked` with chunk-by-chunk ECDSA verification. The
+    /// decoder now BUILDS a `DecoderMode::SignedTrailer { signature_algorithm:
+    /// EcdsaP256, ... }` for an ECDSA trailer sentinel and the request flows
+    /// through normal decode-path framing checks.
+    ///
+    /// Bug-revert reasoning: dropping the
+    /// `STREAMING_AWS4_ECDSA_P256_SHA256_PAYLOAD_TRAILER` arm from
+    /// `decoder_mode_from_headers` flips this assertion from
+    /// `Ok(SignedTrailer { EcdsaP256, ... })` to `InvalidRequest`.
+    #[test]
+    fn test_decoder_mode_from_headers_accepts_ecdsa_trailer_sentinel() {
         let h = make_headers(&[
             (
                 "x-amz-content-sha256",
@@ -1757,13 +1987,18 @@ mod tests {
             ),
             ("x-amz-trailer", "x-amz-checksum-crc32"),
         ]);
-        let err = decoder_mode_from_headers(&h, "r").unwrap_err();
-        assert_eq!(err.code, "InvalidRequest");
-        assert!(
-            err.message.to_ascii_lowercase().contains("unsupported"),
-            "error should mention the unsupported sentinel, got: {}",
-            err.message,
-        );
+        let mode = decoder_mode_from_headers(&h, "r").unwrap();
+        match mode {
+            DecoderMode::SignedTrailer {
+                signature_algorithm,
+                algorithm,
+                ..
+            } => {
+                assert_eq!(signature_algorithm, SignedChunkAlgorithm::EcdsaP256);
+                assert_eq!(algorithm, ChecksumAlgorithm::Crc32);
+            }
+            other => panic!("expected SignedTrailer (ECDSA), got {other:?}"),
+        }
     }
 
     /// Two `x-amz-decoded-content-length` headers must be rejected. Same

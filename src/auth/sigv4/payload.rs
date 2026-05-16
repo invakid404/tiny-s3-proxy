@@ -1,21 +1,19 @@
 //! Classify the `x-amz-content-sha256` header for SigV4 strict verification.
 //!
-//! Five values land in the canonical request directly:
+//! Seven values land in the canonical request directly:
 //! - a 64-char lowercase hex digest (the body's SHA-256)
 //! - the sentinel `UNSIGNED-PAYLOAD`
 //! - the sentinel `STREAMING-UNSIGNED-PAYLOAD-TRAILER`
 //! - the sentinel `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`
 //! - the sentinel `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`
+//! - the sentinel `STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD`
+//! - the sentinel `STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER`
 //!
-//! HMAC-SHA256 streaming sentinels are verified chunk-by-chunk by the
-//! aws-chunked decoder (`crate::auth::sigv4::streaming`), so the request-
-//! level classifier surfaces them as their own variants rather than
-//! demanding a buffered body hash.
-//!
-//! ECDSA streaming variants (`STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD*`)
-//! remain fail-closed: the inbound chunk signatures are bound to the
-//! client's private key, so neither the proxy nor an upstream re-signer
-//! could ever validate them. PR 5 of #63 will address that path.
+//! Signed streaming sentinels are verified chunk-by-chunk by the
+//! aws-chunked decoder — HMAC variants by `crate::auth::sigv4::streaming`
+//! and ECDSA variants by `crate::auth::sigv4a::streaming` — so the
+//! request-level classifier surfaces them as their own variants rather
+//! than demanding a buffered body hash.
 
 use crate::s3::errors::S3Error;
 use sha2::{Digest, Sha256};
@@ -37,6 +35,14 @@ pub enum PayloadHashForSigning {
     /// signed trailer. Per-chunk and trailer HMAC verification both happen
     /// in the aws-chunked decoder.
     StreamingAws4HmacSha256PayloadTrailer,
+    /// `STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD` — ECDSA-signed chunks,
+    /// no trailer. Per-chunk ECDSA verification happens in the
+    /// aws-chunked decoder via `crate::auth::sigv4a::streaming`.
+    StreamingAws4EcdsaP256Sha256Payload,
+    /// `STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER` — ECDSA-signed
+    /// chunks plus a signed trailer. Per-chunk and trailer ECDSA
+    /// verification both happen in the aws-chunked decoder.
+    StreamingAws4EcdsaP256Sha256PayloadTrailer,
 }
 
 impl PayloadHashForSigning {
@@ -54,13 +60,19 @@ impl PayloadHashForSigning {
             PayloadHashForSigning::StreamingAws4HmacSha256PayloadTrailer => {
                 "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
             }
+            PayloadHashForSigning::StreamingAws4EcdsaP256Sha256Payload => {
+                "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD"
+            }
+            PayloadHashForSigning::StreamingAws4EcdsaP256Sha256PayloadTrailer => {
+                "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER"
+            }
         }
     }
 
     /// Whether the verifier still needs to buffer the request body to
-    /// confirm it matches the signed digest. False for HMAC streaming
+    /// confirm it matches the signed digest. False for signed-streaming
     /// variants: the body never arrives as a single buffered SHA-256, it's
-    /// validated frame-by-frame by the decoder.
+    /// validated frame-by-frame by the decoder (HMAC or ECDSA).
     pub fn requires_body_bytes(&self) -> bool {
         matches!(self, PayloadHashForSigning::SignedSha256 { .. })
     }
@@ -84,17 +96,13 @@ pub fn classify_payload_header(
     if value == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER" {
         return Ok(PayloadHashForSigning::StreamingAws4HmacSha256PayloadTrailer);
     }
-
-    // ECDSA streaming variants are still fail-closed: the inbound chunk
-    // signatures are bound to the client's private key, so neither the
-    // proxy nor the upstream can validate them. PR 5 of issue #63 will
-    // address that path.
-    if value.starts_with("STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD") {
-        return Err(S3Error::unsupported_signature(
-            "ECDSA-signed aws-chunked streaming uploads are not supported in strict mode; \
-             tracked in PR 5 of issue #63",
-            request_id,
-        ));
+    // ECDSA streaming variants: verified chunk-by-chunk by the
+    // aws-chunked decoder via `crate::auth::sigv4a::streaming`.
+    if value == "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD" {
+        return Ok(PayloadHashForSigning::StreamingAws4EcdsaP256Sha256Payload);
+    }
+    if value == "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER" {
+        return Ok(PayloadHashForSigning::StreamingAws4EcdsaP256Sha256PayloadTrailer);
     }
 
     // Otherwise we expect a 64-char lowercase hex digest.
@@ -234,15 +242,33 @@ mod tests {
         );
     }
 
+    /// PR 5 commit 5 lifts the SigV4A streaming `UnsupportedSignature`
+    /// rejection. The decoder verifies these chunk-by-chunk through
+    /// `auth::sigv4a::streaming::StreamingSigV4aContext`. Pinning the
+    /// new success/no-body-bytes behaviour: bug-revert reasoning is
+    /// that re-adding the dispatch-level reject flips both arms back
+    /// to `UnsupportedSignature`.
     #[test]
-    fn test_streaming_ecdsa_sentinel_unsupported() {
-        let err = classify_payload_header("STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD", rid())
-            .expect_err("ecdsa streaming fail-closed");
-        assert_eq!(err.code, "UnsupportedSignature");
-        let err =
-            classify_payload_header("STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER", rid())
-                .expect_err("ecdsa streaming trailer fail-closed");
-        assert_eq!(err.code, "UnsupportedSignature");
+    fn test_streaming_ecdsa_sentinel_classified() {
+        let p = classify_payload_header("STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD", rid())
+            .expect("ecdsa streaming now classified");
+        assert_eq!(
+            p,
+            PayloadHashForSigning::StreamingAws4EcdsaP256Sha256Payload
+        );
+        assert!(!p.requires_body_bytes());
+        assert_eq!(
+            p.canonical_string(),
+            "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD"
+        );
+
+        let p = classify_payload_header("STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER", rid())
+            .expect("ecdsa streaming trailer now classified");
+        assert_eq!(
+            p,
+            PayloadHashForSigning::StreamingAws4EcdsaP256Sha256PayloadTrailer
+        );
+        assert!(!p.requires_body_bytes());
     }
 
     #[test]
