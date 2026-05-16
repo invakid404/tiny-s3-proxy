@@ -704,14 +704,24 @@ impl Backend for S3Backend {
 
                 let expires_val = content_headers.get("expires").cloned();
 
-                // `RequestChecksumCalculation::WhenRequired` disables the SDK's
-                // outbound aws-chunked re-encoding: the default `WhenSupported`
-                // value triggers the checksum interceptor to wrap the body in
-                // the streaming-checksum framing, which is exactly what we
-                // just decoded out of. `disable_payload_signing()` makes the
-                // SDK send `x-amz-content-sha256: UNSIGNED-PAYLOAD` — body
-                // integrity is delegated to the TLS transport. The HTTPS guard
-                // above enforces that delegation.
+                // The load-bearing override is
+                // `request_checksum_calculation(WhenRequired)`. The default
+                // `WhenSupported` triggers the SDK's checksum interceptor to
+                // wrap the body in aws-chunked streaming-checksum framing —
+                // exactly what the proxy just decoded out of. Decoded
+                // non-trailer aws-chunked uploads pass `checksum: None` to
+                // this method, so they hit the SDK's default flexible-checksum
+                // path and *would* be re-framed without this override.
+                // Per-algorithm setters above (`.checksum_crc32(...)`, etc.)
+                // happen to also suppress re-framing in `aws-sdk-s3 1.132.0`,
+                // but they're only set when the decoded upload carried a
+                // trailer checksum; the override stays required for the
+                // `checksum: None` callers. `disable_payload_signing()` makes
+                // the SDK send `x-amz-content-sha256: UNSIGNED-PAYLOAD` — body
+                // integrity is delegated to TLS, enforced by the HTTPS guard
+                // above. It does NOT prevent re-framing on its own. See issue
+                // #72 / PR #65, and `tests/sdk_wire.rs` for the regression
+                // pinning all three behaviors.
                 let resp = builder
                     .customize()
                     .mutate_request(move |req| {
@@ -972,6 +982,15 @@ impl Backend for S3Backend {
         }
 
         let extra_amz_headers = req.extra_amz_headers.clone();
+        // See `put_object_from_path` for the full rationale. Short version:
+        // `request_checksum_calculation(WhenRequired)` is load-bearing — it
+        // suppresses the SDK's aws-chunked re-framing for decoded
+        // non-trailer uploads (`checksum: None`), which the default
+        // `WhenSupported` would otherwise reintroduce.
+        // `disable_payload_signing()` keeps the unsigned-payload/TLS
+        // contract explicit (enforced by the HTTPS guard above) but does
+        // not prevent re-framing on its own. Pinned by
+        // `tests/sdk_wire.rs` (issue #72 / PR #65).
         let resp = builder
             .customize()
             .mutate_request(move |req| {
