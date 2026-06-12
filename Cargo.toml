@@ -48,7 +48,7 @@ tokio-util = { version = "=0.7.18", features = ["io"] }
 typed-builder = "=0.23.2"
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "json"] }
-zeroize = "=1.8.2"
+zeroize = "=1.9.0"
 
 [dev-dependencies]
 aws-smithy-http-client = { version = "=1.1.12", features = ["rustls-aws-lc"] }
