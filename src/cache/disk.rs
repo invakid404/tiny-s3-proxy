@@ -499,7 +499,7 @@ impl DiskCache {
         let _guard = self.fill_id_persist_lock.lock().await;
         let fill_id = self
             .next_fill_id
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
                 current.checked_add(1)
             })
             .map_err(|_| ProxyError::Cache {
@@ -1028,13 +1028,13 @@ impl DiskCache {
             }
         };
         if body_removed && body_existed {
-            let _ = self.stats.entry_count.fetch_update(
+            let _ = self.stats.entry_count.try_update(
                 Ordering::Relaxed,
                 Ordering::Relaxed,
                 |current| Some(current.saturating_sub(1)),
             );
             if body_size > 0 {
-                let _ = self.stats.total_bytes.fetch_update(
+                let _ = self.stats.total_bytes.try_update(
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                     |current| Some(current.saturating_sub(body_size)),
@@ -1159,7 +1159,7 @@ impl DiskCache {
                         }
                         std::cmp::Ordering::Less => {
                             let delta = current_len - new_len;
-                            let _ = stats.total_bytes.fetch_update(
+                            let _ = stats.total_bytes.try_update(
                                 Ordering::Relaxed,
                                 Ordering::Relaxed,
                                 |current| Some(current.saturating_sub(delta)),
@@ -1460,16 +1460,18 @@ impl DiskCache {
 
             // Adjust stats after successful publish.
             if old_body_size > 0 || old_meta_size > 0 {
-                let _ = self.stats.entry_count.fetch_update(
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                    |c| Some(c.saturating_sub(1)),
-                );
-                let _ = self.stats.total_bytes.fetch_update(
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                    |c| Some(c.saturating_sub(old_body_size + old_meta_size)),
-                );
+                let _ =
+                    self.stats
+                        .entry_count
+                        .try_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                            Some(c.saturating_sub(1))
+                        });
+                let _ =
+                    self.stats
+                        .total_bytes
+                        .try_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                            Some(c.saturating_sub(old_body_size + old_meta_size))
+                        });
             }
 
             // Best-effort: add the new entry's size. The periodic eviction scan
@@ -1613,13 +1615,13 @@ impl DiskCache {
         }
 
         if removed {
-            let _ = self.stats.entry_count.fetch_update(
+            let _ = self.stats.entry_count.try_update(
                 Ordering::Relaxed,
                 Ordering::Relaxed,
                 |current| Some(current.saturating_sub(1)),
             );
             let total_removed = body_size + meta_size;
-            let _ = self.stats.total_bytes.fetch_update(
+            let _ = self.stats.total_bytes.try_update(
                 Ordering::Relaxed,
                 Ordering::Relaxed,
                 |current| Some(current.saturating_sub(total_removed)),
@@ -1877,7 +1879,7 @@ impl CacheStore for DiskCache {
             }
             std::cmp::Ordering::Less => {
                 let delta = old_len - new_len;
-                let _ = self.stats.total_bytes.fetch_update(
+                let _ = self.stats.total_bytes.try_update(
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                     |current| Some(current.saturating_sub(delta)),
@@ -2008,16 +2010,18 @@ impl DiskCache {
                 let _ = tokio::fs::remove_file(&meta_path).await;
                 let _ = tokio::fs::remove_file(&body_path).await;
                 drop(meta_guard);
-                let _ = self.stats.entry_count.fetch_update(
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                    |c| Some(c.saturating_sub(1)),
-                );
-                let _ = self.stats.total_bytes.fetch_update(
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                    |c| Some(c.saturating_sub(meta_size + body_size)),
-                );
+                let _ =
+                    self.stats
+                        .entry_count
+                        .try_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                            Some(c.saturating_sub(1))
+                        });
+                let _ =
+                    self.stats
+                        .total_bytes
+                        .try_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                            Some(c.saturating_sub(meta_size + body_size))
+                        });
                 if track_access {
                     self.stats.miss_count.fetch_add(1, Ordering::Relaxed);
                 }
@@ -2053,12 +2057,12 @@ impl DiskCache {
                     }
                     let meta_size = meta_bytes.len() as u64;
                     let body_size = meta.content_length.max(0) as u64;
-                    let _ = self.stats.entry_count.fetch_update(
+                    let _ = self.stats.entry_count.try_update(
                         Ordering::Relaxed,
                         Ordering::Relaxed,
                         |c| Some(c.saturating_sub(1)),
                     );
-                    let _ = self.stats.total_bytes.fetch_update(
+                    let _ = self.stats.total_bytes.try_update(
                         Ordering::Relaxed,
                         Ordering::Relaxed,
                         |c| Some(c.saturating_sub(meta_size + body_size)),
@@ -2086,12 +2090,12 @@ impl DiskCache {
                     drop(meta_guard);
                     let meta_size = meta_bytes.len() as u64;
                     let body_size = meta.content_length.max(0) as u64;
-                    let _ = self.stats.entry_count.fetch_update(
+                    let _ = self.stats.entry_count.try_update(
                         Ordering::Relaxed,
                         Ordering::Relaxed,
                         |c| Some(c.saturating_sub(1)),
                     );
-                    let _ = self.stats.total_bytes.fetch_update(
+                    let _ = self.stats.total_bytes.try_update(
                         Ordering::Relaxed,
                         Ordering::Relaxed,
                         |c| Some(c.saturating_sub(meta_size + body_size)),
