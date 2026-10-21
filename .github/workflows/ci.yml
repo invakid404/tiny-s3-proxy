@@ -13,7 +13,7 @@ jobs:
   fmt:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6.1.0
+      - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -22,7 +22,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6.1.0
+      - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.9.3
       - run: cargo check --release
@@ -30,7 +30,7 @@ jobs:
   clippy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6.1.0
+      - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -40,7 +40,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6.1.0
+      - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.9.3
       - run: cargo test
@@ -48,7 +48,7 @@ jobs:
   integration:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6.1.0
+      - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.9.3
       - run: docker pull versity/versitygw:latest
