@@ -220,7 +220,7 @@ mod tests {
 
     fn example_signing_key() -> SigningKey {
         let scalar = aws_sigv4::sign::v4a::generate_signing_key(EXAMPLE_AKID, EXAMPLE_SECRET);
-        SigningKey::from_bytes(scalar.as_ref()).expect("signing key")
+        SigningKey::from_slice(scalar.as_ref()).expect("signing key")
     }
 
     fn sign_chunk_payload(
