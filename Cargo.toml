@@ -53,7 +53,7 @@ zeroize = "=1.8.2"
 
 [dev-dependencies]
 aws-smithy-http-client = { version = "=1.5.1", features = ["rustls-aws-lc"] }
-rcgen = { version = "=0.14.8", default-features = false, features = ["aws_lc_rs", "pem"] }
+rcgen = { version = "=0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
 tempfile = "=3.27.0"
 testcontainers = "=0.27.3"
 tokio-test = "=0.4.5"
