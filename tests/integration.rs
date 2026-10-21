@@ -4870,7 +4870,7 @@ fn sign_sigv4a_get_request(
     let scope = format!("{date_yyyymmdd}/s3/aws4_request");
     let sts = format!("AWS4-ECDSA-P256-SHA256\n{amz_date}\n{scope}\n{creq_hex}");
     let scalar = aws_sigv4::sign::v4a::generate_signing_key(akid, secret);
-    let signing_key = SigningKey::from_bytes(scalar.as_ref()).expect("signing key");
+    let signing_key = SigningKey::from_slice(scalar.as_ref()).expect("signing key");
     let sig: Signature = signing_key.sign(sts.as_bytes());
     let der_hex = hex::encode(sig.to_der().as_ref());
     format!(
@@ -5118,7 +5118,7 @@ async fn test_strict_sigv4a_presigned_get_round_trip() {
     let sts = format!("AWS4-ECDSA-P256-SHA256\n{amz_date}\n{scope}\n{creq_hex}");
     let scalar =
         aws_sigv4::sign::v4a::generate_signing_key(STRICT_INBOUND_KEY, STRICT_INBOUND_SECRET);
-    let signing_key = SigningKey::from_bytes(scalar.as_ref()).expect("signing key");
+    let signing_key = SigningKey::from_slice(scalar.as_ref()).expect("signing key");
     let sig: Signature = signing_key.sign(sts.as_bytes());
     let signature_hex = hex::encode(sig.to_der().as_ref());
     let presigned_url =
@@ -5219,7 +5219,7 @@ async fn test_strict_sigv4a_streaming_put_round_trip() {
     let sts = format!("AWS4-ECDSA-P256-SHA256\n{amz_date}\n{scope}\n{creq_hex}");
     let scalar =
         aws_sigv4::sign::v4a::generate_signing_key(STRICT_INBOUND_KEY, STRICT_INBOUND_SECRET);
-    let signing_key = SigningKey::from_bytes(scalar.as_ref()).expect("signing key");
+    let signing_key = SigningKey::from_slice(scalar.as_ref()).expect("signing key");
     let seed_sig: Signature = signing_key.sign(sts.as_bytes());
     let seed_sig_hex = hex::encode(seed_sig.to_der().as_ref());
     let auth_header = format!(
@@ -5392,7 +5392,7 @@ async fn test_strict_sigv4a_streaming_put_tampered_chunk_rejected() {
     let sts = format!("AWS4-ECDSA-P256-SHA256\n{amz_date}\n{scope}\n{creq_hex}");
     let scalar =
         aws_sigv4::sign::v4a::generate_signing_key(STRICT_INBOUND_KEY, STRICT_INBOUND_SECRET);
-    let signing_key = SigningKey::from_bytes(scalar.as_ref()).expect("signing key");
+    let signing_key = SigningKey::from_slice(scalar.as_ref()).expect("signing key");
     let seed_sig: Signature = signing_key.sign(sts.as_bytes());
     let seed_sig_hex = hex::encode(seed_sig.to_der().as_ref());
     let auth_header = format!(
