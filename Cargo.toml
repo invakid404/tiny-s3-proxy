@@ -5,7 +5,8 @@ edition = "2024"
 
 [dependencies]
 aws-credential-types = "=1.2.14"
-aws-sdk-s3 = "=1.132.0"
+# Use the current HTTPS client without enabling the legacy rustls 0.21 stack.
+aws-sdk-s3 = { version = "=1.132.0", default-features = false, features = ["default-https-client", "http-1x", "rt-tokio", "sigv4a"] }
 aws-sigv4 = "=1.4.3"
 aws-smithy-checksums = "=0.64.7"
 aws-smithy-types = "=1.4.7"
