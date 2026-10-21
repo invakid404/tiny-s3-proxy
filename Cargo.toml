@@ -16,7 +16,7 @@ chrono = { version = "=0.4.45", features = ["serde"] }
 fs2 = "=0.4.3"
 hex = "=0.4.3"
 hmac = "=0.13.0"
-http = "=1.4.0"
+http = "=1.5.0"
 http-body-util = "=0.1.5"
 httpdate = "=1.0.3"
 metrics = "=0.24.6"
