@@ -311,7 +311,7 @@ mod tests {
     fn real_der_hex() -> String {
         use p256::ecdsa::{Signature, SigningKey, signature::Signer};
         let scalar = aws_sigv4::sign::v4a::generate_signing_key("AKID", "SECRET");
-        let signing_key = SigningKey::from_bytes(scalar.as_ref()).unwrap();
+        let signing_key = SigningKey::from_slice(scalar.as_ref()).unwrap();
         let sig: Signature = signing_key.sign(b"parser-test-string-to-sign");
         hex::encode(sig.to_der().as_ref())
     }

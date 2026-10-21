@@ -465,7 +465,7 @@ mod tests {
         let sts = build_sigv4a_string_to_sign(&scope, amz_date, &canonical.canonical_request);
 
         let signing_scalar = aws_sigv4::sign::v4a::generate_signing_key(akid, secret);
-        let signing_key = SigningKey::from_bytes(signing_scalar.as_ref()).unwrap();
+        let signing_key = SigningKey::from_slice(signing_scalar.as_ref()).unwrap();
         let sig: Signature = signing_key.sign(sts.as_bytes());
         let der_hex = hex::encode(sig.to_der().as_ref());
 

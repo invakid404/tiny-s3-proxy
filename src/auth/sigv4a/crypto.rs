@@ -160,7 +160,7 @@ pub fn derive_sigv4a_verifying_key(
     secret_access_key: &str,
 ) -> Result<SigV4aVerifyingKey, SigV4aCryptoError> {
     let scalar = derive_sigv4a_private_scalar(access_key_id, secret_access_key)?;
-    let signing_key = p256::ecdsa::SigningKey::from_bytes(&scalar[..])
+    let signing_key = p256::ecdsa::SigningKey::from_slice(&scalar[..])
         .map_err(|_| SigV4aCryptoError::InvalidDerivedScalar)?;
     let verifying_key = VerifyingKey::from(&signing_key);
     Ok(SigV4aVerifyingKey(verifying_key))
@@ -375,7 +375,7 @@ mod tests {
     fn verifying_key_round_trips_against_aws_sigv4_signature() {
         let vk = derive_sigv4a_verifying_key(EXAMPLE_AKID, EXAMPLE_SECRET).expect("derives");
         let scalar = aws_reference_scalar(EXAMPLE_AKID, EXAMPLE_SECRET);
-        let signing_key = SigningKey::from_bytes(&scalar).expect("signing key");
+        let signing_key = SigningKey::from_slice(&scalar).expect("signing key");
         let message = b"AWS4-ECDSA-P256-SHA256\n20260101T120000Z\n20260101/s3/aws4_request\n00";
         let sig: Signature = signing_key.sign(message);
         let der = sig.to_der();
@@ -389,7 +389,7 @@ mod tests {
     fn verifying_rejects_tampered_message() {
         let vk = derive_sigv4a_verifying_key(EXAMPLE_AKID, EXAMPLE_SECRET).expect("derives");
         let scalar = aws_reference_scalar(EXAMPLE_AKID, EXAMPLE_SECRET);
-        let signing_key = SigningKey::from_bytes(&scalar).expect("signing key");
+        let signing_key = SigningKey::from_slice(&scalar).expect("signing key");
         let message = b"original-string-to-sign";
         let sig: Signature = signing_key.sign(message);
         let der = sig.to_der();
@@ -401,7 +401,7 @@ mod tests {
     #[test]
     fn parse_der_signature_hex_accepts_valid_der() {
         let scalar = aws_reference_scalar(EXAMPLE_AKID, EXAMPLE_SECRET);
-        let signing_key = SigningKey::from_bytes(&scalar).expect("signing key");
+        let signing_key = SigningKey::from_slice(&scalar).expect("signing key");
         let sig: Signature = signing_key.sign(b"some-message");
         let der_hex = hex::encode(sig.to_der().as_ref());
         let parsed = parse_der_signature_hex(&der_hex).expect("parses");
@@ -411,7 +411,7 @@ mod tests {
     #[test]
     fn parse_der_signature_hex_rejects_uppercase() {
         let scalar = aws_reference_scalar(EXAMPLE_AKID, EXAMPLE_SECRET);
-        let signing_key = SigningKey::from_bytes(&scalar).expect("signing key");
+        let signing_key = SigningKey::from_slice(&scalar).expect("signing key");
         let sig: Signature = signing_key.sign(b"some-message");
         let der_hex = hex::encode_upper(sig.to_der().as_ref());
         let err = parse_der_signature_hex(&der_hex).expect_err("uppercase");
@@ -472,7 +472,7 @@ mod tests {
     #[test]
     fn parse_streaming_der_signature_hex_padded_trims_star_padding() {
         let scalar = aws_reference_scalar(EXAMPLE_AKID, EXAMPLE_SECRET);
-        let signing_key = SigningKey::from_bytes(&scalar).expect("signing key");
+        let signing_key = SigningKey::from_slice(&scalar).expect("signing key");
         let sig: Signature = signing_key.sign(b"some-message");
         let der_hex = hex::encode(sig.to_der().as_ref());
         assert!(der_hex.len() <= MAX_SIGV4A_DER_SIGNATURE_HEX_LEN);
@@ -554,7 +554,7 @@ mod tests {
     #[test]
     fn test_streaming_no_padding_accepted() {
         let scalar = aws_reference_scalar(EXAMPLE_AKID, EXAMPLE_SECRET);
-        let signing_key = SigningKey::from_bytes(&scalar).expect("signing key");
+        let signing_key = SigningKey::from_slice(&scalar).expect("signing key");
         let sig: Signature = signing_key.sign(b"some-message");
         let der_hex = hex::encode(sig.to_der().as_ref());
         assert!(der_hex.len() < MAX_SIGV4A_DER_SIGNATURE_HEX_LEN);

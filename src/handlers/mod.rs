@@ -1852,7 +1852,7 @@ mod tests {
         // We don't care WHICH key signs — trust mode is shape-only —
         // so we just feed any DER bytes the signer happens to produce.
         let scalar = aws_sigv4::sign::v4a::generate_signing_key("AKID", "SECRET");
-        let signing_key = SigningKey::from_bytes(scalar.as_ref()).unwrap();
+        let signing_key = SigningKey::from_slice(scalar.as_ref()).unwrap();
         let payload_sig: Signature = signing_key.sign(b"trust-mode-payload-chunk");
         let zero_sig: Signature = signing_key.sign(b"trust-mode-zero-chunk");
         let payload_sig_hex = hex::encode(payload_sig.to_der().as_ref());

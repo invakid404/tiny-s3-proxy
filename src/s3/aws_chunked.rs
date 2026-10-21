@@ -2361,7 +2361,7 @@ mod tests {
 
     fn ecdsa_signing_key() -> SigningKey {
         let scalar = aws_sigv4::sign::v4a::generate_signing_key(ECDSA_AKID, ECDSA_SECRET);
-        SigningKey::from_bytes(scalar.as_ref()).unwrap()
+        SigningKey::from_slice(scalar.as_ref()).unwrap()
     }
 
     fn ecdsa_verify_ctx() -> ChunkSignaturePolicy {
