@@ -12,7 +12,7 @@ aws-smithy-checksums = "=0.65.0"
 aws-smithy-types = "=1.9.0"
 axum = "=0.8.9"
 bytes = "=1.12.1"
-chrono = { version = "=0.4.44", features = ["serde"] }
+chrono = { version = "=0.4.45", features = ["serde"] }
 fs2 = "=0.4.3"
 hex = "=0.4.3"
 hmac = "=0.13.0"
