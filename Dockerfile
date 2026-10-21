@@ -9,9 +9,10 @@ COPY src/ src/
 RUN cargo build --release --locked \
     && strip target/release/tiny-s3-proxy
 
-FROM alpine:3
+FROM alpine:3 AS runtime
 
-RUN apk add --no-cache ca-certificates tini
+# Minimum trust-store release addressing the October 2026 eMudhra compromise.
+RUN apk add --no-cache 'ca-certificates>=20261020-r0' tini
 
 COPY --from=builder /build/target/release/tiny-s3-proxy /usr/local/bin/
 

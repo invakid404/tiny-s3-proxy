@@ -308,6 +308,30 @@ The integration tests use [testcontainers](https://github.com/testcontainers/tes
 
 **CI recommendation**: run `cargo test -- --ignored` in your CI pipeline with Docker available. The integration suite catches real proxy/backend/cache interaction bugs that unit tests cannot.
 
+## TLS security updates
+
+Outbound HTTPS uses the AWS SDK's current default HTTPS client and reqwest.
+The SDK's legacy `rustls` feature is intentionally disabled to avoid bringing
+back rustls 0.21 and rustls-webpki 0.101. Keep `Cargo.lock` committed and build
+with `--locked`; certificate-validation fixes are included in the binary.
+
+The [eMudhra incident report](https://emudhra.we-have-a-problem.com/),
+published October 20, 2026, describes compromised intermediate CA keys.
+Its patched versions include rustls-webpki 0.103.16,
+webpki-roots/webpki-root-certs 1.0.10, and Alpine ca-certificates 20261020-r0.
+This project's lockfile includes those Rust fixes, along with rustls 0.23.46
+and aws-lc-rs 1.18.2. The runtime image requires at least that Alpine
+CA package version, failing the build if the repository cannot supply it.
+
+Published container builds pull fresh base images and rebuild the runtime
+stage so Alpine's `ca-certificates` package is refreshed. For a manual security
+rebuild, use `docker build --pull --no-cache -t tiny-s3-proxy .`. Deploy the new
+image and restart existing instances; running containers do not acquire these
+updates automatically. For native deployments, also update the operating
+system's CA trust store. Review separately managed or mounted CA bundles
+against the specific CA incident; a dependency update alone does not remove
+an explicitly trusted compromised CA.
+
 ## License
 
 MIT
