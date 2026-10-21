@@ -196,8 +196,8 @@ pub fn body_has_checksum_elements(xml_body: &[u8]) -> bool {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
                 let local = e.local_name();
-                let name = String::from_utf8_lossy(local.as_ref());
-                if CHECKSUM_NAMES.contains(&name.as_ref()) {
+                let name = local.as_ref();
+                if CHECKSUM_NAMES.contains(&name) {
                     return true;
                 }
             }
@@ -228,7 +228,7 @@ pub fn parse_complete_multipart_body(xml_body: &[u8]) -> Result<Vec<CompletedPar
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name = e.name().as_ref().to_owned();
                 match name.as_str() {
                     "CompleteMultipartUpload" if depth == 0 => {
                         found_root = true;
@@ -260,17 +260,14 @@ pub fn parse_complete_multipart_body(xml_body: &[u8]) -> Result<Vec<CompletedPar
                 // Self-closing <CompleteMultipartUpload/> at depth 0 is a
                 // valid root but will have zero parts, caught by the
                 // post-parse check. Nested occurrences are ignored.
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name = e.name().as_ref().to_owned();
                 if name == "CompleteMultipartUpload" && depth == 0 {
                     found_root = true;
                 }
                 // Empty elements don't change depth (no matching End).
             }
             Ok(Event::Text(ref e)) if inside_part => {
-                let text = e
-                    .decode()
-                    .map_err(|err| format!("XML decode error: {}", err))?
-                    .to_string();
+                let text = e.as_ref().to_owned();
                 match current_element.as_str() {
                     "PartNumber" => {
                         current_part_number = Some(
@@ -286,7 +283,7 @@ pub fn parse_complete_multipart_body(xml_body: &[u8]) -> Result<Vec<CompletedPar
             }
             Ok(Event::End(ref e)) => {
                 depth = depth.saturating_sub(1);
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name = e.name().as_ref().to_owned();
                 if name == "Part" && inside_part {
                     let part_number = current_part_number
                         .ok_or_else(|| "Missing PartNumber in Part element".to_string())?;
@@ -550,6 +547,37 @@ mod tests {
         assert_eq!(parts[0].etag, "\"etag1\"");
         assert_eq!(parts[1].part_number, 2);
         assert_eq!(parts[1].etag, "\"etag2\"");
+    }
+
+    #[test]
+    fn test_parse_complete_multipart_rejects_invalid_utf8() {
+        for invalid in [
+            b"<Ignored>\xff</Ignored>".as_slice(),
+            b"<\xff/>".as_slice(),
+            b"<Part><PartNumber>2</PartNumber><ETag>\xff</ETag></Part>".as_slice(),
+        ] {
+            let mut body = b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>valid</ETag></Part>".to_vec();
+            body.extend_from_slice(invalid);
+            body.extend_from_slice(b"</CompleteMultipartUpload>");
+            let error = parse_complete_multipart_body(&body).unwrap_err();
+            assert!(error.starts_with("XML parse error:"), "{error}");
+        }
+    }
+
+    #[test]
+    fn test_parse_complete_multipart_preserves_utf8_text() {
+        let body = "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"café-東京\"</ETag></Part></CompleteMultipartUpload>";
+        let parts = parse_complete_multipart_body(body.as_bytes()).unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].etag, "\"café-東京\"");
+    }
+
+    #[test]
+    fn test_write_text_element_preserves_carriage_return_and_escapes_markup() {
+        let mut writer = Writer::new(Vec::new());
+        write_text_element(&mut writer, "Key", "café\r\n<&>\"");
+        let xml = String::from_utf8(writer.into_inner()).unwrap();
+        assert_eq!(xml, "<Key>café&#13;\n&lt;&amp;&gt;\"</Key>");
     }
 
     #[test]
